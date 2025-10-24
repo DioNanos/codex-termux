@@ -55,6 +55,18 @@ This is a pre-compiled distribution of OpenAI's Codex CLI for Termux/ARM64:
 - **Codex CLI bugs**: [Report upstream](https://github.com/openai/codex/issues)
 - **Termux-specific issues**: [Open issue here](https://github.com/DioNanos/codex-termux/issues)
 
+## ⚖️ Legal & Compliance
+
+This distribution is **fully compliant** with Apache License 2.0.
+
+📄 **[See Legal Compliance Document](./LEGAL-COMPLIANCE.md)**
+
+Key points:
+- ✅ No source code modifications
+- ✅ Full Apache 2.0 compliance
+- ✅ All copyrights preserved
+- ✅ Clear attribution to OpenAI
+
 ## 👤 Author
 
 Davide A. Guglielmi (@DioNanos)
