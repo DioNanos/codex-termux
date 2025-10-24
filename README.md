@@ -50,6 +50,7 @@ For full usage guide, see **[npm documentation](https://www.npmjs.com/package/@m
 
 | Document | Purpose |
 |----------|---------|
+| **[docs/PIPELINE.md](./docs/PIPELINE.md)** | 🤖 Automated build & release pipeline |
 | **[LEGAL-COMPLIANCE.md](./LEGAL-COMPLIANCE.md)** | ⚖️ Legal status & compliance |
 | **[npm Package](https://www.npmjs.com/package/@mmmbuto/codex-cli-termux)** | 📖 Complete usage guide |
 | **[Original Codex](https://github.com/openai/codex)** | 🔗 Upstream source & development |
