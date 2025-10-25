@@ -20,14 +20,34 @@ This repository contains **pre-compiled OpenAI Codex CLI binaries for Android Te
 
 ---
 
-## 📦 Quick Install
+## 📦 Installation
+
+### Method 1: npm (Recommended)
 
 ```bash
 npm install -g @mmmbuto/codex-cli-termux
 ```
 
+### Method 2: Manual Download
+
+Download the latest release from [GitHub Releases](https://github.com/DioNanos/codex-termux/releases):
+
+```bash
+# Download and extract
+wget https://github.com/DioNanos/codex-termux/releases/download/v0.49.0-termux/codex-0.49.0-termux-arm64.tar.gz
+tar -xzf codex-0.49.0-termux-arm64.tar.gz
+
+# Make executable and move to PATH
+chmod +x codex
+mv codex ~/.local/bin/  # or any directory in your PATH
+
+# Verify installation
+codex --version
+```
+
 **Links:**
 - 📦 **npm package**: https://www.npmjs.com/package/@mmmbuto/codex-cli-termux
+- 📥 **GitHub Releases**: https://github.com/DioNanos/codex-termux/releases
 - 📋 **Upstream source**: https://github.com/openai/codex
 
 ---
