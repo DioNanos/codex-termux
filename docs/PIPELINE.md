@@ -21,7 +21,10 @@ This document describes the automated pipeline that synchronizes OpenAI Codex, c
 10. Create Release        → GitHub release with changelog
 ```
 
-**Total Duration**: 25-30 minutes (first run with compilation)
+**Total Duration**:
+- 16GB devices: 20-30 minutes
+- 8GB devices: 30-40 minutes
+- (first run with compilation)
 
 ---
 
@@ -82,14 +85,42 @@ The pipeline **automatically aligns with OpenAI Codex upstream**:
 
 **Platform**: ARM64 (Termux/Android)
 
-**Build Command**:
+### Automatic RAM Detection & Optimization
+
+The pipeline automatically detects your device's RAM and applies the optimal compilation settings:
+
+**16GB RAM Configuration:**
+- Cargo.toml: `lto = false`, `codegen-units = 16`
+- Parallel jobs: `-j 2`
+- Estimated time: 20-30 minutes
+- RAM usage: ~12-14GB
+
+**8GB RAM Configuration:**
+- Cargo.toml: `lto = false`, `codegen-units = 32`, `opt-level = 2`
+- Parallel jobs: `-j 1`
+- Estimated time: 30-40 minutes
+- RAM usage: ~6-8GB
+
+**Build Command** (auto-configured):
 ```bash
-cargo build -p codex-cli --release -j 2
+# Automatically detects RAM and applies optimizations
+cargo build -p codex-cli --release -j [1-2 based on RAM]
 ```
 
-**Optimization**: Limited to 2 parallel jobs to prevent OOM on resource-constrained devices.
+**Manual Override**:
+```bash
+# Force 8GB configuration
+RAM_CONFIG=8 ./pipeline.sh --all
+
+# Force 16GB configuration
+RAM_CONFIG=16 ./pipeline.sh --all
+```
 
 **Output Binary**: `codex-termux/target/release/codex`
+
+### Why RAM Optimization Matters
+
+OpenAI Codex default build settings (`lto=fat`, `codegen-units=1`) require 18-22GB RAM and cause OOM errors on most mobile devices. Our pipeline automatically optimizes for Termux/Android constraints.
 
 ---
 
@@ -132,16 +163,23 @@ After successful pipeline execution:
 
 ## Troubleshooting
 
-### Compilation fails
+### Compilation fails with OOM errors
+
+The pipeline automatically detects RAM and applies optimizations, but if you still get out-of-memory errors:
 
 ```bash
-# Check prerequisites
-./pipeline.sh --dry-run
+# Force 8GB ultra-optimized config
+RAM_CONFIG=8 ./pipeline.sh --all
 
-# Clean build
-rm -rf codex-termux/target/
+# Clean build cache
+rm -rf codex-rs/target/
 ./pipeline.sh --compile
+
+# Monitor RAM during compilation
+watch -n 1 'free -h'
 ```
+
+For devices with <8GB RAM, you may need to manually reduce `opt-level` to 1 or 0 in `codex-rs/Cargo.toml`.
 
 ### npm publish fails
 
@@ -190,6 +228,7 @@ Keep this document synchronized with:
 
 ---
 
-**Last Updated**: 2025-10-24
+**Last Updated**: 2025-10-25
 **Pipeline Status**: ✅ Production Ready
-**Current Version Tracking**: OpenAI Codex upstream (rust-v0.49.0)
+**Features**: ✨ Auto RAM detection (8GB/16GB support)
+**Current Version Tracking**: OpenAI Codex upstream
