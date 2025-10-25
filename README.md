@@ -28,7 +28,7 @@ npm install -g @mmmbuto/codex-cli-termux
 
 **Links:**
 - 📦 **npm**: https://www.npmjs.com/package/@mmmbuto/codex-cli-termux
-- 🔗 **GitHub Release**: https://github.com/DioNanos/codex-termux/releases/tag/v1.0.0-termux
+- 🔗 **GitHub Release**: https://github.com/DioNanos/codex-termux/releases/tag/v0.49.0-termux
 
 ---
 
@@ -176,7 +176,7 @@ codex --version
 ```
 
 ### Method 2: GitHub Release
-Download from: https://github.com/DioNanos/codex-termux/releases/tag/v1.0.0-termux
+Download from: https://github.com/DioNanos/codex-termux/releases/tag/v0.49.0-termux
 
 ### Method 3: From Source
 ```bash
