@@ -27,8 +27,8 @@ npm install -g @mmmbuto/codex-cli-termux
 ```
 
 **Links:**
-- 📦 **npm**: https://www.npmjs.com/package/@mmmbuto/codex-cli-termux
-- 🔗 **GitHub Release**: https://github.com/DioNanos/codex-termux/releases/tag/v0.49.0-termux
+- 📦 **npm package**: https://www.npmjs.com/package/@mmmbuto/codex-cli-termux
+- 📋 **Upstream source**: https://github.com/openai/codex
 
 ---
 
