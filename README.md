@@ -56,7 +56,7 @@ What this fork does not do:
 ## Releases and Updates
 
 - Latest GitHub release: [releases/latest](https://github.com/DioNanos/codex-termux/releases/latest)
-- Upstream base: OpenAI Codex `rust-v0.144.4`, packaged as `0.144.4` on npm `next`. The `latest` dist-tag remains on `0.144.1`; `stable` stays on `0.143.0` for conservative installs.
+- Upstream base: OpenAI Codex `rust-v0.144.5`, packaged as `0.144.5` on npm `next`. The `latest` dist-tag remains on `0.144.4`; `stable` stays on `0.143.0` for conservative installs.
 - npm package: [`@mmmbuto/codex-cli-termux`](https://www.npmjs.com/package/@mmmbuto/codex-cli-termux)
 - Legacy `@mmmbuto/codex-cli-lts` (OpenAI Codex 0.80.x) is archived; current builds live in this package or in [`@mmmbuto/codex-vl`](https://www.npmjs.com/package/@mmmbuto/codex-vl) (multi-platform).
 
@@ -73,7 +73,7 @@ Maintainer publish flow:
 - [Changelog](./CHANGELOG.md)
 - [Patch inventory](./patches/README.md)
 - [Building from source](./BUILDING.md)
-- Runtime validation: 0.144.4 device validation pending.
+- Latest runtime validation report: 0.144.5 validation pending; previous report [v0.142.0 Termux device validation](./test-report/CODEX_TEST_REPORT_v0.142.0_run_20260623-2007.md)
 - [Install docs](./docs/install.md)
 - [Authentication](./docs/authentication.md)
 - [Configuration](./docs/config.md)

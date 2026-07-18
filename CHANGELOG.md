@@ -1,3 +1,17 @@
+# [0.144.5] - 2026-07-17
+
+Synced the complete Termux fork to the final upstream OpenAI Codex
+`rust-v0.144.5` patch release for the npm `next` lane. The complete
+Android/Termux compatibility delta remains applied.
+
+## Changed
+- Integrated the complete upstream `rust-v0.144.5` delta, including expanded
+  dangerous-command detection for additional forced recursive deletion forms.
+- Preserved all Termux patches, including Android TLS roots, PTY and lock
+  compatibility, real in-process V8 code-mode, bundled libc++, and
+  `RUNPATH=$ORIGIN` packaging hardening.
+- Bumped npm package and Cargo workspace versions to `0.144.5`.
+
 # [0.144.4] - 2026-07-14
 
 Synced the complete Termux fork to the final upstream OpenAI Codex
