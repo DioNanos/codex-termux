@@ -17,14 +17,14 @@
 ```bash
 pkg update && pkg upgrade -y
 pkg install nodejs-lts -y
-npm install -g @mmmbuto/codex-cli-termux@next
+npm install -g @mmmbuto/codex-cli-termux@latest
 codex --version
 codex login
 ```
 
 Requirements:
 
-- Android 7+ / API 24+
+- Android 10+ / API 29+ (the release binary is built with the API 29 NDK target)
 - ARM64 device
 - Node.js >= 18
 
@@ -47,7 +47,7 @@ What this fork does not do:
 
 - browser login uses `termux-open-url`
 - self-update points to `DioNanos/codex-termux` and `@mmmbuto/codex-cli-termux`
-- packaged wrappers preserve `CODEX_SELF_EXE`, sanitize `LD_LIBRARY_PATH`, and bundle `libc++_shared.so`
+- packaged wrappers set `CODEX_SELF_EXE` to the native ELF, sanitize `LD_LIBRARY_PATH`, and bundle `libc++_shared.so`
 - Android binaries are linked with `RUNPATH=$ORIGIN`
 - `exec`/code-mode now runs for real on Android via the in-process V8 runtime (no longer a stub) — the meaningful capability gain on Termux
 - realtime voice/audio is no longer part of this build: upstream removed the TUI realtime voice feature (openai/codex#27801), so the fork's Android cpal/oboe enablement toggle (never usable from the Termux CLI anyway, as the backend needs an Android JavaVM/Activity) was dropped with it. Termux-native audio remains tracked on the Codex VL roadmap.
@@ -56,24 +56,28 @@ What this fork does not do:
 ## Releases and Updates
 
 - Latest GitHub release: [releases/latest](https://github.com/DioNanos/codex-termux/releases/latest)
-- Upstream base: OpenAI Codex `rust-v0.144.5`, packaged as `0.144.5` on npm `next`. The `latest` dist-tag remains on `0.144.4`; `stable` stays on `0.143.0` for conservative installs.
+- Upstream base: OpenAI Codex `rust-v0.145.0`, packaged as `0.145.0` on npm `latest` and `next`. The conservative `stable` dist-tag stays on `0.144.4`.
 - npm package: [`@mmmbuto/codex-cli-termux`](https://www.npmjs.com/package/@mmmbuto/codex-cli-termux)
 - Legacy `@mmmbuto/codex-cli-lts` (OpenAI Codex 0.80.x) is archived; current builds live in this package or in [`@mmmbuto/codex-vl`](https://www.npmjs.com/package/@mmmbuto/codex-vl) (multi-platform).
 
 Maintainer publish flow:
 
-- land validated changes on `develop`
-- publish the tested npm package to `next`
-- promote the tested commit to clean GitHub `main`
-- publish the GitHub release from `main`
-- add post-release Termux validation reports after device testing
+- build the exact sanitized candidate with GitHub Actions and audit its
+  immutable npm tarball
+- land the validated full tree on `develop`
+- publish that unchanged tarball to `next`
+- promote the tested sanitized commit to clean GitHub `main`
+- point `latest` and `next` at the stable version, then publish the annotated
+  tag and GitHub release from `main`
+- publish a post-release Termux device-validation summary
 
 ## Documentation
 
 - [Changelog](./CHANGELOG.md)
 - [Patch inventory](./patches/README.md)
 - [Building from source](./BUILDING.md)
-- Latest runtime validation report: 0.144.5 validation pending; previous report [v0.142.0 Termux device validation](./test-report/CODEX_TEST_REPORT_v0.142.0_run_20260623-2007.md)
+- The 0.145.0 on-device validation summary will be added separately after
+  post-release device testing
 - [Install docs](./docs/install.md)
 - [Authentication](./docs/authentication.md)
 - [Configuration](./docs/config.md)
@@ -86,8 +90,10 @@ This is a community fork of OpenAI Codex. Security-relevant properties of this b
 - **Supply chain**: builds and releases come only from fork-owned CI and the `@mmmbuto/...` npm
   scope. This package does not silently fetch or run the upstream installer; updates flow through
   the fork's own channel.
-- **Termux**: TLS trust uses bundled webpki roots (no Android platform-verifier dependency), and
-  advisory file locks degrade safely on filesystems that don't support them.
+- **Termux**: TLS trust uses bundled webpki roots (no Android platform-verifier dependency).
+  The daemon, history, PATH-alias, installation-id, and policy lock sites that are safe to run
+  without advisory exclusion degrade only when the filesystem reports locking as unsupported;
+  credential and certificate transactions remain fail-closed.
 
 For sensitive work, prefer the official Codex CLI on Linux/macOS over SSH.
 

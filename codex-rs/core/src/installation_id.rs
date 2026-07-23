@@ -21,10 +21,9 @@ fn is_unsupported_file_lock_error(err: &std::io::Error) -> bool {
     // Filesystems that do not support advisory file locking (observed on
     // Termux storage backends under `/data/data/com.termux/files`) surface
     // `ErrorKind::Unsupported` from `File::lock`. Detect this on every
-    // target rather than gating on `cfg!(target_os = "android")`, because
-    // the Termux release line is packaged as `aarch64-unknown-linux-musl`
-    // (target_os = linux), so the cfg-based gate did not actually fire on
-    // the affected binary.
+    // target rather than gating on `cfg!(target_os = "android")`: support
+    // for the affected filesystem behavior is a runtime property, and this
+    // also covers older Termux package lines.
     err.kind() == ErrorKind::Unsupported
 }
 

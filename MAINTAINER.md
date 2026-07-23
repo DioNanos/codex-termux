@@ -14,11 +14,13 @@ In scope:
 
 - the Android ARM64 / Termux compatibility patches (browser auth via
   `termux-open-url`, packaged wrappers, `LD_LIBRARY_PATH` sanitization,
-  `RUNPATH=$ORIGIN`, PTY/lock-handling fixes, voice/realtime disabled)
+  `RUNPATH=$ORIGIN`, PTY/lock-handling fixes, and the Termux no-audio policy
+  after upstream removed the realtime voice surface)
 - the `@mmmbuto/codex-cli-termux` npm package and the matching GitHub
   release assets
-- the release flow: validate on `develop`, publish npm `latest`, promote
-  tested commits to clean `main`, cut GitHub Releases from `main`
+- the release flow: validate the full tree, build and audit a sanitized GitHub
+  Actions candidate, publish the unchanged npm artifact, promote the tested
+  public commit to clean `main`, and cut GitHub Releases from `main`
 
 Out of scope here:
 

@@ -63,9 +63,9 @@ pub enum AmendError {
 /// Filesystems that do not support advisory file locking (observed on
 /// Termux storage backends under `/data/data/com.termux/files`) surface
 /// `ErrorKind::Unsupported` from `File::lock`. Detect this on every
-/// target rather than gating on `cfg!(target_os = "android")`, because
-/// the Termux release line is packaged as `aarch64-unknown-linux-musl`
-/// (`target_os = linux`).
+/// target rather than gating on `cfg!(target_os = "android")`: the filesystem
+/// behavior is a runtime property, and this also covers older Termux package
+/// lines.
 fn is_unsupported_file_lock_error(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::Unsupported
 }
@@ -202,9 +202,9 @@ fn append_locked_line(policy_path: &Path, line: &str) -> Result<(), AmendError> 
     // Filesystems that do not support advisory file locking (observed on
     // Termux storage backends under `/data/data/com.termux/files`) surface
     // `ErrorKind::Unsupported` from `File::lock`. Append to the policy file
-    // without exclusion in that case; the dedup check below
-    // (`contents.lines().any(|existing| existing == line)`) keeps the file
-    // safe against concurrent identical appends.
+    // without exclusion in that case. Deduplication remains best-effort when
+    // concurrent writers cannot be serialized; duplicate equivalent rules are
+    // preferable to making policy persistence unusable on those filesystems.
 
     file.seek(SeekFrom::Start(0))
         .map_err(|source| AmendError::SeekPolicyFile {

@@ -11,8 +11,8 @@
 //! To minimize the chance of interleaved writes when multiple processes are
 //! appending concurrently, callers should *prepare the full line* (record +
 //! trailing `\n`) and write it with a **single `write(2)` system call** while
-//! the file descriptor is opened with the `O_APPEND` flag. POSIX guarantees
-//! that writes up to `PIPE_BUF` bytes are atomic in that case.
+//! the file descriptor is opened with the `O_APPEND` flag. On Linux/Android,
+//! this keeps each append contiguous even when advisory locks are unavailable.
 
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -37,6 +37,12 @@ use tokio::io::AsyncReadExt;
 use codex_config::types::History;
 use codex_config::types::HistoryPersistence;
 
+mod batch;
+pub use batch::HistoryBatch;
+pub use batch::HistoryBatchCursor;
+pub use batch::HistoryBatchEntry;
+pub use batch::lookup_batch;
+
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
@@ -55,11 +61,12 @@ const RETRY_SLEEP: Duration = Duration::from_millis(100);
 /// Filesystems that do not support advisory file locking (observed on
 /// Termux storage backends under `/data/data/com.termux/files`) surface
 /// `ErrorKind::Unsupported` from `File::try_lock` / `File::try_lock_shared`.
-/// Detect this on every target rather than gating on `cfg!(target_os = "android")`,
-/// because the Termux release line is packaged as `aarch64-unknown-linux-musl`.
+/// Detect this on every target rather than gating on `cfg!(target_os = "android")`:
+/// the filesystem behavior is a runtime property, and this also covers older
+/// Termux package lines.
 /// When this is true, callers should proceed without the advisory lock instead
-/// of failing the operation. The atomic O_APPEND + sub-PIPE_BUF write contract
-/// documented at the top of this file keeps individual lines intact even
+/// of failing the operation. The single-write O_APPEND contract documented at
+/// the top of this file keeps individual lines intact on Linux/Android even
 /// without exclusion.
 fn is_unsupported_file_lock_error(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::Unsupported
@@ -200,14 +207,12 @@ pub async fn append_entry(
                     std::thread::sleep(RETRY_SLEEP);
                     continue;
                 }
-                Err(std::fs::TryLockError::Error(ref e))
-                    if is_unsupported_file_lock_error(e) =>
-                {
+                Err(std::fs::TryLockError::Error(ref e)) if is_unsupported_file_lock_error(e) => {
                     // Termux storage and other backends that reject advisory
                     // file locking. Proceed without the exclusive lock; the
-                    // O_APPEND + atomic sub-PIPE_BUF write contract documented
-                    // at the top of this file keeps each line intact even
-                    // under concurrent writes.
+                    // single-write O_APPEND contract documented at the top of
+                    // this file keeps each line intact under concurrent writes
+                    // on Linux/Android.
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -216,7 +221,16 @@ pub async fn append_entry(
             // open the file with `append(true)` on Windows, so ensure the
             // cursor is positioned at the end before writing.
             history_file.seek(SeekFrom::End(0))?;
-            history_file.write_all(line.as_bytes())?;
+            let written = history_file.write(line.as_bytes())?;
+            if written != line.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    format!(
+                        "partial history append: wrote {written} of {} bytes",
+                        line.len()
+                    ),
+                ));
+            }
             history_file.flush()?;
             enforce_history_limit(&mut history_file, history_max_bytes)?;
             return Ok(());
@@ -489,5 +503,8 @@ fn log_identity(_metadata: &std::fs::Metadata) -> Option<u64> {
     None
 }
 
+#[cfg(test)]
+#[path = "batch_tests.rs"]
+mod batch_tests;
 #[cfg(test)]
 mod tests;

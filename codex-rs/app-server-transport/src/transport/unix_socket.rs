@@ -171,36 +171,6 @@ fn is_unsupported_file_lock_error(err: &std::io::Error) -> bool {
     err.kind() == ErrorKind::Unsupported
 }
 
-#[cfg(test)]
-mod unsupported_lock_helper_tests {
-    use super::is_unsupported_file_lock_error;
-    use std::io::Error;
-    use std::io::ErrorKind;
-
-    #[test]
-    fn unsupported_kind_is_classified_as_unsupported_lock_error() {
-        assert!(is_unsupported_file_lock_error(&Error::from(
-            ErrorKind::Unsupported
-        )));
-    }
-
-    #[test]
-    fn other_kinds_are_not_classified_as_unsupported_lock_error() {
-        assert!(!is_unsupported_file_lock_error(&Error::from(
-            ErrorKind::PermissionDenied
-        )));
-        assert!(!is_unsupported_file_lock_error(&Error::from(
-            ErrorKind::NotFound
-        )));
-        assert!(!is_unsupported_file_lock_error(&Error::from(
-            ErrorKind::WouldBlock
-        )));
-        assert!(!is_unsupported_file_lock_error(&Error::from(
-            ErrorKind::Interrupted
-        )));
-    }
-}
-
 #[cfg(unix)]
 async fn set_control_socket_permissions(socket_path: &Path) -> IoResult<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -232,5 +202,35 @@ impl Drop for ControlSocketFileGuard {
                 "failed to remove app-server control socket file"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unsupported_lock_helper_tests {
+    use super::is_unsupported_file_lock_error;
+    use std::io::Error;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn unsupported_kind_is_classified_as_unsupported_lock_error() {
+        assert!(is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::Unsupported
+        )));
+    }
+
+    #[test]
+    fn other_kinds_are_not_classified_as_unsupported_lock_error() {
+        assert!(!is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::NotFound
+        )));
+        assert!(!is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::WouldBlock
+        )));
+        assert!(!is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
     }
 }

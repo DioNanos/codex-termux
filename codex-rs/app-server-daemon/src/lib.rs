@@ -198,13 +198,6 @@ pub async fn bootstrap(options: BootstrapOptions) -> Result<BootstrapOutput> {
     Daemon::from_environment()?.bootstrap(options).await
 }
 
-pub async fn ensure_remote_control_started() -> Result<RemoteControlStartOutput> {
-    ensure_supported_platform()?;
-    Daemon::from_environment()?
-        .ensure_remote_control_started()
-        .await
-}
-
 pub async fn ensure_remote_control_ready() -> Result<RemoteControlReadyOutput> {
     ensure_supported_platform()?;
     Daemon::from_environment()?
@@ -842,7 +835,7 @@ fn try_lock_file(file: &tokio::fs::File) -> Result<bool> {
     if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
         return Ok(false);
     }
-    // codex-vl Step 14 Bug 3 fix — some Android/Termux storage backends
+    // Some Android/Termux storage backends
     // (e.g. certain f2fs / tmpfs mounts under `/data/data/com.termux`)
     // reject `flock(2)` with ENOTSUP / EOPNOTSUPP, surfacing the cryptic
     // "lock() not supported" error path that aborted `codex remote-control`

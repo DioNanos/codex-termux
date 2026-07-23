@@ -254,12 +254,22 @@ impl PidBackend {
             let started_at = tokio::time::Instant::now();
             let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
             let mut forced = false;
-            while tokio::time::Instant::now() < deadline {
+            loop {
+                #[cfg(unix)]
+                if let Ok(raw_pid) = libc::pid_t::try_from(pid)
+                    && raw_pid > 0
+                {
+                    // A previous updater may have started this child; reap it if it has exited.
+                    unsafe { libc::waitpid(raw_pid, std::ptr::null_mut(), libc::WNOHANG) };
+                }
                 if !self.record_is_active(&record).await? {
                     match self.refresh_after_stale_record(&record).await? {
                         PidFileState::Missing => return Ok(()),
                         PidFileState::Starting | PidFileState::Running(_) => break,
                     }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
                 }
                 if !forced && started_at.elapsed() >= STOP_GRACE_PERIOD {
                     self.force_terminate_process(pid)?;
@@ -602,7 +612,7 @@ fn try_lock_file(file: &fs::File) -> Result<bool> {
     if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
         return Ok(false);
     }
-    // codex-vl Step 14 Bug 3 fix — Android/Termux storage backends that
+    // Android/Termux storage backends that
     // reject `flock(2)` with ENOTSUP / EOPNOTSUPP must not abort daemon
     // startup. Match the permissive degradation used in
     // `core::installation_id::is_unsupported_file_lock_error` and in
@@ -709,8 +719,13 @@ async fn read_process_start_time(pid: u32) -> Result<String> {
     let stat = tokio::fs::read_to_string(format!("/proc/{pid}/stat"))
         .await
         .with_context(|| format!("failed to read /proc/{pid}/stat"))?;
+    parse_proc_stat_start_time(&stat, pid)
+}
+
+#[cfg(any(test, target_os = "android"))]
+fn parse_proc_stat_start_time(stat: &str, pid: u32) -> Result<String> {
     let after_comm = stat
-        .find(')')
+        .rfind(')')
         .with_context(|| format!("malformed /proc/{pid}/stat: missing closing paren"))?;
     let fields: Vec<&str> = stat[after_comm + 1..].split_whitespace().collect();
     // Field 22 total = index 19 after pid and comm (state is index 0 here).

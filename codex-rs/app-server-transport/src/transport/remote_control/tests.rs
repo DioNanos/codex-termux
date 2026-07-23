@@ -25,6 +25,7 @@ use codex_app_server_protocol::RemoteControlPairingStartParams;
 use codex_app_server_protocol::RemoteControlPairingStatusParams;
 use codex_app_server_protocol::RemoteControlStatusChangedNotification;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ServerNotificationEnvelope;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::test_support::auth_manager_from_auth;
 use codex_core::test_support::auth_manager_from_auth_with_home;
@@ -736,14 +737,15 @@ async fn remote_control_transport_manages_virtual_clients_and_routes_messages() 
 
     writer
         .send(QueuedOutgoingMessage::new(
-            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
+            OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+                notification: ServerNotification::ConfigWarning(ConfigWarningNotification {
                     summary: "test".to_string(),
                     details: None,
                     path: None,
                     range: None,
-                },
-            )),
+                }),
+                emitted_at_ms: Some(1_234),
+            }),
         ))
         .await
         .expect("remote writer should accept outgoing message");
@@ -758,7 +760,8 @@ async fn remote_control_transport_manages_virtual_clients_and_routes_messages() 
                 "params": {
                     "summary": "test",
                     "details": null,
-                }
+                },
+                "emittedAtMs": 1_234,
             }
         })
     );
@@ -1344,14 +1347,15 @@ async fn remote_control_transport_clears_outgoing_buffer_when_backend_acks() {
 
     writer
         .send(QueuedOutgoingMessage::new(
-            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
+            OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+                notification: ServerNotification::ConfigWarning(ConfigWarningNotification {
                     summary: "stale".to_string(),
                     details: None,
                     path: None,
                     range: None,
-                },
-            )),
+                }),
+                emitted_at_ms: Some(1_234),
+            }),
         ))
         .await
         .expect("remote writer should accept outgoing message");
@@ -1367,7 +1371,8 @@ async fn remote_control_transport_clears_outgoing_buffer_when_backend_acks() {
                 "params": {
                     "summary": "stale",
                     "details": null,
-                }
+                },
+                "emittedAtMs": 1_234,
             }
         })
     );
@@ -1634,14 +1639,15 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
 
     writer
         .send(QueuedOutgoingMessage::new(
-            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
+            OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+                notification: ServerNotification::ConfigWarning(ConfigWarningNotification {
                     summary: "backend".to_string(),
                     details: None,
                     path: None,
                     range: None,
-                },
-            )),
+                }),
+                emitted_at_ms: Some(1_234),
+            }),
         ))
         .await
         .expect("remote writer should accept outgoing message");
@@ -1656,7 +1662,8 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
                 "params": {
                     "summary": "backend",
                     "details": null,
-                }
+                },
+                "emittedAtMs": 1_234,
             }
         })
     );
@@ -1937,11 +1944,8 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
     .expect("auth with account id should save");
     auth_manager.reload().await;
 
-    // codex-vl/codex-termux 0.134.1 — raised from 100ms to 950ms to remove
-    // intermittent flake under CPU pressure (audit codex-vl-bug-audit Codex
-    // GPT-5.5 2026-05-27: original 100ms window failed at run 11/50;
-    // intermediate 750ms still failed at ~40% on codex-termux release line
-    // even in isolation). Must remain STRICTLY BELOW the production retry
+    // Raised from 100ms to 950ms to remove an intermittent flake under CPU
+    // pressure. Must remain STRICTLY BELOW the production retry
     // interval `REMOTE_CONTROL_ACCOUNT_ID_RETRY_INTERVAL = 1s` so the
     // assertion still verifies "auth change wakes remote control before
     // the retry delay would fire" instead of just "retry eventually

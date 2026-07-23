@@ -1,11 +1,12 @@
 ---
 source: tui/src/history_cell/tests.rs
+assertion_line: 1157
 expression: rendered
 ---
-╭─────────────────────────────────────────────────╮
-│ ✨ Update available! 0.0.0 -> 9.9.9             │
-│ Run pnpm add -g @openai/codex to update.        │
-│                                                 │
-│ See full release notes:                         │
-│ https://github.com/openai/codex/releases/latest │
-╰─────────────────────────────────────────────────╯
+╭─────────────────────────────────────────────────────────────╮
+│ ✨ Update available! 0.0.0 -> 9.9.9                         │
+│ Run pnpm add -g @mmmbuto/codex-cli-termux@latest to update. │
+│                                                             │
+│ See full release notes:                                     │
+│ https://github.com/DioNanos/codex-termux/releases/latest    │
+╰─────────────────────────────────────────────────────────────╯

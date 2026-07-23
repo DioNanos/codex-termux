@@ -11,17 +11,6 @@ on:
       - main
       - lts
   workflow_dispatch:
-    inputs:
-      source_ref:
-        description: "Git ref or branch to build"
-        required: true
-        type: string
-        default: "develop"
-      create_release:
-        description: "Create or refresh draft GitHub release assets"
-        required: true
-        type: boolean
-        default: false
 
 jobs:
   build-android-arm64:
@@ -29,10 +18,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
-      contents: write
+      contents: read
     env:
       ANDROID_NDK_VERSION: "28.2.13676358"
-      # Match codex-vl release packaging so the npm tarball stays under the
+      # Keep the release tarball under the
       # registry's unpacked-size limit (~512 MiB). Default release profile
       # produced ~520 MiB and was rejected with HTTP 413 Payload Too Large.
       CARGO_PROFILE_RELEASE_OPT_LEVEL: "3"
@@ -42,9 +31,15 @@ jobs:
       CARGO_PROFILE_RELEASE_STRIP: "symbols"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref || github.ref_name }}
+          persist-credentials: false
+
+      - name: Verify checked-out revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
 
       - name: Install host dependencies
         shell: bash
@@ -93,7 +88,7 @@ jobs:
           # it, so link the compiler-rt builtins archive explicitly. We replicate
           # the .cargo/config.toml android rustflags here because the per-target
           # RUSTFLAGS env overrides (does not merge with) the config file.
-          builtins="$(find "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64" -name 'libclang_rt.builtins-aarch64-android.a' 2>/dev/null | head -1)"
+          builtins="$(find "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64" -name 'libclang_rt.builtins-aarch64-android.a' -print -quit 2>/dev/null)"
           if [ -z "${builtins}" ]; then echo "clang_rt builtins for aarch64-android not found under NDK" >&2; exit 1; fi
           echo "linking compiler-rt builtins: ${builtins}"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-Clink-arg=-lc++_shared -Clink-arg=-Wl,-rpath,\$ORIGIN -Clink-arg=${builtins}"
@@ -106,12 +101,13 @@ jobs:
           set -euo pipefail
           cp codex-rs/target/aarch64-linux-android/release/codex npm-package/bin/codex.bin
           cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" npm-package/bin/libc++_shared.so
-          # Strip native binaries and libc++ to match codex-vl packaging and stay
+          # Strip native binaries and libc++ to stay
           # under npm's unpacked-size limit (~512 MiB). Without this the tarball is
           # rejected with HTTP 413 Payload Too Large.
           export PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}"
           llvm-strip --strip-all npm-package/bin/codex.bin npm-package/bin/libc++_shared.so
-          chmod +x npm-package/bin/codex npm-package/bin/codex-exec npm-package/bin/codex.bin npm-package/bin/libc++_shared.so
+          chmod 0755 npm-package/bin/codex npm-package/bin/codex-exec npm-package/bin/codex.bin
+          chmod 0644 npm-package/bin/libc++_shared.so
           CODEX_PUBLIC_SANITIZED_TREE=1 bash verify-patches.sh
           cd npm-package
           rm -f ./*.tgz
@@ -122,49 +118,16 @@ jobs:
           echo "PACKAGE_TGZ=npm-package/${package_tgz}" >> "${GITHUB_ENV}"
           echo "PACKAGE_SHA256_FILE=npm-package/${package_tgz}.sha256" >> "${GITHUB_ENV}"
           echo "PACKAGE_VERSION=${package_version}" >> "${GITHUB_ENV}"
-          echo "RELEASE_TAG=v${package_version}" >> "${GITHUB_ENV}"
           ls -lh "${package_tgz}" "${package_tgz}.sha256"
 
       - name: Upload npm tarball artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: codex-cli-termux-android-arm64-${{ env.PACKAGE_VERSION }}
           path: |
             ${{ env.PACKAGE_TGZ }}
             ${{ env.PACKAGE_SHA256_FILE }}
           if-no-files-found: error
-
-      - name: Create Draft GitHub Release
-        if: ${{ github.event.inputs.create_release == 'true' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_REPO: DioNanos/codex-termux
-        run: |
-          set -euo pipefail
-          notes_file=".release/${RELEASE_TAG}.md"
-          if [ ! -f "${notes_file}" ]; then
-            echo "missing release notes file: ${notes_file}" >&2
-            exit 1
-          fi
-          if gh release view "${RELEASE_TAG}" --repo "${RELEASE_REPO}" > /dev/null 2>&1; then
-            gh release edit "${RELEASE_TAG}" \
-              --repo "${RELEASE_REPO}" \
-              --target "${GITHUB_SHA}" \
-              --title "${RELEASE_TAG}" \
-              --notes-file "${notes_file}" \
-              --draft
-            gh release upload "${RELEASE_TAG}" "${PACKAGE_TGZ}" "${PACKAGE_SHA256_FILE}" \
-              --repo "${RELEASE_REPO}" \
-              --clobber
-          else
-            gh release create "${RELEASE_TAG}" "${PACKAGE_TGZ}" "${PACKAGE_SHA256_FILE}" \
-              --repo "${RELEASE_REPO}" \
-              --target "${GITHUB_SHA}" \
-              --title "${RELEASE_TAG}" \
-              --notes-file "${notes_file}" \
-              --draft
-          fi
 
       # npm publish intentionally removed: publishing is performed locally with
       # ~/.npmrc on the maintainer's release host, never from CI. The Android

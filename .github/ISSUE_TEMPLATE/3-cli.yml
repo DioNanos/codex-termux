@@ -30,14 +30,13 @@ body:
     id: model
     attributes:
       label: Which model were you using?
-      description: Like `gpt-5.2`, `gpt-5.2-codex`, etc.
+      description: Copy the model name shown by Codex.
   - type: input
     id: platform
     attributes:
-      label: What platform is your computer?
+      label: What Android device and Termux build are you using?
       description: |
-        For macOS and Linux: copy the output of `uname -mprs`
-        For Windows: copy the output of `"$([Environment]::OSVersion | ForEach-Object VersionString) $(if ([Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" })"` in the PowerShell console
+        Include the device model, Android version/API level, Termux source and version (F-Droid or GitHub), Node.js version, and the output of `uname -mprs`.
   - type: input
     id: terminal
     attributes:

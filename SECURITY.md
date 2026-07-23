@@ -9,7 +9,7 @@ For issues in the fork's own code — Termux/Android compatibility patches, fork
 release workflows, or npm packaging — please report privately:
 
 - Open a private [GitHub Security Advisory](../../security/advisories/new) on this repository, or
-- Email dev@mmmbuto.com
+- Email security@mmmbuto.com (or dev@mmmbuto.com)
 
 Please do not open a public issue for security reports, and allow reasonable time to address the
 issue before public disclosure.

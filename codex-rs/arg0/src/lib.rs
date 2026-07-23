@@ -26,10 +26,9 @@ const TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 /// Filesystems that do not support advisory file locking (observed on
 /// Termux storage backends under `/data/data/com.termux/files`) surface
 /// `ErrorKind::Unsupported` from `File::try_lock`. Detect this on every
-/// target instead of gating on `cfg!(target_os = "android")`, because the
-/// Termux release line is packaged as `aarch64-unknown-linux-musl`
-/// (`target_os = linux`), so the cfg-based gate was inactive on the
-/// affected binary line.
+/// target instead of gating on `cfg!(target_os = "android")`: support for the
+/// affected filesystem behavior is a runtime property, and keeping the helper
+/// target-independent also covers older Termux package lines.
 fn is_unsupported_file_lock_error(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::Unsupported
 }

@@ -54,8 +54,6 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
     })
 }
 
-// We use the latest version from the cask if installation is via homebrew - homebrew does not immediately pick up the latest release and can lag behind.
-const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
 const LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/DioNanos/codex-termux/releases/latest";
 const NPM_LATEST_URL: &str = "https://registry.npmjs.org/@mmmbuto%2fcodex-cli-termux/latest";
@@ -66,11 +64,6 @@ struct ReleaseInfo {
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct HomebrewCaskInfo {
-    version: String,
-}
-
-#[derive(Deserialize, Debug, Clone)]
 struct NpmLatestInfo {
     version: String,
 }
@@ -78,19 +71,10 @@ struct NpmLatestInfo {
 async fn check_for_update(version_file: &Path, action: Option<UpdateAction>) -> anyhow::Result<()> {
     let source = current_update_source(action);
     let latest_version = match action {
-        Some(UpdateAction::BrewUpgrade) => {
-            let HomebrewCaskInfo { version } = create_client()
-                .get(HOMEBREW_CASK_API_URL)
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<HomebrewCaskInfo>()
-                .await?;
-            version
-        }
         Some(UpdateAction::NpmGlobalLatest)
         | Some(UpdateAction::BunGlobalLatest)
-        | Some(UpdateAction::PnpmGlobalLatest) => {
+        | Some(UpdateAction::PnpmGlobalLatest)
+        | Some(UpdateAction::BrewUpgrade) => {
             let NpmLatestInfo { version } = create_client()
                 .get(NPM_LATEST_URL)
                 .send()
@@ -129,7 +113,7 @@ fn current_update_source(action: Option<UpdateAction>) -> &'static str {
         Some(UpdateAction::NpmGlobalLatest) => "npm",
         Some(UpdateAction::BunGlobalLatest) => "bun",
         Some(UpdateAction::PnpmGlobalLatest) => "pnpm",
-        Some(UpdateAction::BrewUpgrade) => "brew",
+        Some(UpdateAction::BrewUpgrade) => "npm",
         Some(UpdateAction::StandaloneUnix) | Some(UpdateAction::StandaloneWindows) | None => {
             "github-release"
         }

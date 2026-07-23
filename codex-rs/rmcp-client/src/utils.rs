@@ -32,11 +32,9 @@ pub(crate) fn create_env_for_mcp_server(
 
 /// codex-termux GitHub issue #10 fix — detect Termux at runtime via the
 /// `TERMUX_VERSION` environment variable (set by Termux init scripts and
-/// not present on any other Linux distribution). The Termux release line
-/// is packaged as `aarch64-unknown-linux-musl`, so `cfg!(target_os =
-/// "android")` is FALSE on the affected binary and cannot be used to
-/// gate this check. Runtime detection works on every target where the
-/// binary actually executes.
+/// not present on ordinary Linux distributions). Runtime detection keeps the
+/// behavior tied to the Termux environment and also covers older package
+/// lines that did not use the current Android target triple.
 fn running_on_termux() -> bool {
     env::var_os("TERMUX_VERSION").is_some()
 }
@@ -52,9 +50,9 @@ fn running_on_termux() -> bool {
 /// reqwest 0.12 `rustls-tls` (webpki-roots) used elsewhere in the workspace.
 ///
 /// Runtime-gated on `TERMUX_VERSION` like the issue #10 fix above — NOT
-/// `cfg!(target_os = "android")` — so both Termux release lines (NDK android
-/// and musl) behave the same, and desktop builds keep the default platform
-/// verifier untouched.
+/// `cfg!(target_os = "android")` — so current and older Termux package lines
+/// behave the same, while desktop builds keep the default platform verifier
+/// untouched.
 pub(crate) fn apply_termux_tls(builder: ClientBuilder) -> ClientBuilder {
     if !running_on_termux() {
         return builder;
@@ -218,7 +216,7 @@ pub(crate) const TERMUX_ENV_VARS: &[&str] = &[
 ];
 
 /// Windows builds of codex-termux never run under Termux (Termux is
-/// Android/Linux musl) so the allowlist is empty. Declared explicitly so
+/// Android/Linux with Bionic) so the allowlist is empty. Declared explicitly so
 /// that `create_env_for_mcp_server` resolves the name on every target —
 /// without this, the non-Unix typecheck of the function body would fail
 /// with `unresolved name TERMUX_ENV_VARS` (caught in the 0.134.1
@@ -383,8 +381,8 @@ mod tests {
         let prefix_value = OsString::from("/data/data/com.termux/files/usr");
         let _prefix_guard = EnvVarGuard::set("PREFIX", &prefix_value);
 
-        let env = create_env_for_mcp_server(/*extra_env*/ None, &[])
-            .expect("local MCP env should build");
+        let env =
+            create_env_for_mcp_server(/*extra_env*/ None, &[]).expect("local MCP env should build");
 
         assert_eq!(env.get(OsStr::new("PREFIX")), Some(&prefix_value));
         assert_eq!(
@@ -405,8 +403,8 @@ mod tests {
         }
         let _prefix_guard = EnvVarGuard::set("PREFIX", "/opt/leaked");
 
-        let env = create_env_for_mcp_server(/*extra_env*/ None, &[])
-            .expect("local MCP env should build");
+        let env =
+            create_env_for_mcp_server(/*extra_env*/ None, &[]).expect("local MCP env should build");
 
         assert_eq!(env.get(OsStr::new("PREFIX")), None);
 

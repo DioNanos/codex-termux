@@ -169,7 +169,7 @@ enum McpCallEvent {
 
 const REMOTE_MCP_ENVIRONMENT: &str = "remote";
 
-fn remote_aware_environment_id() -> String {
+pub(super) fn remote_aware_environment_id() -> String {
     if is_remote_test_environment() {
         REMOTE_MCP_ENVIRONMENT.to_string()
     } else {
@@ -184,7 +184,7 @@ fn remote_aware_environment_id() -> String {
 /// would be meaningless to the process that actually launches the server. When
 /// the remote test environment is active, copy the binary into the executor
 /// container and return that in-container path instead.
-fn remote_aware_stdio_server_bin() -> anyhow::Result<String> {
+pub(super) fn remote_aware_stdio_server_bin() -> anyhow::Result<String> {
     let bin = stdio_server_bin()?;
     let Some(container_name) = test_docker_container_name() else {
         return Ok(bin);
@@ -1274,6 +1274,96 @@ async fn stdio_mcp_parallel_tool_calls_opt_in_runs_concurrently() -> anyhow::Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial(mcp_test_value)]
+async fn stdio_encrypted_content_responses_round_trip() -> anyhow::Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let call_id = "encrypted-1";
+    let server_name = "rmcp";
+    let namespace = format!("mcp__{server_name}");
+
+    mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_function_call_with_namespace(
+                call_id,
+                &namespace,
+                "encrypted_output",
+                "{}",
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let final_mock = mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_assistant_message("msg-1", "rmcp tool completed successfully."),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    let rmcp_test_server_bin = remote_aware_stdio_server_bin()?;
+    let fixture = test_codex()
+        .with_config(move |config| {
+            insert_mcp_server(
+                config,
+                server_name,
+                stdio_transport(rmcp_test_server_bin, /*env*/ None, Vec::new()),
+                TestMcpServerOptions {
+                    environment_id: remote_aware_environment_id(),
+                    ..Default::default()
+                },
+            );
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    wait_for_mcp_server(&fixture.codex, server_name).await?;
+
+    fixture
+        .codex
+        .submit(read_only_user_turn(
+            &fixture,
+            "call the rmcp encrypted output tool",
+        ))
+        .await?;
+    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let output_item = final_mock.single_request().function_call_output(call_id);
+    let output = output_item["output"]
+        .as_array()
+        .expect("encrypted MCP output should be content items");
+    assert_eq!(output.len(), 3);
+    assert_wall_time_header(
+        output[0]["text"]
+            .as_str()
+            .expect("first encrypted MCP output item should be wall-time text"),
+    );
+    assert_eq!(
+        &output[1..],
+        &[
+            json!({
+                "type": "input_text",
+                "text": "Lookup completed",
+            }),
+            json!({
+                "type": "encrypted_content",
+                "encrypted_content": "gAAAA-test",
+            }),
+        ]
+    );
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial(mcp_test_value)]
 async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
     // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
     skip_if_wine_exec!(
@@ -1361,7 +1451,6 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
             mcp_app_resource_uri: None,
             link_id: None,
             app_name: None,
-            template_id: None,
             action_name: None,
             plugin_id: None,
         },
@@ -1653,7 +1742,7 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                 base_instructions: "base instructions".to_string(),
                 model_messages: None,
                 include_skills_usage_instructions: false,
-                supports_reasoning_summaries: false,
+                supports_reasoning_summary_parameter: true,
                 default_reasoning_summary: ReasoningSummary::Auto,
                 support_verbosity: false,
                 default_verbosity: None,
@@ -2364,7 +2453,7 @@ async fn streamable_http_chatgpt_auth_is_not_sent_to_configured_origin() -> anyh
     let server = responses::start_mock_server().await;
     let untrusted_server = MockServer::start().await;
     let untrusted_apps = AppsTestServer::mount(&untrusted_server).await?;
-    let untrusted_mcp_url = format!("{}/api/codex/apps", untrusted_apps.chatgpt_base_url);
+    let untrusted_mcp_url = format!("{}/api/codex/ps/mcp", untrusted_apps.chatgpt_base_url);
     let untrusted_chatgpt_base_url = untrusted_apps.chatgpt_base_url;
 
     let fixture = test_codex()
@@ -2395,7 +2484,7 @@ async fn streamable_http_chatgpt_auth_is_not_sent_to_configured_origin() -> anyh
         .await
         .expect("mock server should capture MCP startup requests")
         .into_iter()
-        .filter(|request| request.url.path() == "/api/codex/apps")
+        .filter(|request| request.url.path() == "/api/codex/ps/mcp")
         .filter_map(|request| {
             let body: Value = serde_json::from_slice(&request.body).ok()?;
             let method = body.get("method")?.as_str()?.to_string();
@@ -2427,7 +2516,7 @@ async fn configured_chatgpt_base_url_does_not_grant_mcp_chatgpt_auth() -> anyhow
     let server = responses::start_mock_server().await;
     let untrusted_server = MockServer::start().await;
     let untrusted_apps = AppsTestServer::mount(&untrusted_server).await?;
-    let untrusted_mcp_url = format!("{}/api/codex/apps", untrusted_apps.chatgpt_base_url);
+    let untrusted_mcp_url = format!("{}/api/codex/ps/mcp", untrusted_apps.chatgpt_base_url);
     let untrusted_chatgpt_base_url = untrusted_apps.chatgpt_base_url;
 
     let fixture = test_codex()
@@ -2456,7 +2545,7 @@ auth = "chatgpt"
         .await
         .expect("mock server should capture MCP startup requests")
         .into_iter()
-        .filter(|request| request.url.path() == "/api/codex/apps")
+        .filter(|request| request.url.path() == "/api/codex/ps/mcp")
         .filter_map(|request| {
             let body: Value = serde_json::from_slice(&request.body).ok()?;
             let method = body.get("method")?.as_str()?.to_string();

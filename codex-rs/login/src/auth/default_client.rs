@@ -127,6 +127,26 @@ pub fn originator() -> Originator {
     get_originator_value(/*provided*/ None)
 }
 
+/// Adds a valid, non-default thread originator override to request headers.
+///
+/// The default client already supplies the process originator. Thread-scoped callers should use
+/// this helper to override that value only when the thread originator differs.
+pub fn add_originator_header(headers: &mut HeaderMap, originator_value: &str) {
+    let default_originator = originator();
+    if originator_value == default_originator.value.as_str() {
+        return;
+    }
+
+    match HeaderValue::from_str(originator_value) {
+        Ok(header_value) => {
+            headers.insert("originator", header_value);
+        }
+        Err(err) => {
+            tracing::warn!("ignoring invalid thread originator header value: {err}");
+        }
+    }
+}
+
 pub fn is_first_party_originator(originator_value: &str) -> bool {
     originator_value == DEFAULT_ORIGINATOR
         || originator_value == "codex-tui"
@@ -295,16 +315,13 @@ fn default_reqwest_client_builder() -> reqwest::ClientBuilder {
     with_chatgpt_cloudflare_cookie_store(builder)
 }
 
-/// Builds a raw reqwest client for an auth endpoint without Codex default headers.
-pub(crate) fn build_raw_auth_reqwest_client(
+/// Builds an HTTP client for an auth endpoint without Codex default headers.
+pub(crate) fn create_raw_auth_client(
     endpoint: &str,
     auth_route_config: Option<&AuthRouteConfig>,
-) -> Result<reqwest::Client, BuildRouteAwareHttpClientError> {
-    auth_http_client_factory(auth_route_config).build_reqwest_client(
-        reqwest::Client::builder(),
-        endpoint,
-        ClientRouteClass::Auth,
-    )
+) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
+    auth_http_client_factory(auth_route_config)
+        .build_client_without_request_logging(endpoint, ClientRouteClass::Auth)
 }
 
 /// Builds the default Codex reqwest client for an auth endpoint.

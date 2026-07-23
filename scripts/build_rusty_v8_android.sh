@@ -14,7 +14,7 @@
 #   The fork's scripts/prepare_rusty_v8_android_source.py does the git checkout
 #   but only inits 4 submodules and leaves the android-specific gn/bindgen setup
 #   to the caller. This script wraps it and fills every gap discovered while
-#   getting a real 149.2.0 android build through (2026-06-08, VPS3).
+#   getting a real 149.2.0 Android build through on the maintainer runner.
 #
 # STATUS (2026-06-08)
 #   COMPLETE end-to-end: V8 compiles from source for aarch64-linux-android

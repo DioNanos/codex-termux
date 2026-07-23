@@ -1,0 +1,13 @@
+OpenAI Codex
+Copyright 2025 OpenAI
+Copyright 2026 Davide A. Guglielmi
+
+Codex Termux is a porting/distribution fork of OpenAI Codex for Android ARM64
+(Termux). It carries only the Android/Termux compatibility delta needed to
+package and run upstream Codex on Termux. These compatibility patches are
+maintained by Davide A. Guglielmi and distributed under the Apache License,
+Version 2.0 together with the upstream Codex codebase.
+
+This project includes code derived from [Ratatui](https://github.com/ratatui/ratatui), licensed under the MIT license.
+Copyright (c) 2016-2022 Florian Dehau
+Copyright (c) 2023-2025 The Ratatui Developers

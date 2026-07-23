@@ -18,6 +18,7 @@ use crate::facts::HookRunInput;
 use crate::facts::PluginInstallFailedInput;
 use crate::facts::PluginInstallRequested;
 use crate::facts::PluginInstallRequestedInput;
+use crate::facts::PluginInstallSource;
 use crate::facts::PluginState;
 use crate::facts::PluginStateChangedInput;
 use crate::facts::SkillInvocation;
@@ -370,11 +371,19 @@ impl AnalyticsEventsClient {
         ));
     }
 
-    pub fn track_plugin_install_failed(&self, plugin: PluginTelemetryMetadata, error_type: String) {
+    pub fn track_plugin_install_failed(
+        &self,
+        plugin: PluginTelemetryMetadata,
+        source: PluginInstallSource,
+        error_type: String,
+        sub_error_type: Option<String>,
+    ) {
         self.record_fact(AnalyticsFact::Custom(
             CustomAnalyticsFact::PluginInstallFailed(PluginInstallFailedInput {
                 plugin,
+                source,
                 error_type,
+                sub_error_type,
             }),
         ));
     }
@@ -548,7 +557,7 @@ impl AnalyticsEventsClient {
 async fn send_track_events(
     auth_manager: &AuthManager,
     destination: &AnalyticsEventsDestination,
-    events: Vec<TrackEventRequest>,
+    mut events: Vec<TrackEventRequest>,
 ) {
     if events.is_empty() {
         return;
@@ -557,7 +566,12 @@ async fn send_track_events(
     let Some(auth) = auth_manager.auth().await else {
         return;
     };
-    if !auth.uses_codex_backend() {
+    if auth.is_api_key_auth() {
+        events.retain(TrackEventRequest::can_send_with_api_key_auth);
+    } else if !auth.uses_codex_backend() {
+        return;
+    }
+    if events.is_empty() {
         return;
     }
 

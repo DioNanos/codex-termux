@@ -14,7 +14,7 @@ pub enum UpdateAction {
     BunGlobalLatest,
     /// Update via `pnpm add -g @mmmbuto/codex-cli-termux@latest`.
     PnpmGlobalLatest,
-    /// Update via `brew upgrade codex`.
+    /// Redirect a detected Homebrew install to the supported fork npm package.
     BrewUpgrade,
     /// Update standalone installs via `npm install -g @mmmbuto/codex-cli-termux@latest`.
     StandaloneUnix,
@@ -49,10 +49,9 @@ impl UpdateAction {
                 "bun",
                 &["install", "-g", "@mmmbuto/codex-cli-termux@latest"],
             ),
-            UpdateAction::PnpmGlobalLatest => (
-                "pnpm",
-                &["add", "-g", "@mmmbuto/codex-cli-termux@latest"],
-            ),
+            UpdateAction::PnpmGlobalLatest => {
+                ("pnpm", &["add", "-g", "@mmmbuto/codex-cli-termux@latest"])
+            }
             // codex-termux fork: no Homebrew cask is shipped, so `brew upgrade
             // --cask codex` would pull the UPSTREAM openai cask and replace the
             // fork. Redirect to the supported npm channel, like Standalone*.
@@ -162,6 +161,13 @@ mod tests {
         );
         assert_eq!(
             UpdateAction::StandaloneWindows.command_args(),
+            (
+                "npm",
+                &["install", "-g", "@mmmbuto/codex-cli-termux@latest"][..],
+            )
+        );
+        assert_eq!(
+            UpdateAction::BrewUpgrade.command_args(),
             (
                 "npm",
                 &["install", "-g", "@mmmbuto/codex-cli-termux@latest"][..],

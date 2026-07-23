@@ -1,3 +1,29 @@
+# [0.145.0] - 2026-07-23
+
+Synced the complete Termux fork directly to the final upstream OpenAI Codex
+`rust-v0.145.0` release, without carrying the parallel alpha-only update and
+installer surfaces. The Android/Termux compatibility delta remains applied.
+
+## Changed
+- Integrated the complete upstream `rust-v0.145.0` stable release.
+- Preserved every verified Termux patch, including Android TLS roots, PTY and
+  lock compatibility, real in-process V8 code-mode, bundled libc++, and
+  `RUNPATH=$ORIGIN` packaging hardening.
+- Kept all installer, update, feedback, and release surfaces on the
+  `DioNanos/codex-termux` and `@mmmbuto/codex-cli-termux` channels.
+- Updated stale update-available snapshots so they assert the fork-owned
+  install commands and release URLs.
+- Kept hidden `apply_patch` and re-exec aliases bound to the native ELF by
+  setting `CODEX_SELF_EXE` to `codex.bin`, not the package shell wrapper.
+- Extended safe `ENOTSUP` degradation to the bounded message-history batch
+  reader added upstream, while credential and certificate locks remain
+  fail-closed.
+- Added the complete Apache `LICENSE` and project `NOTICE` to the published npm
+  payload.
+- Aligned the documented minimum Android version with the API 29 NDK target
+  used by the release workflow.
+- Bumped the npm package and Cargo workspace versions to `0.145.0`.
+
 # [0.144.5] - 2026-07-17
 
 Synced the complete Termux fork to the final upstream OpenAI Codex

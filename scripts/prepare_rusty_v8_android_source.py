@@ -116,10 +116,12 @@ def main() -> int:
     print("- android_toolchain/ndk -> ../android_ndk symlink bootstrapped")
     print()
     print("next step:")
-    print("  export GN=\"$HOME/tmp/gn-bootstrap/out/gn\"  # or another recent gn binary")
+    print('  export GN="$HOME/tmp/gn-bootstrap/out/gn"  # or another recent gn binary')
     print("  export V8_FROM_SOURCE=1")
     print("  python3 build/linux/sysroot_scripts/install-sysroot.py --arch=amd64")
-    print(f"  cd {checkout_dir} && cargo build --target aarch64-linux-android --release")
+    print(
+        f"  cd {checkout_dir} && cargo build --target aarch64-linux-android --release"
+    )
     return 0
 
 

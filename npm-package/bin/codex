@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 TERMUX_PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 
 sanitize_ld_library_path() {
@@ -32,7 +32,8 @@ sanitize_ld_library_path() {
 }
 
 export CODEX_MANAGED_BY_NPM=1
-export CODEX_SELF_EXE="$SCRIPT_DIR/codex"
-export LD_LIBRARY_PATH="$(sanitize_ld_library_path)"
+export CODEX_SELF_EXE="$SCRIPT_DIR/codex.bin"
+LD_LIBRARY_PATH="$(sanitize_ld_library_path)"
+export LD_LIBRARY_PATH
 
 exec "$SCRIPT_DIR/codex.bin" "$@"

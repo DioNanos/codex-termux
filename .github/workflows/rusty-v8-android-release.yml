@@ -1,8 +1,8 @@
 name: rusty-v8-android-release
 
-# Builds the aarch64-linux-android rusty_v8 prebuild from source and publishes
-# it as a fork-owned release asset, mirroring the desktop matrix that lives
-# in `rusty-v8-release.yml`.
+# Builds the aarch64-linux-android rusty_v8 prebuild from source and uploads an
+# immutable CI artifact for coordinator audit. Publishing remains a separate,
+# local operation after the artifact and its checksums have been verified.
 #
 # Why this exists: denoland/rusty_v8 does not publish android prebuilds, and
 # upstream openai/codex rusty-v8-release matrix is desktop-only
@@ -19,23 +19,15 @@ name: rusty-v8-android-release
   workflow_dispatch:
     inputs:
       v8_version:
-        description: "denoland/rusty_v8 tag to build (e.g. 149.3.0)"
+        description: "denoland/rusty_v8 tag to build (e.g. 149.2.0)"
         type: string
-        default: "149.3.0"
+        default: "149.2.0"
       target:
         description: "Rust target triple (only aarch64-linux-android supported)"
         type: choice
         options:
           - aarch64-linux-android
         default: aarch64-linux-android
-      publish_release:
-        description: "Publish a GitHub release on DioNanos/codex-termux (prerelease)"
-        type: boolean
-        default: true
-      release_repository:
-        description: "owner/repo for the release (defaults to current repo)"
-        type: string
-        default: ""
 
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
@@ -45,7 +37,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 jobs:
@@ -188,7 +180,6 @@ jobs:
           BINDING: ${{ steps.locate.outputs.binding }}
           TARGET: ${{ inputs.target }}
           V8_VERSION: ${{ inputs.v8_version }}
-          RELEASE_TAG: rusty-v8-v${{ inputs.v8_version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -208,39 +199,3 @@ jobs:
         with:
           name: rusty-v8-android-${{ inputs.v8_version }}-${{ inputs.target }}
           path: dist/${{ inputs.target }}/*
-
-      - name: Publish fork-owned release
-        if: ${{ inputs.publish_release }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          V8_VERSION: ${{ inputs.v8_version }}
-          TARGET: ${{ inputs.target }}
-          RELEASE_REPO: ${{ inputs.release_repository != '' && inputs.release_repository || github.repository }}
-          RELEASE_TAG: rusty-v8-v${{ inputs.v8_version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          args=(release create "${RELEASE_TAG}"
-                --repo "${RELEASE_REPO}"
-                --title "rusty-v8-v${V8_VERSION} Android ${TARGET} artifacts"
-                --notes "Android ${TARGET} rusty_v8 v${V8_VERSION} artifact pair for Termux-compatible builds.
-
-          Produced by the fork-owned \`rusty-v8-android-release\` workflow (no upstream prebuilt for this target yet). Consumers can pin this URL via the same \`scripts/fetch_rusty_v8_android.py\` path used for the v147.4.0 lineage.
-
-          Checksums:
-          \`\`\`
-          $(cat "dist/${TARGET}/rusty_v8_release_${TARGET}.sha256")
-          \`\`\`"
-                --target "${RELEASE_TAG}"
-                --prerelease
-                "dist/${TARGET}/librusty_v8_release_${TARGET}.a.gz"
-                "dist/${TARGET}/src_binding_release_${TARGET}.rs"
-                "dist/${TARGET}/rusty_v8_release_${TARGET}.sha256")
-          if ! gh "${args[@]}"; then
-            echo "Release ${RELEASE_TAG} may already exist; uploading assets via 'release upload --clobber'." >&2
-            gh release upload "${RELEASE_TAG}" \
-              --repo "${RELEASE_REPO}" --clobber \
-              "dist/${TARGET}/librusty_v8_release_${TARGET}.a.gz" \
-              "dist/${TARGET}/src_binding_release_${TARGET}.rs" \
-              "dist/${TARGET}/rusty_v8_release_${TARGET}.sha256"
-          fi
