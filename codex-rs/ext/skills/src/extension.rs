@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use codex_core_skills::HostSkillsSnapshot;
-use codex_core_skills::default_skill_metadata_budget;
 use codex_core_skills::injection::HostSkillsCatalogInWorldState;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
+use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_extension_api::ConfigContributor;
 use codex_extension_api::ContextContributor;
 use codex_extension_api::ContextualUserFragment;
@@ -12,6 +12,7 @@ use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::ExtensionWarning;
 use codex_extension_api::PromptFragment;
 use codex_extension_api::SkillInvocationContributor;
 use codex_extension_api::SkillInvocationInput;
@@ -28,31 +29,36 @@ use codex_extension_api::WorldStateSectionContribution;
 use codex_mcp::McpResourceClient;
 use codex_otel::MetricsClient;
 use codex_protocol::openai_models::ModelInfo;
-use codex_protocol::protocol::Event;
-use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::WarningEvent;
 
 use crate::SkillsExtensionConfig;
 use crate::catalog::SkillCatalog;
 use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillSourceKind;
+use crate::fragments::AvailableSkillsInstructions;
+use crate::fragments::ExecutorSkillResourceAccess;
 use crate::fragments::SkillInstructions;
 use crate::provider::HostSkillProvider;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillReadRequest;
 use crate::render::MAX_SKILL_NAME_BYTES;
 use crate::render::MAX_SKILL_PATH_BYTES;
-use crate::render::available_skills_fragment;
+use crate::render::SkillCatalogRenderPolicy;
+use crate::render::SkillMetadataBudget;
+use crate::render::capped_skill_metadata_budget;
+use crate::render::render_available_skills;
 use crate::render::truncate_main_prompt_contents;
 use crate::render::truncate_utf8_to_bytes;
 use crate::selection::collect_explicit_skill_mentions;
 use crate::shadow_selection_experiment::ShadowSelectionExperiment;
 use crate::sources::SkillProviders;
+use crate::state::EmittedCatalogBudgetWarnings;
 use crate::state::ExecutorSkillsStepState;
+use crate::state::SkillsSessionState;
 use crate::state::SkillsThreadState;
 use crate::state::SkillsTurnState;
 use crate::tools::skill_tools;
+use crate::warnings::bounded_warnings;
 use crate::world_state::executor_skills_world_state_section;
 use crate::world_state::host_skills_world_state_section;
 
@@ -63,12 +69,38 @@ struct SkillsExtension<C> {
     shadow_selection: Arc<ShadowSelectionExperiment>,
 }
 
+#[derive(Default)]
+struct RenderedCatalog {
+    fragment: Option<AvailableSkillsInstructions>,
+    warning_message: Option<String>,
+}
+
+fn render_catalog(
+    catalog: &SkillCatalog,
+    include_skills_usage_instructions: bool,
+    policy: SkillCatalogRenderPolicy,
+    budget: SkillMetadataBudget,
+) -> RenderedCatalog {
+    let Some(rendered) = render_available_skills(catalog, policy, budget) else {
+        return RenderedCatalog::default();
+    };
+    let warning_message = rendered.report.warning_message();
+    let fragment = rendered.into_fragment(include_skills_usage_instructions);
+    RenderedCatalog {
+        fragment,
+        warning_message,
+    }
+}
+
 impl<C> ThreadLifecycleContributor<C> for SkillsExtension<C>
 where
     C: Send + Sync + 'static,
 {
     fn on_thread_start<'a>(&'a self, input: ThreadStartInput<'a, C>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            input.session_store.insert(SkillsSessionState {
+                mcp_resources: input.mcp_resource_client.clone(),
+            });
             let orchestrator_skills_available = !input
                 .environments
                 .iter()
@@ -127,23 +159,36 @@ where
                     SkillListQuery {
                         turn_id: thread_store.level_id().to_string(),
                         executor_roots: Vec::new(),
+                        resolved_executor_roots: Vec::new(),
                         host_snapshot: None,
                         include_host_skills: false,
                         include_bundled_skills: config.bundled_skills_enabled,
                         include_orchestrator_skills: thread_state.orchestrator_skills_enabled(),
-                        mcp_resources: session_store.get::<McpResourceClient>(),
+                        mcp_resources: session_store
+                            .get::<SkillsSessionState>()
+                            .and_then(|state| state.mcp_resources.clone()),
                         executor_capability_discovery: None,
                     },
                     &thread_state,
                 )
                 .await;
-            for warning in &catalog.warnings {
-                self.emit_warning(thread_store.level_id(), warning.clone());
+            for warning in bounded_warnings(&catalog.warnings) {
+                self.emit_warning(thread_store.level_id(), /*turn_id*/ None, warning);
             }
             let include_usage = thread_store
                 .get::<ModelInfo>()
                 .is_some_and(|model_info| model_info.include_skills_usage_instructions);
-            available_skills_fragment(&catalog, include_usage)
+            let rendered = render_catalog(
+                &catalog,
+                include_usage,
+                SkillCatalogRenderPolicy::ExtensionCompatible,
+                capped_skill_metadata_budget(/*context_window*/ None),
+            );
+            if let Some(message) = rendered.warning_message {
+                self.emit_warning(thread_store.level_id(), /*turn_id*/ None, message);
+            }
+            rendered
+                .fragment
                 .map(|fragment| PromptFragment::developer_capability(fragment.render()))
                 .into_iter()
                 .collect()
@@ -165,11 +210,15 @@ where
                     SkillListQuery {
                         turn_id: input.turn_id.to_string(),
                         executor_roots: input.ready_selected_capability_roots.to_vec(),
+                        resolved_executor_roots: Vec::new(),
                         host_snapshot: None,
                         include_host_skills: false,
                         include_bundled_skills: config.bundled_skills_enabled,
                         include_orchestrator_skills: false,
-                        mcp_resources: input.session_store.get::<McpResourceClient>(),
+                        mcp_resources: input
+                            .session_store
+                            .get::<SkillsSessionState>()
+                            .and_then(|state| state.mcp_resources.clone()),
                         executor_capability_discovery: input.executor_capability_discovery.cloned(),
                     },
                 )
@@ -181,10 +230,32 @@ where
             let include_usage = model_info
                 .as_deref()
                 .is_some_and(|model_info| model_info.include_skills_usage_instructions);
+            let context_window = model_info
+                .as_deref()
+                .and_then(ModelInfo::resolved_context_window);
+            let metadata_budget = capped_skill_metadata_budget(context_window);
+            let rendered = if config.include_instructions {
+                render_catalog(
+                    &catalog,
+                    include_usage,
+                    SkillCatalogRenderPolicy::ExtensionCompatible,
+                    metadata_budget,
+                )
+            } else {
+                RenderedCatalog::default()
+            };
+            if let Some(message) = rendered.warning_message
+                && input
+                    .turn_store
+                    .get_or_init(EmittedCatalogBudgetWarnings::default)
+                    .insert(&message)
+            {
+                self.emit_warning(input.thread_store.level_id(), Some(input.turn_id), message);
+            }
+            let executor_body = rendered.fragment.map(|fragment| fragment.body());
             let mut sections = vec![executor_skills_world_state_section(
-                &catalog,
+                executor_body,
                 config.include_instructions,
-                include_usage,
             )];
             if let Some(host_snapshot) = input.turn_store.get::<HostSkillsSnapshot>()
                 && self.providers.has_host_provider()
@@ -194,11 +265,7 @@ where
                     &host_snapshot,
                     config.include_instructions,
                     include_usage,
-                    default_skill_metadata_budget(
-                        model_info
-                            .as_deref()
-                            .and_then(|model_info| model_info.context_window),
-                    ),
+                    metadata_budget,
                 ));
             }
             sections
@@ -215,21 +282,34 @@ where
         session_store: &ExtensionData,
         thread_store: &ExtensionData,
     ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
-        let Some(thread_state) = thread_store.get::<SkillsThreadState>() else {
-            return Vec::new();
-        };
-        if !self.providers.has_orchestrator_provider()
-            || !thread_state.orchestrator_skills_enabled()
-        {
-            return Vec::new();
-        }
+        self.build_skill_tools(session_store, thread_store, /*executor_query*/ None)
+    }
 
-        skill_tools(
-            self.providers.clone(),
-            session_store.get::<McpResourceClient>(),
-            thread_state,
-            Arc::clone(&self.shadow_selection),
-        )
+    fn tools_for_step(
+        &self,
+        session_store: &ExtensionData,
+        thread_store: &ExtensionData,
+        step_store: &ExtensionData,
+    ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+        let resolved_executor_roots = step_store
+            .get::<Vec<ResolvedSelectedCapabilityRoot>>()
+            .map(|roots| roots.as_slice().to_vec())
+            .unwrap_or_default();
+        let executor_query = (!resolved_executor_roots.is_empty()).then(|| SkillListQuery {
+            turn_id: step_store.level_id().to_string(),
+            executor_roots: resolved_executor_roots
+                .iter()
+                .map(|root| root.selected_root().clone())
+                .collect(),
+            resolved_executor_roots,
+            host_snapshot: None,
+            include_host_skills: false,
+            include_bundled_skills: false,
+            include_orchestrator_skills: false,
+            mcp_resources: None,
+            executor_capability_discovery: None,
+        });
+        self.build_skill_tools(session_store, thread_store, executor_query)
     }
 }
 
@@ -276,17 +356,21 @@ where
             };
 
             let config = thread_state.config();
+            let mcp_resources = session_store
+                .get::<SkillsSessionState>()
+                .and_then(|state| state.mcp_resources.clone());
             let host_snapshot = turn_store.get::<HostSkillsSnapshot>();
             let host_catalog_in_world_state =
                 turn_store.get::<HostSkillsCatalogInWorldState>().is_some();
             let query = SkillListQuery {
                 turn_id: input.turn_id.clone(),
                 executor_roots: Vec::new(),
+                resolved_executor_roots: Vec::new(),
                 host_snapshot: host_snapshot.clone(),
                 include_host_skills: !host_catalog_in_world_state,
                 include_bundled_skills: config.bundled_skills_enabled,
                 include_orchestrator_skills: thread_state.orchestrator_skills_enabled(),
-                mcp_resources: session_store.get::<McpResourceClient>(),
+                mcp_resources: mcp_resources.clone(),
                 executor_capability_discovery: None,
             };
             let host_query = query.clone();
@@ -295,8 +379,8 @@ where
                 .map(|executor_skills| executor_skills.0.clone())
                 .unwrap_or_default();
             catalog.extend(self.list_skills(query, &thread_state).await);
-            for warning in &catalog.warnings {
-                self.emit_warning(&input.turn_id, warning.clone());
+            for warning in bounded_warnings(&catalog.warnings) {
+                self.emit_warning(thread_store.level_id(), Some(&input.turn_id), warning);
             }
 
             let selected_entries = collect_explicit_skill_mentions(&input.user_input, &catalog);
@@ -323,10 +407,24 @@ where
                     entry.authority.kind != SkillSourceKind::Executor
                         && entry.authority.kind != SkillSourceKind::Orchestrator
                 });
-                let include_usage = thread_store
-                    .get::<ModelInfo>()
+                let model_info = thread_store.get::<ModelInfo>();
+                let include_usage = model_info
+                    .as_deref()
                     .is_some_and(|model_info| model_info.include_skills_usage_instructions);
-                if let Some(fragment) = available_skills_fragment(&turn_catalog, include_usage) {
+                let context_window = model_info
+                    .as_deref()
+                    .and_then(ModelInfo::resolved_context_window);
+                let metadata_budget = capped_skill_metadata_budget(context_window);
+                let rendered = render_catalog(
+                    &turn_catalog,
+                    include_usage,
+                    SkillCatalogRenderPolicy::ExtensionCompatible,
+                    metadata_budget,
+                );
+                if let Some(message) = rendered.warning_message {
+                    self.emit_warning(thread_store.level_id(), Some(&input.turn_id), message);
+                }
+                if let Some(fragment) = rendered.fragment {
                     fragments.push(Box::new(fragment));
                 }
             }
@@ -336,7 +434,12 @@ where
             let mut injected_host_skill_prompts = InjectedHostSkillPrompts::default();
             for entry in &selected_entries {
                 match self
-                    .read_main_prompt(entry, host_snapshot.clone(), session_store, &thread_state)
+                    .read_main_prompt(
+                        entry,
+                        host_snapshot.clone(),
+                        mcp_resources.clone(),
+                        &thread_state,
+                    )
                     .await
                 {
                     Ok(read_result) => {
@@ -347,7 +450,11 @@ where
                                 "Skill `{}` exceeded the main prompt context limit and was truncated.",
                                 entry.name
                             );
-                            self.emit_warning(&input.turn_id, warning.clone());
+                            self.emit_warning(
+                                thread_store.level_id(),
+                                Some(&input.turn_id),
+                                warning.clone(),
+                            );
                             warnings.push(warning);
                         }
                         let fragment = SkillInstructions {
@@ -358,6 +465,13 @@ where
                             )
                             .0,
                             contents,
+                            executor_resource_access: (!entry.prompt_visible
+                                && entry.authority.kind == SkillSourceKind::Executor)
+                                .then(|| ExecutorSkillResourceAccess {
+                                    authority_id: entry.authority.id.clone(),
+                                    package: entry.id.0.clone(),
+                                    main_resource: entry.main_prompt.as_str().to_string(),
+                                }),
                         };
                         fragments.push(Box::new(fragment));
                         main_prompts_injected = true;
@@ -367,7 +481,11 @@ where
                     }
                     Err(message) => {
                         let warning = format!("Failed to load skill `{}`: {message}", entry.name);
-                        self.emit_warning(&input.turn_id, warning.clone());
+                        self.emit_warning(
+                            thread_store.level_id(),
+                            Some(&input.turn_id),
+                            warning.clone(),
+                        );
                         warnings.push(warning);
                     }
                 }
@@ -406,6 +524,33 @@ where
 }
 
 impl<C> SkillsExtension<C> {
+    fn build_skill_tools(
+        &self,
+        session_store: &ExtensionData,
+        thread_store: &ExtensionData,
+        executor_query: Option<SkillListQuery>,
+    ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+        let Some(thread_state) = thread_store.get::<SkillsThreadState>() else {
+            return Vec::new();
+        };
+        let orchestrator_available = self.providers.has_orchestrator_provider()
+            && thread_state.orchestrator_skills_enabled();
+        if !orchestrator_available && executor_query.is_none() {
+            return Vec::new();
+        }
+
+        skill_tools(
+            self.providers.clone(),
+            session_store
+                .get::<SkillsSessionState>()
+                .and_then(|state| state.mcp_resources.clone()),
+            thread_state,
+            orchestrator_available,
+            executor_query,
+            Arc::clone(&self.shadow_selection),
+        )
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn list_skills(
         &self,
@@ -436,7 +581,7 @@ impl<C> SkillsExtension<C> {
         &self,
         entry: &SkillCatalogEntry,
         host_snapshot: Option<Arc<HostSkillsSnapshot>>,
-        session_store: &ExtensionData,
+        mcp_resources: Option<Arc<McpResourceClient>>,
         thread_state: &SkillsThreadState,
     ) -> Result<SkillReadResult, String> {
         thread_state
@@ -446,18 +591,20 @@ impl<C> SkillsExtension<C> {
                     authority: entry.authority.clone(),
                     package: entry.id.clone(),
                     resource: entry.main_prompt.clone(),
+                    resolved_executor_roots: Vec::new(),
                     host_snapshot,
-                    mcp_resources: session_store.get::<McpResourceClient>(),
+                    mcp_resources,
                 },
             )
             .await
             .map_err(|err| err.message)
     }
 
-    fn emit_warning(&self, turn_id: &str, message: String) {
-        self.event_sink.emit(Event {
-            id: turn_id.to_string(),
-            msg: EventMsg::Warning(WarningEvent { message }),
+    fn emit_warning(&self, thread_id: &str, turn_id: Option<&str>, message: String) {
+        self.event_sink.emit_warning(ExtensionWarning {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.map(str::to_string),
+            message,
         });
     }
 }

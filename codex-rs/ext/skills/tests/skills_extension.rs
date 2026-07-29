@@ -8,10 +8,15 @@ use codex_core_skills::HostSkillsSnapshot;
 use codex_core_skills::SKILLS_INTRO_WITH_ABSOLUTE_PATHS;
 use codex_core_skills::SkillLoadOutcome;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
+use codex_core_skills::loader::MAX_CONCURRENT_ROOT_SCANS;
+use codex_core_skills::loader::SkillRoot;
+use codex_core_skills::loader::load_skills_from_roots;
+use codex_exec_server::LOCAL_FS;
 use codex_extension_api::ConversationHistory;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::ExtensionWarning;
 use codex_extension_api::NoopTurnItemEmitter;
 use codex_extension_api::PreviousWorldStateSection;
 use codex_extension_api::ThreadStartInput;
@@ -19,10 +24,10 @@ use codex_extension_api::ToolCall;
 use codex_extension_api::ToolPayload;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::WorldStateContributionInput;
+use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::protocol::Event;
-use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::SessionSource;
@@ -52,6 +57,7 @@ use codex_skills_extension::provider::SkillSearchRequest;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
+use tokio::sync::Semaphore;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -84,6 +90,7 @@ async fn installed_extension_uses_host_service_snapshot() -> TestResult {
             session_source: &session_source,
             persistent_thread_state_available: true,
             environments: &[],
+            mcp_resource_client: None,
             session_store: &session_store,
             thread_store: &thread_store,
         })
@@ -102,6 +109,7 @@ async fn installed_extension_uses_host_service_snapshot() -> TestResult {
         path_to_skills_md: skill_path,
         scope: SkillScope::User,
         plugin_id: None,
+        remote_plugin_id: None,
     });
     let loaded_skills = Arc::new(outcome);
     let skill_prompt_path = skill_path_string.replace('\\', "/");
@@ -186,6 +194,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
             session_source: &session_source,
             persistent_thread_state_available: true,
             environments: &[],
+            mcp_resource_client: None,
             session_store: &session_store,
             thread_store: &thread_store,
         })
@@ -374,6 +383,7 @@ async fn default_context_truncates_catalog_descriptions() -> TestResult {
             session_source: &session_source,
             persistent_thread_state_available: true,
             environments: &[],
+            mcp_resource_client: None,
             session_store: &session_store,
             thread_store: &thread_store,
         })
@@ -392,19 +402,25 @@ async fn default_context_truncates_catalog_descriptions() -> TestResult {
 }
 
 #[tokio::test]
-async fn skills_list_truncates_catalog_descriptions_in_tool_output() -> TestResult {
+async fn moderate_budget_pressure_keeps_every_catalog_entry() -> TestResult {
     let description = "x".repeat(1_025);
-    let mut entry = test_entry(
-        SkillSourceKind::Orchestrator,
-        "codex_apps",
-        "orchestrator/long-description",
-        "skill://orchestrator/long-description/SKILL.md",
-    );
-    entry.description = description.clone();
+    let entries = (0..10)
+        .map(|index| {
+            let package_id = format!("orchestrator/skill-{index:02}");
+            let mut entry = test_entry(
+                SkillSourceKind::Orchestrator,
+                "codex_apps",
+                &package_id,
+                &format!("skill://{package_id}/SKILL.md"),
+            );
+            entry.description = description.clone();
+            entry
+        })
+        .collect();
     let providers =
         SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
             catalog: SkillCatalog {
-                entries: vec![entry],
+                entries,
                 warnings: Vec::new(),
             },
             read_requests: Arc::new(Mutex::new(Vec::new())),
@@ -424,6 +440,170 @@ async fn skills_list_truncates_catalog_descriptions_in_tool_output() -> TestResu
             session_source: &session_source,
             persistent_thread_state_available: true,
             environments: &[],
+            mcp_resource_client: None,
+            session_store: &session_store,
+            thread_store: &thread_store,
+        })
+        .await;
+
+    let fragments = registry.context_contributors()[0]
+        .contribute_thread_context(&session_store, &thread_store)
+        .await;
+    assert_eq!(1, fragments.len());
+    let rendered = fragments[0].text();
+    let description_lengths = (0..10)
+        .map(|index| {
+            let package_id = format!("orchestrator/skill-{index:02}");
+            let line_prefix = format!("- skill-{index:02}: ");
+            let line_suffix = format!(" (orchestrator resource: skill://{package_id}/SKILL.md)");
+            rendered
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix(&line_prefix)
+                        .and_then(|line| line.strip_suffix(&line_suffix))
+                })
+                .unwrap_or_else(|| panic!("rendered catalog should include skill-{index:02}"))
+                .chars()
+                .count()
+        })
+        .collect::<Vec<_>>();
+    let shortest_description = *description_lengths
+        .iter()
+        .min()
+        .expect("catalog should include descriptions");
+    let longest_description = *description_lengths
+        .iter()
+        .max()
+        .expect("catalog should include descriptions");
+    assert!(shortest_description > 0);
+    assert!(longest_description < 1_024);
+    assert!(longest_description.abs_diff(shortest_description) <= 1);
+    assert!(!rendered.contains("additional skills omitted from this bounded skills list"));
+    assert!(!rendered.contains(&"x".repeat(1_021)));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn extreme_budget_pressure_removes_descriptions_before_omitting_entries() -> TestResult {
+    let entries = (0..200)
+        .map(|index| {
+            let package_id = format!("orchestrator/skill-{index:03}");
+            let mut entry = test_entry(
+                SkillSourceKind::Orchestrator,
+                "codex_apps",
+                &package_id,
+                &format!("skill://{package_id}/SKILL.md"),
+            );
+            entry.description = format!("description-{index:03}");
+            entry
+        })
+        .collect();
+    let providers =
+        SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
+            catalog: SkillCatalog {
+                entries,
+                warnings: Vec::new(),
+            },
+            read_requests: Arc::new(Mutex::new(Vec::new())),
+            list_calls: None,
+            fail_first_list: false,
+        }));
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut builder =
+        ExtensionRegistryBuilder::with_event_sink(Arc::new(ChannelEventSink(event_tx)));
+    install_with_providers(&mut builder, providers, skills_extension_config);
+    let registry = builder.build();
+    let session_store = ExtensionData::new("session");
+    let thread_store = ExtensionData::new("thread");
+    let session_source = SessionSource::Cli;
+    let config = default_config();
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            config: &config,
+            session_source: &session_source,
+            persistent_thread_state_available: true,
+            environments: &[],
+            mcp_resource_client: None,
+            session_store: &session_store,
+            thread_store: &thread_store,
+        })
+        .await;
+
+    let fragments = registry.context_contributors()[0]
+        .contribute_thread_context(&session_store, &thread_store)
+        .await;
+    assert_eq!(1, fragments.len());
+    let rendered = fragments[0].text();
+    let included_count = rendered
+        .lines()
+        .filter(|line| line.starts_with("- skill-"))
+        .count();
+    assert!(included_count > 0);
+    assert!(included_count < 200);
+    assert!(rendered.contains("- skill-000: (orchestrator resource:"));
+    assert!(!rendered.contains("- skill-199:"));
+    assert!(!rendered.contains("description-"));
+    assert!(rendered.contains("additional skills omitted from this bounded skills list"));
+    let omitted_count = 200 - included_count;
+    let warning = event_rx.try_recv()?.into_warning();
+    assert_eq!(warning.thread_id, "thread");
+    assert_eq!(warning.turn_id, None);
+    assert_eq!(
+        warning.message,
+        format!(
+            "Exceeded skills context budget. All skill descriptions were removed and {omitted_count} additional skills were not included in the model-visible skills list."
+        )
+    );
+    assert!(event_rx.try_recv().is_err());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult {
+    let description = "x".repeat(1_025);
+    let opaque_suffix = "\\".repeat(1_500);
+    let mut entry = test_entry(
+        SkillSourceKind::Orchestrator,
+        "codex_apps",
+        &format!("orchestrator/{opaque_suffix}"),
+        &format!("skill://orchestrator/{opaque_suffix}/SKILL.md"),
+    );
+    entry.description = description.clone();
+    let providers =
+        SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
+            catalog: SkillCatalog {
+                entries: vec![
+                    entry,
+                    test_entry(
+                        SkillSourceKind::Orchestrator,
+                        "codex_apps",
+                        "orchestrator/hidden",
+                        "skill://orchestrator/hidden/SKILL.md",
+                    )
+                    .hidden_from_prompt(),
+                ],
+                warnings: vec!["w".repeat(256); 4],
+            },
+            read_requests: Arc::new(Mutex::new(Vec::new())),
+            list_calls: None,
+            fail_first_list: false,
+        }));
+    let mut builder = ExtensionRegistryBuilder::new();
+    install_with_providers(&mut builder, providers, skills_extension_config);
+    let registry = builder.build();
+    let session_store = ExtensionData::new("session");
+    let thread_store = ExtensionData::new("thread");
+    let session_source = SessionSource::Cli;
+    let config = default_config();
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            config: &config,
+            session_source: &session_source,
+            persistent_thread_state_available: true,
+            environments: &[],
+            mcp_resource_client: None,
             session_store: &session_store,
             thread_store: &thread_store,
         })
@@ -458,6 +638,9 @@ async fn skills_list_truncates_catalog_descriptions_in_tool_output() -> TestResu
         .as_str()
         .ok_or("skills.list response should include a description")?;
 
+    assert_eq!(response["skills"].as_array().map(Vec::len), Some(1));
+    assert_eq!(response["warnings"].as_array().map(Vec::len), Some(4));
+    assert_eq!(response["next_cursor"], serde_json::Value::Null);
     assert_eq!(rendered_description, "x".repeat(1_021) + "...");
     assert_ne!(rendered_description, description);
 
@@ -497,6 +680,7 @@ async fn orchestrator_catalog_snapshot_caches_failure() -> TestResult {
             session_source: &session_source,
             persistent_thread_state_available: true,
             environments: &[],
+            mcp_resource_client: None,
             session_store: &session_store,
             thread_store: &thread_store,
         })
@@ -506,9 +690,9 @@ async fn orchestrator_catalog_snapshot_caches_failure() -> TestResult {
         .contribute_thread_context(&session_store, &thread_store)
         .await;
     assert!(initial_fragments.is_empty());
-    let EventMsg::Warning(warning) = event_rx.try_recv()?.msg else {
-        panic!("expected warning event");
-    };
+    let warning = event_rx.try_recv()?.into_warning();
+    assert_eq!(warning.thread_id, thread_store.level_id());
+    assert_eq!(warning.turn_id, None);
     assert_eq!(
         warning.message,
         "orchestrator skills unavailable: temporary orchestrator failure"
@@ -531,6 +715,13 @@ async fn orchestrator_catalog_snapshot_caches_failure() -> TestResult {
             )
             .await;
         assert!(fragments.is_empty());
+        let warning = event_rx.try_recv()?.into_warning();
+        assert_eq!(warning.thread_id, thread_store.level_id());
+        assert_eq!(warning.turn_id.as_deref(), Some(turn_id));
+        assert_eq!(
+            warning.message,
+            "orchestrator skills unavailable: temporary orchestrator failure"
+        );
     }
     assert_eq!(1, list_calls.load(Ordering::Relaxed));
 
@@ -587,6 +778,7 @@ async fn root_qualified_locator_selects_only_the_matching_executor_skill() -> Te
             session_source: &session_source,
             persistent_thread_state_available: true,
             environments: &[],
+            mcp_resource_client: None,
             session_store: &session_store,
             thread_store: &thread_store,
         })
@@ -640,6 +832,314 @@ async fn root_qualified_locator_selects_only_the_matching_executor_skill() -> Te
 }
 
 #[tokio::test]
+async fn model_context_window_scales_executor_catalog_but_not_thread_catalog() -> TestResult {
+    let orchestrator_entries = (0..40)
+        .map(|index| {
+            test_entry(
+                SkillSourceKind::Orchestrator,
+                "orchestrator",
+                &format!("orchestrator/skill-{index:02}"),
+                &format!("skill-{index:02}/SKILL.md"),
+            )
+        })
+        .collect();
+    let executor_entries = (0..200)
+        .map(|index| {
+            test_entry(
+                SkillSourceKind::Executor,
+                "env-1",
+                &format!("executor/skill-{index:02}"),
+                &format!("skill-{index:02}/SKILL.md"),
+            )
+        })
+        .collect();
+    let providers = SkillProviders::new()
+        .with_orchestrator_provider(Arc::new(StaticSkillProvider {
+            catalog: SkillCatalog {
+                entries: orchestrator_entries,
+                warnings: Vec::new(),
+            },
+            read_requests: Arc::new(Mutex::new(Vec::new())),
+            list_calls: None,
+            fail_first_list: false,
+        }))
+        .with_executor_provider(Arc::new(StaticSkillProvider {
+            catalog: SkillCatalog {
+                entries: executor_entries,
+                warnings: Vec::new(),
+            },
+            read_requests: Arc::new(Mutex::new(Vec::new())),
+            list_calls: None,
+            fail_first_list: false,
+        }));
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut builder =
+        ExtensionRegistryBuilder::with_event_sink(Arc::new(ChannelEventSink(event_tx)));
+    install_with_providers(&mut builder, providers, skills_extension_config);
+    let registry = builder.build();
+    let session_store = ExtensionData::new("session");
+    let thread_store = ExtensionData::new("thread");
+    let mut config = default_config();
+    config.bundled_skills_enabled = false;
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            config: &config,
+            session_source: &SessionSource::Cli,
+            persistent_thread_state_available: true,
+            environments: &[],
+            mcp_resource_client: None,
+            session_store: &session_store,
+            thread_store: &thread_store,
+        })
+        .await;
+    let mut model_info = model_info_from_slug("test-model");
+    model_info.context_window = Some(10_000);
+    thread_store.insert(model_info);
+
+    let thread_fragments = registry.context_contributors()[0]
+        .contribute_thread_context(&session_store, &thread_store)
+        .await;
+    assert_eq!(1, thread_fragments.len());
+    assert!(thread_fragments[0].text().contains("skill-39"));
+    assert!(
+        !thread_fragments[0]
+            .text()
+            .contains("additional skills omitted")
+    );
+
+    let selected_roots = vec![SelectedCapabilityRoot {
+        id: "skills".to_string(),
+        location: CapabilityRootLocation::Environment {
+            environment_id: "env-1".to_string(),
+            path: PathUri::parse("file:///skills").expect("skill root URI"),
+        },
+    }];
+    let turn_store = ExtensionData::new("turn-1");
+    let sections = registry.context_contributors()[0]
+        .contribute_world_state(WorldStateContributionInput {
+            thread_id: codex_protocol::ThreadId::new(),
+            turn_id: "turn-1",
+            environments: &[],
+            ready_selected_capability_roots: &selected_roots,
+            executor_capability_discovery: None,
+            session_store: &session_store,
+            thread_store: &thread_store,
+            turn_store: &turn_store,
+        })
+        .await;
+    // Core rebuilds world state before each sampling step.
+    let _repeated_sections = registry.context_contributors()[0]
+        .contribute_world_state(WorldStateContributionInput {
+            thread_id: codex_protocol::ThreadId::new(),
+            turn_id: "turn-1",
+            environments: &[],
+            ready_selected_capability_roots: &selected_roots,
+            executor_capability_discovery: None,
+            session_store: &session_store,
+            thread_store: &thread_store,
+            turn_store: &turn_store,
+        })
+        .await;
+    let warning = event_rx.try_recv()?.into_warning();
+    assert_eq!(warning.thread_id, thread_store.level_id());
+    assert_eq!(warning.turn_id.as_deref(), Some("turn-1"));
+    assert!(
+        warning
+            .message
+            .starts_with("Exceeded skills context budget.")
+    );
+    assert!(
+        warning
+            .message
+            .ends_with("additional skills were not included in the model-visible skills list.")
+    );
+    let snapshot = sections[0].snapshot().clone();
+    let fragment = sections[0]
+        .render_diff(PreviousWorldStateSection::Absent)
+        .ok_or("bounded executor catalog should render")?;
+    assert!(fragment.body().contains("additional skills omitted"));
+    assert!(!fragment.body().contains("skill-39"));
+    assert!(
+        sections[0]
+            .render_diff(PreviousWorldStateSection::Known(&snapshot))
+            .is_none()
+    );
+    assert!(event_rx.try_recv().is_err());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn executor_catalog_emits_at_most_four_warnings() -> TestResult {
+    let executor_provider = Arc::new(StaticSkillProvider {
+        catalog: SkillCatalog {
+            entries: Vec::new(),
+            warnings: (0..6).map(|index| format!("warning-{index}")).collect(),
+        },
+        read_requests: Arc::new(Mutex::new(Vec::new())),
+        list_calls: None,
+        fail_first_list: false,
+    });
+    let providers = SkillProviders::new().with_executor_provider(executor_provider);
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut builder =
+        ExtensionRegistryBuilder::with_event_sink(Arc::new(ChannelEventSink(event_tx)));
+    install_with_providers(&mut builder, providers, skills_extension_config);
+    let registry = builder.build();
+    let session_store = ExtensionData::new("session");
+    let thread_store = ExtensionData::new("thread");
+    let mut config = default_config();
+    config.bundled_skills_enabled = false;
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            config: &config,
+            session_source: &SessionSource::Cli,
+            persistent_thread_state_available: true,
+            environments: &[],
+            mcp_resource_client: None,
+            session_store: &session_store,
+            thread_store: &thread_store,
+        })
+        .await;
+    let selected_roots = vec![SelectedCapabilityRoot {
+        id: "skills".to_string(),
+        location: CapabilityRootLocation::Environment {
+            environment_id: "env-1".to_string(),
+            path: PathUri::parse("file:///skills").expect("skill root URI"),
+        },
+    }];
+    let turn_store = ExtensionData::new("turn-1");
+
+    registry.context_contributors()[0]
+        .contribute_world_state(WorldStateContributionInput {
+            thread_id: codex_protocol::ThreadId::new(),
+            turn_id: "turn-1",
+            environments: &[],
+            ready_selected_capability_roots: &selected_roots,
+            executor_capability_discovery: None,
+            session_store: &session_store,
+            thread_store: &thread_store,
+            turn_store: &turn_store,
+        })
+        .await;
+    registry.turn_input_contributors()[0]
+        .contribute(
+            TurnInputContext {
+                turn_id: "turn-1".to_string(),
+                user_input: Vec::new(),
+                environments: Vec::new(),
+            },
+            &session_store,
+            &thread_store,
+            &turn_store,
+        )
+        .await;
+
+    let messages = event_rx
+        .try_iter()
+        .map(|event| event.into_warning().message)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        vec!["warning-0", "warning-1", "warning-2", "warning-3"]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn host_catalog_compacts_shared_paths_under_budget_pressure() -> TestResult {
+    let test_root = test_codex_home();
+    let root = test_root.join(
+        "plugins/cache/openai-curated/example/hash1234567890/skills-with-a-very-long-shared-prefix",
+    );
+    for index in 0..12 {
+        let skill_dir = root.join(format!("skill-{index:02}"));
+        std::fs::create_dir_all(&skill_dir)?;
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: skill-{index:02}\ndescription: Fix lint errors.\n---\n# Skill {index:02}\n"
+            ),
+        )?;
+    }
+    let root = AbsolutePathBuf::try_from(std::fs::canonicalize(root)?)?;
+    let rendered_root = root.to_string_lossy().replace('\\', "/");
+    let outcome = load_skills_from_roots(
+        [SkillRoot {
+            path: root,
+            scope: SkillScope::User,
+            file_system: Arc::clone(&LOCAL_FS),
+            plugin_identity: None,
+            plugin_namespace: None,
+            plugin_root: None,
+            discovery_mode: Default::default(),
+        }],
+        /*plugin_skill_snapshots*/ None,
+        Arc::new(Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
+    )
+    .await;
+    assert_eq!(outcome.errors, Vec::new());
+    assert_eq!(outcome.skills.len(), 12);
+
+    let mut builder = ExtensionRegistryBuilder::new();
+    install(&mut builder, skills_extension_config);
+    let registry = builder.build();
+    let session_store = ExtensionData::new("session");
+    let thread_store = ExtensionData::new("thread");
+    let mut config = default_config();
+    config.bundled_skills_enabled = false;
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            config: &config,
+            session_source: &SessionSource::Cli,
+            persistent_thread_state_available: true,
+            environments: &[],
+            mcp_resource_client: None,
+            session_store: &session_store,
+            thread_store: &thread_store,
+        })
+        .await;
+    let mut model_info = model_info_from_slug("test-model");
+    model_info.context_window = Some(10_000);
+    thread_store.insert(model_info);
+    let turn_store = ExtensionData::new("turn-1");
+    turn_store.insert(HostSkillsSnapshot::new(Arc::new(outcome)));
+
+    let fragments = registry.turn_input_contributors()[0]
+        .contribute(
+            TurnInputContext {
+                turn_id: "turn-1".to_string(),
+                user_input: vec![UserInput::Text {
+                    text: "hello".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                environments: Vec::new(),
+            },
+            &session_store,
+            &thread_store,
+            &turn_store,
+        )
+        .await;
+    let catalog = fragments
+        .iter()
+        .find(|fragment| fragment.role() == "developer")
+        .ok_or("host catalog should render")?
+        .render();
+
+    assert!(
+        catalog.contains(&format!("- `r0` = `{rendered_root}`")),
+        "{catalog}"
+    );
+    assert!(catalog.contains("(file: r0/skill-00/SKILL.md)"));
+    assert!(catalog.contains("(file: r0/skill-11/SKILL.md)"));
+    assert!(!catalog.contains("additional skills omitted"));
+
+    std::fs::remove_dir_all(test_root)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
     let read_requests = Arc::new(Mutex::new(Vec::new()));
     let provider = Arc::new(StaticSkillProvider {
@@ -679,6 +1179,7 @@ async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
             session_source: &session_source,
             persistent_thread_state_available: true,
             environments: &[],
+            mcp_resource_client: None,
             session_store: &session_store,
             thread_store: &thread_store,
         })
@@ -724,11 +1225,30 @@ struct StaticSkillProvider {
     fail_first_list: bool,
 }
 
-struct ChannelEventSink(std::sync::mpsc::Sender<Event>);
+#[derive(Debug)]
+enum CapturedExtensionEvent {
+    Event(Box<Event>),
+    Warning(ExtensionWarning),
+}
+
+impl CapturedExtensionEvent {
+    fn into_warning(self) -> ExtensionWarning {
+        match self {
+            Self::Warning(warning) => warning,
+            Self::Event(event) => panic!("expected extension warning, got {event:?}"),
+        }
+    }
+}
+
+struct ChannelEventSink(std::sync::mpsc::Sender<CapturedExtensionEvent>);
 
 impl ExtensionEventSink for ChannelEventSink {
     fn emit(&self, event: Event) {
-        let _ = self.0.send(event);
+        let _ = self.0.send(CapturedExtensionEvent::Event(Box::new(event)));
+    }
+
+    fn emit_warning(&self, warning: ExtensionWarning) {
+        let _ = self.0.send(CapturedExtensionEvent::Warning(warning));
     }
 }
 

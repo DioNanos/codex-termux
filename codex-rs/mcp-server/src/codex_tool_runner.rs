@@ -11,6 +11,7 @@ use crate::outgoing_message::OutgoingNotificationMeta;
 use crate::patch_approval::handle_patch_approval_request;
 use codex_core::CodexThread;
 use codex_core::NewThread;
+use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
 use codex_core::config::Config as CodexConfig;
 use codex_protocol::ThreadId;
@@ -66,7 +67,10 @@ pub async fn run_codex_tool_session(
         thread_id,
         thread,
         session_configured,
-    } = match thread_manager.start_thread(config.clone()).await {
+    } = match thread_manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+    {
         Ok(res) => res,
         Err(e) => {
             let result = CallToolResult::error(vec![Content::text(format!(
@@ -225,6 +229,8 @@ async fn run_codex_tool_session_inner(
                             command,
                             cwd,
                             call_id,
+                            plugin_id: _,
+                            script_path: _,
                             approval_id: _,
                             reason: _,
                             proposed_execpolicy_amendment: _,

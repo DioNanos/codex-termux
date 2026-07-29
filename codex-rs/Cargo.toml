@@ -47,11 +47,13 @@ members = [
     "file-system",
     "exec-server-protocol",
     "exec-server",
+    "exec-server/tests/support",
     "execpolicy",
     "ext/agent",
     "ext/connectors",
     "ext/extension-api",
     "ext/goal",
+    "ext/git-attribution",
     "ext/guardian",
     "ext/image-generation",
     "ext/items",
@@ -128,7 +130,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.145.0"
+version = "0.146.0"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -180,10 +182,12 @@ codex-exec = { path = "exec" }
 codex-file-system = { path = "file-system" }
 codex-exec-server-protocol = { path = "exec-server-protocol" }
 codex-exec-server = { path = "exec-server" }
+codex-exec-server-test-support = { path = "exec-server/tests/support" }
 codex-execpolicy = { path = "execpolicy" }
 codex-extension-api = { path = "ext/extension-api" }
 codex-extension-items = { path = "ext/items" }
 codex-goal-extension = { path = "ext/goal" }
+codex-git-attribution = { path = "ext/git-attribution" }
 codex-guardian = { path = "ext/guardian" }
 codex-image-generation-extension = { path = "ext/image-generation" }
 codex-external-agent-migration = { path = "external-agent-migration" }

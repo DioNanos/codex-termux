@@ -98,7 +98,11 @@ fn catalog_from_outcome(outcome: &SkillLoadOutcome) -> SkillCatalog {
     };
 
     for (skill, enabled) in outcome.skills_with_enabled() {
-        catalog.push_entry(catalog_entry_from_skill(skill, enabled));
+        let mut entry = catalog_entry_from_skill(skill, enabled);
+        if let Some(root) = outcome.skill_root_for_path(&skill.path_to_skills_md) {
+            entry = entry.with_display_path_root(root.to_string_lossy().replace('\\', "/"));
+        }
+        catalog.push_entry(entry);
     }
 
     catalog
@@ -116,6 +120,7 @@ fn catalog_entry_from_skill(skill: &SkillMetadata, enabled: bool) -> SkillCatalo
     )
     .with_short_description(skill.short_description.clone())
     .with_display_path(display_path)
+    .with_prompt_scope(skill.scope)
     .with_dependencies(skill.dependencies.clone());
 
     if !enabled {
@@ -127,3 +132,7 @@ fn catalog_entry_from_skill(skill: &SkillMetadata, enabled: bool) -> SkillCatalo
 
     entry
 }
+
+#[cfg(test)]
+#[path = "host_tests.rs"]
+mod tests;

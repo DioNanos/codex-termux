@@ -8,7 +8,6 @@ use app_test_support::ChatGptAuthFixture;
 use app_test_support::ChatGptIdTokenClaims;
 use app_test_support::TestAppServer;
 use app_test_support::encode_id_token;
-use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use axum::Json;
 use axum::Router;
@@ -22,7 +21,6 @@ use codex_app_server_protocol::AppsReadParams;
 use codex_app_server_protocol::AppsReadResponse;
 use codex_app_server_protocol::ConnectorMetadata;
 use codex_app_server_protocol::JSONRPCError;
-use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::RequestId;
 use codex_config::types::AuthCredentialsStoreMode;
@@ -35,6 +33,54 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[test]
+fn app_read_deserializes_legacy_tool_summaries() -> Result<()> {
+    let response: AppsReadResponse = serde_json::from_value(json!({
+        "apps": [{
+            "id": "alpha",
+            "name": "Alpha",
+            "description": null,
+            "iconUrl": null,
+            "iconUrlDark": null,
+            "distributionChannel": null,
+            "installUrl": null,
+            "pluginDisplayNames": [],
+            "toolSummaries": [{
+                "name": "search",
+                "title": "Search",
+                "description": "Search Alpha",
+            }],
+        }],
+        "missingAppIds": [],
+    }))?;
+
+    assert_eq!(
+        serde_json::to_value(response)?,
+        json!({
+            "apps": [{
+                "id": "alpha",
+                "name": "Alpha",
+                "description": null,
+                "iconUrl": null,
+                "iconUrlDark": null,
+                "distributionChannel": null,
+                "installUrl": null,
+                "pluginDisplayNames": [],
+                "toolSummaries": [{
+                    "name": "search",
+                    "title": "Search",
+                    "description": "Search Alpha",
+                    "isEnabled": true,
+                    "disabledReason": null,
+                    "isReadOnly": false,
+                }],
+            }],
+            "missingAppIds": [],
+        })
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn app_read_deduplicates_orders_partial_misses_and_reuses_cached_metadata() -> Result<()> {
@@ -72,9 +118,8 @@ async fn app_read_deduplicates_orders_partial_misses_and_reuses_cached_metadata(
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .without_managed_config()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
     let login_id = mcp
         .send_chatgpt_auth_tokens_login_request(
             access_token,
@@ -82,15 +127,9 @@ async fn app_read_deduplicates_orders_partial_misses_and_reuses_cached_metadata(
             Some("plus".to_string()),
         )
         .await?;
-    let login_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(login_id)),
-    )
-    .await??;
-    assert_eq!(
-        to_response::<LoginAccountResponse>(login_response)?,
-        LoginAccountResponse::ChatgptAuthTokens {}
-    );
+    let login_response: LoginAccountResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(login_id)).await??;
+    assert_eq!(login_response, LoginAccountResponse::ChatgptAuthTokens {});
 
     let raw_response = read_apps_raw(
         &mut mcp,
@@ -183,9 +222,8 @@ async fn app_read_refetches_metadata_only_cache_entries_when_tools_are_requested
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .without_managed_config()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     assert_eq!(
         read_apps(&mut mcp, vec!["cached"], /*include_tools*/ false).await?,
@@ -269,9 +307,8 @@ async fn app_read_backend_failure_preserves_fresh_cached_records() -> Result<()>
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .without_managed_config()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     assert_eq!(
         read_apps(&mut mcp, vec!["cached"], /*include_tools*/ true).await?,
@@ -359,9 +396,8 @@ enabled = false
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let response = read_apps(
         &mut mcp,
@@ -401,9 +437,8 @@ async fn app_read_rejects_more_than_one_hundred_input_ids() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
         .send_apps_read_request(AppsReadParams {
@@ -442,12 +477,7 @@ async fn read_apps_raw(
             include_tools,
         })
         .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    Ok(response.result)
+    timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await?
 }
 
 fn metadata(id: &str, name: &str, icon_url: Option<&str>) -> ConnectorMetadata {
@@ -468,6 +498,9 @@ fn metadata_json(id: &str, name: &str, icon_url: Option<&str>) -> Value {
             "name": format!("{id}_tool"),
             "title": format!("{name} Tool"),
             "description": format!("Use {name}"),
+            "isEnabled": false,
+            "disabledReason": "disabled_by_admin",
+            "isReadOnly": true,
         }],
     })
 }
@@ -491,6 +524,9 @@ fn app_response(id: &str, name: &str, icon_url: Option<&str>) -> Value {
             "name": format!("{id}_tool"),
             "title": format!("{name} Tool"),
             "description": format!("Use {name}"),
+            "is_enabled": false,
+            "disabled_reason": "disabled_by_admin",
+            "is_read_only": true,
         }],
         "branding": {
             "category": "PRODUCTIVITY",
@@ -515,7 +551,6 @@ fn app_response(id: &str, name: &str, icon_url: Option<&str>) -> Value {
             "version": "1.0.0",
             "version_id": "version-1",
             "version_notes": "Initial release",
-            "first_party_type": "must-not-escape",
             "first_party_requires_install": true,
             "show_in_composer_when_unlinked": true,
             "subtitle": "must-not-escape",

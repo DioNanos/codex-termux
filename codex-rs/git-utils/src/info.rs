@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use codex_file_system::ExecutorFileSystem;
 use codex_file_system::FindUpErrorPolicy;
@@ -39,30 +40,6 @@ pub fn get_git_repo_root(base_dir: &Path) -> Option<PathBuf> {
         base_dir.parent()?
     };
     find_ancestor_git_entry(base).map(|(repo_root, _)| repo_root)
-}
-
-/// Return the repository root for `cwd` using the provided filesystem.
-///
-/// This mirrors [`get_git_repo_root`] for local paths, but works when `cwd`
-/// only exists inside a selected remote environment.
-pub async fn get_git_repo_root_with_fs(
-    fs: &dyn ExecutorFileSystem,
-    cwd: &AbsolutePathBuf,
-) -> Option<AbsolutePathBuf> {
-    let cwd_uri = PathUri::from_abs_path(cwd);
-    let base = match fs.get_metadata(&cwd_uri, /*sandbox*/ None).await {
-        Ok(metadata) if metadata.is_directory => cwd.clone(),
-        _ => cwd.parent()?,
-    };
-    find_nearest_native_ancestor_with_markers(
-        fs,
-        &base,
-        vec![".git".to_string()],
-        FindUpErrorPolicy::Ignore,
-        /*sandbox*/ None,
-    )
-    .await
-    .ok()?
 }
 
 /// Timeout for git commands to prevent freezing on large repositories
@@ -424,7 +401,11 @@ impl crate::FsmonitorProbeRunner for LocalFsmonitorProbeRunner<'_> {
         // Both probes are fast, bounded metadata queries that do not inspect the
         // worktree or index, so do not reduce the requested command's timeout.
         let mut command = Command::new(self.git);
-        command.args(args).current_dir(self.cwd).kill_on_drop(true);
+        command
+            .args(args)
+            .current_dir(self.cwd)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
         match timeout(GIT_COMMAND_TIMEOUT, command.output()).await {
             Ok(Ok(output)) if output.status.success() => Some(output.stdout),
             _ => None,
@@ -452,6 +433,7 @@ async fn run_git_command_with_timeout_from(
         .args(["-c", fsmonitor.git_config_arg()])
         .args(args)
         .current_dir(cwd)
+        .stdin(Stdio::null())
         .kill_on_drop(true);
     let result = timeout(GIT_COMMAND_TIMEOUT, command.output()).await;
 
@@ -811,7 +793,20 @@ pub async fn resolve_root_git_project_for_trust(
     fs: &dyn ExecutorFileSystem,
     cwd: &AbsolutePathBuf,
 ) -> Option<AbsolutePathBuf> {
-    let repo_root = get_git_repo_root_with_fs(fs, cwd).await?;
+    let cwd_uri = PathUri::from_abs_path(cwd);
+    let base = match fs.get_metadata(&cwd_uri, /*sandbox*/ None).await {
+        Ok(metadata) if metadata.is_directory => cwd.clone(),
+        _ => cwd.parent()?,
+    };
+    let repo_root = find_nearest_native_ancestor_with_markers(
+        fs,
+        &base,
+        vec![".git".to_string()],
+        FindUpErrorPolicy::Ignore,
+        /*sandbox*/ None,
+    )
+    .await
+    .ok()??;
     let dot_git = repo_root.join(".git");
     let dot_git_uri = PathUri::from_abs_path(&dot_git);
     if fs
@@ -910,6 +905,58 @@ mod tests {
     use pretty_assertions::assert_eq;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn git_metadata_commands_do_not_inherit_stdin() {
+        const CHILD_ENV: &str = "CODEX_GIT_UTILS_STDIN_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let temp_dir = tempfile::tempdir().expect("create temp dir");
+            let status = Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(temp_dir.path())
+                .stdin(Stdio::null())
+                .status()
+                .await
+                .expect("initialize test repository");
+            assert!(status.success(), "initialize test repository");
+
+            let git = Path::new("git");
+            let mut runner = LocalFsmonitorProbeRunner {
+                git,
+                cwd: temp_dir.path(),
+            };
+            assert!(
+                crate::FsmonitorProbeRunner::run_probe(&mut runner, &["cat-file", "--batch"])
+                    .await
+                    .is_some()
+            );
+            assert!(
+                run_git_command_with_timeout_from(
+                    git,
+                    &["cat-file", "--batch"],
+                    temp_dir.path(),
+                    crate::FsmonitorOverride::Disabled,
+                )
+                .await
+                .is_some()
+            );
+            return;
+        }
+
+        let mut child =
+            Command::new(std::env::current_exe().expect("find current test executable"))
+                .args(["git_metadata_commands_do_not_inherit_stdin", "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("spawn child test process");
+        let stdin = child.stdin.take().expect("hold child stdin open");
+        let status = child.wait().await.expect("wait for child test process");
+        drop(stdin);
+
+        assert!(status.success(), "child test process failed: {status}");
+    }
 
     #[test]
     fn canonicalize_git_remote_url_normalizes_github_variants() {

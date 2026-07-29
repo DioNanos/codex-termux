@@ -300,12 +300,14 @@ mod tests {
                             value: FileSystemSpecialPath::Root,
                         },
                         access: FileSystemAccessMode::Read,
+                        missing_path_behavior: None,
                     },
                     FileSystemSandboxEntry {
                         path: FileSystemPath::GlobPattern {
                             pattern: "**/.env".to_string(),
                         },
                         access: FileSystemAccessMode::Deny,
+                        missing_path_behavior: None,
                     },
                 ],
                 glob_scan_max_depth: None,
@@ -415,6 +417,7 @@ mod tests {
             parent_thread_id: None,
             preview: "read thread".to_string(),
             ephemeral: false,
+            is_pinned: false,
             history_mode: Default::default(),
             model_provider: "read-provider".to_string(),
             created_at: 1,

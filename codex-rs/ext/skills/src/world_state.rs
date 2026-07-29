@@ -1,5 +1,4 @@
 use codex_core_skills::HostSkillsSnapshot;
-use codex_core_skills::SkillMetadataBudget;
 use codex_core_skills::build_available_skills;
 use codex_core_skills::render::SkillRenderSideEffects;
 use codex_extension_api::ContextualUserFragment;
@@ -10,14 +9,11 @@ use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use serde_json::json;
 
-use crate::catalog::SkillCatalog;
 use crate::fragments::AvailableSkillsInstructions;
-use crate::render::available_skills_fragment;
+use crate::render::SkillMetadataBudget;
 
 pub(crate) const SKILLS_WORLD_STATE_ID: &str = "skills";
 pub(crate) const HOST_SKILLS_WORLD_STATE_ID: &str = "host_skills";
-const MAX_HOST_SKILLS_METADATA_CHARS: usize = 8_000;
-const MAX_HOST_SKILLS_METADATA_TOKENS: usize = 4_000;
 const NO_EXECUTOR_SKILLS_BODY: &str =
     "\n## Skills update\nNo selected-environment skills are currently available.\n";
 const HIDDEN_EXECUTOR_SKILLS_BODY: &str = "\n## Skills update\nSelected-environment skills are not listed automatically. Explicit skill mentions can still be resolved when available.\n";
@@ -26,16 +22,9 @@ const NO_HOST_SKILLS_BODY: &str =
 const HIDDEN_HOST_SKILLS_BODY: &str = "\n## Host skills update\nHost skills are not listed automatically. Explicit skill mentions can still be resolved when available.\n";
 
 pub(crate) fn executor_skills_world_state_section(
-    catalog: &SkillCatalog,
+    body: Option<String>,
     include_instructions: bool,
-    include_skills_usage_instructions: bool,
 ) -> WorldStateSectionContribution {
-    let body = if include_instructions {
-        available_skills_fragment(catalog, include_skills_usage_instructions)
-            .map(|fragment| fragment.body())
-    } else {
-        None
-    };
     let snapshot = json!({
         "body": body,
         "includeInstructions": include_instructions,
@@ -58,16 +47,18 @@ pub(crate) fn executor_skills_world_state_section(
             }
 
             let body = match body.as_deref() {
-                Some(body) => body,
-                None if previous_is_absent => return None,
-                None if !include_instructions => HIDDEN_EXECUTOR_SKILLS_BODY,
-                None => NO_EXECUTOR_SKILLS_BODY,
+                Some(body) => Some(body),
+                None if previous_is_absent => None,
+                None if !include_instructions => Some(HIDDEN_EXECUTOR_SKILLS_BODY),
+                None => Some(NO_EXECUTOR_SKILLS_BODY),
             };
-            Some(RenderedWorldStateFragment::new(
-                "developer",
-                (SKILLS_INSTRUCTIONS_OPEN_TAG, SKILLS_INSTRUCTIONS_CLOSE_TAG),
-                body,
-            ))
+            body.map(|body| {
+                RenderedWorldStateFragment::new(
+                    "developer",
+                    (SKILLS_INSTRUCTIONS_OPEN_TAG, SKILLS_INSTRUCTIONS_CLOSE_TAG),
+                    body,
+                )
+            })
         })
         .with_legacy_matcher(|role, text| {
             role == "developer"
@@ -90,11 +81,9 @@ pub(crate) fn host_skills_world_state_section(
 ) -> WorldStateSectionContribution {
     let outcome = host_snapshot.outcome();
     let metadata_budget = match metadata_budget {
-        SkillMetadataBudget::Tokens(limit) => {
-            SkillMetadataBudget::Tokens(limit.min(MAX_HOST_SKILLS_METADATA_TOKENS))
-        }
+        SkillMetadataBudget::Tokens(limit) => codex_core_skills::SkillMetadataBudget::Tokens(limit),
         SkillMetadataBudget::Characters(limit) => {
-            SkillMetadataBudget::Characters(limit.min(MAX_HOST_SKILLS_METADATA_CHARS))
+            codex_core_skills::SkillMetadataBudget::Characters(limit)
         }
     };
     let available = if include_instructions {

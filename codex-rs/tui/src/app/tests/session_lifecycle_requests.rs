@@ -8,6 +8,7 @@ use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_protocol::AgentPath;
+use codex_state::SqliteConfig;
 use futures::SinkExt;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
@@ -138,6 +139,62 @@ async fn start_recording_app_server(
 }
 
 #[test]
+fn fresh_session_applies_requested_name() -> Result<()> {
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
+    std::thread::Builder::new()
+        .name("tui-named-fresh-session".to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let mut app = make_test_app().await;
+                let codex_home = tempdir()?;
+                app.config.codex_home = codex_home.path().to_path_buf().abs();
+                app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+                let (mut app_server, requests, proxy) =
+                    start_recording_app_server(&app.config).await?;
+                let mut tui = crate::tui::test_support::make_test_tui()?;
+
+                app.start_fresh_session_with_summary_hint(
+                    &mut tui,
+                    &mut app_server,
+                    /*session_start_source*/ None,
+                    /*initial_user_message*/ None,
+                    /*new_thread_name*/ Some("Add User".to_string()),
+                )
+                .await;
+
+                let thread_id = app
+                    .chat_widget
+                    .thread_id()
+                    .expect("fresh session should have a thread id");
+                assert_eq!(app.chat_widget.thread_name(), Some("Add User".to_string()));
+                assert!(
+                    requests
+                        .lock()
+                        .expect("request recorder lock")
+                        .iter()
+                        .any(|method| method == "thread/name/set"),
+                    "fresh session should be named through the app server"
+                );
+                let thread = app_server
+                    .thread_read(thread_id, /*include_turns*/ false)
+                    .await?;
+                assert_eq!(thread.name.as_deref(), Some("Add User"));
+
+                app_server.shutdown().await?;
+                proxy.await??;
+                Ok(())
+            })
+        })?
+        .join()
+        .expect("named fresh session test thread")
+}
+
+#[test]
 fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
     const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -152,7 +209,8 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                 let mut app = make_test_app().await;
                 let codex_home = tempdir()?;
                 app.config.codex_home = codex_home.path().to_path_buf().abs();
-                app.config.sqlite_home = codex_home.path().to_path_buf();
+                app.config.sqlite =
+                    codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
                 let root_timestamp = "2026-01-01T00-00-00";
                 let root_thread_id = ThreadId::from_string(
                     &create_fake_rollout(
@@ -231,6 +289,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                     &mut app_server,
                     /*session_start_source*/ None,
                     /*initial_user_message*/ None,
+                    /*new_thread_name*/ None,
                 )
                 .await;
 

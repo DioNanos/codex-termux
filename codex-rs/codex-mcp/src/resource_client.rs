@@ -8,8 +8,8 @@ use codex_protocol::mcp::ResourceContent;
 use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ReadResourceRequestParams;
 
-use crate::McpConnectionManager;
 use crate::McpRuntime;
+use crate::connection_manager::McpConnectionSet;
 
 /// One page of resources returned by an MCP server.
 #[derive(Clone, Debug, PartialEq)]
@@ -27,9 +27,7 @@ pub struct McpResourceReadResult {
     pub contents: Vec<ResourceContent>,
 }
 
-/// Session-scoped access to MCP resources through the thread runtime.
-///
-/// Calls automatically use the connection set most recently published by the runtime.
+/// Access to MCP resources through the latest runtime.
 #[derive(Clone)]
 pub struct McpResourceClient {
     runtime: Arc<McpRuntime>,
@@ -37,7 +35,7 @@ pub struct McpResourceClient {
 
 /// Opaque identity for the connection set currently used by an MCP resource client.
 #[derive(Clone)]
-pub struct McpResourceClientCacheKey(Weak<McpConnectionManager>);
+pub struct McpResourceClientCacheKey(Weak<McpConnectionSet>);
 
 impl PartialEq for McpResourceClientCacheKey {
     fn eq(&self, other: &Self) -> bool {
@@ -56,21 +54,21 @@ impl std::fmt::Debug for McpResourceClient {
 }
 
 impl McpResourceClient {
-    /// Creates a resource client backed by the thread's MCP runtime.
+    /// Creates a resource client that follows the thread's latest published runtime.
     pub fn new(runtime: Arc<McpRuntime>) -> Self {
         Self { runtime }
     }
 
-    /// Returns an identity that changes whenever the published connection set changes.
+    /// Returns the identity of the connection set used by this client.
     pub fn cache_key(&self) -> McpResourceClientCacheKey {
-        McpResourceClientCacheKey(Arc::downgrade(&self.runtime.snapshot()))
+        McpResourceClientCacheKey(Arc::downgrade(&self.runtime.latest_connections()))
     }
 
-    /// Returns whether the current connection set contains the named server.
+    /// Returns whether this client can address the named server.
     ///
-    /// This does not wait for server startup or imply that startup succeeded.
+    /// This does not wait for server startup.
     pub async fn has_server(&self, server: &str) -> bool {
-        self.runtime.snapshot().contains_server(server)
+        self.runtime.latest_connections().contains_server(server)
     }
 
     /// Lists one resource page from the named server.
@@ -83,7 +81,7 @@ impl McpResourceClient {
             cursor.map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
         let result = self
             .runtime
-            .snapshot()
+            .latest_connections()
             .list_resources(server, params)
             .await?;
         let resources = result
@@ -99,10 +97,11 @@ impl McpResourceClient {
 
     /// Reads one resource from the named server.
     pub async fn read_resource(&self, server: &str, uri: &str) -> Result<McpResourceReadResult> {
+        let params = ReadResourceRequestParams::new(uri.to_string());
         let result = self
             .runtime
-            .snapshot()
-            .read_resource(server, ReadResourceRequestParams::new(uri.to_string()))
+            .latest_connections()
+            .read_resource(server, params)
             .await?;
         let contents = result
             .contents

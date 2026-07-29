@@ -1,17 +1,14 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
+use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
-use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
-use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
@@ -23,7 +20,9 @@ use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_app_server_protocol::WebSearchAction;
 use codex_app_server_protocol::WebSearchItem;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_features::Feature;
 use core_test_support::responses;
+use core_test_support::responses::strip_response_item_ids_from_json;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -44,6 +43,23 @@ const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
 async fn standalone_web_search_round_trips_output() -> Result<()> {
+    assert_standalone_web_search_round_trips_output(WebSearchProvider::ChatGpt).await
+}
+
+#[tokio::test]
+async fn standalone_web_search_round_trips_output_for_custom_provider() -> Result<()> {
+    assert_standalone_web_search_round_trips_output(WebSearchProvider::CustomResponses).await
+}
+
+#[derive(Clone, Copy)]
+enum WebSearchProvider {
+    ChatGpt,
+    CustomResponses,
+}
+
+async fn assert_standalone_web_search_round_trips_output(
+    provider: WebSearchProvider,
+) -> Result<()> {
     let call_id = "web-run-1";
     let expected_model_id = "model-id-from-search-context";
     let search_context = json!({
@@ -58,7 +74,11 @@ async fn standalone_web_search_round_trips_output() -> Result<()> {
         json!({ "openai/search_context": search_context }).to_string(),
     )]);
     let server = responses::start_mock_server().await;
-    mount_search_response(&server).await;
+    let search_path = match provider {
+        WebSearchProvider::ChatGpt => "/api/codex/alpha/search",
+        WebSearchProvider::CustomResponses => "/v1/alpha/search",
+    };
+    mount_search_response(&server, search_path).await;
 
     let response_mock = responses::mount_sse_sequence(
         &server,
@@ -85,19 +105,49 @@ async fn standalone_web_search_round_trips_output() -> Result<()> {
     .await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("access-chatgpt"),
-        AuthCredentialsStoreMode::File,
-    )?;
+    let config = MockResponsesConfig::new(&server.uri())
+        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
+        .enable_feature(Feature::StandaloneWebSearch)
+        .with_provider_config("supports_websockets = false");
+    let config = match provider {
+        WebSearchProvider::ChatGpt => config
+            .with_model_provider("openai-custom")
+            .with_provider_name("OpenAI")
+            .with_provider_base_url(&format!("{}/api/codex", server.uri()))
+            .with_provider_config("requires_openai_auth = true"),
+        WebSearchProvider::CustomResponses => config
+            .with_model_provider("custom-responses")
+            .with_provider_name("Custom Responses")
+            .with_provider_base_url(&format!("{}/v1", server.uri()))
+            .with_provider_config("env_key = \"CUSTOM_RESPONSES_API_KEY\"")
+            .with_provider_config("supports_standalone_web_search = true")
+            .with_provider_config("requires_openai_auth = false"),
+    };
+    config.write(codex_home.path())?;
+
+    if matches!(provider, WebSearchProvider::ChatGpt) {
+        write_chatgpt_auth(
+            codex_home.path(),
+            ChatGptAuthFixture::new("access-chatgpt"),
+            AuthCredentialsStoreMode::File,
+        )?;
+    }
+
+    let env_overrides = match provider {
+        WebSearchProvider::ChatGpt => {
+            vec![("OPENAI_API_KEY", None), ("CUSTOM_RESPONSES_API_KEY", None)]
+        }
+        WebSearchProvider::CustomResponses => vec![
+            ("OPENAI_API_KEY", None),
+            ("CUSTOM_RESPONSES_API_KEY", Some("test-api-key")),
+        ],
+    };
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .with_env_overrides(&[("OPENAI_API_KEY", None)])
-        .build()
+        .with_env_overrides(&env_overrides)
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_req = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
@@ -105,12 +155,8 @@ async fn standalone_web_search_round_trips_output() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    let thread_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(thread_req)).await??;
     let thread_id = thread.id.clone();
 
     let turn_req = mcp
@@ -125,12 +171,8 @@ async fn standalone_web_search_round_trips_output() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    let _turn: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
+    let _turn: TurnStartResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_req)).await??;
 
     let started = timeout(DEFAULT_READ_TIMEOUT, wait_for_web_search_started(&mut mcp)).await??;
     let completed = timeout(
@@ -161,7 +203,28 @@ async fn standalone_web_search_round_trips_output() -> Result<()> {
         "standalone web search should replace hosted web search"
     );
 
-    let search_request = search_request(&server).await?;
+    let search_request = search_request(&server, search_path).await?;
+    let expected_authorization = match provider {
+        WebSearchProvider::ChatGpt => "Bearer access-chatgpt",
+        WebSearchProvider::CustomResponses => "Bearer test-api-key",
+    };
+    assert_eq!(
+        search_request
+            .headers
+            .get("authorization")
+            .context("standalone search should include provider authorization")?
+            .to_str()
+            .context("standalone search authorization should be valid ASCII")?,
+        expected_authorization
+    );
+    if matches!(provider, WebSearchProvider::CustomResponses) {
+        assert!(
+            search_request
+                .headers
+                .get("x-openai-actor-authorization")
+                .is_none()
+        );
+    }
     assert_eq!(
         search_request
             .headers
@@ -228,7 +291,9 @@ async fn standalone_web_search_round_trips_output() -> Result<()> {
     );
 
     assert_eq!(
-        responses::strip_metadata_from_json(requests[1].function_call_output(call_id)),
+        strip_response_item_ids_from_json(responses::strip_metadata_from_json(
+            requests[1].function_call_output(call_id),
+        )),
         json!({
             "type": "function_call_output",
             "call_id": call_id,
@@ -268,22 +333,17 @@ async fn standalone_web_search_round_trips_output() -> Result<()> {
     drop(mcp);
     let mut reloaded_mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .with_env_overrides(&[("OPENAI_API_KEY", None)])
-        .build()
+        .with_env_overrides(&env_overrides)
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, reloaded_mcp.initialize()).await??;
     let read_req = reloaded_mcp
         .send_thread_read_request(ThreadReadParams {
             thread_id,
             include_turns: true,
         })
         .await?;
-    let read_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        reloaded_mcp.read_stream_until_response_message(RequestId::Integer(read_req)),
-    )
-    .await??;
-    let ThreadReadResponse { thread, .. } = to_response::<ThreadReadResponse>(read_resp)?;
+    let ThreadReadResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, reloaded_mcp.read_response(read_req)).await??;
     let persisted_web_searches: Vec<&ThreadItem> = thread
         .turns
         .iter()
@@ -297,14 +357,7 @@ async fn standalone_web_search_round_trips_output() -> Result<()> {
 
 async fn wait_for_web_search_started(mcp: &mut TestAppServer) -> Result<ItemStartedNotification> {
     loop {
-        let notification = mcp
-            .read_stream_until_notification_message("item/started")
-            .await?;
-        let started: ItemStartedNotification = serde_json::from_value(
-            notification
-                .params
-                .context("item/started notification should include params")?,
-        )?;
+        let started: ItemStartedNotification = mcp.read_notification("item/started").await?;
         if matches!(&started.item, ThreadItem::WebSearch(_)) {
             return Ok(started);
         }
@@ -315,23 +368,16 @@ async fn wait_for_web_search_completed(
     mcp: &mut TestAppServer,
 ) -> Result<ItemCompletedNotification> {
     loop {
-        let notification = mcp
-            .read_stream_until_notification_message("item/completed")
-            .await?;
-        let completed: ItemCompletedNotification = serde_json::from_value(
-            notification
-                .params
-                .context("item/completed notification should include params")?,
-        )?;
+        let completed: ItemCompletedNotification = mcp.read_notification("item/completed").await?;
         if matches!(&completed.item, ThreadItem::WebSearch(_)) {
             return Ok(completed);
         }
     }
 }
 
-async fn mount_search_response(server: &MockServer) {
+async fn mount_search_response(server: &MockServer, search_path: &str) {
     Mock::given(method("POST"))
-        .and(path("/api/codex/alpha/search"))
+        .and(path(search_path))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "encrypted_output": "ciphertext",
             "output": "Search result",
@@ -359,40 +405,13 @@ fn has_hosted_web_search(body: &Value) -> bool {
         })
 }
 
-async fn search_request(server: &MockServer) -> Result<wiremock::Request> {
+async fn search_request(server: &MockServer, search_path: &str) -> Result<wiremock::Request> {
     let requests = server
         .received_requests()
         .await
         .context("failed to fetch received requests")?;
     requests
         .into_iter()
-        .find(|request| request.url.path() == "/api/codex/alpha/search")
+        .find(|request| request.url.path() == search_path)
         .context("expected standalone search request")
-}
-
-fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
-    std::fs::write(
-        codex_home.join("config.toml"),
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-model_provider = "openai-custom"
-chatgpt_base_url = "{server_uri}"
-
-[features]
-standalone_web_search = true
-
-[model_providers.openai-custom]
-name = "OpenAI"
-base_url = "{server_uri}/api/codex"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-supports_websockets = false
-requires_openai_auth = true
-"#
-        ),
-    )
 }

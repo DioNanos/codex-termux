@@ -1,3 +1,4 @@
+use super::apps_processor::APP_READ_MAX_IDS;
 use super::*;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
@@ -17,6 +18,8 @@ use codex_core_plugins::remote::REMOTE_WORKSPACE_SHARED_WITH_ME_MARKETPLACE_NAME
 use codex_core_plugins::remote::REMOTE_WORKSPACE_SHARED_WITH_ME_PRIVATE_MARKETPLACE_NAME;
 use codex_core_plugins::remote::REMOTE_WORKSPACE_SHARED_WITH_ME_UNLISTED_MARKETPLACE_NAME;
 use codex_core_plugins::remote::RemoteAppTemplateUnavailableReason;
+use codex_core_plugins::remote::RemotePluginCatalogCacheMode;
+use codex_core_plugins::remote::RemotePluginScope;
 use codex_core_plugins::remote::is_valid_remote_plugin_id;
 use codex_core_plugins::remote::validate_remote_plugin_id;
 use codex_core_plugins::remote_bundle::RemotePluginBundleInstallError;
@@ -56,6 +59,8 @@ fn plugin_skills_to_info(
                     short_description: interface.short_description,
                     icon_small: interface.icon_small,
                     icon_large: interface.icon_large,
+                    icon_small_url: None,
+                    icon_large_url: None,
                     brand_color: interface.brand_color,
                     default_prompt: interface.default_prompt,
                 }
@@ -129,6 +134,13 @@ fn load_shared_plugin_ids_by_local_path(
     })
 }
 
+fn remote_plugin_service_config(config: &Config) -> RemotePluginServiceConfig {
+    RemotePluginServiceConfig::new(
+        config.chatgpt_base_url.clone(),
+        config.http_client_factory(),
+    )
+}
+
 fn share_context_for_source(
     source: &MarketplacePluginSource,
     shared_plugin_ids_by_local_path: &std::collections::BTreeMap<AbsolutePathBuf, String>,
@@ -145,6 +157,7 @@ fn share_context_for_source(
                 creator_account_user_id: None,
                 creator_name: None,
                 share_principals: None,
+                can_publish_to_workspace: None,
             }),
         MarketplacePluginSource::Git { .. } | MarketplacePluginSource::Npm { .. } => None,
     }
@@ -533,6 +546,7 @@ impl PluginRequestProcessor {
         let PluginListParams {
             cwds,
             marketplace_kinds,
+            force_refetch,
         } = params;
         let roots = cwds.unwrap_or_default();
         let explicit_marketplace_kinds = marketplace_kinds.is_some();
@@ -560,6 +574,14 @@ impl PluginRequestProcessor {
         let auth_mode = auth.as_ref().map(CodexAuth::api_auth_mode);
         plugins_manager.set_auth_mode(auth_mode);
         let plugins_input = config.plugins_config_input();
+        if include_local
+            && force_refetch
+            && plugins_manager
+                .refresh_non_curated_plugin_cache_for_config(&plugins_input, &roots)
+                .await
+        {
+            self.on_effective_plugins_changed();
+        }
         let include_shared_with_me =
             marketplace_kinds.contains(&PluginListMarketplaceKind::SharedWithMe);
         let include_created_by_me_remote = marketplace_kinds
@@ -569,15 +591,13 @@ impl PluginRequestProcessor {
             !explicit_marketplace_kinds && config.features.enabled(Feature::RemotePlugin);
         let use_remote_global_catalog =
             include_global_remote && auth_mode.is_some_and(DomainAuthMode::uses_codex_backend);
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
+        let remote_plugin_service_config = remote_plugin_service_config(&config);
+        let remote_catalog_cache_mode = if force_refetch {
+            RemotePluginCatalogCacheMode::ForceRefetch
+        } else {
+            RemotePluginCatalogCacheMode::PreferCache
         };
-        let refresh_global_remote_catalog_cache = use_remote_global_catalog
-            && codex_core_plugins::remote::has_cached_global_remote_plugin_catalog(
-                config.codex_home.as_path(),
-                &remote_plugin_service_config,
-                auth.as_ref(),
-            );
+        let mut remote_catalog_cache_refresh_scopes = Default::default();
         let (mut data, marketplace_load_errors) = if include_local {
             let config_for_marketplace_listing = plugins_input.clone();
             let plugins_manager_for_marketplace_listing = plugins_manager.clone();
@@ -694,12 +714,15 @@ impl PluginRequestProcessor {
                 &remote_plugin_service_config,
                 auth.as_ref(),
                 &remote_sources,
-                /*global_catalog_cache_path*/ Some(config.codex_home.as_path()),
+                /*catalog_cache_root*/ Some(config.codex_home.as_path()),
+                remote_catalog_cache_mode,
             )
             .await
             {
-                Ok(remote_marketplaces) => {
-                    for remote_marketplace in remote_marketplaces
+                Ok(outcome) => {
+                    remote_catalog_cache_refresh_scopes = outcome.catalog_cache_refresh_scopes;
+                    for remote_marketplace in outcome
+                        .marketplaces
                         .into_iter()
                         .map(remote_marketplace_to_info)
                     {
@@ -737,13 +760,14 @@ impl PluginRequestProcessor {
             || include_created_by_me_remote
             || include_shared_with_me
             || include_global_remote
+            || !remote_catalog_cache_refresh_scopes.is_empty()
         {
             plugins_manager.maybe_start_plugin_list_background_tasks_for_config(
                 &plugins_input,
                 auth.clone(),
                 &roots,
                 PluginListBackgroundTaskOptions {
-                    refresh_global_remote_catalog_cache,
+                    remote_catalog_cache_refresh_scopes,
                 },
                 Some(self.effective_plugins_changed_callback()),
             );
@@ -1018,9 +1042,7 @@ impl PluginRequestProcessor {
                 );
                 let share_context = match share_context {
                     Some(context) => {
-                        let remote_plugin_service_config = RemotePluginServiceConfig {
-                            chatgpt_base_url: config.chatgpt_base_url.clone(),
-                        };
+                        let remote_plugin_service_config = remote_plugin_service_config(&config);
                         match codex_core_plugins::remote::fetch_remote_plugin_share_context(
                             &remote_plugin_service_config,
                             auth.as_ref(),
@@ -1033,6 +1055,8 @@ impl PluginRequestProcessor {
                                     Some(remote_plugin_share_context_to_info(remote_share_context))
                                 } else {
                                     let remote_version = remote_share_context.remote_version;
+                                    let can_publish_to_workspace =
+                                        remote_share_context.can_publish_to_workspace;
                                     let remote_plugin_id = context.remote_plugin_id.clone();
                                     warn!(
                                         remote_plugin_id = %remote_plugin_id,
@@ -1040,6 +1064,7 @@ impl PluginRequestProcessor {
                                     );
                                     Some(PluginShareContext {
                                         remote_version,
+                                        can_publish_to_workspace,
                                         ..context
                                     })
                                 }
@@ -1065,6 +1090,7 @@ impl PluginRequestProcessor {
                 };
                 let app_summaries = load_plugin_app_summaries(
                     &config,
+                    auth.as_ref(),
                     &outcome.plugin.apps,
                     &outcome.plugin.app_category_by_id,
                 )
@@ -1128,9 +1154,7 @@ impl PluginRequestProcessor {
                         "remote plugin read is not enabled for marketplace {remote_marketplace_name}"
                     )));
                 }
-                let remote_plugin_service_config = RemotePluginServiceConfig {
-                    chatgpt_base_url: config.chatgpt_base_url.clone(),
-                };
+                let remote_plugin_service_config = remote_plugin_service_config(&config);
                 validate_remote_plugin_id(&plugin_name)?;
                 let remote_detail = codex_core_plugins::remote::fetch_remote_plugin_detail(
                     &remote_plugin_service_config,
@@ -1153,8 +1177,13 @@ impl PluginRequestProcessor {
                     .as_ref()
                     .map(plugin_app_category_by_id_from_value)
                     .unwrap_or_default();
-                let app_summaries =
-                    load_plugin_app_summaries(&config, &plugin_apps, &app_category_by_id).await;
+                let app_summaries = load_plugin_app_summaries(
+                    &config,
+                    auth.as_ref(),
+                    &plugin_apps,
+                    &app_category_by_id,
+                )
+                .await;
                 remote_plugin_detail_to_info(remote_detail, app_summaries)
             }
         };
@@ -1186,9 +1215,7 @@ impl PluginRequestProcessor {
         }
 
         let auth = self.auth_manager.auth().await;
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = remote_plugin_service_config(&config);
         let remote_skill_detail = codex_core_plugins::remote::fetch_remote_plugin_skill_detail(
             &remote_plugin_service_config,
             auth.as_ref(),
@@ -1239,9 +1266,7 @@ impl PluginRequestProcessor {
             validate_client_plugin_share_targets(share_targets)?;
         }
 
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = remote_plugin_service_config(&config);
         let access_policy = codex_core_plugins::remote::RemotePluginShareAccessPolicy {
             discoverability: discoverability.map(remote_plugin_share_discoverability),
             share_targets: share_targets.map(remote_plugin_share_targets),
@@ -1256,11 +1281,18 @@ impl PluginRequestProcessor {
         )
         .await
         .map_err(|err| remote_plugin_catalog_error_to_jsonrpc(err, "save remote plugin share"))?;
+        codex_core_plugins::remote::invalidate_cached_remote_plugin_catalog_scopes(
+            config.codex_home.as_path(),
+            &remote_plugin_service_config,
+            auth.as_ref(),
+            &[RemotePluginScope::User, RemotePluginScope::Workspace],
+        );
         let remote_plugin_id = result.remote_plugin_id;
         self.clear_plugin_related_caches();
         Ok(PluginShareSaveResponse {
             remote_plugin_id,
             share_url: result.share_url.unwrap_or_default(),
+            can_publish_to_workspace: result.can_publish_to_workspace,
         })
     }
 
@@ -1282,9 +1314,7 @@ impl PluginRequestProcessor {
         }
         validate_client_plugin_share_targets(&share_targets)?;
 
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = remote_plugin_service_config(&config);
         let result = codex_core_plugins::remote::update_remote_plugin_share_targets(
             &remote_plugin_service_config,
             auth.as_ref(),
@@ -1296,6 +1326,12 @@ impl PluginRequestProcessor {
         .map_err(|err| {
             remote_plugin_catalog_error_to_jsonrpc(err, "update remote plugin share targets")
         })?;
+        codex_core_plugins::remote::invalidate_cached_remote_plugin_catalog_scopes(
+            config.codex_home.as_path(),
+            &remote_plugin_service_config,
+            auth.as_ref(),
+            &[RemotePluginScope::User, RemotePluginScope::Workspace],
+        );
         self.clear_plugin_related_caches();
         Ok(PluginShareUpdateTargetsResponse {
             principals: result
@@ -1312,9 +1348,7 @@ impl PluginRequestProcessor {
         _params: PluginShareListParams,
     ) -> Result<PluginShareListResponse, JSONRPCErrorError> {
         let (config, auth) = self.load_plugin_share_config_and_auth().await?;
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = remote_plugin_service_config(&config);
         let data = codex_core_plugins::remote::list_remote_plugin_shares(
             &remote_plugin_service_config,
             auth.as_ref(),
@@ -1351,9 +1385,7 @@ impl PluginRequestProcessor {
             return Err(invalid_request("invalid remote plugin id"));
         }
 
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = remote_plugin_service_config(&config);
         let result = codex_core_plugins::remote::checkout_remote_plugin_share(
             &remote_plugin_service_config,
             auth.as_ref(),
@@ -1384,9 +1416,7 @@ impl PluginRequestProcessor {
             return Err(invalid_request("invalid remote plugin id"));
         }
 
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = remote_plugin_service_config(&config);
         codex_core_plugins::remote::delete_remote_plugin_share(
             &remote_plugin_service_config,
             auth.as_ref(),
@@ -1395,6 +1425,12 @@ impl PluginRequestProcessor {
         )
         .await
         .map_err(|err| remote_plugin_catalog_error_to_jsonrpc(err, "delete remote plugin share"))?;
+        codex_core_plugins::remote::invalidate_cached_remote_plugin_catalog_scopes(
+            config.codex_home.as_path(),
+            &remote_plugin_service_config,
+            auth.as_ref(),
+            &[RemotePluginScope::User, RemotePluginScope::Workspace],
+        );
         self.clear_plugin_related_caches();
         Ok(PluginShareDeleteResponse {})
     }
@@ -1490,14 +1526,12 @@ impl PluginRequestProcessor {
         }
 
         let plugin_app_declarations = load_plugin_apps(result.installed_path.as_path()).await;
-        let plugin_apps =
-            codex_plugin::app_connector_ids_from_declarations(&plugin_app_declarations);
         let apps_needing_auth = self
             .plugin_apps_needing_auth_for_install(
                 &config,
-                auth.as_ref().is_some_and(CodexAuth::is_chatgpt_auth),
+                auth.as_ref(),
                 &result.plugin_id.as_key(),
-                &plugin_apps,
+                &plugin_app_declarations,
             )
             .await;
 
@@ -1521,9 +1555,7 @@ impl PluginRequestProcessor {
         validate_remote_plugin_id(&remote_plugin_id)?;
 
         let auth = self.auth_manager.auth().await;
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = remote_plugin_service_config(&config);
         let remote_detail =
             codex_core_plugins::remote::fetch_remote_plugin_detail_with_download_urls(
                 &remote_plugin_service_config,
@@ -1596,6 +1628,7 @@ impl PluginRequestProcessor {
         })?;
 
         let result = codex_core_plugins::remote_bundle::download_and_install_remote_plugin_bundle(
+            &remote_plugin_service_config,
             config.codex_home.to_path_buf(),
             validated_bundle,
         )
@@ -1684,35 +1717,16 @@ impl PluginRequestProcessor {
                     .as_ref()
                     .map(plugin_app_category_by_id_from_value)
                     .unwrap_or_default();
-                let all_connectors = connectors::list_cached_all_connectors(&config, &[])
+                load_plugin_app_summaries(&config, auth.as_ref(), &plugin_apps, &app_category_by_id)
                     .await
-                    .unwrap_or_default();
-                connectors::connectors_for_plugin_apps(all_connectors, &plugin_apps)
-                    .into_iter()
-                    .map(|connector| {
-                        let category = app_category_by_id
-                            .get(&connector.id)
-                            .cloned()
-                            .or_else(|| connector.category());
-                        AppSummary {
-                            category,
-                            id: connector.id,
-                            name: connector.name,
-                            description: connector.description,
-                            install_url: connector.install_url,
-                        }
-                    })
-                    .collect()
             }
         } else {
             let plugin_app_declarations = load_plugin_apps(result.installed_path.as_path()).await;
-            let plugin_apps =
-                codex_plugin::app_connector_ids_from_declarations(&plugin_app_declarations);
             self.plugin_apps_needing_auth_for_install(
                 &config,
-                is_chatgpt_auth,
+                auth.as_ref(),
                 &result.plugin_id.as_key(),
-                &plugin_apps,
+                &plugin_app_declarations,
             )
             .await
         };
@@ -1762,17 +1776,31 @@ impl PluginRequestProcessor {
     async fn plugin_apps_needing_auth_for_install(
         &self,
         config: &Config,
-        is_chatgpt_auth: bool,
+        auth: Option<&CodexAuth>,
         plugin_id: &str,
-        plugin_apps: &[codex_plugin::AppConnectorId],
+        plugin_app_declarations: &[codex_plugin::AppDeclaration],
     ) -> Vec<AppSummary> {
-        if plugin_apps.is_empty() || !config.features.apps_enabled_for_auth(is_chatgpt_auth) {
+        if plugin_app_declarations.is_empty()
+            || !config
+                .features
+                .apps_enabled_for_auth(auth.is_some_and(CodexAuth::is_chatgpt_auth))
+        {
             return Vec::new();
         }
 
+        let plugin_apps =
+            codex_plugin::app_connector_ids_from_declarations(plugin_app_declarations);
+        let app_category_by_id = plugin_app_declarations
+            .iter()
+            .filter_map(|app| {
+                app.category
+                    .as_ref()
+                    .map(|category| (app.connector_id.0.clone(), category.clone()))
+            })
+            .collect();
         let environment_manager = self.thread_manager.environment_manager();
-        let (all_connectors_result, accessible_connectors_result) = tokio::join!(
-            connectors::list_all_connectors_with_options(config, /*force_refetch*/ false, &[]),
+        let (app_summaries, accessible_connectors_result) = tokio::join!(
+            load_plugin_app_summaries(config, auth, &plugin_apps, &app_category_by_id),
             connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
                 config,
                 /*force_refetch*/ true,
@@ -1781,19 +1809,6 @@ impl PluginRequestProcessor {
             ),
         );
 
-        let all_connectors = match all_connectors_result {
-            Ok(connectors) => connectors,
-            Err(err) => {
-                warn!(
-                    plugin = plugin_id,
-                    "failed to load app metadata after plugin install: {err:#}"
-                );
-                connectors::list_cached_all_connectors(config, &[])
-                    .await
-                    .unwrap_or_default()
-            }
-        };
-        let all_connectors = connectors::connectors_for_plugin_apps(all_connectors, plugin_apps);
         let (accessible_connectors, codex_apps_ready) = match accessible_connectors_result {
             Ok(status) => (status.connectors, status.codex_apps_ready),
             Err(err) => {
@@ -1814,14 +1829,17 @@ impl PluginRequestProcessor {
                 plugin = plugin_id,
                 "codex_apps MCP not ready after plugin install; skipping appsNeedingAuth check"
             );
+            return Vec::new();
         }
 
-        plugin_apps_needing_auth(
-            &all_connectors,
-            &accessible_connectors,
-            plugin_apps,
-            codex_apps_ready,
-        )
+        let accessible_ids = accessible_connectors
+            .iter()
+            .map(|connector| connector.id.as_str())
+            .collect::<HashSet<_>>();
+        app_summaries
+            .into_iter()
+            .filter(|app| !accessible_ids.contains(app.id.as_str()))
+            .collect()
     }
 
     async fn start_plugin_mcp_oauth_logins(
@@ -1853,6 +1871,7 @@ impl PluginRequestProcessor {
             let callback_url = config.mcp_oauth_callback_url.clone();
             let outgoing = Arc::clone(&self.outgoing);
             let notification_name = name.clone();
+            let thread_manager = Arc::clone(&self.thread_manager);
 
             tokio::spawn(async move {
                 let oauth_client_id = server.oauth_client_id();
@@ -1895,6 +1914,9 @@ impl PluginRequestProcessor {
                     Ok(()) => (true, None),
                     Err(err) => (false, Some(err.to_string())),
                 };
+                if success {
+                    thread_manager.invalidate_mcp_runtimes().await;
+                }
 
                 let notification = ServerNotification::McpServerOauthLoginCompleted(
                     McpServerOauthLoginCompletedNotification {
@@ -2011,9 +2033,7 @@ impl PluginRequestProcessor {
         validate_remote_plugin_id(&plugin_id)?;
 
         let auth = self.auth_manager.auth().await;
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = remote_plugin_service_config(&config);
         let uninstall_target = codex_core_plugins::remote::resolve_remote_plugin_uninstall_target(
             &remote_plugin_service_config,
             auth.as_ref(),
@@ -2067,43 +2087,66 @@ impl PluginRequestProcessor {
 
 async fn load_plugin_app_summaries(
     config: &Config,
+    auth: Option<&CodexAuth>,
     plugin_apps: &[codex_plugin::AppConnectorId],
     app_category_by_id: &HashMap<String, String>,
 ) -> Vec<AppSummary> {
-    if plugin_apps.is_empty() {
-        return Vec::new();
+    let mut seen_app_ids = HashSet::new();
+    let app_ids = plugin_apps
+        .iter()
+        .map(|app| app.0.clone())
+        .filter(|app_id| seen_app_ids.insert(app_id.clone()))
+        .collect::<Vec<_>>();
+    let mut metadata_by_id = HashMap::new();
+    if let Some(auth) = auth.filter(|auth| {
+        config
+            .features
+            .apps_enabled_for_auth(auth.uses_codex_backend())
+    }) {
+        metadata_by_id.extend(
+            codex_connectors::ConnectorMetadataStore::new(
+                config.chatgpt_base_url.clone(),
+                auth.get_account_id(),
+                auth.get_chatgpt_user_id(),
+                auth.is_workspace_account(),
+            )
+            .fresh_records(&app_ids, /*include_tools*/ false),
+        );
+        for app_ids in app_ids.chunks(APP_READ_MAX_IDS) {
+            match connectors::read_connector_metadata(
+                config, auth, app_ids, /*include_tools*/ false,
+            )
+            .await
+            {
+                Ok(result) => metadata_by_id.extend(
+                    result
+                        .apps
+                        .into_iter()
+                        .map(|metadata| (metadata.id.clone(), metadata)),
+                ),
+                Err(err) => {
+                    warn!("failed to load app metadata for plugin: {err:#}");
+                    break;
+                }
+            }
+        }
     }
 
-    let connectors = match connectors::list_all_connectors_with_options(
-        config,
-        /*force_refetch*/ false,
-        &[],
-    )
-    .await
-    {
-        Ok(connectors) => connectors,
-        Err(err) => {
-            warn!("failed to load app metadata for plugin/read: {err:#}");
-            connectors::list_cached_all_connectors(config, &[])
-                .await
-                .unwrap_or_default()
-        }
-    };
-
-    let plugin_connectors = connectors::connectors_for_plugin_apps(connectors, plugin_apps);
-
-    plugin_connectors
+    app_ids
         .into_iter()
-        .map(|connector| {
-            let category = app_category_by_id
-                .get(&connector.id)
-                .cloned()
-                .or_else(|| connector.category());
+        .map(|app_id| {
+            let (name, description) = metadata_by_id
+                .remove(&app_id)
+                .map(|metadata| (metadata.name, metadata.description))
+                .unwrap_or_else(|| (app_id.clone(), None));
+            let category = app_category_by_id.get(&app_id).cloned();
             AppSummary {
-                id: connector.id,
-                name: connector.name,
-                description: connector.description,
-                install_url: connector.install_url,
+                install_url: Some(codex_connectors::metadata::connector_install_url(
+                    &name, &app_id,
+                )),
+                id: app_id,
+                name,
+                description,
                 category,
             }
         })
@@ -2114,45 +2157,6 @@ fn plugin_app_category_by_id_from_value(value: &serde_json::Value) -> HashMap<St
     codex_core_plugins::loader::plugin_app_declarations_from_value(value)
         .into_iter()
         .filter_map(|app| app.category.map(|category| (app.connector_id.0, category)))
-        .collect()
-}
-
-fn plugin_apps_needing_auth(
-    all_connectors: &[AppInfo],
-    accessible_connectors: &[AppInfo],
-    plugin_apps: &[codex_plugin::AppConnectorId],
-    codex_apps_ready: bool,
-) -> Vec<AppSummary> {
-    if !codex_apps_ready {
-        return Vec::new();
-    }
-
-    let accessible_ids = accessible_connectors
-        .iter()
-        .map(|connector| connector.id.as_str())
-        .collect::<HashSet<_>>();
-    let plugin_app_ids = plugin_apps
-        .iter()
-        .map(|connector_id| connector_id.0.as_str())
-        .collect::<HashSet<_>>();
-
-    all_connectors
-        .iter()
-        .filter(|connector| {
-            plugin_app_ids.contains(connector.id.as_str())
-                && !accessible_ids.contains(connector.id.as_str())
-        })
-        .cloned()
-        .map(|connector| {
-            let category = connector.category();
-            AppSummary {
-                category,
-                id: connector.id,
-                name: connector.name,
-                description: connector.description,
-                install_url: connector.install_url,
-            }
-        })
         .collect()
 }
 
@@ -2212,6 +2216,7 @@ fn remote_plugin_share_context_to_info(
                 .map(plugin_share_principal_from_remote)
                 .collect()
         }),
+        can_publish_to_workspace: context.can_publish_to_workspace,
     }
 }
 

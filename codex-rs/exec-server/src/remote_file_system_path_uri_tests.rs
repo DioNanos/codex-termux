@@ -2,6 +2,8 @@
 
 use codex_exec_server_protocol::JSONRPCMessage;
 use codex_exec_server_protocol::JSONRPCResponse;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -41,6 +43,7 @@ async fn remote_file_system_sends_path_and_sandbox_cwd_uris_without_native_conve
             websocket_url,
             DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
         ),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     ));
     let paths = vec![
         PathUri::parse("file:///C:/Users/Alice/src/main.rs").expect("valid drive URI"),
@@ -52,6 +55,7 @@ async fn remote_file_system_sends_path_and_sandbox_cwd_uris_without_native_conve
             value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
         },
         access: FileSystemAccessMode::Write,
+        missing_path_behavior: None,
     }]);
     let sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
         PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),

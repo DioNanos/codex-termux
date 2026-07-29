@@ -6,6 +6,7 @@ mod app_read;
 mod attestation;
 mod auto_env;
 mod client_metadata;
+mod code_mode_host;
 mod collaboration_mode_list;
 #[cfg(unix)]
 mod command_exec;
@@ -27,6 +28,7 @@ mod experimental_api;
 mod experimental_feature_list;
 mod external_agent_config;
 mod fs;
+mod git_attribution;
 mod hooks_list;
 mod host_skills;
 mod imagegen_extension;

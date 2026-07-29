@@ -206,6 +206,12 @@ fn populate_merged_regular_fields_with_sources(
     // Destructure without `..` so every new requirements field must choose
     // whether it belongs in the regular TOML merge path or in a special merger.
     let ConfigRequirementsToml {
+        sqlite_home,
+        log_dir,
+        model_catalog_json,
+        check_for_update_on_startup,
+        allow_login_shell,
+        feedback,
         allowed_approval_policies,
         allowed_approvals_reviewers,
         allowed_sandbox_modes,
@@ -217,6 +223,7 @@ fn populate_merged_regular_fields_with_sources(
         allow_appshots,
         allow_remote_control,
         computer_use,
+        browser_use,
         windows,
         feature_requirements,
         hooks: _,
@@ -232,6 +239,15 @@ fn populate_merged_regular_fields_with_sources(
         guardian_policy_config,
     } = requirements;
 
+    set_sourced!(sqlite_home, &["sqlite_home"]);
+    set_sourced!(log_dir, &["log_dir"]);
+    set_sourced!(model_catalog_json, &["model_catalog_json"]);
+    set_sourced!(
+        check_for_update_on_startup,
+        &["check_for_update_on_startup"]
+    );
+    set_sourced!(allow_login_shell, &["allow_login_shell"]);
+    set_sourced!(feedback, &["feedback"]);
     set_sourced!(allowed_approval_policies, &["allowed_approval_policies"]);
     set_sourced!(
         allowed_approvals_reviewers,
@@ -248,6 +264,7 @@ fn populate_merged_regular_fields_with_sources(
     set_sourced!(allow_appshots, &["allow_appshots"]);
     set_sourced!(allow_remote_control, &["allow_remote_control"]);
     set_sourced!(computer_use, &["computer_use"]);
+    set_sourced!(browser_use, &["browser_use"]);
     set_sourced!(windows, &["windows"]);
     set_sourced!(feature_requirements, &["features", "feature_requirements"]);
     set_sourced!(mcp_servers, &["mcp_servers"]);

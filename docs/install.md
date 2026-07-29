@@ -26,13 +26,13 @@ The npm package includes one native Android ARM64 `codex` binary, `codex` and
 library. The `codex-exec` launcher dispatches the native binary's `exec`
 subcommand instead of duplicating the V8-linked ELF.
 
-### Install from GitHub release
+### Install from a published GitHub release
 
 Download the `mmmbuto-codex-cli-termux-<version>.tgz` asset from the matching
 GitHub release, then install it with npm:
 
 ```bash
-npm install -g ./mmmbuto-codex-cli-termux-0.145.0.tgz
+npm install -g ./mmmbuto-codex-cli-termux-<published-version>.tgz
 codex --version
 ```
 

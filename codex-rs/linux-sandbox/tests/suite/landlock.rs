@@ -7,7 +7,7 @@ use codex_core::exec_env::create_env;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::config_types::WindowsSandboxLevel;
-use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::models::PermissionProfile;
@@ -218,13 +218,15 @@ async fn should_skip_bwrap_tests() -> bool {
     .await
     {
         Ok(output) => is_bwrap_unavailable_output(&output),
-        Err(CodexErr::Sandbox(SandboxErr::Denied { output, .. })) => {
-            is_bwrap_unavailable_output(&output)
-        }
-        // Probe timeouts are not actionable for the bwrap-specific assertions below;
-        // skip rather than fail the whole suite.
-        Err(CodexErr::Sandbox(SandboxErr::Timeout { .. })) => true,
-        Err(err) => panic!("bwrap availability probe failed unexpectedly: {err:?}"),
+        Err(err) => match err.details() {
+            CodexErrorDetails::Sandbox(SandboxErr::Denied { output, .. }) => {
+                is_bwrap_unavailable_output(output)
+            }
+            // Probe timeouts are not actionable for the bwrap-specific assertions below;
+            // skip rather than fail the whole suite.
+            CodexErrorDetails::Sandbox(SandboxErr::Timeout { .. }) => true,
+            details => panic!("bwrap availability probe failed unexpectedly: {details:?}"),
+        },
     }
 }
 
@@ -237,8 +239,12 @@ fn expect_denied(
             assert_ne!(output.exit_code, 0, "{context}: expected nonzero exit code");
             output
         }
-        Err(CodexErr::Sandbox(SandboxErr::Denied { output, .. })) => *output,
-        Err(err) => panic!("{context}: {err:?}"),
+        Err(err) => match err.details() {
+            CodexErrorDetails::Sandbox(SandboxErr::Denied { output, .. }) => {
+                output.as_ref().clone()
+            }
+            details => panic!("{context}: {details:?}"),
+        },
     }
 }
 
@@ -456,10 +462,12 @@ async fn assert_network_blocked(cmd: &[&str]) {
 
     let output = match result {
         Ok(output) => output,
-        Err(CodexErr::Sandbox(SandboxErr::Denied { output, .. })) => *output,
-        _ => {
-            panic!("expected sandbox denied error, got: {result:?}");
-        }
+        Err(err) => match err.details() {
+            CodexErrorDetails::Sandbox(SandboxErr::Denied { output, .. }) => {
+                output.as_ref().clone()
+            }
+            details => panic!("expected sandbox denied error, got: {details:?}"),
+        },
     };
 
     dbg!(&output.stderr.text);
@@ -612,8 +620,13 @@ async fn sandbox_reports_codex_symlink_build_failure_without_panicking() {
     )
     .await
     {
-        Err(CodexErr::Sandbox(SandboxErr::Denied { output, .. })) => *output,
-        result => panic!(".codex symlink build failure should deny: {result:?}"),
+        Err(err) => match err.details() {
+            CodexErrorDetails::Sandbox(SandboxErr::Denied { output, .. }) => {
+                output.as_ref().clone()
+            }
+            details => panic!(".codex symlink build failure should deny: {details:?}"),
+        },
+        Ok(output) => panic!(".codex symlink build failure should deny: {output:?}"),
     };
 
     assert_eq!(output.exit_code, 1);
@@ -787,6 +800,7 @@ async fn sandbox_blocks_explicit_split_policy_carveouts_under_bwrap() {
                 value: FileSystemSpecialPath::Minimal,
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
@@ -794,18 +808,21 @@ async fn sandbox_blocks_explicit_split_policy_carveouts_under_bwrap() {
                     .expect("absolute helper dir"),
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: AbsolutePathBuf::try_from(tmpdir.path()).expect("absolute tempdir"),
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: AbsolutePathBuf::try_from(blocked.as_path()).expect("absolute blocked dir"),
             },
             access: FileSystemAccessMode::Deny,
+            missing_path_behavior: None,
         },
     ]);
     let permission_profile = PermissionProfile::from_runtime_permissions(
@@ -855,6 +872,7 @@ async fn sandbox_reenables_writable_subpaths_under_unreadable_parents() {
                 value: FileSystemSpecialPath::Minimal,
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
@@ -862,24 +880,28 @@ async fn sandbox_reenables_writable_subpaths_under_unreadable_parents() {
                     .expect("absolute helper dir"),
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: AbsolutePathBuf::try_from(tmpdir.path()).expect("absolute tempdir"),
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: AbsolutePathBuf::try_from(blocked.as_path()).expect("absolute blocked dir"),
             },
             access: FileSystemAccessMode::Deny,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: AbsolutePathBuf::try_from(allowed.as_path()).expect("absolute allowed dir"),
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
     ]);
     let permission_profile = PermissionProfile::from_runtime_permissions(
@@ -926,12 +948,14 @@ async fn sandbox_blocks_root_read_carveouts_under_bwrap() {
                 value: FileSystemSpecialPath::Root,
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: AbsolutePathBuf::try_from(blocked.as_path()).expect("absolute blocked dir"),
             },
             access: FileSystemAccessMode::Deny,
+            missing_path_behavior: None,
         },
     ]);
     let permission_profile = PermissionProfile::from_runtime_permissions(

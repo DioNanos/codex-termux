@@ -1,3 +1,4 @@
+use codex_utils_absolute_path::test_support::PathExt;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io::ErrorKind;
@@ -7,16 +8,17 @@ use anyhow::Context;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::DEFAULT_CLIENT_NAME;
+use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
-use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
 use codex_app_server::AppServerRuntimeOptions;
 use codex_app_server::AppServerTransport;
 use codex_app_server::AppServerWebsocketAuthSettings;
 use codex_app_server::PluginStartupTasks;
 use codex_app_server::RemoteControlStartupMode;
 use codex_app_server::run_main_with_transport_options;
+use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RemoteControlClient;
@@ -97,12 +99,9 @@ async fn remote_control_preference(
         .remote_control_enabled)
 }
 
-async fn wait_for_response(mcp: &mut TestAppServer, request_id: i64) -> Result<JSONRPCResponse> {
-    timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await?
+async fn wait_for_response(mcp: &mut TestAppServer, request_id: i64) -> Result<()> {
+    let _: serde_json::Value = timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+    Ok(())
 }
 
 async fn assert_remote_control_disabled_by_requirements(
@@ -132,20 +131,14 @@ async fn managed_requirements_reject_all_remote_control_rpcs() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    let notification = timeout(
+    let status: RemoteControlStatusChangedNotification = timeout(
         DEFAULT_TIMEOUT,
-        mcp.read_stream_until_notification_message("remoteControl/status/changed"),
+        mcp.read_notification("remoteControl/status/changed"),
     )
     .await??;
-    let status: RemoteControlStatusChangedNotification = serde_json::from_value(
-        notification
-            .params
-            .context("remote-control status notification should include params")?,
-    )?;
     assert_eq!(status.status, RemoteControlConnectionStatus::Disabled);
     assert_eq!(status.environment_id, None);
 
@@ -194,17 +187,15 @@ async fn managed_requirements_allow_remote_control_true_does_not_enable_or_block
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp.send_remote_control_status_read_request().await?;
-    let response = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let received: RemoteControlStatusReadResponse = to_response(response)?;
+    let received: RemoteControlStatusReadResponse = mcp
+        .request(|request_id| ClientRequest::RemoteControlStatusRead {
+            request_id,
+            params: None,
+        })
+        .await?;
     assert_eq!(received.status, RemoteControlConnectionStatus::Disabled);
     Ok(())
 }
@@ -242,6 +233,7 @@ async fn explicit_remote_control_startup_fails_when_disabled_by_requirements() -
                 plugin_startup_tasks: PluginStartupTasks::Skip,
                 remote_control_startup_mode: RemoteControlStartupMode::EnabledEphemeral,
                 install_shutdown_signal_handler: false,
+                ..Default::default()
             },
         ),
     )
@@ -264,8 +256,11 @@ async fn listen_off_honors_persisted_remote_control_enable() -> Result<()> {
         "ws://{}/backend-api/wham/remote/control/server",
         listener.local_addr()?
     );
-    let state_db =
-        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "test-provider".to_string(),
+    )
+    .await?;
     state_db
         .upsert_remote_control_enrollment(&RemoteControlEnrollmentRecord {
             websocket_url,
@@ -308,8 +303,11 @@ async fn listen_off_ignores_persisted_enable_when_disabled_by_requirements() -> 
         "ws://{}/backend-api/wham/remote/control/server",
         listener.local_addr()?
     );
-    let state_db =
-        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "test-provider".to_string(),
+    )
+    .await?;
     state_db
         .upsert_remote_control_enrollment(&RemoteControlEnrollmentRecord {
             websocket_url: websocket_url.clone(),
@@ -358,9 +356,11 @@ async fn listen_off_exits_without_persisted_remote_control_enable() -> Result<()
                 "ws://{}/backend-api/wham/remote/control/server",
                 listener.local_addr()?
             );
-            let state_db =
-                StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
-                    .await?;
+            let state_db = StateRuntime::init(
+                codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+                "test-provider".to_string(),
+            )
+            .await?;
             state_db
                 .upsert_remote_control_enrollment(&RemoteControlEnrollmentRecord {
                     websocket_url,
@@ -393,17 +393,15 @@ async fn remote_control_disable_returns_disabled_status() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp.send_remote_control_disable_request().await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let received: RemoteControlDisableResponse = to_response(response)?;
+    let received: RemoteControlDisableResponse = mcp
+        .request(|request_id| ClientRequest::RemoteControlDisable {
+            request_id,
+            params: None,
+        })
+        .await?;
 
     assert_eq!(received.status, RemoteControlConnectionStatus::Disabled);
     assert!(!received.server_name.is_empty());
@@ -418,17 +416,15 @@ async fn remote_control_status_read_returns_disabled_status() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp.send_remote_control_status_read_request().await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let received: RemoteControlStatusReadResponse = to_response(response)?;
+    let received: RemoteControlStatusReadResponse = mcp
+        .request(|request_id| ClientRequest::RemoteControlStatusRead {
+            request_id,
+            params: None,
+        })
+        .await?;
 
     assert_eq!(received.status, RemoteControlConnectionStatus::Disabled);
     assert!(!received.server_name.is_empty());
@@ -444,9 +440,8 @@ async fn remote_control_enable_returns_connecting_status() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp.send_remote_control_enable_request().await?;
     assert_eq!(
@@ -460,12 +455,8 @@ async fn remote_control_enable_returns_connecting_status() -> Result<()> {
     .await
     .expect_err("enable response should wait for enrollment");
     backend.complete_enrollment()?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let received: RemoteControlEnableResponse = to_response(response)?;
+    let received: RemoteControlEnableResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(received.status, RemoteControlConnectionStatus::Connecting);
     assert!(!received.server_name.is_empty());
@@ -479,14 +470,16 @@ async fn disable_waits_for_in_flight_durable_enable() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mut backend = BlockingRemoteControlBackend::start(codex_home.path()).await?;
     let websocket_url = backend.websocket_url().to_string();
-    let state_db =
-        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "test-provider".to_string(),
+    )
+    .await?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     mcp.send_remote_control_enable_request().await?;
     timeout(DEFAULT_TIMEOUT, backend.wait_for_enroll_request()).await??;
@@ -499,8 +492,8 @@ async fn disable_waits_for_in_flight_durable_enable() -> Result<()> {
     .expect_err("disable response should wait for the in-flight enable");
 
     backend.complete_enrollment()?;
-    let response = wait_for_response(&mut mcp, disable_request_id).await?;
-    let received: RemoteControlDisableResponse = to_response(response)?;
+    let received: RemoteControlDisableResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(disable_request_id)).await??;
     assert_eq!(received.status, RemoteControlConnectionStatus::Disabled);
     assert_eq!(
         remote_control_preference(&state_db, &websocket_url).await?,
@@ -514,15 +507,17 @@ async fn rpc_updates_durable_preference_but_ephemeral_does_not() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mut backend = BlockingRemoteControlBackend::start(codex_home.path()).await?;
     let websocket_url = backend.websocket_url().to_string();
-    let state_db =
-        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "test-provider".to_string(),
+    )
+    .await?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp.send_remote_control_enable_request().await?;
     assert_eq!(
@@ -581,9 +576,8 @@ async fn remote_control_status_read_returns_connecting_status_after_enable() -> 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp.send_remote_control_enable_request().await?;
     let enroll_request = timeout(DEFAULT_TIMEOUT, backend.wait_for_enroll_request()).await??;
@@ -592,19 +586,15 @@ async fn remote_control_status_read_returns_connecting_status_after_enable() -> 
         "POST /backend-api/wham/remote/control/server/enroll HTTP/1.1"
     );
     backend.complete_enrollment()?;
-    let _: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
+    let _: RemoteControlEnableResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
-    let request_id = mcp.send_remote_control_status_read_request().await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let received: RemoteControlStatusReadResponse = to_response(response)?;
+    let received: RemoteControlStatusReadResponse = mcp
+        .request(|request_id| ClientRequest::RemoteControlStatusRead {
+            request_id,
+            params: None,
+        })
+        .await?;
 
     assert_eq!(received.status, RemoteControlConnectionStatus::Connecting);
     assert!(!received.server_name.is_empty());
@@ -620,16 +610,12 @@ async fn remote_control_pairing_start_returns_pairing_artifacts() -> Result<()> 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp.send_remote_control_enable_request().await?;
-    let _: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
+    let _: RemoteControlEnableResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(
         timeout(DEFAULT_TIMEOUT, backend.wait_for_enroll_request()).await??,
         "POST /backend-api/wham/remote/control/server/enroll HTTP/1.1"
@@ -721,9 +707,8 @@ async fn pairing_start_works_after_ephemeral_enable() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
     let request_id = mcp.send_remote_control_ephemeral_enable_request().await?;
     wait_for_response(&mut mcp, request_id).await?;
 
@@ -763,24 +748,20 @@ async fn remote_control_client_management_works_while_disabled() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp
-        .send_remote_control_clients_list_request(RemoteControlClientsListParams {
-            environment_id: "environment-id".to_string(),
-            cursor: Some("cursor-id".to_string()),
-            limit: Some(10),
-            order: Some(RemoteControlClientsListOrder::Desc),
+    let received: RemoteControlClientsListResponse = mcp
+        .request(|request_id| ClientRequest::RemoteControlClientsList {
+            request_id,
+            params: RemoteControlClientsListParams {
+                environment_id: "environment-id".to_string(),
+                cursor: Some("cursor-id".to_string()),
+                limit: Some(10),
+                order: Some(RemoteControlClientsListOrder::Desc),
+            },
         })
         .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let received: RemoteControlClientsListResponse = to_response(response)?;
     assert_eq!(
         received,
         RemoteControlClientsListResponse {
@@ -798,18 +779,15 @@ async fn remote_control_client_management_works_while_disabled() -> Result<()> {
         }
     );
 
-    let request_id = mcp
-        .send_remote_control_clients_revoke_request(RemoteControlClientsRevokeParams {
-            environment_id: "environment-id".to_string(),
-            client_id: "client-id".to_string(),
+    let received: RemoteControlClientsRevokeResponse = mcp
+        .request(|request_id| ClientRequest::RemoteControlClientsRevoke {
+            request_id,
+            params: RemoteControlClientsRevokeParams {
+                environment_id: "environment-id".to_string(),
+                client_id: "client-id".to_string(),
+            },
         })
         .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let received: RemoteControlClientsRevokeResponse = to_response(response)?;
     assert_eq!(received, RemoteControlClientsRevokeResponse {});
     assert_eq!(
         timeout(DEFAULT_TIMEOUT, backend.wait_for_requests()).await??,
@@ -1080,11 +1058,9 @@ struct HttpRequest {
 async fn configured_remote_control_listener(codex_home: &std::path::Path) -> Result<TcpListener> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let remote_control_url = format!("http://{}/backend-api/", listener.local_addr()?);
-    write_mock_responses_config_toml_with_chatgpt_base_url(
-        codex_home,
-        &remote_control_url,
-        &remote_control_url,
-    )?;
+    MockResponsesConfig::new(&remote_control_url)
+        .with_root_config(&format!("chatgpt_base_url = \"{remote_control_url}\""))
+        .write(codex_home)?;
     write_chatgpt_auth(
         codex_home,
         ChatGptAuthFixture::new("chatgpt-token")

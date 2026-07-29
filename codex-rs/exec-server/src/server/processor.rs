@@ -10,6 +10,7 @@ use crate::ExecServerRuntimePaths;
 use crate::connection::CHANNEL_CAPACITY;
 use crate::connection::JsonRpcConnection;
 use crate::connection::JsonRpcConnectionEvent;
+use crate::rpc::RpcCallError;
 use crate::rpc::RpcNotificationSender;
 use crate::rpc::RpcServerOutboundMessage;
 use crate::rpc::encode_server_message;
@@ -20,28 +21,38 @@ use crate::server::registry::build_router;
 use crate::server::session_registry::SessionRegistry;
 use crate::telemetry::ConnectionTransport;
 use crate::telemetry::ExecServerTelemetry;
+use codex_http_client::HttpClientFactory;
 
 #[derive(Clone)]
 pub(crate) struct ConnectionProcessor {
     session_registry: Arc<SessionRegistry>,
     runtime_paths: ExecServerRuntimePaths,
     telemetry: ExecServerTelemetry,
+    http_client_factory: HttpClientFactory,
 }
 
 impl ConnectionProcessor {
     #[cfg(test)]
     pub(crate) fn new(runtime_paths: ExecServerRuntimePaths) -> Self {
-        Self::new_with_telemetry(runtime_paths, ExecServerTelemetry::default())
+        Self::new_with_telemetry(
+            runtime_paths,
+            ExecServerTelemetry::default(),
+            codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
+        )
     }
 
     pub(crate) fn new_with_telemetry(
         runtime_paths: ExecServerRuntimePaths,
         telemetry: ExecServerTelemetry,
+        http_client_factory: HttpClientFactory,
     ) -> Self {
         Self {
             session_registry: SessionRegistry::new(telemetry.clone()),
             runtime_paths,
             telemetry,
+            http_client_factory,
         }
     }
 
@@ -55,6 +66,7 @@ impl ConnectionProcessor {
             Arc::clone(&self.session_registry),
             self.runtime_paths.clone(),
             self.telemetry.clone(),
+            self.http_client_factory.clone(),
             transport,
         )
         .await;
@@ -70,6 +82,7 @@ async fn run_connection(
     session_registry: Arc<SessionRegistry>,
     runtime_paths: ExecServerRuntimePaths,
     telemetry: ExecServerTelemetry,
+    http_client_factory: HttpClientFactory,
     transport: ConnectionTransport,
 ) {
     let _connection_metrics = telemetry.connection_started(transport);
@@ -84,10 +97,12 @@ async fn run_connection(
     let (outgoing_tx, mut outgoing_rx) =
         mpsc::channel::<RpcServerOutboundMessage>(CHANNEL_CAPACITY);
     let notifications = RpcNotificationSender::new(outgoing_tx.clone());
+    let requests = notifications.request_sender();
     let handler = Arc::new(ExecServerHandler::new(
         session_registry,
         notifications,
         runtime_paths,
+        http_client_factory,
     ));
 
     let outbound_task = tokio::spawn(async move {
@@ -208,18 +223,23 @@ async fn run_connection(
                     }
                 }
                 codex_exec_server_protocol::JSONRPCMessage::Response(response) => {
-                    warn!(
-                        "closing exec-server connection after unexpected client response: {:?}",
-                        response.id
-                    );
-                    break;
+                    if !requests.complete(response.id.clone(), Ok(response.result)) {
+                        warn!(
+                            "closing exec-server connection after unexpected client response: {:?}",
+                            response.id
+                        );
+                        break;
+                    }
                 }
                 codex_exec_server_protocol::JSONRPCMessage::Error(error) => {
-                    warn!(
-                        "closing exec-server connection after unexpected client error: {:?}",
-                        error.id
-                    );
-                    break;
+                    if !requests.complete(error.id.clone(), Err(RpcCallError::Server(error.error)))
+                    {
+                        warn!(
+                            "closing exec-server connection after unexpected client error: {:?}",
+                            error.id
+                        );
+                        break;
+                    }
                 }
             },
             JsonRpcConnectionEvent::Disconnected { reason } => {
@@ -231,8 +251,10 @@ async fn run_connection(
         }
     }
 
+    requests.close();
     handler.shutdown().await;
     drop(handler);
+    drop(requests);
     drop(outgoing_tx);
     for task in connection_tasks {
         task.abort();
@@ -265,7 +287,9 @@ fn request_result(message: &Option<RpcServerOutboundMessage>) -> &'static str {
     match message {
         Some(RpcServerOutboundMessage::Error { .. }) => "error",
         Some(
-            RpcServerOutboundMessage::Response { .. } | RpcServerOutboundMessage::Notification(_),
+            RpcServerOutboundMessage::Request(_)
+            | RpcServerOutboundMessage::Response { .. }
+            | RpcServerOutboundMessage::Notification(_),
         )
         | None => "success",
     }
@@ -519,6 +543,9 @@ mod tests {
             registry,
             test_runtime_paths(),
             crate::ExecServerTelemetry::default(),
+            codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
             crate::telemetry::ConnectionTransport::Stdio,
         ));
         (client_writer, BufReader::new(client_reader).lines(), task)

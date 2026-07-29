@@ -39,6 +39,7 @@ use codex_login::token_data::parse_chatgpt_jwt_claims;
 use codex_protocol::auth::AuthMode;
 use codex_state::RemoteControlEnrollmentRecord;
 use codex_state::StateRuntime;
+use codex_utils_absolute_path::test_support::PathExt;
 use futures::SinkExt;
 use futures::StreamExt;
 use gethostname::gethostname;
@@ -126,9 +127,12 @@ fn remote_control_auth_dot_json(account_id: Option<&str>) -> AuthDotJson {
 }
 
 async fn remote_control_state_runtime(codex_home: &TempDir) -> Arc<StateRuntime> {
-    StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
-        .await
-        .expect("state runtime should initialize")
+    StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "test-provider".to_string(),
+    )
+    .await
+    .expect("state runtime should initialize")
 }
 
 #[tokio::test]
@@ -1045,7 +1049,7 @@ async fn remote_control_start_allows_missing_auth_when_enabled() {
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let (transport_event_tx, _transport_event_rx) =
@@ -1895,7 +1899,7 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let expected_server_name = gethostname().to_string_lossy().trim().to_string();
@@ -1999,7 +2003,7 @@ async fn persisted_enable_does_not_follow_auth_to_an_account_without_a_preferenc
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let remote_control_target =

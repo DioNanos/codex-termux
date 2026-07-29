@@ -1,3 +1,4 @@
+use crate::client::AnalyticsEventsClient;
 use crate::client::AnalyticsEventsQueue;
 use crate::events::AppServerRpcTransport;
 use crate::events::CodexAcceptedLineFingerprintsEventParams;
@@ -174,6 +175,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::SystemTime;
 use tokio::sync::mpsc;
 
 const TEST_PRODUCT_CLIENT_ID: &str = "codex_work_desktop";
@@ -202,6 +204,7 @@ fn sample_thread_with_metadata(
         parent_thread_id,
         preview: "first prompt".to_string(),
         ephemeral,
+        is_pinned: false,
         history_mode: Default::default(),
         model_provider: "openai".to_string(),
         created_at: 1,
@@ -439,9 +442,10 @@ fn sample_turn_profile() -> TurnProfile {
     TurnProfile {
         before_first_sampling_ms: 100,
         sampling_ms: 700,
+        compaction_ms: 40,
         between_sampling_overhead_ms: 50,
         tool_blocking_ms: 250,
-        after_last_sampling_ms: 134,
+        after_last_sampling_ms: 94,
         sampling_request_count: 2,
         sampling_retry_count: 1,
     }
@@ -862,6 +866,8 @@ fn sample_command_execution_item_with_id(
 ) -> ThreadItem {
     ThreadItem::CommandExecution {
         id: id.to_string(),
+        plugin_id: None,
+        script_path: None,
         command: "echo hi".to_string(),
         cwd: test_path_buf("/tmp").abs().into(),
         process_id: Some("pid-1".to_string()),
@@ -879,16 +885,22 @@ fn sample_command_execution_item_with_actions(
     exit_code: Option<i32>,
     duration_ms: Option<i64>,
     command_actions: Vec<CommandAction>,
+    plugin_id: Option<&str>,
+    script_path: Option<&str>,
 ) -> ThreadItem {
     let mut item = sample_command_execution_item(status, exit_code, duration_ms);
     let ThreadItem::CommandExecution {
         command_actions: item_command_actions,
+        plugin_id: item_plugin_id,
+        script_path: item_script_path,
         ..
     } = &mut item
     else {
         unreachable!("sample command execution item should be CommandExecution");
     };
     *item_command_actions = command_actions;
+    *item_plugin_id = plugin_id.map(str::to_string);
+    *item_script_path = script_path.map(str::to_string);
     item
 }
 
@@ -1298,6 +1310,110 @@ index 1111111..2222222
     assert!(event.event_params.line_fingerprints.is_empty());
 }
 
+#[tokio::test]
+#[cfg(debug_assertions)]
+async fn analytics_flush_delivers_completed_turn_with_file_diff() {
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock should be after Unix epoch")
+        .as_nanos();
+    let capture_path = std::env::temp_dir().join(format!(
+        "codex-analytics-turn-flush-{}-{nonce}.jsonl",
+        std::process::id()
+    ));
+    let auth_manager = codex_login::AuthManager::from_auth_for_testing(
+        codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+    );
+    let client = AnalyticsEventsClient::new_for_capture_file(auth_manager, capture_path.clone());
+
+    for fact in [
+        sample_initialize_fact(/*connection_id*/ 7),
+        AnalyticsFact::ClientResponse {
+            connection_id: 7,
+            request_id: RequestId::Integer(1),
+            response: Box::new(sample_thread_start_response(
+                "thread-2", /*ephemeral*/ false, "gpt-5",
+            )),
+            thread_originator: None,
+        },
+        AnalyticsFact::ClientRequest {
+            connection_id: 7,
+            request_id: RequestId::Integer(3),
+            request: Box::new(sample_turn_start_request("thread-2", /*request_id*/ 3)),
+        },
+        AnalyticsFact::ClientResponse {
+            connection_id: 7,
+            request_id: RequestId::Integer(3),
+            response: Box::new(sample_turn_start_response("turn-2")),
+            thread_originator: None,
+        },
+        AnalyticsFact::Custom(CustomAnalyticsFact::TurnResolvedConfig(Box::new(
+            sample_turn_resolved_config("thread-2", "turn-2"),
+        ))),
+        AnalyticsFact::Notification(Box::new(sample_turn_started_notification(
+            "thread-2", "turn-2",
+        ))),
+        AnalyticsFact::Custom(CustomAnalyticsFact::TurnProfile(Box::new(
+            TurnProfileFact {
+                turn_id: "turn-2".to_string(),
+                profile: sample_turn_profile(),
+            },
+        ))),
+        AnalyticsFact::Notification(Box::new(ServerNotification::TurnDiffUpdated(
+            TurnDiffUpdatedNotification {
+                thread_id: "thread-2".to_string(),
+                turn_id: "turn-2".to_string(),
+                diff: "\
+diff --git a/src/lib.rs b/src/lib.rs
+index 1111111..2222222
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -0,0 +1 @@
++let value = 1;
+"
+                .to_string(),
+            },
+        ))),
+        AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
+            "thread-2",
+            "turn-2",
+            AppServerTurnStatus::Completed,
+            /*codex_error_info*/ None,
+        ))),
+    ] {
+        client.record_fact(fact);
+    }
+
+    client.flush().await;
+
+    let contents = std::fs::read_to_string(&capture_path).expect("read captured analytics events");
+    let event_types = contents
+        .lines()
+        .flat_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .expect("parse captured analytics events")["events"]
+                .as_array()
+                .expect("captured events should be an array")
+                .iter()
+                .map(|event| {
+                    event["event_type"]
+                        .as_str()
+                        .expect("captured event type should be a string")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(event_types.iter().any(|event| event == "codex_turn_event"));
+    assert!(
+        event_types
+            .iter()
+            .any(|event| event == "codex_accepted_line_fingerprints")
+    );
+
+    std::fs::remove_file(capture_path).expect("remove analytics capture file");
+}
+
 #[test]
 fn compaction_event_serializes_expected_shape() {
     let event = TrackEventRequest::Compaction(Box::new(CodexCompactionEventRequest {
@@ -1517,6 +1633,8 @@ fn command_execution_event_serializes_expected_shape() {
                 requested_additional_permissions: false,
                 requested_network_access: false,
             },
+            plugin_id: Some("sample@openai-curated".to_string()),
+            script_path: Some("scripts/run.py".to_string()),
             command_execution_source: CommandExecutionSource::Agent,
             exit_code: Some(0),
             command_total_action_count: 4,
@@ -1566,6 +1684,8 @@ fn command_execution_event_serializes_expected_shape() {
                 "failure_kind": null,
                 "requested_additional_permissions": false,
                 "requested_network_access": false,
+                "plugin_id": "sample@openai-curated",
+                "script_path": "scripts/run.py",
                 "command_execution_source": "agent",
                 "exit_code": 0,
                 "command_total_action_count": 4,
@@ -2338,6 +2458,8 @@ async fn item_lifecycle_notifications_publish_command_execution_event() {
                                 command: "cargo test".to_string(),
                             },
                         ],
+                        Some("sample@openai-curated"),
+                        Some("scripts/run.py"),
                     ),
                 },
             ))),
@@ -2353,6 +2475,11 @@ async fn item_lifecycle_notifications_publish_command_execution_event() {
     assert_eq!(payload[0]["event_params"]["turn_id"], "turn-1");
     assert_eq!(payload[0]["event_params"]["item_id"], "item-1");
     assert_eq!(payload[0]["event_params"]["tool_name"], "shell");
+    assert_eq!(
+        payload[0]["event_params"]["plugin_id"],
+        "sample@openai-curated"
+    );
+    assert_eq!(payload[0]["event_params"]["script_path"], "scripts/run.py");
     assert_eq!(
         payload[0]["event_params"]["command_execution_source"],
         "agent"
@@ -3460,6 +3587,7 @@ async fn reducer_ingests_skill_invoked_fact() {
                     skill_scope: codex_protocol::protocol::SkillScope::User,
                     skill_path,
                     plugin_id: None,
+                    remote_plugin_id: None,
                     invocation_type: InvocationType::Explicit,
                 }],
             })),
@@ -3478,6 +3606,7 @@ async fn reducer_ingests_skill_invoked_fact() {
                 "product_client_id": TEST_PRODUCT_CLIENT_ID,
                 "skill_scope": "user",
                 "plugin_id": null,
+                "remote_plugin_id": null,
                 "repo_url": null,
                 "thread_id": "thread-1",
                 "turn_id": "turn-1",
@@ -3489,7 +3618,7 @@ async fn reducer_ingests_skill_invoked_fact() {
 }
 
 #[tokio::test]
-async fn reducer_includes_plugin_id_for_plugin_skill_invocations() {
+async fn reducer_includes_plugin_ids_for_plugin_skill_invocations() {
     let mut reducer = AnalyticsReducer::default();
     let mut events = Vec::new();
     let tracking = test_tracking_context("thread-1", "turn-1");
@@ -3505,6 +3634,7 @@ async fn reducer_includes_plugin_id_for_plugin_skill_invocations() {
                     skill_scope: codex_protocol::protocol::SkillScope::User,
                     skill_path,
                     plugin_id: Some("sample@test".to_string()),
+                    remote_plugin_id: Some("plugins~Plugin_sample".to_string()),
                     invocation_type: InvocationType::Explicit,
                 }],
             })),
@@ -3514,8 +3644,11 @@ async fn reducer_includes_plugin_id_for_plugin_skill_invocations() {
 
     let payload = serde_json::to_value(&events).expect("serialize events");
     assert_eq!(
-        payload[0]["event_params"]["plugin_id"],
-        json!("sample@test")
+        (
+            &payload[0]["event_params"]["plugin_id"],
+            &payload[0]["event_params"]["remote_plugin_id"],
+        ),
+        (&json!("sample@test"), &json!("plugins~Plugin_sample"))
     );
 }
 
@@ -3801,6 +3934,7 @@ async fn reducer_ingests_external_agent_config_import_completed_fact() {
                 ExternalAgentConfigImportCompletedInput {
                     import_id: "import-1".to_string(),
                     source: "app_server".to_string(),
+                    provider_id: "test-provider-42".to_string(),
                     item_type: "PLUGINS".to_string(),
                     success_count: 2,
                     failed_count: 1,
@@ -3818,6 +3952,7 @@ async fn reducer_ingests_external_agent_config_import_completed_fact() {
             "event_params": {
                 "import_id": "import-1",
                 "source": "app_server",
+                "provider_id": "test-provider-42",
                 "type": "PLUGINS",
                 "success_count": 2,
                 "failed_count": 1,
@@ -3835,6 +3970,7 @@ fn external_agent_config_import_failure_event_serializes_expected_shape() {
             event_params: CodexOnboardingExternalAgentImportFailureMetadata {
                 import_id: "import-1".to_string(),
                 source: "app_server".to_string(),
+                provider_id: "test-provider-42".to_string(),
                 item_type: "PLUGINS".to_string(),
                 failure_stage: "plugin_import".to_string(),
                 error_type: "plugin_import".to_string(),
@@ -3853,6 +3989,7 @@ fn external_agent_config_import_failure_event_serializes_expected_shape() {
             "event_params": {
                 "import_id": "import-1",
                 "source": "app_server",
+                "provider_id": "test-provider-42",
                 "type": "PLUGINS",
                 "failure_stage": "plugin_import",
                 "error_type": "plugin_import",
@@ -3874,6 +4011,7 @@ async fn reducer_ingests_external_agent_config_import_failure_fact() {
                 ExternalAgentConfigImportFailureInput {
                     import_id: "import-1".to_string(),
                     source: "app_server".to_string(),
+                    provider_id: "test-provider-42".to_string(),
                     item_type: "PLUGINS".to_string(),
                     failure_stage: "plugin_import".to_string(),
                     error_type: "plugin_import".to_string(),
@@ -3892,6 +4030,7 @@ async fn reducer_ingests_external_agent_config_import_failure_fact() {
             "event_params": {
                 "import_id": "import-1",
                 "source": "app_server",
+                "provider_id": "test-provider-42",
                 "type": "PLUGINS",
                 "failure_stage": "plugin_import",
                 "error_type": "plugin_import",
@@ -3953,9 +4092,10 @@ fn turn_event_serializes_expected_shape() {
             total_tokens: None,
             before_first_sampling_ms: 100,
             sampling_ms: 700,
+            compaction_ms: 40,
             between_sampling_overhead_ms: 50,
             tool_blocking_ms: 250,
-            after_last_sampling_ms: 134,
+            after_last_sampling_ms: 94,
             sampling_request_count: 2,
             sampling_retry_count: 1,
             duration_ms: Some(1234),
@@ -4026,9 +4166,10 @@ fn turn_event_serializes_expected_shape() {
                 "total_tokens": null,
                 "before_first_sampling_ms": 100,
                 "sampling_ms": 700,
+                "compaction_ms": 40,
                 "between_sampling_overhead_ms": 50,
                 "tool_blocking_ms": 250,
-                "after_last_sampling_ms": 134,
+                "after_last_sampling_ms": 94,
                 "sampling_request_count": 2,
                 "sampling_retry_count": 1,
                 "duration_ms": 1234,

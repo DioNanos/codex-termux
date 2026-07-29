@@ -1,4 +1,5 @@
 use anyhow::Result;
+use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
@@ -12,6 +13,8 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
+use codex_app_server_protocol::ThreadMetadataUpdateParams;
+use codex_app_server_protocol::ThreadMetadataUpdateResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
@@ -57,13 +60,12 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 async fn thread_unarchive_moves_rollout_back_into_sessions_directory() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let start_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
@@ -71,12 +73,8 @@ async fn thread_unarchive_moves_rollout_back_into_sessions_directory() -> Result
             ..Default::default()
         })
         .await?;
-    let start_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
 
     let rollout_path = thread.path.clone().expect("thread path");
 
@@ -91,17 +89,25 @@ async fn thread_unarchive_moves_rollout_back_into_sessions_directory() -> Result
             ..Default::default()
         })
         .await?;
-    let turn_start_response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
-    )
-    .await??;
-    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_start_response)?;
+    let _: TurnStartResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_start_id)).await??;
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+
+    let pin_id = mcp
+        .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
+            thread_id: thread.id.clone(),
+            git_info: None,
+            is_pinned: Some(true),
+        })
+        .await?;
+    let ThreadMetadataUpdateResponse {
+        thread: pinned_thread,
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(pin_id)).await??;
+    assert!(pinned_thread.is_pinned);
 
     let found_rollout_path =
         find_thread_path_by_id_str(codex_home.path(), &thread.id, /*state_db_ctx*/ None)
@@ -114,12 +120,8 @@ async fn thread_unarchive_moves_rollout_back_into_sessions_directory() -> Result
             thread_id: thread.id.clone(),
         })
         .await?;
-    let archive_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(archive_id)),
-    )
-    .await??;
-    let _: ThreadArchiveResponse = to_response::<ThreadArchiveResponse>(archive_resp)?;
+    let _: ThreadArchiveResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(archive_id)).await??;
 
     let archived_path = find_archived_thread_path_by_id_str(
         codex_home.path(),
@@ -158,17 +160,13 @@ async fn thread_unarchive_moves_rollout_back_into_sessions_directory() -> Result
     let ThreadUnarchiveResponse {
         thread: unarchived_thread,
     } = to_response::<ThreadUnarchiveResponse>(unarchive_resp)?;
-    let unarchive_notification = timeout(
+    let unarchived_notification: ThreadUnarchivedNotification = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/unarchived"),
+        mcp.read_notification("thread/unarchived"),
     )
     .await??;
-    let unarchived_notification: ThreadUnarchivedNotification = serde_json::from_value(
-        unarchive_notification
-            .params
-            .expect("thread/unarchived notification params"),
-    )?;
     assert_eq!(unarchived_notification.thread_id, thread.id);
+    assert!(unarchived_thread.is_pinned);
     assert!(
         unarchived_thread.updated_at > old_timestamp,
         "expected updated_at to be bumped on unarchive"
@@ -181,6 +179,7 @@ async fn thread_unarchive_moves_rollout_back_into_sessions_directory() -> Result
         .and_then(Value::as_object)
         .expect("thread/unarchive result.thread must be an object");
     assert_eq!(unarchived_thread.name, None);
+    assert_eq!(thread_json.get("isPinned"), Some(&Value::Bool(true)));
     assert_eq!(
         thread_json.get("name"),
         Some(&Value::Null),
@@ -204,7 +203,11 @@ async fn thread_unarchive_moves_rollout_back_into_sessions_directory() -> Result
 async fn thread_unarchive_preserves_pathless_store_metadata() -> Result<()> {
     let codex_home = TempDir::new()?;
     let store_id = Uuid::new_v4().to_string();
-    create_config_toml_with_in_memory_thread_store(codex_home.path(), &store_id)?;
+    MockResponsesConfig::new("http://127.0.0.1:1")
+        .with_root_config(&format!(
+            r#"experimental_thread_store = {{ type = "in_memory", id = "{store_id}" }}"#
+        ))
+        .write(codex_home.path())?;
     let store = InMemoryThreadStore::for_id(store_id.clone());
     let _in_memory_store = InMemoryThreadStoreId { store_id };
     let thread_id = ThreadId::from_string("00000000-0000-4000-8000-000000000126")?;
@@ -224,6 +227,7 @@ async fn thread_unarchive_preserves_pathless_store_metadata() -> Result<()> {
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
             history_mode: Default::default(),
+            history_base: None,
             subagent_history_start_ordinal: None,
             initial_window_id: Uuid::now_v7().to_string(),
             metadata: ThreadPersistenceMetadata {
@@ -301,11 +305,6 @@ async fn thread_unarchive_preserves_pathless_store_metadata() -> Result<()> {
     Ok(())
 }
 
-fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(config_toml, config_contents(server_uri))
-}
-
 struct InMemoryThreadStoreId {
     store_id: String,
 }
@@ -314,50 +313,6 @@ impl Drop for InMemoryThreadStoreId {
     fn drop(&mut self) {
         InMemoryThreadStore::remove_id(&self.store_id);
     }
-}
-
-fn create_config_toml_with_in_memory_thread_store(
-    codex_home: &Path,
-    store_id: &str,
-) -> std::io::Result<()> {
-    std::fs::write(
-        codex_home.join("config.toml"),
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-experimental_thread_store = {{ type = "in_memory", id = "{store_id}" }}
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "http://127.0.0.1:1/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
-        ),
-    )
-}
-
-fn config_contents(server_uri: &str) -> String {
-    format!(
-        r#"model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
-    )
 }
 
 fn assert_paths_match_on_disk(actual: &Path, expected: &Path) -> std::io::Result<()> {

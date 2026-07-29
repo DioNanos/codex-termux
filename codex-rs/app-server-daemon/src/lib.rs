@@ -231,8 +231,14 @@ pub async fn set_remote_control(mode: RemoteControlMode) -> Result<RemoteControl
     Daemon::from_environment()?.set_remote_control(mode).await
 }
 
-pub async fn run_pid_update_loop() -> Result<()> {
+pub async fn run_pid_update_loop(
+    _http_client_factory: codex_http_client::HttpClientFactory,
+) -> Result<()> {
     ensure_supported_platform()?;
+    // Termux packages update through the fork-owned release channel. Its
+    // standalone updater is intentionally isolated from upstream HTTP install
+    // machinery, so retain the public caller contract while invoking the
+    // fail-closed no-argument loop.
     update_loop::run().await
 }
 

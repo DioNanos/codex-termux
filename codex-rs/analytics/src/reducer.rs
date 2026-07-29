@@ -133,6 +133,7 @@ use codex_login::default_client::originator;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::items::is_safe_plugin_relative_path;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillScope;
@@ -758,6 +759,7 @@ impl AnalyticsReducer {
                         repo_url,
                         skill_scope: Some(skill_scope.to_string()),
                         plugin_id: invocation.plugin_id,
+                        remote_plugin_id: invocation.remote_plugin_id,
                     },
                 },
             ));
@@ -867,6 +869,7 @@ impl AnalyticsReducer {
                 event_params: CodexOnboardingExternalAgentImportCompleteMetadata {
                     import_id: input.import_id,
                     source: input.source,
+                    provider_id: input.provider_id,
                     item_type: input.item_type,
                     success_count: input.success_count,
                     failed_count: input.failed_count,
@@ -887,6 +890,7 @@ impl AnalyticsReducer {
                 event_params: CodexOnboardingExternalAgentImportFailureMetadata {
                     import_id: input.import_id,
                     source: input.source,
+                    provider_id: input.provider_id,
                     item_type: input.item_type,
                     failure_stage: input.failure_stage,
                     error_type: input.error_type,
@@ -1797,6 +1801,8 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
     match item {
         ThreadItem::CommandExecution {
             id,
+            plugin_id,
+            script_path,
             source,
             status,
             command_actions,
@@ -1830,6 +1836,11 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     event_type: "codex_command_execution_event",
                     event_params: CodexCommandExecutionEventParams {
                         base,
+                        plugin_id: plugin_id.clone(),
+                        script_path: safe_plugin_relative_script_path(
+                            plugin_id.as_deref(),
+                            script_path.as_deref(),
+                        ),
                         command_execution_source: *source,
                         exit_code: *exit_code,
                         command_total_action_count: action_counts.total,
@@ -2104,6 +2115,14 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
         }
         _ => None,
     }
+}
+
+fn safe_plugin_relative_script_path(
+    plugin_id: Option<&str>,
+    script_path: Option<&str>,
+) -> Option<String> {
+    let script_path = script_path.filter(|path| is_safe_plugin_relative_path(path))?;
+    plugin_id.map(|_| script_path.to_string())
 }
 
 struct ToolItemOutcome {
@@ -2634,6 +2653,7 @@ fn codex_turn_event_params(
     let TurnProfile {
         before_first_sampling_ms,
         sampling_ms,
+        compaction_ms,
         between_sampling_overhead_ms,
         tool_blocking_ms,
         after_last_sampling_ms,
@@ -2706,6 +2726,7 @@ fn codex_turn_event_params(
             .map(|token_usage| token_usage.total_tokens),
         before_first_sampling_ms,
         sampling_ms,
+        compaction_ms,
         between_sampling_overhead_ms,
         tool_blocking_ms,
         after_last_sampling_ms,
@@ -2882,6 +2903,25 @@ mod tests {
                 image: 1,
                 audio: 1,
             }
+        );
+    }
+
+    #[test]
+    fn command_execution_script_paths_reject_unsafe_values() {
+        assert_eq!(
+            safe_plugin_relative_script_path(
+                Some("sample@openai-curated"),
+                Some("/home/user/.codex/plugins/cache/openai-curated/sample/scripts/run.py"),
+            ),
+            None
+        );
+        assert_eq!(
+            safe_plugin_relative_script_path(Some("sample@openai-curated"), Some("scripts/run.py"),),
+            Some("scripts/run.py".to_string())
+        );
+        assert_eq!(
+            safe_plugin_relative_script_path(/*plugin_id*/ None, Some("scripts/run.py"),),
+            None
         );
     }
 }

@@ -10,6 +10,8 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::environment_selection::default_thread_environment_selections;
 use crate::mcp::McpManager;
 use crate::rollout::truncation;
+use crate::session::ForkPersistence;
+use crate::session::GitEnrichmentPolicy;
 use crate::session::INITIAL_SUBMIT_ID;
 use crate::session::SessionIo;
 use crate::session::SessionSpawnArgs;
@@ -68,6 +70,7 @@ use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
+use codex_thread_store::PreparedFork;
 use codex_thread_store::ReadThreadByRolloutPathParams;
 use codex_thread_store::ReadThreadParams;
 use codex_thread_store::StoredModelContext;
@@ -159,6 +162,12 @@ pub enum ForkSnapshot {
     Interrupted,
 }
 
+struct ForkHistory {
+    snapshot: ForkSnapshot,
+    initial_history: InitialHistory,
+    persistence: ForkPersistence,
+}
+
 /// Preserve legacy `fork_thread(usize, ...)` callsites by mapping them to the
 /// existing truncate-before-nth-user-message snapshot mode.
 impl From<usize> for ForkSnapshot {
@@ -197,9 +206,28 @@ pub struct StartThreadOptions {
     pub dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
     pub metrics_service_name: Option<String>,
     pub parent_trace: Option<W3cTraceContext>,
-    pub environments: Vec<TurnEnvironmentSelection>,
+    pub environments: Option<Vec<TurnEnvironmentSelection>>,
     pub thread_extension_init: ExtensionDataInit,
     pub supports_openai_form_elicitation: bool,
+}
+
+impl StartThreadOptions {
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            allow_provider_model_fallback: false,
+            initial_history: InitialHistory::New,
+            history_mode: None,
+            session_source: None,
+            thread_source: None,
+            dynamic_tools: Vec::new(),
+            metrics_service_name: None,
+            parent_trace: None,
+            environments: None,
+            thread_extension_init: ExtensionDataInit::default(),
+            supports_openai_form_elicitation: false,
+        }
+    }
 }
 
 fn originator_from_service_name(service_name: Option<&str>) -> Option<String> {
@@ -251,6 +279,7 @@ pub(crate) struct ThreadManagerState {
     auth_manager: Arc<AuthManager>,
     models_manager: SharedModelsManager,
     environment_manager: Arc<EnvironmentManager>,
+    starting_mcp_runtimes: std::sync::Mutex<Vec<std::sync::Weak<AtomicBool>>>,
     skills_service: Arc<SkillsService>,
     plugins_manager: Arc<PluginsManager>,
     mcp_manager: Arc<McpManager>,
@@ -345,20 +374,28 @@ impl ThreadManager {
             config.bundled_skills_enabled(),
             restriction_product,
         ));
+        let code_mode_session_provider: Arc<dyn CodeModeSessionProvider> =
+            if config.features.enabled(Feature::CodeModeHost) {
+                let provider = ProcessOwnedCodeModeSessionProvider::default();
+                if config.code_mode.disable_in_process_fallback {
+                    Arc::new(provider.without_in_process_fallback())
+                } else {
+                    Arc::new(provider)
+                }
+            } else {
+                Arc::new(InProcessCodeModeSessionProvider)
+            };
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
                 models_manager,
                 environment_manager,
+                starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
                 skills_service,
                 plugins_manager,
                 mcp_manager,
-                code_mode_session_provider: if config.features.enabled(Feature::CodeModeHost) {
-                    Arc::new(ProcessOwnedCodeModeSessionProvider::default())
-                } else {
-                    Arc::new(InProcessCodeModeSessionProvider)
-                },
+                code_mode_session_provider,
                 extensions,
                 user_instructions_provider,
                 thread_store,
@@ -376,13 +413,32 @@ impl ThreadManager {
         }
     }
 
-    pub(crate) fn with_code_mode_host_program_for_tests(mut self, host_program: PathBuf) -> Self {
+    /// Replaces the process-wide provider before this manager is shared with threads.
+    pub fn with_code_mode_session_provider(
+        mut self,
+        provider: Arc<dyn CodeModeSessionProvider>,
+    ) -> Self {
+        let Some(state) = Arc::get_mut(&mut self.state) else {
+            unreachable!("code-mode session provider must be set before thread manager is shared");
+        };
+        state.code_mode_session_provider = provider;
+        self
+    }
+
+    pub(crate) fn with_code_mode_host_program_for_tests(
+        mut self,
+        host_program: PathBuf,
+        config: &Config,
+    ) -> Self {
         let Some(state) = Arc::get_mut(&mut self.state) else {
             unreachable!("new thread manager state should not be shared");
         };
-        state.code_mode_session_provider = Arc::new(
-            ProcessOwnedCodeModeSessionProvider::with_host_program(host_program),
-        );
+        let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(host_program);
+        state.code_mode_session_provider = if config.code_mode.disable_in_process_fallback {
+            Arc::new(provider.without_in_process_fallback())
+        } else {
+            Arc::new(provider)
+        };
         self
     }
 
@@ -436,7 +492,7 @@ impl ThreadManager {
         set_thread_manager_test_mode_for_tests(/*enabled*/ true);
         let auth_manager = AuthManager::from_auth_for_testing(auth);
         let installation_id = uuid::Uuid::new_v4().to_string();
-        let skills_codex_home = match AbsolutePathBuf::from_absolute_path_checked(&codex_home) {
+        let absolute_codex_home = match AbsolutePathBuf::from_absolute_path_checked(&codex_home) {
             Ok(codex_home) => codex_home,
             Err(err) => panic!("test codex_home should be absolute: {err}"),
         };
@@ -449,7 +505,7 @@ impl ThreadManager {
         ));
         let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
         let skills_service = Arc::new(SkillsService::new_with_restriction_product(
-            skills_codex_home,
+            absolute_codex_home.clone(),
             /*bundled_skills_enabled*/ true,
             restriction_product,
         ));
@@ -458,7 +514,7 @@ impl ThreadManager {
         let thread_store: Arc<dyn ThreadStore> = Arc::new(LocalThreadStore::new(
             LocalThreadStoreConfig {
                 codex_home: codex_home.clone(),
-                sqlite_home: codex_home.clone(),
+                sqlite: codex_state::SqliteConfig::new_for_testing(absolute_codex_home),
                 default_model_provider_id: OPENAI_PROVIDER_ID.to_string(),
             },
             state_db.clone(),
@@ -471,6 +527,7 @@ impl ThreadManager {
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
                     .models_manager(codex_home, /*config_model_catalog*/ None),
                 environment_manager,
+                starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
                 skills_service,
                 plugins_manager,
                 mcp_manager,
@@ -516,6 +573,37 @@ impl ThreadManager {
 
     pub fn environment_manager(&self) -> Arc<EnvironmentManager> {
         self.state.environment_manager.clone()
+    }
+
+    /// Refreshes every loaded thread and marks threads that are still being created.
+    pub async fn invalidate_mcp_runtimes(&self) {
+        self.invalidate_starting_mcp_runtimes();
+        let threads = self
+            .state
+            .threads
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.session.request_mcp_runtime_refresh();
+        }
+    }
+
+    fn invalidate_starting_mcp_runtimes(&self) {
+        let mut starting = self
+            .state
+            .starting_mcp_runtimes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        starting.retain(|runtime| {
+            let Some(runtime) = runtime.upgrade() else {
+                return false;
+            };
+            runtime.store(true, Ordering::Release);
+            true
+        });
     }
 
     pub fn default_environment_selections(
@@ -661,52 +749,22 @@ impl ThreadManager {
         Ok(subtree_thread_ids)
     }
 
-    pub async fn start_thread(&self, config: Config) -> CodexResult<NewThread> {
-        // Box delegated thread-spawn futures so these convenience wrappers do
-        // not inline the full spawn path into every caller's async state.
-        Box::pin(self.start_thread_with_tools(config, Vec::new())).await
+    pub async fn start_thread(&self, options: StartThreadOptions) -> CodexResult<NewThread> {
+        Box::pin(self.start_thread_inner(options, /*forked_from_thread_id*/ None)).await
     }
 
-    pub async fn start_thread_with_tools(
-        &self,
-        config: Config,
-        dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
-    ) -> CodexResult<NewThread> {
-        let environments = default_thread_environment_selections(
-            self.state.environment_manager.as_ref(),
-            &config.cwd,
-            &config.workspace_roots,
-        );
-        Box::pin(self.start_thread_with_options(StartThreadOptions {
-            config,
-            allow_provider_model_fallback: false,
-            initial_history: InitialHistory::New,
-            history_mode: None,
-            session_source: None,
-            thread_source: None,
-            dynamic_tools,
-            metrics_service_name: None,
-            parent_trace: None,
-            environments,
-            thread_extension_init: ExtensionDataInit::default(),
-            supports_openai_form_elicitation: false,
-        }))
-        .await
-    }
-
-    pub async fn start_thread_with_options(
-        &self,
-        options: StartThreadOptions,
-    ) -> CodexResult<NewThread> {
-        self.start_thread_with_options_and_fork_source(options, /*forked_from_thread_id*/ None)
-            .await
-    }
-
-    async fn start_thread_with_options_and_fork_source(
+    async fn start_thread_inner(
         &self,
         options: StartThreadOptions,
         forked_from_thread_id: Option<ThreadId>,
     ) -> CodexResult<NewThread> {
+        let environments = options.environments.unwrap_or_else(|| {
+            default_thread_environment_selections(
+                self.state.environment_manager.as_ref(),
+                &options.config.cwd,
+                &options.config.workspace_roots,
+            )
+        });
         let agent_control = self.agent_control_for_config(&options.config);
         let (resumed_session_source, resumed_thread_source) = options
             .initial_history
@@ -724,13 +782,14 @@ impl ThreadManager {
             session_source,
             /*parent_thread_id*/ None,
             forked_from_thread_id,
+            ForkPersistence::Copied,
             thread_source,
             options.dynamic_tools,
             options.metrics_service_name,
             /*inherited_environments*/ None,
             /*inherited_exec_policy*/ None,
             options.parent_trace,
-            options.environments,
+            environments,
             options.thread_extension_init,
             options.supports_openai_form_elicitation,
             /*user_shell_override*/ None,
@@ -771,7 +830,7 @@ impl ThreadManager {
                 inherited_multi_agent_version,
             ),
         );
-        self.start_thread_with_options_and_fork_source(options, Some(forked_from_thread_id))
+        self.start_thread_inner(options, Some(forked_from_thread_id))
             .await
     }
 
@@ -830,6 +889,7 @@ impl ThreadManager {
             session_source,
             /*parent_thread_id*/ None,
             /*forked_from_thread_id*/ None,
+            ForkPersistence::Copied,
             thread_source,
             Vec::new(),
             /*metrics_service_name*/ None,
@@ -863,6 +923,7 @@ impl ThreadManager {
             agent_control,
             /*parent_thread_id*/ None,
             /*forked_from_thread_id*/ None,
+            ForkPersistence::Copied,
             /*thread_source*/ None,
             Vec::new(),
             /*metrics_service_name*/ None,
@@ -903,6 +964,7 @@ impl ThreadManager {
             session_source,
             /*parent_thread_id*/ None,
             /*forked_from_thread_id*/ None,
+            ForkPersistence::Copied,
             thread_source,
             Vec::new(),
             /*metrics_service_name*/ None,
@@ -1035,9 +1097,12 @@ impl ThreadManager {
         S: Into<ForkSnapshot>,
     {
         self.fork_thread_with_initial_history(
-            snapshot.into(),
             config,
-            history,
+            ForkHistory {
+                snapshot: snapshot.into(),
+                initial_history: history,
+                persistence: ForkPersistence::Copied,
+            },
             thread_source,
             parent_trace,
             supports_openai_form_elicitation,
@@ -1045,15 +1110,54 @@ impl ThreadManager {
         .await
     }
 
-    async fn fork_thread_with_initial_history(
+    /// Fork prepared reference-backed history using the same snapshot semantics as copied forks.
+    pub async fn fork_prepared_thread(
         &self,
-        snapshot: ForkSnapshot,
         config: Config,
-        history: InitialHistory,
+        prepared: PreparedFork,
         thread_source: Option<ThreadSource>,
         parent_trace: Option<W3cTraceContext>,
         supports_openai_form_elicitation: bool,
     ) -> CodexResult<NewThread> {
+        let history = InitialHistory::Resumed(ResumedHistory {
+            conversation_id: prepared.source_thread_id,
+            history: Arc::clone(&prepared.model_context),
+            rollout_path: None,
+        });
+        let fork_persistence = ForkPersistence::Referenced {
+            history_base: prepared.history_base,
+            inherited_item_count: prepared.model_context.len(),
+        };
+        let result = self
+            .fork_thread_with_initial_history(
+                config,
+                ForkHistory {
+                    snapshot: ForkSnapshot::Interrupted,
+                    initial_history: history,
+                    persistence: fork_persistence,
+                },
+                thread_source,
+                parent_trace,
+                supports_openai_form_elicitation,
+            )
+            .await;
+        drop(prepared);
+        result
+    }
+
+    async fn fork_thread_with_initial_history(
+        &self,
+        config: Config,
+        fork_history: ForkHistory,
+        thread_source: Option<ThreadSource>,
+        parent_trace: Option<W3cTraceContext>,
+        supports_openai_form_elicitation: bool,
+    ) -> CodexResult<NewThread> {
+        let ForkHistory {
+            snapshot,
+            initial_history: history,
+            persistence: fork_persistence,
+        } = fork_history;
         // `forked_from_id()` describes this history's existing lineage. When
         // forking a resumed thread, the child copies the resumed thread itself.
         let source_thread_id = match &history {
@@ -1087,6 +1191,7 @@ impl ThreadManager {
             agent_control,
             /*parent_thread_id*/ None,
             source_thread_id,
+            fork_persistence,
             thread_source,
             Vec::new(),
             /*metrics_service_name*/ None,
@@ -1433,6 +1538,7 @@ impl ThreadManagerState {
             session_source,
             parent_thread_id,
             forked_from_thread_id,
+            ForkPersistence::Copied,
             thread_source,
             Vec::new(),
             metrics_service_name,
@@ -1476,6 +1582,7 @@ impl ThreadManagerState {
             session_source,
             parent_thread_id,
             /*forked_from_thread_id*/ None,
+            ForkPersistence::Copied,
             thread_source,
             Vec::new(),
             /*metrics_service_name*/ None,
@@ -1523,6 +1630,7 @@ impl ThreadManagerState {
             session_source,
             parent_thread_id,
             forked_from_thread_id,
+            ForkPersistence::Copied,
             thread_source,
             Vec::new(),
             /*metrics_service_name*/ None,
@@ -1547,6 +1655,7 @@ impl ThreadManagerState {
         agent_control: AgentControl,
         parent_thread_id: Option<ThreadId>,
         forked_from_thread_id: Option<ThreadId>,
+        fork_persistence: ForkPersistence,
         thread_source: Option<ThreadSource>,
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
         metrics_service_name: Option<String>,
@@ -1566,6 +1675,7 @@ impl ThreadManagerState {
             self.session_source.clone(),
             parent_thread_id,
             forked_from_thread_id,
+            fork_persistence,
             thread_source,
             dynamic_tools,
             metrics_service_name,
@@ -1592,6 +1702,7 @@ impl ThreadManagerState {
         session_source: SessionSource,
         parent_thread_id: Option<ThreadId>,
         forked_from_thread_id: Option<ThreadId>,
+        fork_persistence: ForkPersistence,
         thread_source: Option<ThreadSource>,
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
         metrics_service_name: Option<String>,
@@ -1603,6 +1714,15 @@ impl ThreadManagerState {
         supports_openai_form_elicitation: bool,
         user_shell_override: Option<crate::shell::Shell>,
     ) -> CodexResult<NewThread> {
+        let source_changed_during_startup = Arc::new(AtomicBool::new(false));
+        {
+            let mut starting = self
+                .starting_mcp_runtimes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            starting.retain(|runtime| runtime.strong_count() != 0);
+            starting.push(Arc::downgrade(&source_changed_during_startup));
+        }
         let is_resumed_thread = matches!(&initial_history, InitialHistory::Resumed(_));
         if let InitialHistory::Resumed(resumed) = &initial_history {
             let mut threads = self.threads.write().await;
@@ -1649,6 +1769,15 @@ impl ThreadManagerState {
                 forked_from_thread_id,
             )
             .await;
+        let source_changed_during_startup = Arc::new(AtomicBool::new(false));
+        {
+            let mut starting = self
+                .starting_mcp_runtimes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            starting.retain(|runtime| runtime.strong_count() != 0);
+            starting.push(Arc::downgrade(&source_changed_during_startup));
+        }
         let (session, io) = Box::pin(Session::spawn(SessionSpawnArgs {
             config,
             allow_provider_model_fallback,
@@ -1664,6 +1793,7 @@ impl ThreadManagerState {
             extensions: Arc::clone(&self.extensions),
             conversation_history: initial_history,
             requested_history_mode: history_mode,
+            fork_persistence,
             session_source,
             forked_from_thread_id,
             parent_thread_id,
@@ -1685,11 +1815,17 @@ impl ThreadManagerState {
             attestation_provider: self.attestation_provider.clone(),
             external_time_provider: self.external_time_provider.clone(),
             inherited_multi_agent_version: multi_agent_version,
+            git_enrichment_policy: GitEnrichmentPolicy::Fresh,
+            windows_sandbox_proxy_settings_mode:
+                codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
         }))
         .await?;
         let new_thread = self
             .finalize_thread_spawn(session, io, tracked_session_source)
             .await?;
+        if source_changed_during_startup.load(Ordering::Acquire) {
+            new_thread.thread.session.request_mcp_runtime_refresh();
+        }
         if is_resumed_thread {
             new_thread.thread.emit_thread_resume_lifecycle().await;
         }

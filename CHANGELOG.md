@@ -1,3 +1,16 @@
+# [0.146.0] - 2026-07-29
+
+Candidate Termux release synchronized to final upstream OpenAI Codex
+`rust-v0.146.0`. Publication remains gated on the sanitized artifact audit and
+device validation.
+
+## Changed
+
+- Integrated the final upstream `rust-v0.146.0` release.
+- Preserved the verified Android/Termux compatibility and release-profile
+  contracts, including the fork-owned updater and installer channels.
+- Bumped the Cargo workspace and npm package versions to `0.146.0`.
+
 # [0.145.0] - 2026-07-23
 
 Synced the complete Termux fork directly to the final upstream OpenAI Codex

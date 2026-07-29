@@ -1,4 +1,5 @@
 //! Prototype MCP server.
+#![recursion_limit = "256"]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use std::io::ErrorKind;
@@ -100,6 +101,7 @@ pub async fn run_main(
                 arg0_paths.codex_self_exe.clone(),
                 arg0_paths.codex_linux_sandbox_exe.clone(),
             )?),
+            config.http_client_factory(),
         )
         .await
         .map_err(std::io::Error::other)?,

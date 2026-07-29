@@ -113,6 +113,7 @@ async fn exec_command_with_tty(
             .open_session_with_prepared_exec_env(
                 process_id,
                 &request,
+                codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
                 tty,
                 Box::new(NoopSpawnLifecycle),
                 turn.environments
@@ -322,6 +323,7 @@ async fn write_stdin(
             yield_time_ms,
             max_output_tokens: None,
             truncation_policy: TruncationPolicy::Tokens(10_000),
+            interaction_event: None,
         })
         .await
 }
@@ -752,6 +754,7 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
         .open_session_with_prepared_exec_env(
             /*process_id*/ 1234,
             &request,
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*tty*/ false,
             Box::new(NoopSpawnLifecycle),
             &environment,
@@ -792,6 +795,7 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
         .open_session_with_prepared_exec_env(
             /*process_id*/ 1234,
             &request,
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*tty*/ true,
             Box::new(NoopSpawnLifecycle),
             remote_test_env.environment(),
@@ -850,6 +854,7 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
         .open_session_with_prepared_exec_env(
             /*process_id*/ 1234,
             &request,
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*tty*/ true,
             Box::new(TestSpawnLifecycle {
                 inherited_fds: vec![42],

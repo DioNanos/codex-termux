@@ -111,10 +111,28 @@ fn launch_config_materializes_audit_and_execution_attribution() {
         audit_metadata: audit_metadata.clone(),
         environment_id: Some("remote".to_string()),
         execution_id: Some("execution-1".to_string()),
+        policy_decision_timeout_ms: None,
     })
     .expect("remote launch state");
 
     assert_eq!(state.audit_metadata(), &audit_metadata);
     assert_eq!(state.environment_id(), Some("remote"));
     assert_eq!(state.execution_id().as_deref(), Some("execution-1"));
+}
+
+#[test]
+fn policy_decision_callback_timeout_round_trips() {
+    let config = RemoteNetworkProxyConfig::from_effective_config(&NetworkProxyConfig::default())
+        .expect("supported remote config");
+    let mut launch = RemoteNetworkProxyLaunchConfig::new(config);
+    let without_timeout = serde_json::to_value(&launch).expect("serialize launch config");
+    assert_eq!(without_timeout.get("policyDecisionTimeoutMs"), None);
+    launch.policy_decision_timeout_ms = Some(900_000);
+    let with_timeout = serde_json::to_value(&launch).expect("serialize launch timeout");
+    assert_eq!(with_timeout["policyDecisionTimeoutMs"], 900_000);
+    assert_eq!(
+        serde_json::from_value::<RemoteNetworkProxyLaunchConfig>(with_timeout)
+            .expect("deserialize launch timeout"),
+        launch
+    );
 }

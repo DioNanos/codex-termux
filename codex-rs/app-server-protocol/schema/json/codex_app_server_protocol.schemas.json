@@ -2202,6 +2202,30 @@
             },
             "method": {
               "enum": [
+                "externalAgentConfig/import/recordHistory"
+              ],
+              "title": "ExternalAgentConfig/import/recordHistoryRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigImportHistoryRecordParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "ExternalAgentConfig/import/recordHistoryRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "externalAgentConfig/import/readHistories"
               ],
               "title": "ExternalAgentConfig/import/readHistoriesRequestMethod",
@@ -6619,12 +6643,6 @@
               "null"
             ]
           },
-          "firstPartyType": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "review": {
             "anyOf": [
               {
@@ -6858,6 +6876,20 @@
         "properties": {
           "description": {
             "type": "string"
+          },
+          "disabledReason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "isEnabled": {
+            "default": true,
+            "type": "boolean"
+          },
+          "isReadOnly": {
+            "default": false,
+            "type": "boolean"
           },
           "name": {
             "type": "string"
@@ -7209,6 +7241,17 @@
           "agent"
         ],
         "type": "string"
+      },
+      "BrowserUseRequirements": {
+        "properties": {
+          "disableAutoReview": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
       },
       "ByteRange": {
         "properties": {
@@ -8233,7 +8276,7 @@
             ]
           },
           "reloadUserConfig": {
-            "description": "When true, hot-reload the updated user config into all loaded threads after writing.",
+            "description": "When true, hot-reload updated runtime settings into loaded threads after writing. Session-static model, reasoning-effort, Plan-mode reasoning-effort, service-tier, and personality defaults are not reloaded.",
             "type": "boolean"
           }
         },
@@ -8542,6 +8585,12 @@
               "null"
             ]
           },
+          "allowLoginShell": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "allowManagedHooksOnly": {
             "type": [
               "boolean",
@@ -8599,6 +8648,22 @@
               "null"
             ]
           },
+          "browserUse": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/BrowserUseRequirements"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "checkForUpdateOnStartup": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "computerUse": {
             "anyOf": [
               {
@@ -8634,6 +8699,28 @@
               "null"
             ]
           },
+          "feedback": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/FeedbackRequirements"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "logDir": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "modelCatalogJson": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "models": {
             "anyOf": [
               {
@@ -8642,6 +8729,18 @@
               {
                 "type": "null"
               }
+            ]
+          },
+          "sqliteHome": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "windowsSandboxPrivateDesktop": {
+            "type": [
+              "boolean",
+              "null"
             ]
           }
         },
@@ -9577,6 +9676,24 @@
             "description": "If true, include detection under the user's home directory.",
             "type": "boolean"
           },
+          "maxSessionAgeDays": {
+            "description": "Maximum age in days for detected sessions. Missing values use the default limit.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "maxSessions": {
+            "description": "Maximum number of sessions to detect. Missing values use the default limit.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "migrationSource": {
             "description": "Optional migration-source selector. Missing or unrecognized values use the default source.",
             "type": [
@@ -9669,6 +9786,12 @@
           "importId": {
             "type": "string"
           },
+          "providerId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "successes": {
             "items": {
               "$ref": "#/definitions/v2/ExternalAgentConfigImportItemTypeSuccess"
@@ -9682,6 +9805,41 @@
           "importId",
           "successes"
         ],
+        "type": "object"
+      },
+      "ExternalAgentConfigImportHistoryRecordParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "itemTypeResults": {
+            "description": "Completed results grouped by imported item type.",
+            "items": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigImportTypeResult"
+            },
+            "type": "array"
+          },
+          "providerId": {
+            "description": "Opaque provider identifier for the externally completed import.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "itemTypeResults",
+          "providerId"
+        ],
+        "title": "ExternalAgentConfigImportHistoryRecordParams",
+        "type": "object"
+      },
+      "ExternalAgentConfigImportHistoryRecordResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "importId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "importId"
+        ],
+        "title": "ExternalAgentConfigImportHistoryRecordResponse",
         "type": "object"
       },
       "ExternalAgentConfigImportItemTypeFailure": {
@@ -9767,6 +9925,13 @@
           },
           "migrationSource": {
             "description": "Migration-source selector used to produce the migration items. Pass the same value to detection and import; missing or unrecognized values use the default source.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "providerId": {
+            "description": "Opaque provider identifier supplied by the caller for analytics attribution and import history display. This does not select the migration source.",
             "type": [
               "string",
               "null"
@@ -9917,6 +10082,17 @@
           "remoteMcpServersConfig"
         ],
         "type": "string"
+      },
+      "FeedbackRequirements": {
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
       },
       "FeedbackUploadParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
@@ -13699,6 +13875,9 @@
           }
         ]
       },
+      "PathUri": {
+        "type": "string"
+      },
       "PermissionProfileListParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -13820,6 +13999,7 @@
           "team",
           "self_serve_business_usage_based",
           "business",
+          "ent26",
           "enterprise_cbp_usage_based",
           "enterprise",
           "edu",
@@ -14232,6 +14412,10 @@
               "null"
             ]
           },
+          "forceRefetch": {
+            "description": "Whether the client requests a fresh remote plugin catalog fetch.",
+            "type": "boolean"
+          },
           "marketplaceKinds": {
             "description": "Optional marketplace kind filter. When omitted, only local marketplaces are queried, plus the default remote catalog when enabled by feature flag.",
             "items": {
@@ -14411,6 +14595,13 @@
       },
       "PluginShareContext": {
         "properties": {
+          "canPublishToWorkspace": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "creatorAccountUserId": {
             "type": [
               "string",
@@ -14613,6 +14804,13 @@
       "PluginShareSaveResponse": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
+          "canPublishToWorkspace": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "remotePluginId": {
             "type": "string"
           },
@@ -17296,6 +17494,13 @@
               }
             ]
           },
+          "iconLargeUrl": {
+            "description": "Remote large icon URL from the plugin catalog.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "iconSmall": {
             "anyOf": [
               {
@@ -17304,6 +17509,13 @@
               {
                 "type": "null"
               }
+            ]
+          },
+          "iconSmallUrl": {
+            "description": "Remote small icon URL from the plugin catalog.",
+            "type": [
+              "string",
+              "null"
             ]
           },
           "shortDescription": {
@@ -17876,6 +18088,11 @@
           "id": {
             "description": "Identifier for this thread. Codex-generated thread IDs are UUIDv7.",
             "type": "string"
+          },
+          "isPinned": {
+            "default": false,
+            "description": "Whether the thread has been pinned by the user.",
+            "type": "boolean"
           },
           "modelProvider": {
             "description": "Model provider used for this thread (for example, 'openai').",
@@ -18727,8 +18944,24 @@
               "id": {
                 "type": "string"
               },
+              "pluginId": {
+                "default": null,
+                "description": "Trusted first-party plugin id when this command resolves to one plugin script.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "processId": {
                 "description": "Identifier for the underlying PTY process (when available).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scriptPath": {
+                "default": null,
+                "description": "Safe plugin-relative path when this command resolves to one plugin script.",
                 "type": [
                   "string",
                   "null"
@@ -19321,6 +19554,13 @@
             ],
             "description": "Optional cwd filter or filters; when set, only threads whose session cwd exactly matches one of these paths are returned."
           },
+          "isPinned": {
+            "description": "Optional pinned filter; when set, only threads matching this value are returned.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "limit": {
             "description": "Optional page size; defaults to a reasonable server-side value.",
             "format": "uint32",
@@ -19510,6 +19750,13 @@
               }
             ],
             "description": "Patch the stored Git metadata for this thread. Omit a field to leave it unchanged, set it to `null` to clear it, or provide a string to replace the stored value."
+          },
+          "isPinned": {
+            "description": "Patch whether this thread is pinned. Omit to leave the stored value unchanged.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "threadId": {
             "type": "string"

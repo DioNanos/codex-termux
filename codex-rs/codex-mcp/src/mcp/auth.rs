@@ -10,8 +10,8 @@ use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server::HttpClient;
 use codex_login::CodexAuth;
 use codex_rmcp_client::McpAuthState;
+use codex_rmcp_client::OAuthDiscoveryTimeout;
 use codex_rmcp_client::OAuthProviderError;
-use codex_rmcp_client::determine_streamable_http_auth_status;
 use codex_rmcp_client::determine_streamable_http_auth_status_with_http_client;
 use codex_rmcp_client::discover_streamable_http_oauth;
 use codex_rmcp_client::discover_streamable_http_oauth_with_http_client;
@@ -80,6 +80,7 @@ pub async fn oauth_login_support(transport: &McpServerTransportConfig) -> McpOAu
 pub async fn oauth_login_support_with_http_client(
     transport: &McpServerTransportConfig,
     http_client: Arc<dyn HttpClient>,
+    discovery_timeout: OAuthDiscoveryTimeout,
 ) -> McpOAuthLoginSupport {
     let Some(mut config) = oauth_login_candidate(transport) else {
         return McpOAuthLoginSupport::Unsupported;
@@ -89,6 +90,7 @@ pub async fn oauth_login_support_with_http_client(
         config.http_headers.clone(),
         config.env_http_headers.clone(),
         http_client,
+        discovery_timeout,
     )
     .await
     {
@@ -134,8 +136,9 @@ pub async fn discover_supported_scopes(
 pub async fn discover_supported_scopes_with_http_client(
     transport: &McpServerTransportConfig,
     http_client: Arc<dyn HttpClient>,
+    discovery_timeout: OAuthDiscoveryTimeout,
 ) -> Option<Vec<String>> {
-    match oauth_login_support_with_http_client(transport, http_client).await {
+    match oauth_login_support_with_http_client(transport, http_client, discovery_timeout).await {
         McpOAuthLoginSupport::Supported(config) => config.discovered_scopes,
         McpOAuthLoginSupport::Unsupported | McpOAuthLoginSupport::Unknown(_) => None,
     }
@@ -192,46 +195,38 @@ where
 {
     let futures = servers.into_iter().map(|(name, server)| {
         let name = name.clone();
-        let config = server.configured_config().cloned();
+        let config = server.config().clone();
         let runtime_context = runtime_context.clone();
-        let has_runtime_auth = config
-            .as_ref()
-            .is_some_and(|config| matches!(&config.auth, McpServerAuth::ChatGpt))
+        let has_runtime_auth = matches!(&config.auth, McpServerAuth::ChatGpt)
             && auth.is_some_and(CodexAuth::uses_codex_backend)
-            && config.as_ref().is_some_and(|config| {
-                matches!(
-                    &config.transport,
-                    McpServerTransportConfig::StreamableHttp {
-                        bearer_token_env_var: None,
-                        ..
-                    }
-                )
-            });
-        async move {
-            let auth_state = match config.as_ref() {
-                Some(config) => {
-                    match compute_auth_status(
-                        &name,
-                        config,
-                        store_mode,
-                        keyring_backend_kind,
-                        has_runtime_auth,
-                        &runtime_context,
-                    )
-                    .await
-                    {
-                        Ok(status) => status,
-                        Err(error) => {
-                            warn!(
-                                "failed to determine auth status for MCP server `{name}`: {error:?}"
-                            );
-                            McpAuthState::Unsupported
-                        }
-                    }
+            && matches!(
+                &config.transport,
+                McpServerTransportConfig::StreamableHttp {
+                    bearer_token_env_var: None,
+                    ..
                 }
-                None => McpAuthState::Unsupported,
+            );
+        async move {
+            let auth_state = match compute_auth_status(
+                &name,
+                &config,
+                store_mode,
+                keyring_backend_kind,
+                has_runtime_auth,
+                &runtime_context,
+            )
+            .await
+            {
+                Ok(status) => status,
+                Err(error) => {
+                    warn!("failed to determine auth status for MCP server `{name}`: {error:?}");
+                    McpAuthState::Unsupported
+                }
             };
-            let entry = McpAuthStatusEntry { config, auth_state };
+            let entry = McpAuthStatusEntry {
+                config: Some(config),
+                auth_state,
+            };
             (name, entry)
         }
     });
@@ -263,35 +258,27 @@ async fn compute_auth_status(
             http_headers,
             env_http_headers,
         } => {
-            if config.is_local_environment() {
-                determine_streamable_http_auth_status(
-                    server_name,
-                    url,
-                    bearer_token_env_var.as_deref(),
-                    http_headers.clone(),
-                    env_http_headers.clone(),
-                    store_mode,
-                    keyring_backend_kind,
-                )
-                .boxed()
-                .await
+            let http_client = runtime_context
+                .resolve_http_client(server_name, config)
+                .map_err(anyhow::Error::msg)?;
+            let discovery_timeout = if config.is_local_environment() {
+                OAuthDiscoveryTimeout::LOCAL
             } else {
-                let http_client = runtime_context
-                    .resolve_http_client(server_name, config)
-                    .map_err(anyhow::Error::msg)?;
-                determine_streamable_http_auth_status_with_http_client(
-                    server_name,
-                    url,
-                    bearer_token_env_var.as_deref(),
-                    http_headers.clone(),
-                    env_http_headers.clone(),
-                    store_mode,
-                    keyring_backend_kind,
-                    http_client,
-                )
-                .boxed()
-                .await
-            }
+                OAuthDiscoveryTimeout::Requested
+            };
+            determine_streamable_http_auth_status_with_http_client(
+                server_name,
+                url,
+                bearer_token_env_var.as_deref(),
+                http_headers.clone(),
+                env_http_headers.clone(),
+                store_mode,
+                keyring_backend_kind,
+                http_client,
+                discovery_timeout,
+            )
+            .boxed()
+            .await
         }
     }
 }

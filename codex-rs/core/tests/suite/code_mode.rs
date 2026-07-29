@@ -5,6 +5,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
+use codex_core::StartThreadOptions;
 use codex_core::config::Config;
 use codex_core::config::CurrentTimeReminderConfig;
 use codex_extension_api::ExtensionRegistryBuilder;
@@ -254,6 +255,63 @@ async fn missing_process_host_falls_back_to_in_process_code_mode() -> Result<()>
         ),
         "fallback"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_process_host_fails_when_in_process_fallback_is_disabled() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_code_mode_host_program("codex-code-mode-host-does-not-exist".into())
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("code mode should be enabled");
+            config.code_mode.disable_in_process_fallback = true;
+        });
+    let (_test, follow_up_mock) =
+        run_code_mode_turn_with_builder(&server, "Run code mode", "text('unreachable')", builder)
+            .await?;
+
+    let (output, _) =
+        custom_tool_output_body_and_success(&follow_up_mock.single_request(), "call-1");
+    assert!(output.contains("failed to spawn code-mode host codex-code-mode-host-does-not-exist"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_process_host_error_is_bounded_when_in_process_fallback_is_disabled() -> Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let executable = "codex-code-mode-host-does-not-exist";
+    let host_program = format!("{}{executable}", "missing-directory/".repeat(/*n*/ 64));
+    let builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_code_mode_host_program(host_program.into())
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("code mode should be enabled");
+            config.code_mode.disable_in_process_fallback = true;
+        });
+    let (_test, follow_up_mock) =
+        run_code_mode_turn_with_builder(&server, "Run code mode", "text('unreachable')", builder)
+            .await?;
+
+    let (output, _) =
+        custom_tool_output_body_and_success(&follow_up_mock.single_request(), "call-1");
+    assert!(output.contains("failed to spawn code-mode host ..."));
+    assert!(output.contains(executable));
+    assert!(output.len() <= 1024, "host error must remain bounded");
 
     Ok(())
 }
@@ -3628,9 +3686,8 @@ async fn code_mode_can_call_hidden_dynamic_tools() -> Result<()> {
     let base_test = builder.build(&server).await?;
     let new_thread = base_test
         .thread_manager
-        .start_thread_with_tools(
-            base_test.config.clone(),
-            vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        .start_thread(StartThreadOptions {
+            dynamic_tools: vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
                 name: "codex_app".to_string(),
                 description: "Codex app tools.".to_string(),
                 tools: vec![DynamicToolNamespaceTool::Function(
@@ -3649,7 +3706,8 @@ async fn code_mode_can_call_hidden_dynamic_tools() -> Result<()> {
                     },
                 )],
             })],
-        )
+            ..StartThreadOptions::new(base_test.config.clone())
+        })
         .await?;
     let mut test = base_test;
     test.codex = new_thread.thread;
@@ -3797,9 +3855,8 @@ async fn code_mode_excludes_configured_nested_tool_namespaces() -> Result<()> {
     let base_test = builder.build(&server).await?;
     let new_thread = base_test
         .thread_manager
-        .start_thread_with_tools(
-            base_test.config.clone(),
-            vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        .start_thread(StartThreadOptions {
+            dynamic_tools: vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
                 name: "excluded".to_string(),
                 description: "Excluded tools.".to_string(),
                 tools: vec![DynamicToolNamespaceTool::Function(
@@ -3815,7 +3872,8 @@ async fn code_mode_excludes_configured_nested_tool_namespaces() -> Result<()> {
                     },
                 )],
             })],
-        )
+            ..StartThreadOptions::new(base_test.config.clone())
+        })
         .await?;
     let mut test = base_test;
     test.codex = new_thread.thread;

@@ -1,6 +1,7 @@
 mod app_mcp_routing;
 mod command_migration;
 mod discoverable;
+mod http_client_selector;
 pub mod installed_marketplaces;
 pub mod loader;
 mod manager;
@@ -16,6 +17,8 @@ mod provider;
 pub mod remote;
 pub mod remote_bundle;
 pub mod remote_legacy;
+mod remote_plugin_id_resolver;
+mod script_attribution;
 pub mod startup_sync;
 pub mod store;
 #[cfg(test)]
@@ -71,3 +74,5 @@ pub use provider::ExecutorPluginProviderError;
 pub use provider::ResolvedExecutorPlugin;
 pub use remote::RecommendedPlugin;
 pub use remote::RecommendedPluginsMode;
+pub use script_attribution::PluginCommandAttribution;
+pub use script_attribution::TrustedPluginRoots;

@@ -1,10 +1,7 @@
 use anyhow::Result;
 use app_test_support::TestAppServer;
-use app_test_support::to_response;
-use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::MarketplaceAddParams;
 use codex_app_server_protocol::MarketplaceAddResponse;
-use codex_app_server_protocol::RequestId;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -16,7 +13,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 #[tokio::test]
 async fn marketplace_add_local_directory_source() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let source = codex_home.path().join("marketplace");
+    let source = codex_home.path().join("alice@example.com/marketplace");
     std::fs::create_dir_all(source.join(".agents/plugins"))?;
     std::fs::create_dir_all(source.join("plugins/sample/.codex-plugin"))?;
     std::fs::write(
@@ -31,28 +28,22 @@ async fn marketplace_add_local_directory_source() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
         .send_marketplace_add_request(MarketplaceAddParams {
-            source: "./marketplace".to_string(),
+            source: "./alice@example.com/marketplace".to_string(),
             ref_name: None,
             sparse_paths: None,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
     let MarketplaceAddResponse {
         marketplace_name,
         installed_root,
         already_added,
-    } = to_response(response)?;
+    } = timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     let expected_root = AbsolutePathBuf::from_absolute_path(source.canonicalize()?)?;
 
     assert_eq!(marketplace_name, "debug");

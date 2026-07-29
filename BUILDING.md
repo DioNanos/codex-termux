@@ -91,12 +91,12 @@ node ./bin/codex.js --help >/dev/null
 - Termux patch verification lives in `verify-patches.sh`.
 - The maintainer GitHub Actions workflow is `.github/workflows/termux-npm-build-publish.yml`.
 - Fork-owned Android `rusty_v8` assets are described in `third_party/v8/android-artifacts.toml`.
-- For the `0.145.0` release, the maintainer flow is: build the sanitized public
-  candidate with GitHub Actions, download and audit the immutable npm tarball,
-  publish that exact tarball locally, promote the tested commit to GitHub
-  `main`, and create the tag and GitHub release with the same tarball and
-  checksum. Both `latest` and `next` then point to `0.145.0`; `stable` remains
-  on the conservative release documented in the release notes.
+- For the `0.146.0` release candidate, the maintainer flow is: build the
+  sanitized public candidate with GitHub Actions, download and audit the
+  immutable npm tarball, validate the Android device artifact, then obtain
+  explicit publication approval before any npm dist-tag, GitHub `main`, tag,
+  or GitHub release mutation. No `0.146.0` package or release currently
+  exists.
 
 If the Android `rusty_v8` pair for the resolved crate version does not exist
 yet, bootstrap a source checkout with:

@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Write;
+use std::path::Path;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -10,8 +11,11 @@ use codex_protocol::items::AgentMessageItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
@@ -20,20 +24,220 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::UserMessageEvent;
+use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutRecorder;
+use codex_rollout::RolloutRecorderParams;
+use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
 use super::super::LocalThreadStore;
+use super::super::LocalThreadStoreConfig;
 use super::super::test_support::test_config;
 use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
+use crate::ForkBoundary;
+use crate::ListThreadsParams;
 use crate::ListTurnsParams;
+use crate::PrepareForkParams;
+use crate::PreparedFork;
+use crate::ResumeThreadParams;
 use crate::SortDirection;
 use crate::StoredTurnItemsView;
+use crate::StoredTurnStatus;
 use crate::ThreadPersistenceMetadata;
+use crate::ThreadSortKey;
 use crate::ThreadStore;
+
+/// Separate Codex and SQLite homes must work together across startup backfill,
+/// thread listing, and projection-backed paginated history reads.
+#[tokio::test]
+async fn split_homes_support_backfill_listing_and_paginated_history() {
+    let root = TempDir::new().expect("temp dir");
+    let codex_home = root.path().join("codex");
+    let sqlite_home = root.path().join("sqlite");
+    let thread_id = ThreadId::new();
+    let sqlite = codex_state::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+    let rollout_config = RolloutConfig {
+        codex_home: codex_home.clone(),
+        sqlite: sqlite.clone(),
+        cwd: codex_home.clone(),
+        model_provider_id: "test-provider".to_string(),
+        generate_memories: false,
+    };
+    let recorder = RolloutRecorder::new(
+        &rollout_config,
+        RolloutRecorderParams::new(
+            thread_id,
+            /*forked_from_id*/ None,
+            /*parent_thread_id*/ None,
+            SessionSource::Exec,
+            /*thread_source*/ None,
+            "test-originator".to_string(),
+            BaseInstructions::default(),
+            Vec::new(),
+        )
+        .with_history_mode(ThreadHistoryMode::Paginated)
+        .with_initial_window_id("window-1".to_string()),
+    )
+    .await
+    .expect("create paginated rollout");
+    recorder
+        .record_canonical_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
+            UserMessageEvent {
+                message: "existing thread".to_string(),
+                ..Default::default()
+            },
+        ))])
+        .await
+        .expect("record existing user message");
+    recorder.persist().await.expect("persist paginated rollout");
+    let rollout_path = recorder.rollout_path().to_path_buf();
+    recorder.shutdown().await.expect("close paginated rollout");
+
+    let runtime = codex_rollout::state_db::try_init(&rollout_config)
+        .await
+        .expect("backfill state from Codex home");
+    assert!(
+        runtime
+            .get_thread(thread_id)
+            .await
+            .expect("read backfilled thread")
+            .is_some(),
+        "startup backfill should index the rollout"
+    );
+    let store = LocalThreadStore::new(
+        LocalThreadStoreConfig::from_config(&rollout_config),
+        Some(runtime),
+    );
+
+    let threads = store
+        .list_threads(ListThreadsParams {
+            page_size: 10,
+            cursor: None,
+            sort_key: ThreadSortKey::CreatedAt,
+            sort_direction: SortDirection::Desc,
+            allowed_sources: Vec::new(),
+            model_providers: None,
+            cwd_filters: None,
+            archived: false,
+            search_term: None,
+            relation_filter: None,
+            is_pinned: None,
+            use_state_db_only: true,
+        })
+        .await
+        .expect("list backfilled threads");
+    assert_eq!(threads.items.len(), 1);
+    assert_eq!(
+        (
+            threads.items[0].thread_id,
+            threads.items[0].rollout_path.as_deref(),
+            threads.items[0].history_mode,
+        ),
+        (
+            thread_id,
+            Some(rollout_path.as_path()),
+            ThreadHistoryMode::Paginated,
+        )
+    );
+
+    store
+        .resume_thread(ResumeThreadParams {
+            thread_id,
+            rollout_path: Some(rollout_path),
+            history: None,
+            include_archived: false,
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(codex_home.clone()),
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await
+        .expect("resume backfilled thread");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                turn_started("turn-1"),
+                completed_item(
+                    thread_id,
+                    "turn-1",
+                    TurnItem::UserMessage(UserMessageItem {
+                        id: "user-1".to_string(),
+                        client_id: None,
+                        content: Vec::new(),
+                    }),
+                ),
+                completed_item(
+                    thread_id,
+                    "turn-1",
+                    TurnItem::AgentMessage(AgentMessageItem {
+                        id: "agent-1".to_string(),
+                        content: vec![AgentMessageContent::Text {
+                            text: "done".to_string(),
+                        }],
+                        phase: None,
+                        memory_citation: None,
+                    }),
+                ),
+                turn_completed("turn-1"),
+            ],
+        })
+        .await
+        .expect("append paginated history");
+
+    let turns = store
+        .list_turns(ListTurnsParams {
+            thread_id,
+            include_archived: false,
+            cursor: None,
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            items_view: StoredTurnItemsView::Summary,
+        })
+        .await
+        .expect("list paginated history");
+    assert_eq!(
+        turns
+            .turns
+            .iter()
+            .map(|turn| {
+                (
+                    turn.turn_id.as_str(),
+                    turn.status,
+                    turn.items
+                        .iter()
+                        .map(|item| item.item_id.as_str())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![(
+            "turn-1",
+            StoredTurnStatus::Completed,
+            vec!["user-1", "agent-1"],
+        )]
+    );
+
+    let state_db_path = sqlite.state_db_path();
+    let thread_history_db_path = sqlite.thread_history_db_path();
+    for sqlite_path in [&state_db_path, &thread_history_db_path] {
+        assert!(
+            sqlite_path.exists(),
+            "expected SQLite database at {}",
+            sqlite_path.display()
+        );
+        let filename = sqlite_path.file_name().expect("SQLite database filename");
+        assert!(
+            !codex_home.join(filename).exists(),
+            "SQLite database should not be created under Codex home"
+        );
+    }
+}
 
 #[tokio::test]
 async fn paginated_live_append_materializes_turn_items_and_state() {
@@ -78,13 +282,26 @@ async fn paginated_live_append_materializes_turn_items_and_state() {
         .await
         .expect("append paginated items");
 
-    let pool = codex_state::open_thread_history_db(home.path())
+    let rollout_path = store
+        .live_rollout_path(thread_id)
         .await
-        .expect("open thread history db");
+        .expect("rollout path");
+    let (turn_start_byte_offset, _) =
+        rollout_line_byte_offsets(rollout_path.as_path(), /*ordinal*/ 1);
+    let (_, turn_end_byte_offset) =
+        rollout_line_byte_offsets(rollout_path.as_path(), /*ordinal*/ 4);
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
     let turn = sqlx::query_as::<
         _,
         (
             i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
             String,
             Option<i64>,
             Option<i64>,
@@ -96,6 +313,9 @@ async fn paginated_live_append_materializes_turn_items_and_state() {
         r#"
 SELECT
     rollout_ordinal,
+    rollout_byte_offset,
+    rollout_end_ordinal,
+    rollout_end_byte_offset,
     status,
     started_at,
     completed_at,
@@ -115,6 +335,9 @@ WHERE thread_id = ? AND turn_id = ?
         turn,
         (
             1,
+            Some(turn_start_byte_offset),
+            Some(4),
+            Some(turn_end_byte_offset),
             "completed".to_string(),
             Some(10),
             Some(20),
@@ -141,10 +364,6 @@ ORDER BY rollout_ordinal
         vec![("user-1".to_string(), 2), ("agent-1".to_string(), 3)]
     );
 
-    let rollout_path = store
-        .live_rollout_path(thread_id)
-        .await
-        .expect("rollout path");
     let rollout_len = i64::try_from(fs::metadata(rollout_path).expect("rollout metadata").len())
         .expect("rollout length");
     let projection_state = sqlx::query_as::<_, (i64, i64)>(
@@ -162,6 +381,581 @@ WHERE thread_id = ?
 }
 
 #[tokio::test]
+async fn referenced_paginated_rollout_projects_inherited_ordinal_range() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let source_id = ThreadId::default();
+    create_paginated_thread(&store, source_id).await;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: source_id,
+            items: vec![
+                turn_started("source-turn"),
+                user_message("source message"),
+                turn_completed("source-turn"),
+            ],
+        })
+        .await
+        .expect("append source history");
+    let source_path = store
+        .live_rollout_path(source_id)
+        .await
+        .expect("source rollout path");
+    let (_, source_end_byte_offset) =
+        rollout_line_byte_offsets(source_path.as_path(), /*ordinal*/ 3);
+    let child_id = ThreadId::default();
+    let history_base = HistoryPosition {
+        thread_id: source_id,
+        end_ordinal_exclusive: 4,
+        end_byte_offset: u64::try_from(source_end_byte_offset).expect("source byte offset"),
+    };
+    create_paginated_subagent_thread(
+        &store,
+        child_id,
+        Some(history_base),
+        /*subagent_history_start_ordinal*/ None,
+    )
+    .await;
+    store
+        .persist_thread(child_id)
+        .await
+        .expect("persist child metadata");
+    assert_eq!(
+        prepare_paginated_fork(&store, child_id, ForkBoundary::Latest)
+            .await
+            .history_base,
+        Some(history_base)
+    );
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: child_id,
+            items: vec![
+                turn_started("child-turn"),
+                user_message("child message"),
+                turn_completed("child-turn"),
+            ],
+        })
+        .await
+        .expect("append child history");
+    let latest_history_base = prepare_paginated_fork(&store, child_id, ForkBoundary::Latest)
+        .await
+        .history_base;
+    for (boundary, expected_base) in [
+        (ForkBoundary::Latest, latest_history_base),
+        (
+            ForkBoundary::ThroughTurn("source-turn".to_string()),
+            Some(history_base),
+        ),
+        (
+            ForkBoundary::BeforeTurn("child-turn".to_string()),
+            Some(history_base),
+        ),
+        (
+            ForkBoundary::ThroughTurn("child-turn".to_string()),
+            latest_history_base,
+        ),
+        (ForkBoundary::BeforeTurn("source-turn".to_string()), None),
+    ] {
+        let prepared = prepare_paginated_fork(&store, child_id, boundary).await;
+        assert_eq!(prepared.history_base, expected_base);
+        assert!(matches!(
+            prepared.model_context.first(),
+            Some(RolloutItem::SessionMeta(meta)) if meta.meta.id == child_id
+        ));
+        assert_eq!(
+            contains_user_message(&prepared.model_context, "source message"),
+            expected_base.is_some()
+        );
+        assert_eq!(
+            contains_user_message(&prepared.model_context, "child message"),
+            expected_base == latest_history_base
+        );
+    }
+
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    let turn_ordinal = sqlx::query_scalar::<_, i64>(
+        "SELECT rollout_ordinal FROM thread_turns WHERE thread_id = ? AND turn_id = ?",
+    )
+    .bind(child_id.to_string())
+    .bind("child-turn")
+    .fetch_one(&pool)
+    .await
+    .expect("read child turn ordinal");
+    let next_ordinal = sqlx::query_scalar::<_, i64>(
+        "SELECT next_rollout_ordinal FROM thread_history_projection_state WHERE thread_id = ?",
+    )
+    .bind(child_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("read child projection ordinal");
+    assert_eq!((turn_ordinal, next_ordinal), (5, 8));
+}
+
+#[tokio::test]
+async fn named_fork_boundaries_reject_invisible_and_noncanonical_turns() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let source_id = ThreadId::default();
+    create_paginated_thread(&store, source_id).await;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: source_id,
+            items: vec![turn_started("inherited-turn"), user_message("before fork")],
+        })
+        .await
+        .expect("append inherited active turn");
+
+    let history_base = prepare_paginated_fork(&store, source_id, ForkBoundary::Latest)
+        .await
+        .history_base;
+    let child_id = ThreadId::default();
+    create_paginated_subagent_thread(
+        &store,
+        child_id,
+        history_base,
+        /*subagent_history_start_ordinal*/ None,
+    )
+    .await;
+    store
+        .persist_thread(child_id)
+        .await
+        .expect("persist child metadata");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: child_id,
+            items: vec![turn_started("child-turn"), turn_completed("child-turn")],
+        })
+        .await
+        .expect("append child turn after inherited active turn");
+    let error = store
+        .prepare_fork(PrepareForkParams {
+            thread_id: child_id,
+            boundary: ForkBoundary::ThroughTurn("inherited-turn".to_string()),
+        })
+        .await
+        .expect_err("cannot fork through an inherited active turn");
+    assert!(matches!(
+        error,
+        crate::ThreadStoreError::InvalidRequest { message }
+            if message == "lastTurnId 'inherited-turn' identifies an in-progress turn"
+    ));
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: source_id,
+            items: vec![
+                user_message("after fork"),
+                turn_completed("inherited-turn"),
+                turn_started("stale-turn"),
+                turn_started("replacement-turn"),
+                turn_completed("replacement-turn"),
+                completed_item(
+                    source_id,
+                    "review-turn",
+                    TurnItem::UserMessage(UserMessageItem {
+                        id: "review-message".to_string(),
+                        client_id: None,
+                        content: Vec::new(),
+                    }),
+                ),
+                turn_completed("review-turn"),
+            ],
+        })
+        .await
+        .expect("append invisible, stale, and terminal-only turns");
+
+    for (thread_id, boundary, expected_error) in [
+        (
+            child_id,
+            ForkBoundary::ThroughTurn("inherited-turn".to_string()),
+            "fork boundary exceeds inherited source history",
+        ),
+        (
+            source_id,
+            ForkBoundary::ThroughTurn("stale-turn".to_string()),
+            "lastTurnId 'stale-turn' identifies an in-progress turn",
+        ),
+        (
+            source_id,
+            ForkBoundary::BeforeTurn("review-turn".to_string()),
+            "turn review-turn does not have a persisted start boundary",
+        ),
+    ] {
+        let error = store
+            .prepare_fork(PrepareForkParams {
+                thread_id,
+                boundary,
+            })
+            .await
+            .expect_err("reject an invalid fork boundary");
+        assert!(matches!(
+            error,
+            crate::ThreadStoreError::InvalidRequest { message } if message == expected_error
+        ));
+    }
+}
+
+#[tokio::test]
+async fn active_turn_stores_only_its_start_position() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![turn_started("turn-1")],
+        })
+        .await
+        .expect("append active turn");
+
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    let (turn_start_byte_offset, _) =
+        rollout_line_byte_offsets(rollout_path.as_path(), /*ordinal*/ 1);
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    let turn_position = sqlx::query_as::<_, (Option<i64>, Option<i64>, Option<i64>)>(
+        "SELECT rollout_byte_offset, rollout_end_ordinal, rollout_end_byte_offset FROM thread_turns WHERE thread_id = ? AND turn_id = ?",
+    )
+    .bind(thread_id.to_string())
+    .bind("turn-1")
+    .fetch_one(&pool)
+    .await
+    .expect("read active turn position");
+    assert_eq!(turn_position, (Some(turn_start_byte_offset), None, None));
+
+    let (latest_byte_offset, latest_ordinal) = projection_state(&pool, thread_id).await;
+    let prepared = prepare_paginated_fork(&store, thread_id, ForkBoundary::Latest).await;
+    assert_eq!(
+        prepared.history_base,
+        Some(HistoryPosition {
+            thread_id,
+            end_ordinal_exclusive: u64::try_from(latest_ordinal).expect("latest ordinal"),
+            end_byte_offset: u64::try_from(latest_byte_offset).expect("latest byte offset"),
+        })
+    );
+    assert!(prepared.model_context.iter().any(|item| {
+        matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(event)) if event.turn_id == "turn-1")
+    }));
+    assert_eq!(
+        prepare_paginated_fork(
+            &store,
+            thread_id,
+            ForkBoundary::BeforeTurn("turn-1".to_string()),
+        )
+        .await
+        .history_base,
+        None
+    );
+}
+
+#[tokio::test]
+async fn paginated_fork_persists_empty_source() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    assert!(!rollout_path.exists());
+
+    let prepared = prepare_paginated_fork(&store, thread_id, ForkBoundary::Latest).await;
+
+    assert!(rollout_path.exists());
+    assert_eq!(prepared.history_base, None);
+    assert!(matches!(
+        prepared.model_context.as_slice(),
+        [RolloutItem::SessionMeta(meta)] if meta.meta.id == thread_id
+    ));
+}
+
+#[tokio::test]
+async fn paginated_fork_materializes_compressed_source_and_ancestor() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let ancestor_thread_id = ThreadId::default();
+    create_paginated_thread(&store, ancestor_thread_id).await;
+    store
+        .persist_thread(ancestor_thread_id)
+        .await
+        .expect("persist ancestor meta");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: ancestor_thread_id,
+            items: vec![
+                turn_started("ancestor-turn"),
+                user_message("inherited ancestor message"),
+                turn_completed("ancestor-turn"),
+            ],
+        })
+        .await
+        .expect("append ancestor turn");
+    let ancestor_path = store
+        .live_rollout_path(ancestor_thread_id)
+        .await
+        .expect("ancestor rollout path");
+    let ancestor_base = prepare_paginated_fork(&store, ancestor_thread_id, ForkBoundary::Latest)
+        .await
+        .history_base
+        .expect("ancestor prefix");
+    store
+        .shutdown_thread(ancestor_thread_id)
+        .await
+        .expect("shutdown ancestor");
+
+    let source_thread_id = ThreadId::default();
+    create_paginated_subagent_thread(
+        &store,
+        source_thread_id,
+        Some(ancestor_base),
+        /*subagent_history_start_ordinal*/ None,
+    )
+    .await;
+    store
+        .persist_thread(source_thread_id)
+        .await
+        .expect("persist source meta");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: source_thread_id,
+            items: vec![
+                turn_started("source-turn"),
+                user_message("inherited source message"),
+                turn_completed("source-turn"),
+            ],
+        })
+        .await
+        .expect("append source turn");
+    let source_path = store
+        .live_rollout_path(source_thread_id)
+        .await
+        .expect("source rollout path");
+    store
+        .shutdown_thread(source_thread_id)
+        .await
+        .expect("shutdown source");
+    let ancestor_compressed_path = ancestor_path.with_extension("jsonl.zst");
+    let source_compressed_path = source_path.with_extension("jsonl.zst");
+    compress_rollout(ancestor_path.as_path());
+    compress_rollout(source_path.as_path());
+    let ancestor_modified = fs::metadata(&ancestor_compressed_path)
+        .and_then(|metadata| metadata.modified())
+        .expect("read compressed ancestor timestamp");
+    let source_modified = fs::metadata(&source_compressed_path)
+        .and_then(|metadata| metadata.modified())
+        .expect("read compressed source timestamp");
+
+    let (first, second) = tokio::join!(
+        prepare_paginated_fork(&store, source_thread_id, ForkBoundary::Latest),
+        prepare_paginated_fork(&store, source_thread_id, ForkBoundary::Latest),
+    );
+    assert!(ancestor_path.exists());
+    assert!(source_path.exists());
+    assert!(!ancestor_compressed_path.exists());
+    assert!(!source_compressed_path.exists());
+    assert_eq!(
+        fs::metadata(&ancestor_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("read materialized ancestor timestamp"),
+        ancestor_modified
+    );
+    assert_eq!(
+        fs::metadata(&source_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("read materialized source timestamp"),
+        source_modified
+    );
+    for prepared in [first, second] {
+        assert!(matches!(
+            prepared.model_context.first(),
+            Some(RolloutItem::SessionMeta(meta)) if meta.meta.id == source_thread_id
+        ));
+        for message in ["inherited ancestor message", "inherited source message"] {
+            assert!(contains_user_message(
+                prepared.model_context.as_slice(),
+                message
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_fork_keeps_source_reserved_until_lineage_materialization_finishes() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let ancestor_thread_id = ThreadId::default();
+    create_paginated_thread(&store, ancestor_thread_id).await;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: ancestor_thread_id,
+            items: vec![
+                turn_started("ancestor-turn"),
+                turn_completed("ancestor-turn"),
+            ],
+        })
+        .await
+        .expect("append ancestor history");
+    let ancestor_base = prepare_paginated_fork(&store, ancestor_thread_id, ForkBoundary::Latest)
+        .await
+        .history_base
+        .expect("ancestor prefix");
+
+    let source_thread_id = ThreadId::default();
+    create_paginated_subagent_thread(
+        &store,
+        source_thread_id,
+        Some(ancestor_base),
+        /*subagent_history_start_ordinal*/ None,
+    )
+    .await;
+    store
+        .persist_thread(source_thread_id)
+        .await
+        .expect("persist source metadata");
+    let source_path = store
+        .live_rollout_path(source_thread_id)
+        .await
+        .expect("source rollout path");
+    store
+        .shutdown_thread(source_thread_id)
+        .await
+        .expect("shutdown source");
+    compress_rollout(source_path.as_path());
+
+    let ancestor_writer_guard = store.live_writer_locks.lock(ancestor_thread_id).await;
+    let preparation_store = store.clone();
+    let preparation = tokio::spawn(async move {
+        preparation_store
+            .prepare_fork(PrepareForkParams {
+                thread_id: source_thread_id,
+                boundary: ForkBoundary::Latest,
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !source_path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached lineage task should materialize the source");
+    preparation.abort();
+    assert!(
+        preparation
+            .await
+            .expect_err("fork preparation should be cancelled")
+            .is_cancelled()
+    );
+
+    let mut delete = Box::pin(store.delete_thread(DeleteThreadParams {
+        thread_id: source_thread_id,
+    }));
+    tokio::select! {
+        biased;
+        result = &mut delete => {
+            panic!("source deletion completed while lineage materialization was active: {result:?}")
+        }
+        _ = tokio::task::yield_now() => {}
+    }
+    drop(ancestor_writer_guard);
+    delete
+        .await
+        .expect("delete source after lineage materialization finishes");
+}
+
+#[tokio::test]
+async fn prepared_fork_reserves_source_until_child_reference_is_durable() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let source_thread_id = ThreadId::default();
+    create_paginated_thread(&store, source_thread_id).await;
+    store
+        .persist_thread(source_thread_id)
+        .await
+        .expect("persist source metadata");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: source_thread_id,
+            items: vec![turn_started("source-turn"), turn_completed("source-turn")],
+        })
+        .await
+        .expect("append source turn");
+    let prepared = store
+        .prepare_fork(PrepareForkParams {
+            thread_id: source_thread_id,
+            boundary: ForkBoundary::Latest,
+        })
+        .await
+        .expect("prepare referenced fork");
+    let history_base = prepared.history_base.expect("source history base");
+
+    let mut delete = Box::pin(store.delete_thread(DeleteThreadParams {
+        thread_id: source_thread_id,
+    }));
+    tokio::select! {
+        biased;
+        result = &mut delete => {
+            panic!("source deletion completed before its child reference was durable: {result:?}")
+        }
+        _ = tokio::task::yield_now() => {}
+    }
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        store.append_items(AppendThreadItemsParams {
+            thread_id: source_thread_id,
+            items: vec![
+                turn_started("later-turn"),
+                user_message("later source message"),
+                turn_completed("later-turn"),
+            ],
+        }),
+    )
+    .await
+    .expect("source write should not wait behind deletion")
+    .expect("source writes remain available during fork preparation");
+    assert_eq!(prepared.history_base, Some(history_base));
+    assert!(!contains_user_message(
+        prepared.model_context.as_slice(),
+        "later source message"
+    ));
+
+    let child_thread_id = ThreadId::default();
+    create_paginated_subagent_thread(
+        &store,
+        child_thread_id,
+        Some(history_base),
+        /*subagent_history_start_ordinal*/ None,
+    )
+    .await;
+    store
+        .persist_thread(child_thread_id)
+        .await
+        .expect("persist child history reference");
+    drop(prepared);
+
+    let error = delete
+        .await
+        .expect_err("durable child reference protects its source");
+    assert!(
+        error
+            .to_string()
+            .contains("forked history still references")
+    );
+}
+
+#[tokio::test]
 async fn subagent_prefix_advances_projection_without_materializing_history() {
     let home = TempDir::new().expect("temp dir");
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
@@ -169,6 +963,7 @@ async fn subagent_prefix_advances_projection_without_materializing_history() {
     create_paginated_subagent_thread(
         &store,
         thread_id,
+        /*history_base*/ None,
         /*subagent_history_start_ordinal*/ Some(4),
     )
     .await;
@@ -208,17 +1003,28 @@ async fn subagent_prefix_advances_projection_without_materializing_history() {
         .await
         .expect("append inherited prefix and child history");
 
-    let pool = codex_state::open_thread_history_db(home.path())
+    let rollout_path = store
+        .live_rollout_path(thread_id)
         .await
-        .expect("open thread history db");
-    let turns = sqlx::query_as::<_, (String, i64)>(
-        "SELECT turn_id, rollout_ordinal FROM thread_turns WHERE thread_id = ?",
+        .expect("rollout path");
+    let (child_start_byte_offset, _) =
+        rollout_line_byte_offsets(rollout_path.as_path(), /*ordinal*/ 4);
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    let turns = sqlx::query_as::<_, (String, i64, Option<i64>)>(
+        "SELECT turn_id, rollout_ordinal, rollout_byte_offset FROM thread_turns WHERE thread_id = ?",
     )
     .bind(thread_id.to_string())
     .fetch_all(&pool)
     .await
     .expect("read projected turns");
-    assert_eq!(turns, vec![("child-turn".to_string(), 4)]);
+    assert_eq!(
+        turns,
+        vec![("child-turn".to_string(), 4, Some(child_start_byte_offset))]
+    );
     let items = sqlx::query_as::<_, (String, i64)>(
         "SELECT item_id, rollout_ordinal FROM thread_items WHERE thread_id = ?",
     )
@@ -231,7 +1037,7 @@ async fn subagent_prefix_advances_projection_without_materializing_history() {
 }
 
 #[tokio::test]
-async fn replayed_item_snapshot_updates_content_without_reordering() {
+async fn unexpected_duplicate_item_completion_does_not_poison_projection() {
     let home = TempDir::new().expect("temp dir");
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
     let thread_id = ThreadId::default();
@@ -254,10 +1060,12 @@ async fn replayed_item_snapshot_updates_content_without_reordering() {
             ],
         })
         .await
-        .expect("append first item snapshot");
-    let pool = codex_state::open_thread_history_db(home.path())
-        .await
-        .expect("open thread history db");
+        .expect("append completed item");
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
     let first_created_at_ms = sqlx::query_scalar::<_, i64>(
         "SELECT created_at_ms FROM thread_items WHERE thread_id = ? AND turn_id = ? AND item_id = ?",
     )
@@ -281,11 +1089,11 @@ async fn replayed_item_snapshot_updates_content_without_reordering() {
             )],
         })
         .await
-        .expect("append replayed item snapshot");
+        .expect("append unexpected duplicate item completion");
 
-    let item = sqlx::query_as::<_, (i64, i64, String)>(
+    let item = sqlx::query_as::<_, (i64, i64, i64, String)>(
         r#"
-SELECT rollout_ordinal, created_at_ms, item_json
+SELECT rollout_ordinal, updated_at_ordinal, created_at_ms, item_json
 FROM thread_items
 WHERE thread_id = ? AND turn_id = ? AND item_id = ?
         "#,
@@ -296,10 +1104,9 @@ WHERE thread_id = ? AND turn_id = ? AND item_id = ?
     .fetch_one(&pool)
     .await
     .expect("read projected item");
-    assert_eq!(item.0, 2);
-    assert_eq!(item.1, first_created_at_ms);
+    assert_eq!((item.0, item.1, item.2), (2, 3, first_created_at_ms));
     assert_eq!(
-        serde_json::from_str::<ThreadItem>(item.2.as_str()).expect("parse projected item"),
+        serde_json::from_str::<ThreadItem>(item.3.as_str()).expect("parse projected item"),
         ThreadItem::UserMessage {
             id: "user-1".to_string(),
             client_id: Some("updated".to_string()),
@@ -309,12 +1116,99 @@ WHERE thread_id = ? AND turn_id = ? AND item_id = ?
 }
 
 #[tokio::test]
+async fn terminal_turn_does_not_change_after_later_records() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![turn_started("turn-1"), turn_completed("turn-1")],
+        })
+        .await
+        .expect("append terminal turn");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                turn_started("turn-1"),
+                completed_item(
+                    thread_id,
+                    "turn-1",
+                    TurnItem::UserMessage(UserMessageItem {
+                        id: "late-user".to_string(),
+                        client_id: None,
+                        content: Vec::new(),
+                    }),
+                ),
+            ],
+        })
+        .await
+        .expect("append later records");
+
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    let (turn_start_byte_offset, _) =
+        rollout_line_byte_offsets(rollout_path.as_path(), /*ordinal*/ 1);
+    let (_, turn_end_byte_offset) =
+        rollout_line_byte_offsets(rollout_path.as_path(), /*ordinal*/ 2);
+    let turn = sqlx::query_as::<
+        _,
+        (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            String,
+            Option<String>,
+        ),
+    >(
+        r#"
+SELECT
+    rollout_ordinal,
+    rollout_byte_offset,
+    rollout_end_ordinal,
+    rollout_end_byte_offset,
+    status,
+    first_user_item_id
+FROM thread_turns
+WHERE thread_id = ? AND turn_id = ?
+        "#,
+    )
+    .bind(thread_id.to_string())
+    .bind("turn-1")
+    .fetch_one(&pool)
+    .await
+    .expect("read projected turn");
+    assert_eq!(
+        turn,
+        (
+            1,
+            Some(turn_start_byte_offset),
+            Some(2),
+            Some(turn_end_byte_offset),
+            "completed".to_string(),
+            None,
+        )
+    );
+}
+
+#[tokio::test]
 async fn summary_items_use_final_answers_and_ignore_commentary() {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
     let thread_id = ThreadId::default();
     let runtime = codex_state::StateRuntime::init(
-        config.sqlite_home.clone(),
+        config.sqlite.clone(),
         config.default_model_provider_id.clone(),
     )
     .await
@@ -439,9 +1333,11 @@ async fn next_write_catches_up_unprojected_durable_suffix() {
         .await
         .expect("persist session metadata");
 
-    let pool = codex_state::open_thread_history_db(home.path())
-        .await
-        .expect("open thread history db");
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
     let checkpoint = projection_state(&pool, thread_id).await;
     store
         .append_items(AppendThreadItemsParams {
@@ -524,9 +1420,11 @@ async fn synchronized_catch_up_does_not_replay_old_rows() {
         .await
         .expect("append turn start");
 
-    let pool = codex_state::open_thread_history_db(home.path())
-        .await
-        .expect("open thread history db");
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
     let before = projection_state(&pool, thread_id).await;
     sqlx::query("UPDATE thread_turns SET status = 'sentinel' WHERE thread_id = ?")
         .bind(thread_id.to_string())
@@ -552,7 +1450,7 @@ async fn synchronized_catch_up_does_not_replay_old_rows() {
 }
 
 #[tokio::test]
-async fn catch_up_leaves_trailing_partial_line_unprojected() {
+async fn catch_up_preserves_trailing_partial_line_boundaries() {
     let home = TempDir::new().expect("temp dir");
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
     let thread_id = ThreadId::default();
@@ -562,23 +1460,14 @@ async fn catch_up_leaves_trailing_partial_line_unprojected() {
         .await
         .expect("persist session metadata");
 
-    let pool = codex_state::open_thread_history_db(home.path())
-        .await
-        .expect("open thread history db");
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
     let before = projection_state(&pool, thread_id).await;
     let complete_line = rollout_line(Some(1), turn_started("turn-1"));
-    let partial_line = rollout_line(
-        Some(2),
-        completed_item(
-            thread_id,
-            "turn-1",
-            TurnItem::UserMessage(UserMessageItem {
-                id: "user-1".to_string(),
-                client_id: None,
-                content: Vec::new(),
-            }),
-        ),
-    );
+    let partial_line = rollout_line(Some(2), turn_completed("turn-1"));
     let complete_suffix = format!("{complete_line}\n");
     let rollout_path = store
         .live_rollout_path(thread_id)
@@ -599,19 +1488,22 @@ async fn catch_up_leaves_trailing_partial_line_unprojected() {
         projection_state(&pool, thread_id).await,
         (expected_offset, 2)
     );
-    let counts = sqlx::query_as::<_, (i64, i64)>(
-        r#"
-SELECT
-    (SELECT COUNT(*) FROM thread_turns WHERE thread_id = ?),
-    (SELECT COUNT(*) FROM thread_items WHERE thread_id = ?)
-        "#,
+    append_suffix(rollout_path.as_path(), "\n");
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+        .await
+        .expect("catch up completed partial suffix");
+
+    let rollout_len = i64::try_from(fs::metadata(rollout_path).expect("rollout metadata").len())
+        .expect("rollout length");
+    let turn_position = sqlx::query_as::<_, (Option<i64>, Option<i64>, Option<i64>)>(
+        "SELECT rollout_byte_offset, rollout_end_ordinal, rollout_end_byte_offset FROM thread_turns WHERE thread_id = ? AND turn_id = ?",
     )
     .bind(thread_id.to_string())
-    .bind(thread_id.to_string())
+    .bind("turn-1")
     .fetch_one(&pool)
     .await
-    .expect("read projected row counts");
-    assert_eq!(counts, (1, 0));
+    .expect("read completed turn position");
+    assert_eq!(turn_position, (Some(before.0), Some(2), Some(rollout_len)));
 }
 
 #[tokio::test]
@@ -647,9 +1539,11 @@ async fn catch_up_rejects_invalid_complete_suffixes_without_advancing_state() {
             .await
             .expect("persist session metadata");
 
-        let pool = codex_state::open_thread_history_db(home.path())
-            .await
-            .expect("open thread history db");
+        let pool = codex_state::open_thread_history_db(
+            &codex_state::SqliteConfig::new_for_testing(home.path().abs()),
+        )
+        .await
+        .expect("open thread history db");
         let before = projection_state(&pool, thread_id).await;
         let rollout_path = store
             .live_rollout_path(thread_id)
@@ -698,7 +1592,11 @@ async fn jsonl_failure_does_not_create_projection_database() {
         .await
         .expect_err("JSONL append should fail");
 
-    assert!(!codex_state::thread_history_db_path(home.path()).exists());
+    assert!(
+        !codex_state::SqliteConfig::new_for_testing(home.path().abs())
+            .thread_history_db_path()
+            .exists()
+    );
 }
 
 #[tokio::test]
@@ -732,7 +1630,7 @@ async fn sqlite_failure_does_not_fail_durable_jsonl_write() {
     let sqlite_home = home.path().join("not-a-directory");
     fs::write(sqlite_home.as_path(), "not a directory").expect("block sqlite home");
     let mut config = test_config(home.path());
-    config.sqlite_home = sqlite_home;
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
     let store = LocalThreadStore::new(config, /*state_db*/ None);
     let thread_id = ThreadId::default();
     create_paginated_thread(&store, thread_id).await;
@@ -762,7 +1660,7 @@ async fn sqlite_failure_does_not_fail_durable_jsonl_write() {
 }
 
 #[tokio::test]
-async fn rejected_rollout_line_does_not_poison_projection() {
+async fn blank_and_rejected_rollout_lines_do_not_poison_projection() {
     let home = TempDir::new().expect("temp dir");
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
     let thread_id = ThreadId::default();
@@ -780,8 +1678,8 @@ async fn rejected_rollout_line_does_not_poison_projection() {
         .append(true)
         .open(rollout_path.as_path())
         .expect("open rollout for rejected line");
-    file.write_all(b"{not json}\n")
-        .expect("append rejected line");
+    file.write_all(b"\n \t\r\n{not json}\n\xff\n")
+        .expect("append blank and rejected lines");
     file.flush().expect("flush rejected line");
     let recorder = store
         .live_recorders
@@ -801,18 +1699,22 @@ async fn rejected_rollout_line_does_not_poison_projection() {
         .await
         .expect("project valid retry after rejected line");
 
-    let pool = codex_state::open_thread_history_db(home.path())
-        .await
-        .expect("open thread history db");
-    let projected_turns = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM thread_turns WHERE thread_id = ? AND turn_id = ?",
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    let (expected_start_byte_offset, _) =
+        rollout_line_byte_offsets(rollout_path.as_path(), /*ordinal*/ 1);
+    let start_byte_offset = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT rollout_byte_offset FROM thread_turns WHERE thread_id = ? AND turn_id = ?",
     )
     .bind(thread_id.to_string())
     .bind("turn-1")
     .fetch_one(&pool)
     .await
-    .expect("read projected turns");
-    assert_eq!(projected_turns, 1);
+    .expect("read projected turn byte offset");
+    assert_eq!(start_byte_offset, Some(expected_start_byte_offset));
 }
 
 #[tokio::test]
@@ -839,9 +1741,11 @@ async fn shutdown_materializes_items_queued_without_a_flush() {
         .await
         .expect("shutdown live thread");
 
-    let pool = codex_state::open_thread_history_db(home.path())
-        .await
-        .expect("open thread history db");
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
     let projected_turns = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM thread_turns WHERE thread_id = ? AND turn_id = ?",
     )
@@ -891,9 +1795,11 @@ async fn delete_waits_for_in_flight_projection_before_removing_rows() {
         .expect("finish in-flight append");
     delete.await.expect("join delete").expect("delete thread");
 
-    let pool = codex_state::open_thread_history_db(home.path())
-        .await
-        .expect("open thread history db");
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
     let counts = sqlx::query_as::<_, (i64, i64, i64)>(
         r#"
 SELECT
@@ -913,14 +1819,29 @@ SELECT
 
 async fn create_paginated_thread(store: &LocalThreadStore, thread_id: ThreadId) {
     create_paginated_subagent_thread(
-        store, thread_id, /*subagent_history_start_ordinal*/ None,
+        store, thread_id, /*history_base*/ None, /*subagent_history_start_ordinal*/ None,
     )
     .await;
+}
+
+async fn prepare_paginated_fork(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    boundary: ForkBoundary,
+) -> PreparedFork {
+    store
+        .prepare_fork(PrepareForkParams {
+            thread_id,
+            boundary,
+        })
+        .await
+        .expect("prepare paginated fork")
 }
 
 async fn create_paginated_subagent_thread(
     store: &LocalThreadStore,
     thread_id: ThreadId,
+    history_base: Option<HistoryPosition>,
     subagent_history_start_ordinal: Option<u64>,
 ) {
     store
@@ -938,6 +1859,7 @@ async fn create_paginated_subagent_thread(
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
             history_mode: ThreadHistoryMode::Paginated,
+            history_base,
             subagent_history_start_ordinal,
             initial_window_id: "window-1".to_string(),
             metadata: ThreadPersistenceMetadata {
@@ -972,11 +1894,36 @@ fn turn_completed(turn_id: &str) -> RolloutItem {
     }))
 }
 
+fn user_message(message: &str) -> RolloutItem {
+    RolloutItem::ResponseItem(ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: message.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    })
+}
+
+fn contains_user_message(items: &[RolloutItem], expected: &str) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::ResponseItem(ResponseItem::Message { content, .. })
+                if content.iter().any(|content| {
+                    matches!(content, ContentItem::InputText { text } if text == expected)
+                })
+        )
+    })
+}
+
 fn completed_item(thread_id: ThreadId, turn_id: &str, item: TurnItem) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
         thread_id,
         turn_id: turn_id.to_string(),
         item,
+        started_at_ms: Some(0),
         completed_at_ms: 1,
     }))
 }
@@ -990,6 +1937,38 @@ fn agent_message(id: &str, phase: MessagePhase) -> TurnItem {
         phase: Some(phase),
         memory_citation: None,
     })
+}
+
+fn rollout_line_byte_offsets(path: &std::path::Path, ordinal: u64) -> (i64, i64) {
+    let bytes = fs::read(path).expect("read rollout");
+    let mut start_byte_offset = 0;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let end_byte_offset = start_byte_offset + line.len();
+        if serde_json::from_slice::<RolloutLine>(line)
+            .ok()
+            .and_then(|line| line.ordinal)
+            == Some(ordinal)
+        {
+            return (
+                i64::try_from(start_byte_offset).expect("start byte offset fits i64"),
+                i64::try_from(end_byte_offset).expect("end byte offset fits i64"),
+            );
+        }
+        start_byte_offset = end_byte_offset;
+    }
+    panic!("missing rollout ordinal {ordinal}");
+}
+
+fn compress_rollout(path: &Path) {
+    let mut compressed_path = path.as_os_str().to_os_string();
+    compressed_path.push(".zst");
+    let compressed = zstd::stream::encode_all(
+        fs::File::open(path).expect("open rollout for compression"),
+        /*level*/ 0,
+    )
+    .expect("compress rollout");
+    fs::write(compressed_path, compressed).expect("write compressed rollout");
+    fs::remove_file(path).expect("remove plain rollout");
 }
 
 async fn projection_state(pool: &sqlx::SqlitePool, thread_id: ThreadId) -> (i64, i64) {

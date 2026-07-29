@@ -385,6 +385,19 @@
       },
       "type": "object"
     },
+    "CodeModeHostConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "disable_in_process_fallback": {
+          "description": "Fail instead of running embedded V8 when the standalone host is unavailable.",
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "ConfigProfile": {
       "additionalProperties": false,
       "description": "Collection of common configuration options that a user can define as a unit in `config.toml`.",
@@ -462,7 +475,7 @@
               "type": "boolean"
             },
             "code_mode_host": {
-              "type": "boolean"
+              "$ref": "#/definitions/FeatureToml_for_CodeModeHostConfigToml"
             },
             "code_mode_only": {
               "type": "boolean"
@@ -495,6 +508,9 @@
               "type": "boolean"
             },
             "deferred_executor": {
+              "type": "boolean"
+            },
+            "deferred_tool_world_state": {
               "type": "boolean"
             },
             "elevated_windows_sandbox": {
@@ -539,6 +555,9 @@
             "guardian_approval": {
               "type": "boolean"
             },
+            "guardianv2": {
+              "type": "boolean"
+            },
             "hooks": {
               "type": "boolean"
             },
@@ -554,6 +573,9 @@
             "in_app_browser": {
               "type": "boolean"
             },
+            "in_app_updates": {
+              "type": "boolean"
+            },
             "item_ids": {
               "type": "boolean"
             },
@@ -564,6 +586,9 @@
               "type": "boolean"
             },
             "local_thread_store_compression": {
+              "type": "boolean"
+            },
+            "mcp_2026_07_28": {
               "type": "boolean"
             },
             "memories": {
@@ -588,7 +613,7 @@
               "$ref": "#/definitions/FeatureToml_for_NetworkProxyConfigToml"
             },
             "non_prefixed_mcp_tool_names": {
-              "type": "boolean"
+              "$ref": "#/definitions/FeatureToml_for_NonPrefixedMcpToolNamesConfigToml"
             },
             "personality": {
               "type": "boolean"
@@ -974,6 +999,16 @@
         }
       ]
     },
+    "FeatureToml_for_CodeModeHostConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/CodeModeHostConfigToml"
+        }
+      ]
+    },
     "FeatureToml_for_CurrentTimeReminderConfigToml": {
       "anyOf": [
         {
@@ -1001,6 +1036,16 @@
         },
         {
           "$ref": "#/definitions/NetworkProxyConfigToml"
+        }
+      ]
+    },
+    "FeatureToml_for_NonPrefixedMcpToolNamesConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/NonPrefixedMcpToolNamesConfigToml"
         }
       ]
     },
@@ -1733,6 +1778,11 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "supports_standalone_web_search": {
+          "default": false,
+          "description": "Whether this provider supports the standalone web-search endpoint.",
+          "type": "boolean"
+        },
         "supports_websockets": {
           "default": false,
           "description": "Whether this provider supports the Responses API WebSocket transport.",
@@ -1816,6 +1866,10 @@
         },
         "usage_hint_text": {
           "type": "string"
+        },
+        "wait_agent_enabled": {
+          "description": "Expose the multi-agent v2 `wait_agent` tool.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -2071,6 +2125,22 @@
       "type": "string"
     },
     "NetworkUnixSocketPermissionsToml": {
+      "type": "object"
+    },
+    "NonPrefixedMcpToolNamesConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "server_names": {
+          "description": "MCP servers whose tools should omit the legacy `mcp__` namespace prefix.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
       "type": "object"
     },
     "Notice": {
@@ -2849,6 +2919,14 @@
       ],
       "type": "string"
     },
+    "ShellEnvironmentPolicyFilter": {
+      "description": "Assigns a shell environment variable pattern to the include-only or exclude set. Includes do not re-add variables removed by another exclude pattern.",
+      "enum": [
+        "include",
+        "exclude"
+      ],
+      "type": "string"
+    },
     "ShellEnvironmentPolicyInherit": {
       "oneOf": [
         {
@@ -2876,10 +2954,28 @@
     },
     "ShellEnvironmentPolicyToml": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "exclude",
+              "filters"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "filters",
+              "include_only"
+            ]
+          }
+        }
+      ],
       "description": "Policy for building the `env` when spawning a process via shell-like tools.",
       "properties": {
         "exclude": {
-          "description": "List of regular expressions.",
+          "description": "Legacy list of regular expressions to exclude.",
           "items": {
             "type": "string"
           },
@@ -2888,11 +2984,18 @@
         "experimental_use_profile": {
           "type": "boolean"
         },
+        "filters": {
+          "additionalProperties": {
+            "$ref": "#/definitions/ShellEnvironmentPolicyFilter"
+          },
+          "description": "Pattern actions used by the canonical table representation.\n\nOrdinary config keeps accepting the legacy arrays above during the migration. Requirements will accept only this keyed form, keeping array compatibility isolated so the legacy fields can be deprecated later. Pattern keys merge case-insensitively across config layers, matching how the resulting patterns match environment variable names.",
+          "type": "object"
+        },
         "ignore_default_excludes": {
           "type": "boolean"
         },
         "include_only": {
-          "description": "List of regular expressions.",
+          "description": "Legacy list of regular expressions to include.",
           "items": {
             "type": "string"
           },
@@ -3073,6 +3176,9 @@
         "experimental_request_user_input": {
           "$ref": "#/definitions/ExperimentalRequestUserInput"
         },
+        "update_plan": {
+          "$ref": "#/definitions/UpdatePlanToolConfig"
+        },
         "web_search": {
           "allOf": [
             {
@@ -3169,6 +3275,7 @@
               "toggle_fast_mode": null,
               "toggle_raw_output": null,
               "toggle_shortcuts": null,
+              "toggle_side_conversation": null,
               "toggle_vim_mode": null
             },
             "list": {
@@ -3747,6 +3854,14 @@
           ],
           "description": "Toggle the composer shortcut overlay."
         },
+        "toggle_side_conversation": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Switch between a side conversation and its parent without closing either."
+        },
         "toggle_vim_mode": {
           "allOf": [
             {
@@ -3848,6 +3963,7 @@
             "toggle_fast_mode": null,
             "toggle_raw_output": null,
             "toggle_shortcuts": null,
+            "toggle_side_conversation": null,
             "toggle_vim_mode": null
           }
         },
@@ -4564,6 +4680,16 @@
       },
       "type": "object"
     },
+    "UpdatePlanToolConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "UriBasedFileOpener": {
       "oneOf": [
         {
@@ -4693,7 +4819,6 @@
       "description": "Agent-related settings (thread limits, etc.)."
     },
     "allow_login_shell": {
-      "default": true,
       "description": "Whether the model may request a login shell for shell-based tools. Default to `true`\n\nIf `true`, the model may request a login shell (`login = true`), and omitting `login` defaults to using a login shell. If `false`, the model can never use a login shell: `login = true` requests are rejected, and omitting `login` defaults to a non-login shell.",
       "type": "boolean"
     },
@@ -4903,7 +5028,7 @@
           "type": "boolean"
         },
         "code_mode_host": {
-          "type": "boolean"
+          "$ref": "#/definitions/FeatureToml_for_CodeModeHostConfigToml"
         },
         "code_mode_only": {
           "type": "boolean"
@@ -4936,6 +5061,9 @@
           "type": "boolean"
         },
         "deferred_executor": {
+          "type": "boolean"
+        },
+        "deferred_tool_world_state": {
           "type": "boolean"
         },
         "elevated_windows_sandbox": {
@@ -4980,6 +5108,9 @@
         "guardian_approval": {
           "type": "boolean"
         },
+        "guardianv2": {
+          "type": "boolean"
+        },
         "hooks": {
           "type": "boolean"
         },
@@ -4995,6 +5126,9 @@
         "in_app_browser": {
           "type": "boolean"
         },
+        "in_app_updates": {
+          "type": "boolean"
+        },
         "item_ids": {
           "type": "boolean"
         },
@@ -5005,6 +5139,9 @@
           "type": "boolean"
         },
         "local_thread_store_compression": {
+          "type": "boolean"
+        },
+        "mcp_2026_07_28": {
           "type": "boolean"
         },
         "memories": {
@@ -5029,7 +5166,7 @@
           "$ref": "#/definitions/FeatureToml_for_NetworkProxyConfigToml"
         },
         "non_prefixed_mcp_tool_names": {
-          "type": "boolean"
+          "$ref": "#/definitions/FeatureToml_for_NonPrefixedMcpToolNamesConfigToml"
         },
         "personality": {
           "type": "boolean"
@@ -5541,6 +5678,7 @@
       "default": {
         "exclude": null,
         "experimental_use_profile": null,
+        "filters": null,
         "ignore_default_excludes": null,
         "include_only": null,
         "inherit": null,

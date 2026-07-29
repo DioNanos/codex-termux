@@ -1,4 +1,6 @@
 use super::*;
+use crate::test_support::recorded_http_client_urls;
+use crate::test_support::recording_remote_plugin_service_config;
 use codex_app_server_protocol::PluginAuthPolicy;
 use codex_app_server_protocol::PluginInstallPolicy;
 use codex_app_server_protocol::PluginInterface;
@@ -23,9 +25,10 @@ use wiremock::matchers::query_param;
 use wiremock::matchers::query_param_is_missing;
 
 fn test_config(server: &MockServer) -> RemotePluginServiceConfig {
-    RemotePluginServiceConfig {
-        chatgpt_base_url: format!("{}/backend-api", server.uri()),
-    }
+    RemotePluginServiceConfig::new(
+        format!("{}/backend-api", server.uri()),
+        crate::test_support::test_http_client_factory(),
+    )
 }
 
 fn test_auth() -> CodexAuth {
@@ -174,7 +177,8 @@ async fn save_remote_plugin_share_creates_workspace_plugin() {
         .unwrap()
         .len();
     let server = MockServer::start().await;
-    let config = test_config(&server);
+    let (config, selected_urls) =
+        recording_remote_plugin_service_config(format!("{}/backend-api", server.uri()));
     let auth = test_auth();
 
     Mock::given(method("POST"))
@@ -226,6 +230,7 @@ async fn save_remote_plugin_share_creates_workspace_plugin() {
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "plugin_id": "plugins_123",
             "share_url": "https://chatgpt.example/plugins/share/share-key-1",
+            "can_publish_to_workspace": true,
         })))
         .expect(1)
         .mount(&server)
@@ -254,11 +259,23 @@ async fn save_remote_plugin_share_creates_workspace_plugin() {
         RemotePluginShareSaveResult {
             remote_plugin_id: "plugins_123".to_string(),
             share_url: Some("https://chatgpt.example/plugins/share/share-key-1".to_string()),
+            can_publish_to_workspace: Some(true),
         }
     );
     assert_eq!(
         local_paths::load_plugin_share_local_paths(codex_home.path()).unwrap(),
         BTreeMap::from([("plugins_123".to_string(), plugin_path)])
+    );
+    assert_eq!(
+        recorded_http_client_urls(&selected_urls),
+        vec![
+            format!(
+                "{}/backend-api/public/plugins/workspace/upload-url",
+                server.uri()
+            ),
+            format!("{}/upload/file_123", server.uri()),
+            format!("{}/backend-api/public/plugins/workspace", server.uri()),
+        ]
     );
 
     let requests = server.received_requests().await.unwrap_or_default();
@@ -420,6 +437,7 @@ async fn save_remote_plugin_share_updates_existing_workspace_plugin() {
         RemotePluginShareSaveResult {
             remote_plugin_id: "plugins_123".to_string(),
             share_url: None,
+            can_publish_to_workspace: None,
         }
     );
 }
@@ -644,6 +662,7 @@ async fn list_remote_plugin_shares_fetches_created_workspace_plugins() {
                                 name: "Reader".to_string(),
                             },
                         ]),
+                        can_publish_to_workspace: None,
                     }),
                     installed: false,
                     enabled: false,
@@ -685,6 +704,7 @@ async fn list_remote_plugin_shares_fetches_created_workspace_plugins() {
                                 name: "Editor".to_string(),
                             },
                         ]),
+                        can_publish_to_workspace: None,
                     }),
                     installed: true,
                     enabled: true,

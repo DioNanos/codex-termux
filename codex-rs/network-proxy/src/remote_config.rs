@@ -24,6 +24,9 @@ pub struct RemoteNetworkProxyLaunchConfig {
     pub environment_id: Option<String>,
     #[serde(default)]
     pub execution_id: Option<String>,
+    /// Controller-side policy decision budget. The executor adds transport overhead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_decision_timeout_ms: Option<u64>,
 }
 
 impl RemoteNetworkProxyLaunchConfig {
@@ -33,6 +36,7 @@ impl RemoteNetworkProxyLaunchConfig {
             audit_metadata: NetworkProxyAuditMetadata::default(),
             environment_id: None,
             execution_id: None,
+            policy_decision_timeout_ms: None,
         }
     }
 

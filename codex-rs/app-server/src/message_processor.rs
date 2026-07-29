@@ -63,6 +63,7 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::experimental_required_message;
 use codex_arg0::Arg0DispatchPaths;
 use codex_chatgpt::workspace_settings;
+use codex_code_mode::CodeModeSessionProvider;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_exec_server::EnvironmentManager;
@@ -88,15 +89,9 @@ use crate::models_refresh_worker::ModelsRefreshWorker;
 
 const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
 
-fn deserialize_client_request(
-    request: &JSONRPCRequest,
-) -> Result<ClientRequest, JSONRPCErrorError> {
-    serde_json::to_value(request)
+fn deserialize_client_request(request: JSONRPCRequest) -> Result<ClientRequest, JSONRPCErrorError> {
+    ClientRequest::try_from(request)
         .map_err(|err| invalid_request(format!("Invalid request: {err}")))
-        .and_then(|request_json| {
-            serde_json::from_value(request_json)
-                .map_err(|err| invalid_request(format!("Invalid request: {err}")))
-        })
 }
 
 pub(crate) struct MessageProcessor {
@@ -216,6 +211,7 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) session_source: SessionSource,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) installation_id: String,
+    pub(crate) code_mode_session_provider: Option<Arc<dyn CodeModeSessionProvider>>,
     pub(crate) rpc_transport: AppServerRpcTransport,
     pub(crate) remote_control_handle: Option<RemoteControlHandle>,
     pub(crate) plugin_startup_tasks: crate::PluginStartupTasks,
@@ -239,6 +235,7 @@ impl MessageProcessor {
             session_source,
             auth_manager,
             installation_id,
+            code_mode_session_provider,
             rpc_transport,
             remote_control_handle,
             plugin_startup_tasks,
@@ -259,7 +256,7 @@ impl MessageProcessor {
         );
         let goal_service = Arc::new(GoalService::new());
         let thread_manager = Arc::new_cyclic(|thread_manager| {
-            ThreadManager::new(
+            let manager = ThreadManager::new(
                 config.as_ref(),
                 auth_manager.clone(),
                 codex_core::build_models_manager(config.as_ref(), auth_manager.clone()),
@@ -280,6 +277,8 @@ impl MessageProcessor {
                         goal_service: Arc::clone(&goal_service),
                         environment_manager: Arc::clone(&environment_manager_for_extensions),
                         executor_skill_provider: Arc::clone(&executor_skill_provider),
+                        git_attribution_base_url: config.chatgpt_base_url.clone(),
+                        http_client_factory: config.http_client_factory(),
                         thread_store: Arc::clone(&thread_store),
                     },
                 ),
@@ -298,7 +297,11 @@ impl MessageProcessor {
                     outgoing.clone(),
                     thread_state_manager.clone(),
                 )),
-            )
+            );
+            match code_mode_session_provider {
+                Some(provider) => manager.with_code_mode_session_provider(provider),
+                None => manager,
+            }
         });
         let models_manager = thread_manager.get_models_manager();
         let models_refresh_worker =
@@ -306,7 +309,11 @@ impl MessageProcessor {
         thread_manager
             .plugins_manager()
             .set_analytics_events_client(analytics_events_client.clone());
-        let skills_watcher = SkillsWatcher::new(thread_manager.skills_service(), outgoing.clone());
+        let skills_watcher = SkillsWatcher::new(
+            thread_manager.skills_service(),
+            &config.codex_home,
+            outgoing.clone(),
+        );
 
         let pending_thread_unloads = Arc::new(Mutex::new(HashSet::new()));
         let thread_watch_manager =
@@ -543,7 +550,7 @@ impl MessageProcessor {
             Arc::clone(&self.outgoing),
             request_context.clone(),
             async {
-                let codex_request = deserialize_client_request(&request);
+                let codex_request = deserialize_client_request(request);
                 let result = match codex_request {
                     Ok(codex_request) => {
                         // Websocket callers finalize outbound readiness in lib.rs after mirroring
@@ -900,6 +907,11 @@ impl MessageProcessor {
                 .import(request_id.clone(), params)
                 .await
                 .map(|()| None),
+            ClientRequest::ExternalAgentConfigImportHistoryRecord { params, .. } => self
+                .external_agent_config_processor
+                .record_import_history(params)
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ExternalAgentConfigImportHistoriesRead { .. } => self
                 .external_agent_config_processor
                 .read_import_histories()

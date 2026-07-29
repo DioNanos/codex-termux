@@ -414,8 +414,14 @@ else
   fail
 fi
 
-printf "Bazel patch inventory present: "
-if [ -f patches/windows-link.patch ] && [ -f patches/aws-lc-sys_memcmp_check.patch ]; then
+printf "Bazel patch/integration inventory present: "
+# rust-v0.146.0 moves AWS-LC from the fork-specific crate patch to the upstream
+# BCR/rules_rs integration. Keep the Windows linker patch, and assert the new
+# explicit aws-lc dependency, additive build file, and injected repository.
+if [ -f patches/windows-link.patch ] \
+  && grep -q 'bazel_dep(name = "aws-lc"' MODULE.bazel \
+  && grep -q '@rules_rs//3rd_party/aws-lc-sys:additive.BUILD.bazel' MODULE.bazel \
+  && grep -q 'inject_repo(crate, "aws-lc")' MODULE.bazel; then
   pass
 else
   fail

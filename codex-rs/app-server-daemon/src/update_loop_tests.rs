@@ -1,5 +1,6 @@
 use pretty_assertions::assert_eq;
 
+use super::install_latest_standalone;
 use super::update_modes_for_identities;
 use crate::RestartMode;
 use crate::UpdaterRefreshMode;
@@ -28,4 +29,13 @@ fn changed_updater_forces_refresh_even_when_version_may_match() {
             UpdaterRefreshMode::ReexecIfManagedBinaryChanged,
         )
     );
+}
+
+#[tokio::test]
+async fn standalone_installer_is_intentionally_a_noop() {
+    // Termux packages update through the fork-owned release channel. The
+    // upstream standalone installer must never fetch or execute here.
+    install_latest_standalone()
+        .await
+        .expect("Termux standalone updater must fail closed as a no-op");
 }

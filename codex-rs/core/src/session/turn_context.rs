@@ -1,6 +1,8 @@
 use super::*;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::shell_snapshot::ShellSnapshotFile;
+use codex_core_plugins::PluginCommandAttribution;
+use codex_core_plugins::TrustedPluginRoots;
 use codex_core_skills::HostSkillsSnapshot;
 use codex_file_system::FileSystemSandboxContext;
 use codex_model_provider::SharedModelProvider;
@@ -162,11 +164,6 @@ enum TurnMultiAgentRuntime {
 }
 
 impl TurnContext {
-    pub(crate) fn item_ids_enabled(&self) -> bool {
-        self.config.features.enabled(Feature::ItemIds)
-            || matches!(self.history_mode, ThreadHistoryMode::Paginated)
-    }
-
     pub(crate) fn collaboration_mode(&self) -> CollaborationMode {
         CollaborationMode {
             mode: self.mode,
@@ -176,6 +173,16 @@ impl TurnContext {
                 developer_instructions: self.collaboration_mode_developer_instructions.clone(),
             },
         }
+    }
+
+    pub(crate) fn plugin_attribution_for_command(
+        &self,
+        command: &[String],
+        cwd: &AbsolutePathBuf,
+    ) -> Option<PluginCommandAttribution> {
+        self.extension_data
+            .get::<TrustedPluginRoots>()?
+            .resolve_attribution(command, cwd)
     }
 
     pub(crate) fn permission_profile(&self) -> PermissionProfile {
@@ -353,6 +360,7 @@ impl TurnContext {
                 .config
                 .permissions
                 .windows_sandbox_private_desktop,
+            windows_sandbox_proxy_settings_mode: None,
             use_legacy_landlock: self.config.features.use_legacy_landlock(),
         }
     }
@@ -394,7 +402,7 @@ impl TurnContext {
             personality: self.personality,
             collaboration_mode: Some(self.collaboration_mode()),
             multi_agent_version: Some(self.multi_agent_version),
-            multi_agent_mode: super::multi_agents::effective_multi_agent_mode(self),
+            multi_agent_mode: None,
             realtime_active: Some(self.realtime_active),
             effort: self.reasoning_effort.clone(),
             summary: ReasoningSummaryConfig::Auto,
@@ -608,6 +616,7 @@ impl Session {
             let mut state = self.state.lock().await;
             match state.session_configuration.clone().apply(&updates) {
                 Ok(next) => {
+                    let mcp_inputs_changed = state.session_configuration.mcp_inputs_differ(&next);
                     let previous_permission_profile =
                         state.session_configuration.permission_profile();
                     let next_permission_profile = next.permission_profile();
@@ -623,9 +632,13 @@ impl Session {
                             .turn_environments
                             .update_selections(next.environment_selections());
                     }
+                    if mcp_inputs_changed {
+                        self.mark_mcp_runtime_dirty();
+                    }
                     state.session_configuration = next.clone();
                     Ok((
                         next,
+                        mcp_inputs_changed,
                         permission_profile_changed,
                         previous_config,
                         new_config,
@@ -635,29 +648,36 @@ impl Session {
             }
         };
 
-        let (session_configuration, permission_profile_changed, previous_config, new_config) =
-            match update_result {
-                Ok(update) => update,
-                Err(err) => {
-                    let message = err.to_string();
-                    self.send_event_raw(Event {
-                        id: sub_id.clone(),
-                        msg: EventMsg::Error(ErrorEvent {
-                            message: message.clone(),
-                            codex_error_info: Some(CodexErrorInfo::BadRequest),
-                        }),
-                    })
-                    .await;
-                    return Err(CodexErr::InvalidRequest(message));
-                }
-            };
+        let (
+            session_configuration,
+            mcp_inputs_changed,
+            permission_profile_changed,
+            previous_config,
+            new_config,
+        ) = match update_result {
+            Ok(update) => update,
+            Err(err) => {
+                let message = err.to_string();
+                self.send_event_raw(Event {
+                    id: sub_id.clone(),
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: message.clone(),
+                        codex_error_info: Some(CodexErrorInfo::BadRequest),
+                    }),
+                })
+                .await;
+                return Err(CodexErr::InvalidRequest(message));
+            }
+        };
         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
+        if mcp_inputs_changed {
+            self.schedule_mcp_prewarm();
+        }
 
         if permission_profile_changed {
             self.refresh_managed_network_proxy_for_current_permission_profile()
                 .await;
         }
-
         Ok(self
             .new_turn_from_configuration(
                 sub_id,
@@ -678,6 +698,7 @@ impl Session {
             session_configuration,
             final_output_json_schema,
             TurnMultiAgentRuntime::ResolveAndStore,
+            self.git_enrichment_policy,
         )
         .await
     }
@@ -692,6 +713,7 @@ impl Session {
             session_configuration,
             /*final_output_json_schema*/ None,
             TurnMultiAgentRuntime::Preview,
+            GitEnrichmentPolicy::Skip,
         )
         .await
     }
@@ -703,6 +725,7 @@ impl Session {
         session_configuration: SessionConfiguration,
         final_output_json_schema: Option<Option<Value>>,
         multi_agent_runtime: TurnMultiAgentRuntime,
+        git_enrichment_policy: GitEnrichmentPolicy,
     ) -> Arc<TurnContext> {
         let turn_environments = self.services.turn_environments.snapshot().await;
         let primary_turn_environment = turn_environments.primary();
@@ -713,14 +736,6 @@ impl Session {
             .and_then(|turn_environment| turn_environment.cwd().to_abs_path().ok())
             .unwrap_or_else(|| session_configuration.cwd().clone());
         let per_turn_config = Self::build_per_turn_config(&session_configuration, cwd.clone());
-        {
-            let mcp_runtime = self.services.latest_mcp_runtime();
-            let mcp_connection_manager = mcp_runtime.manager();
-            mcp_connection_manager.set_approval_policy(&session_configuration.approval_policy);
-            mcp_connection_manager
-                .set_permission_profile(session_configuration.permission_profile());
-        }
-
         let model_info = self
             .services
             .models_manager
@@ -748,6 +763,10 @@ impl Session {
             .plugins_manager
             .plugins_for_config(&plugins_input)
             .await;
+        let trusted_plugin_roots = TrustedPluginRoots::from_plugin_load_outcome(
+            &plugin_outcome,
+            per_turn_config.codex_home.as_path(),
+        );
         let effective_skill_roots = plugin_outcome.effective_plugin_skill_roots();
         let plugin_skill_snapshots = self
             .services
@@ -791,16 +810,18 @@ impl Session {
             sub_id,
             skills_snapshot,
         );
+        turn_context.extension_data.insert(trusted_plugin_roots);
         turn_context.realtime_active = self.conversation.running_state().await.is_some();
 
         if let Some(final_schema) = final_output_json_schema {
             turn_context.final_output_json_schema = final_schema;
         }
         let turn_context = Arc::new(turn_context);
-        if turn_context
-            .environments
-            .single_local_environment_cwd()
-            .is_some()
+        if git_enrichment_policy == GitEnrichmentPolicy::Fresh
+            && turn_context
+                .environments
+                .single_local_environment_cwd()
+                .is_some()
         {
             turn_context.turn_metadata_state.spawn_git_enrichment_task();
         }

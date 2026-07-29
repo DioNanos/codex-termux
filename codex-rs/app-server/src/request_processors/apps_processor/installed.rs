@@ -6,13 +6,17 @@ use codex_connectors::connector_tool_is_synthetic;
 use codex_connectors::installed_connector_runtime;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::MCP_TOOL_CODEX_APPS_META_KEY;
-use codex_mcp::McpConnectionManager;
+use codex_mcp::McpRuntime;
+use codex_mcp::McpRuntimeInput;
 use codex_mcp::ToolInfo;
 use codex_mcp::effective_mcp_servers;
 use codex_mcp::host_owned_codex_apps_enabled;
 use codex_mcp::tool_is_model_visible;
-use codex_mcp::tool_plugin_provenance;
 use codex_protocol::models::PermissionProfile;
+
+#[cfg(test)]
+#[path = "installed_tests.rs"]
+mod tests;
 
 const CONNECTOR_RUNTIME_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 const APPS_INSTALLED_SUBMIT_ID: &str = "app-installed";
@@ -20,6 +24,11 @@ const APPS_INSTALLED_RESPONSE_BYTES_METRIC: &str = "codex.apps.installed.respons
 const APPS_INSTALLED_CONNECTOR_COUNT_METRIC: &str = "codex.apps.installed.connector_count";
 const APPS_INSTALLED_TOOL_COUNT_METRIC: &str = "codex.apps.installed.tool_count";
 const APPS_SNAPSHOT_AGE_METRIC: &str = "codex.apps.snapshot.age_ms";
+
+struct AppsInstalledSnapshotMetrics {
+    age: Option<Duration>,
+    tool_count: usize,
+}
 
 impl AppsRequestProcessor {
     pub(crate) async fn apps_installed(
@@ -52,7 +61,10 @@ impl AppsRequestProcessor {
             let runtime_enabled = apps_enabled && workspace_enabled;
 
             let mcp_manager = self.thread_manager.mcp_manager();
-            let mcp_config = mcp_manager.runtime_config(&config).await;
+            let mut mcp_config = mcp_manager.runtime_config(&config).await;
+            // Installed-app discovery has no active turn or reviewer.
+            mcp_config.permission_profile = PermissionProfile::default();
+            let mcp_config = Arc::new(mcp_config);
             let mut mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
             mcp_servers.retain(|name, _| name == CODEX_APPS_MCP_SERVER_NAME);
             let cache_key = connector_runtime_context_key(auth.as_ref());
@@ -67,8 +79,7 @@ impl AppsRequestProcessor {
                     );
                     let startup_timeout = mcp_servers
                         .get(CODEX_APPS_MCP_SERVER_NAME)
-                        .and_then(|server| server.configured_config())
-                        .and_then(|config| config.startup_timeout_sec)
+                        .and_then(|server| server.config().startup_timeout_sec)
                         .unwrap_or(CONNECTOR_RUNTIME_REFRESH_TIMEOUT);
                     let runtime_context = McpRuntimeContext::new(
                         self.thread_manager.environment_manager(),
@@ -78,34 +89,31 @@ impl AppsRequestProcessor {
                     let codex_apps_auth_manager =
                         host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
                             .then(|| Arc::clone(&self.auth_manager));
-                    let connection_manager = McpConnectionManager::new(
-                        &mcp_servers,
-                        config.mcp_oauth_credentials_store_mode,
-                        config.auth_keyring_backend_kind(),
-                        &config.permissions.approval_policy,
-                        APPS_INSTALLED_SUBMIT_ID.to_string(),
-                        /*tx_event*/ None,
-                        cancellation_token.clone(),
-                        PermissionProfile::default(),
+                    let runtime = McpRuntime::new(McpRuntimeInput {
+                        config: Arc::clone(&mcp_config),
+                        plugins_available: false,
+                        ready_selected_capability_roots: Vec::new(),
+                        mcp_servers,
+                        submit_id: APPS_INSTALLED_SUBMIT_ID.to_string(),
+                        tx_event: None,
+                        startup_cancellation_token: cancellation_token.clone(),
                         runtime_context,
-                        mcp_config.codex_home.clone(),
-                        mcp_manager.codex_apps_tools_cache(),
-                        mcp_manager.tool_catalog_cache(),
-                        cache_key.clone(),
-                        mcp_config.prefix_mcp_tool_names,
-                        mcp_config.client_elicitation_capability.clone(),
-                        /*supports_openai_form_elicitation*/ false,
-                        tool_plugin_provenance(&mcp_config),
-                        auth.as_ref(),
+                        codex_apps_tools_cache: mcp_manager.codex_apps_tools_cache(),
+                        tool_catalog_cache: mcp_manager.tool_catalog_cache(),
+                        codex_apps_tools_cache_key: cache_key.clone(),
+                        supports_openai_form_elicitation: false,
+                        auth: auth.clone(),
                         codex_apps_auth_manager,
-                        /*elicitation_reviewer*/ None,
-                        /*elicitation_lifecycle*/ None,
-                        codex_mcp::ElicitationRequestRouter::default(),
-                    )
+                        elicitation_reviewer: None,
+                        elicitation_lifecycle: None,
+                    })
                     .await;
 
-                    let result = if connection_manager
-                        .wait_for_server_ready(CODEX_APPS_MCP_SERVER_NAME, startup_timeout)
+                    let result = if runtime
+                        .latest_wait_for_server_ready(
+                            CODEX_APPS_MCP_SERVER_NAME,
+                            startup_timeout,
+                        )
                         .await
                     {
                         mcp_manager
@@ -122,7 +130,7 @@ impl AppsRequestProcessor {
                         ))
                     };
                     cancellation_token.cancel();
-                    connection_manager.shutdown().await;
+                    runtime.shutdown().await;
                     result
                 }
                 .await;
@@ -173,15 +181,20 @@ impl AppsRequestProcessor {
         }
         .await;
 
-        record_apps_installed_metrics(
-            started_at,
-            force_refresh,
-            retained_previous_snapshot,
-            refresh_disposition,
-            snapshot_age,
-            snapshot_tool_count,
-            result.as_ref().ok(),
-        );
+        if let Some(metrics) = codex_otel::global() {
+            record_apps_installed_metrics(
+                &metrics,
+                started_at,
+                force_refresh,
+                retained_previous_snapshot,
+                refresh_disposition,
+                AppsInstalledSnapshotMetrics {
+                    age: snapshot_age,
+                    tool_count: snapshot_tool_count,
+                },
+                result.as_ref().ok(),
+            );
+        }
         result
     }
 
@@ -221,23 +234,18 @@ fn connector_runtime_tool(tool: &ToolInfo) -> ConnectorRuntimeTool<'_> {
 }
 
 fn record_apps_installed_metrics(
+    metrics: &codex_otel::MetricsClient,
     started_at: Instant,
     force_refresh: bool,
     retained_previous_snapshot: bool,
     refresh_disposition: &'static str,
-    snapshot_age: Option<Duration>,
-    snapshot_tool_count: usize,
+    snapshot_metrics: AppsInstalledSnapshotMetrics,
     response: Option<&AppsInstalledResponse>,
 ) {
-    let Some(metrics) = codex_otel::global() else {
+    let Some(response) = response else {
         return;
     };
     let force_refresh = if force_refresh { "true" } else { "false" };
-    let outcome = if response.is_some() {
-        "success"
-    } else {
-        "error"
-    };
     let retained_previous_snapshot = if retained_previous_snapshot {
         "true"
     } else {
@@ -247,16 +255,14 @@ fn record_apps_installed_metrics(
         APPS_INSTALLED_DURATION_METRIC,
         started_at.elapsed(),
         &[
-            ("path", "new"),
+            ("path", "installed"),
+            ("reload", force_refresh),
             ("force_refresh", force_refresh),
             ("refresh", refresh_disposition),
-            ("outcome", outcome),
+            ("outcome", "success"),
             ("retained_previous_snapshot", retained_previous_snapshot),
         ],
     );
-    let Some(response) = response else {
-        return;
-    };
     if let Ok(bytes) = serde_json::to_vec(response) {
         let _ = metrics.histogram(
             APPS_INSTALLED_RESPONSE_BYTES_METRIC,
@@ -271,10 +277,10 @@ fn record_apps_installed_metrics(
     );
     let _ = metrics.histogram(
         APPS_INSTALLED_TOOL_COUNT_METRIC,
-        i64::try_from(snapshot_tool_count).unwrap_or(i64::MAX),
+        i64::try_from(snapshot_metrics.tool_count).unwrap_or(i64::MAX),
         &[("path", "new")],
     );
-    if let Some(snapshot_age) = snapshot_age {
+    if let Some(snapshot_age) = snapshot_metrics.age {
         let _ = metrics.record_duration(
             APPS_SNAPSHOT_AGE_METRIC,
             snapshot_age,

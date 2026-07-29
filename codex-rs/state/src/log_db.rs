@@ -59,6 +59,7 @@ pub fn default_filter() -> Targets {
         .with_target("codex_otel.trace_safe", LevelFilter::OFF)
         .with_target("rmcp::service", LevelFilter::INFO)
         .with_target("codex_api::responses_websocket_timing", LevelFilter::OFF)
+        .with_target("codex_core::post_sampling_token_estimate", LevelFilter::OFF)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -492,6 +493,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
     use tracing_subscriber::filter::Targets;
     use tracing_subscriber::fmt::writer::MakeWriter;
@@ -582,9 +584,12 @@ mod tests {
     #[tokio::test]
     async fn sqlite_feedback_logs_match_feedback_formatter_shape() {
         let codex_home = temp_codex_home();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
         let writer = SharedWriter::default();
         let layer = start(runtime.clone());
 
@@ -640,9 +645,12 @@ mod tests {
     #[tokio::test]
     async fn flush_persists_logs_for_query() {
         let codex_home = temp_codex_home();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
         let layer = start(runtime.clone());
 
         let guard = tracing_subscriber::registry()
@@ -671,9 +679,12 @@ mod tests {
     #[tokio::test]
     async fn configured_batch_size_flushes_without_explicit_flush() {
         let codex_home = temp_codex_home();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
         let layer = LogDbLayer::start_with_config(
             runtime.clone(),
             LogSinkQueueConfig {
@@ -720,9 +731,12 @@ mod tests {
     #[tokio::test]
     async fn configured_flush_interval_persists_buffered_logs() {
         let codex_home = temp_codex_home();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
         let layer = LogDbLayer::start_with_config(
             runtime.clone(),
             LogSinkQueueConfig {

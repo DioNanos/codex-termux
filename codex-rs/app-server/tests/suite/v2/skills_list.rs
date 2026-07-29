@@ -1,26 +1,27 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::Context;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
+use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_repeating_assistant;
-use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
-use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
+use codex_app_server_protocol::ConfigBatchWriteParams;
+use codex_app_server_protocol::ConfigEdit;
+use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetResponse;
-use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::PluginListParams;
 use codex_app_server_protocol::PluginListResponse;
-use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SkillsChangedNotification;
 use codex_app_server_protocol::SkillsExtraRootsSetParams;
 use codex_app_server_protocol::SkillsExtraRootsSetResponse;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadStartParams;
+use codex_app_server_protocol::ThreadStartResponse;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -51,15 +52,8 @@ async fn expect_skills_changed_notification(
     mcp: &mut TestAppServer,
     timeout_duration: Duration,
 ) -> Result<()> {
-    let notification = timeout(
-        timeout_duration,
-        mcp.read_stream_until_notification_message("skills/changed"),
-    )
-    .await??;
-    let params = notification
-        .params
-        .context("skills/changed params must be present")?;
-    let notification: SkillsChangedNotification = serde_json::from_value(params)?;
+    let notification: SkillsChangedNotification =
+        timeout(timeout_duration, mcp.read_notification("skills/changed")).await??;
     assert_eq!(notification, SkillsChangedNotification {});
     Ok(())
 }
@@ -190,21 +184,16 @@ enabled = true
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let disablement_request_id = mcp
         .send_experimental_feature_enablement_set_request(ExperimentalFeatureEnablementSetParams {
             enablement: BTreeMap::from([("remote_plugin".to_string(), false)]),
         })
         .await?;
-    let disablement_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(disablement_request_id)),
-    )
-    .await??;
-    let _: ExperimentalFeatureEnablementSetResponse = to_response(disablement_response)?;
+    let _: ExperimentalFeatureEnablementSetResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(disablement_request_id)).await??;
 
     let initial_skills_list_request_id = mcp
         .send_skills_list_request(SkillsListParams {
@@ -212,12 +201,11 @@ enabled = true
             force_reload: true,
         })
         .await?;
-    let initial_skills_list_response: JSONRPCResponse = timeout(
+    let SkillsListResponse { data } = timeout(
         DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(initial_skills_list_request_id)),
+        mcp.read_response(initial_skills_list_request_id),
     )
     .await??;
-    let SkillsListResponse { data } = to_response(initial_skills_list_response)?;
     assert!(data.iter().any(|entry| {
         entry
             .skills
@@ -230,12 +218,8 @@ enabled = true
             enablement: BTreeMap::from([("remote_plugin".to_string(), true)]),
         })
         .await?;
-    let enablement_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(enablement_request_id)),
-    )
-    .await??;
-    let _: ExperimentalFeatureEnablementSetResponse = to_response(enablement_response)?;
+    let _: ExperimentalFeatureEnablementSetResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(enablement_request_id)).await??;
 
     let skills_list_request_id = mcp
         .send_skills_list_request(SkillsListParams {
@@ -243,12 +227,8 @@ enabled = true
             force_reload: true,
         })
         .await?;
-    let skills_list_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(skills_list_request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data } = to_response(skills_list_response)?;
+    let SkillsListResponse { data } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(skills_list_request_id)).await??;
 
     assert!(data.iter().all(|entry| {
         entry
@@ -350,9 +330,8 @@ async fn skills_list_loads_remote_installed_plugin_skills_from_cache() -> Result
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let stale_skills_list_request_id = mcp
         .send_skills_list_request(SkillsListParams {
@@ -360,12 +339,11 @@ async fn skills_list_loads_remote_installed_plugin_skills_from_cache() -> Result
             force_reload: true,
         })
         .await?;
-    let stale_skills_list_response: JSONRPCResponse = timeout(
+    let SkillsListResponse { data } = timeout(
         DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(stale_skills_list_request_id)),
+        mcp.read_response(stale_skills_list_request_id),
     )
     .await??;
-    let SkillsListResponse { data } = to_response(stale_skills_list_response)?;
     assert_eq!(data.len(), 1);
     assert!(
         data[0]
@@ -394,14 +372,11 @@ async fn skills_list_loads_remote_installed_plugin_skills_from_cache() -> Result
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
-    let plugin_list_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(plugin_list_request_id)),
-    )
-    .await??;
-    let _: PluginListResponse = to_response(plugin_list_response)?;
+    let _: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(plugin_list_request_id)).await??;
 
     let SkillsListResponse { data } = timeout(DEFAULT_TIMEOUT, async {
         loop {
@@ -411,12 +386,8 @@ async fn skills_list_loads_remote_installed_plugin_skills_from_cache() -> Result
                     force_reload: false,
                 })
                 .await?;
-            let skills_list_response: JSONRPCResponse = timeout(
-                DEFAULT_TIMEOUT,
-                mcp.read_stream_until_response_message(RequestId::Integer(skills_list_request_id)),
-            )
-            .await??;
-            let response: SkillsListResponse = to_response(skills_list_response)?;
+            let response: SkillsListResponse =
+                timeout(DEFAULT_TIMEOUT, mcp.read_response(skills_list_request_id)).await??;
             if response.data.iter().any(|entry| {
                 entry
                     .skills
@@ -480,9 +451,8 @@ async fn skills_list_excludes_plugin_skills_when_workspace_codex_plugins_disable
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .without_managed_config()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
         .send_skills_list_request(SkillsListParams {
@@ -491,12 +461,8 @@ async fn skills_list_excludes_plugin_skills_when_workspace_codex_plugins_disable
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data } = to_response(response)?;
+    let SkillsListResponse { data } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(data.len(), 1);
     assert!(
         data[0]
@@ -531,9 +497,8 @@ async fn skills_list_skips_cwd_roots_when_environment_disabled() -> Result<()> {
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .with_env_overrides(&[(CODEX_EXEC_SERVER_URL_ENV_VAR, Some("none"))])
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
         .send_skills_list_request(SkillsListParams {
@@ -542,12 +507,8 @@ async fn skills_list_skips_cwd_roots_when_environment_disabled() -> Result<()> {
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data } = to_response(response)?;
+    let SkillsListResponse { data } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(data.len(), 1);
     assert_eq!(data[0].cwd, cwd.path().to_path_buf());
     assert_eq!(data[0].errors, Vec::new());
@@ -575,9 +536,8 @@ async fn skills_list_accepts_relative_cwds() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
         .send_skills_list_request(SkillsListParams {
@@ -586,12 +546,8 @@ async fn skills_list_accepts_relative_cwds() -> Result<()> {
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data } = to_response(response)?;
+    let SkillsListResponse { data } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(data.len(), 1);
     assert_eq!(data[0].cwd, relative_cwd);
     assert_eq!(data[0].errors, Vec::new());
@@ -607,9 +563,8 @@ async fn skills_list_preserves_requested_cwd_order() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
         .send_skills_list_request(SkillsListParams {
@@ -621,12 +576,8 @@ async fn skills_list_preserves_requested_cwd_order() -> Result<()> {
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data } = to_response(response)?;
+    let SkillsListResponse { data } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(
         data.iter()
             .map(|entry| entry.cwd.clone())
@@ -640,16 +591,16 @@ async fn skills_list_preserves_requested_cwd_order() -> Result<()> {
 }
 
 #[tokio::test]
-async fn skills_list_uses_cached_result_until_force_reload() -> Result<()> {
+async fn skills_list_uses_cached_result_after_session_default_writes_until_force_reload()
+-> Result<()> {
     let codex_home = TempDir::new()?;
     let cwd = TempDir::new()?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     // Seed the cwd cache before the cwd-local skill exists.
     let first_request_id = mcp
@@ -658,12 +609,8 @@ async fn skills_list_uses_cached_result_until_force_reload() -> Result<()> {
             force_reload: false,
         })
         .await?;
-    let first_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(first_request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data: first_data } = to_response(first_response)?;
+    let SkillsListResponse { data: first_data } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(first_request_id)).await??;
     assert_eq!(first_data.len(), 1);
     assert!(
         first_data[0]
@@ -679,18 +626,55 @@ async fn skills_list_uses_cached_result_until_force_reload() -> Result<()> {
         "---\nname: late-extra-skill\ndescription: late skill\n---\n\n# Body\n",
     )?;
 
+    for edits in [
+        vec![ConfigEdit {
+            key_path: "plan_mode_reasoning_effort".to_string(),
+            value: serde_json::json!("high"),
+            merge_strategy: MergeStrategy::Replace,
+        }],
+        vec![ConfigEdit {
+            key_path: "service_tier".to_string(),
+            value: serde_json::json!("fast"),
+            merge_strategy: MergeStrategy::Replace,
+        }],
+        vec![ConfigEdit {
+            key_path: "personality".to_string(),
+            value: serde_json::json!("friendly"),
+            merge_strategy: MergeStrategy::Replace,
+        }],
+        vec![
+            ConfigEdit {
+                key_path: "model".to_string(),
+                value: serde_json::json!("gpt-5.4"),
+                merge_strategy: MergeStrategy::Replace,
+            },
+            ConfigEdit {
+                key_path: "model_reasoning_effort".to_string(),
+                value: serde_json::json!("high"),
+                merge_strategy: MergeStrategy::Replace,
+            },
+        ],
+    ] {
+        let write_id = mcp
+            .send_config_batch_write_request(ConfigBatchWriteParams {
+                edits,
+                file_path: None,
+                expected_version: None,
+                reload_user_config: true,
+            })
+            .await?;
+        let _: ConfigWriteResponse =
+            timeout(DEFAULT_TIMEOUT, mcp.read_response(write_id)).await??;
+    }
+
     let second_request_id = mcp
         .send_skills_list_request(SkillsListParams {
             cwds: vec![cwd.path().to_path_buf()],
             force_reload: false,
         })
         .await?;
-    let second_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(second_request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data: second_data } = to_response(second_response)?;
+    let SkillsListResponse { data: second_data } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(second_request_id)).await??;
     assert_eq!(second_data.len(), 1);
     assert!(
         second_data[0]
@@ -705,12 +689,8 @@ async fn skills_list_uses_cached_result_until_force_reload() -> Result<()> {
             force_reload: true,
         })
         .await?;
-    let third_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(third_request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data: third_data } = to_response(third_response)?;
+    let SkillsListResponse { data: third_data } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(third_request_id)).await??;
     assert_eq!(third_data.len(), 1);
     assert!(
         third_data[0]
@@ -737,21 +717,16 @@ async fn skills_extra_roots_set_updates_process_runtime_roots() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let set_request_id = mcp
         .send_skills_extra_roots_set_request(SkillsExtraRootsSetParams {
             extra_roots: vec![AbsolutePathBuf::from_absolute_path(&extra_skills_root)?],
         })
         .await?;
-    let set_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(set_request_id)),
-    )
-    .await??;
-    let _: SkillsExtraRootsSetResponse = to_response(set_response)?;
+    let _: SkillsExtraRootsSetResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(set_request_id)).await??;
     expect_skills_changed_notification(&mut mcp, DEFAULT_TIMEOUT).await?;
 
     let skills_request_id = mcp
@@ -760,12 +735,8 @@ async fn skills_extra_roots_set_updates_process_runtime_roots() -> Result<()> {
             force_reload: false,
         })
         .await?;
-    let skills_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(skills_request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data } = to_response(skills_response)?;
+    let SkillsListResponse { data } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(skills_request_id)).await??;
     assert_eq!(data.len(), 1);
     assert_eq!(data[0].errors, Vec::new());
     assert!(
@@ -781,12 +752,8 @@ async fn skills_extra_roots_set_updates_process_runtime_roots() -> Result<()> {
             extra_roots: vec![AbsolutePathBuf::from_absolute_path(&missing_root)?],
         })
         .await?;
-    let reset_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(reset_request_id)),
-    )
-    .await??;
-    let _: SkillsExtraRootsSetResponse = to_response(reset_response)?;
+    let _: SkillsExtraRootsSetResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(reset_request_id)).await??;
     expect_skills_changed_notification(&mut mcp, DEFAULT_TIMEOUT).await?;
 
     let skills_request_id = mcp
@@ -795,12 +762,8 @@ async fn skills_extra_roots_set_updates_process_runtime_roots() -> Result<()> {
             force_reload: false,
         })
         .await?;
-    let skills_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(skills_request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data } = to_response(skills_response)?;
+    let SkillsListResponse { data } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(skills_request_id)).await??;
     assert_eq!(data.len(), 1);
     assert_eq!(data[0].errors, Vec::new());
     assert!(
@@ -815,12 +778,8 @@ async fn skills_extra_roots_set_updates_process_runtime_roots() -> Result<()> {
             extra_roots: Vec::new(),
         })
         .await?;
-    let clear_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(clear_request_id)),
-    )
-    .await??;
-    let _: SkillsExtraRootsSetResponse = to_response(clear_response)?;
+    let _: SkillsExtraRootsSetResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(clear_request_id)).await??;
     expect_skills_changed_notification(&mut mcp, DEFAULT_TIMEOUT).await?;
     let skills_request_id = mcp
         .send_skills_list_request(SkillsListParams {
@@ -828,12 +787,8 @@ async fn skills_extra_roots_set_updates_process_runtime_roots() -> Result<()> {
             force_reload: false,
         })
         .await?;
-    let skills_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(skills_request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data } = to_response(skills_response)?;
+    let SkillsListResponse { data } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(skills_request_id)).await??;
     assert_eq!(data.len(), 1);
     assert_eq!(data[0].errors, Vec::new());
     assert!(
@@ -847,21 +802,16 @@ async fn skills_extra_roots_set_updates_process_runtime_roots() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
     let skills_request_id = mcp
         .send_skills_list_request(SkillsListParams {
             cwds: vec![cwd.path().to_path_buf()],
             force_reload: false,
         })
         .await?;
-    let skills_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(skills_request_id)),
-    )
-    .await??;
-    let SkillsListResponse { data } = to_response(skills_response)?;
+    let SkillsListResponse { data } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(skills_request_id)).await??;
     assert_eq!(data.len(), 1);
     assert_eq!(data[0].errors, Vec::new());
     assert!(
@@ -883,30 +833,26 @@ async fn skills_changed_notification_is_emitted_after_skill_change() -> Result<(
 
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    write_mock_responses_config_toml_with_chatgpt_base_url(
-        codex_home.path(),
-        &server.uri(),
-        &server.uri(),
-    )?;
+    MockResponsesConfig::new(&server.uri())
+        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
+        .write(codex_home.path())?;
     write_skill(&codex_home, "demo")?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
     let initial_skills_request_id = mcp
         .send_skills_list_request(SkillsListParams {
             cwds: vec![codex_home.path().to_path_buf()],
             force_reload: true,
         })
         .await?;
-    let initial_skills_response: JSONRPCResponse = timeout(
+    let SkillsListResponse { data } = timeout(
         DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(initial_skills_request_id)),
+        mcp.read_response(initial_skills_request_id),
     )
     .await??;
-    let SkillsListResponse { data } = to_response(initial_skills_response)?;
     assert_eq!(data.len(), 1);
     assert!(
         data[0]
@@ -944,11 +890,8 @@ async fn skills_changed_notification_is_emitted_after_skill_change() -> Result<(
             experimental_raw_events: false,
         })
         .await?;
-    let _: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_request_id)),
-    )
-    .await??;
+    let _: ThreadStartResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(thread_start_request_id)).await??;
 
     let skill_path = codex_home
         .path()
@@ -960,29 +903,18 @@ async fn skills_changed_notification_is_emitted_after_skill_change() -> Result<(
         "---\nname: demo\ndescription: updated\n---\n\n# Updated\n",
     )?;
 
-    let notification = timeout(
-        WATCHER_TIMEOUT,
-        mcp.read_stream_until_notification_message("skills/changed"),
-    )
-    .await??;
-    let params = notification
-        .params
-        .context("skills/changed params must be present")?;
-    let notification: SkillsChangedNotification = serde_json::from_value(params)?;
-
-    assert_eq!(notification, SkillsChangedNotification {});
+    expect_skills_changed_notification(&mut mcp, WATCHER_TIMEOUT).await?;
     let updated_skills_request_id = mcp
         .send_skills_list_request(SkillsListParams {
             cwds: vec![codex_home.path().to_path_buf()],
             force_reload: false,
         })
         .await?;
-    let updated_skills_response: JSONRPCResponse = timeout(
+    let SkillsListResponse { data } = timeout(
         DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(updated_skills_request_id)),
+        mcp.read_response(updated_skills_request_id),
     )
     .await??;
-    let SkillsListResponse { data } = to_response(updated_skills_response)?;
     assert_eq!(data.len(), 1);
     assert!(
         data[0]

@@ -59,6 +59,17 @@
         }
       ]
     },
+    "BrowserUseRequirements": {
+      "properties": {
+        "disableAutoReview": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "ComputerUseRequirements": {
       "properties": {
         "allowLockedComputerUse": {
@@ -73,6 +84,12 @@
     "ConfigRequirements": {
       "properties": {
         "allowAppshots": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "allowLoginShell": {
           "type": [
             "boolean",
             "null"
@@ -135,6 +152,22 @@
             "null"
           ]
         },
+        "browserUse": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BrowserUseRequirements"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "checkForUpdateOnStartup": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "computerUse": {
           "anyOf": [
             {
@@ -170,6 +203,28 @@
             "null"
           ]
         },
+        "feedback": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FeedbackRequirements"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "logDir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "modelCatalogJson": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "models": {
           "anyOf": [
             {
@@ -178,6 +233,18 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "sqliteHome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "windowsSandboxPrivateDesktop": {
+          "type": [
+            "boolean",
+            "null"
           ]
         }
       },
@@ -290,6 +357,17 @@
       "required": [
         "hooks"
       ],
+      "type": "object"
+    },
+    "FeedbackRequirements": {
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "ManagedHooksRequirements": {

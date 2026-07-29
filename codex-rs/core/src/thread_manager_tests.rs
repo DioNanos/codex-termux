@@ -31,6 +31,7 @@ use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
 use core_test_support::responses::mount_models_once;
+use core_test_support::responses::strip_response_item_ids_from_json;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -397,12 +398,12 @@ async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let thread_1 = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start first thread")
         .thread_id;
     let thread_2 = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start second thread")
         .thread_id;
@@ -427,18 +428,20 @@ async fn code_mode_session_provider_is_shared_across_threads() {
     config.cwd = config.codex_home.abs();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
 
+    let provider: Arc<dyn CodeModeSessionProvider> = Arc::new(InProcessCodeModeSessionProvider);
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-    );
+    )
+    .with_code_mode_session_provider(Arc::clone(&provider));
     let first = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start first thread");
     let second = manager
-        .start_thread(config)
+        .start_thread(StartThreadOptions::new(config))
         .await
         .expect("start second thread");
 
@@ -455,6 +458,7 @@ async fn code_mode_session_provider_is_shared_across_threads() {
         .code_mode_service
         .session_provider();
     assert!(Arc::ptr_eq(&first_provider, &second_provider));
+    assert!(Arc::ptr_eq(&first_provider, &provider));
     assert!(Arc::ptr_eq(
         &first_provider,
         &manager.state.code_mode_session_provider
@@ -476,6 +480,102 @@ async fn code_mode_session_provider_is_shared_across_threads() {
 }
 
 #[tokio::test]
+async fn mcp_invalidation_refreshes_threads_that_are_still_starting() {
+    struct BlockingThreadStartup {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        refreshed: tokio::sync::Notify,
+        projections: std::sync::atomic::AtomicUsize,
+    }
+
+    impl codex_extension_api::ThreadLifecycleContributor<Config> for BlockingThreadStartup {
+        fn on_thread_start<'a>(
+            &'a self,
+            _input: codex_extension_api::ThreadStartInput<'a, Config>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+            })
+        }
+    }
+
+    impl codex_extension_api::McpServerContributor<Config> for BlockingThreadStartup {
+        fn id(&self) -> &'static str {
+            "starting_mcp_runtime_refresh_test"
+        }
+
+        fn contribute<'a>(
+            &'a self,
+            _context: codex_extension_api::McpServerContributionContext<'a, Config>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::McpServerContribution>>
+        {
+            Box::pin(async move {
+                if self.projections.fetch_add(1, Ordering::AcqRel) != 0 {
+                    self.refreshed.notify_one();
+                }
+                Vec::new()
+            })
+        }
+    }
+
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let observer = Arc::new(BlockingThreadStartup {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        refreshed: tokio::sync::Notify::new(),
+        projections: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.thread_lifecycle_contributor(observer.clone());
+    extensions.mcp_server_contributor(observer.clone());
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = Arc::new(ThreadManager::new(
+        &config,
+        Arc::clone(&auth_manager),
+        build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(extensions.build()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store_from_config(&config, /*state_db*/ None),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    ));
+    let starting = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move { manager.start_thread(StartThreadOptions::new(config)).await }
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), observer.entered.notified())
+        .await
+        .expect("thread should enter its startup lifecycle");
+    assert!(manager.list_thread_ids().await.is_empty());
+    manager.invalidate_mcp_runtimes().await;
+    observer.release.notify_one();
+    starting
+        .await
+        .expect("thread startup task should finish")
+        .expect("thread should start");
+    tokio::time::timeout(Duration::from_secs(5), observer.refreshed.notified())
+        .await
+        .expect("invalidation during startup should refresh the newly published thread");
+    let shutdown = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert!(shutdown.timed_out.is_empty());
+}
+
+#[tokio::test]
 async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
@@ -490,21 +590,12 @@ async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let thread = manager
-        .start_thread_with_options(StartThreadOptions {
-            config,
-            allow_provider_model_fallback: false,
-            initial_history: InitialHistory::New,
-            history_mode: None,
+        .start_thread(StartThreadOptions {
             session_source: Some(SessionSource::Internal(
                 InternalSessionSource::MemoryConsolidation,
             )),
-            thread_source: None,
-            dynamic_tools: Vec::new(),
-            metrics_service_name: None,
-            parent_trace: None,
-            environments: Vec::new(),
-            thread_extension_init: Default::default(),
-            supports_openai_form_elicitation: false,
+            environments: Some(Vec::new()),
+            ..StartThreadOptions::new(config)
         })
         .await
         .expect("internal thread should start");
@@ -643,36 +734,19 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
     };
 
     let first_thread = manager
-        .start_thread_with_options(StartThreadOptions {
-            config: config.clone(),
-            allow_provider_model_fallback: false,
-            initial_history: InitialHistory::New,
-            history_mode: None,
-            session_source: None,
-            thread_source: None,
-            dynamic_tools: Vec::new(),
+        .start_thread(StartThreadOptions {
             metrics_service_name: Some("codex_work_desktop".to_string()),
-            parent_trace: None,
-            environments: Vec::new(),
+            environments: Some(Vec::new()),
             thread_extension_init: selected_root_init("selected-a", "env-a"),
-            supports_openai_form_elicitation: false,
+            ..StartThreadOptions::new(config.clone())
         })
         .await
         .expect("start first thread");
     let second_thread = manager
-        .start_thread_with_options(StartThreadOptions {
-            config: config.clone(),
-            allow_provider_model_fallback: false,
-            initial_history: InitialHistory::New,
-            history_mode: None,
-            session_source: None,
-            thread_source: None,
-            dynamic_tools: Vec::new(),
-            metrics_service_name: None,
-            parent_trace: None,
-            environments: Vec::new(),
+        .start_thread(StartThreadOptions {
+            environments: Some(Vec::new()),
             thread_extension_init: selected_root_init("selected-b", "env-b"),
-            supports_openai_form_elicitation: false,
+            ..StartThreadOptions::new(config.clone())
         })
         .await
         .expect("start second thread");
@@ -782,9 +856,7 @@ async fn selected_capability_roots_round_trip_through_fork() {
         },
     }];
     let inherited = manager
-        .start_thread_with_options(StartThreadOptions {
-            config,
-            allow_provider_model_fallback: false,
+        .start_thread(StartThreadOptions {
             initial_history: InitialHistory::Forked(vec![RolloutItem::SessionMeta(
                 SessionMetaLine {
                     meta: SessionMeta {
@@ -794,15 +866,8 @@ async fn selected_capability_roots_round_trip_through_fork() {
                     git: None,
                 },
             )]),
-            history_mode: None,
-            session_source: None,
-            thread_source: None,
-            dynamic_tools: Vec::new(),
-            metrics_service_name: None,
-            parent_trace: None,
-            environments: Vec::new(),
-            thread_extension_init: Default::default(),
-            supports_openai_form_elicitation: false,
+            environments: Some(Vec::new()),
+            ..StartThreadOptions::new(config)
         })
         .await
         .expect("start inherited fork");
@@ -865,19 +930,9 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
     let mut source_config = config.clone();
     source_config.cwd = selected_cwd.clone();
     let source = manager
-        .start_thread_with_options(StartThreadOptions {
-            config: source_config,
-            allow_provider_model_fallback: false,
-            initial_history: InitialHistory::New,
-            history_mode: None,
-            session_source: None,
-            thread_source: None,
-            dynamic_tools: Vec::new(),
-            metrics_service_name: None,
-            parent_trace: None,
-            environments: environments.clone(),
-            thread_extension_init: Default::default(),
-            supports_openai_form_elicitation: false,
+        .start_thread(StartThreadOptions {
+            environments: Some(environments.clone()),
+            ..StartThreadOptions::new(source_config)
         })
         .await
         .expect("start source thread");
@@ -998,7 +1053,7 @@ async fn explicit_installation_id_skips_codex_home_file() {
     );
 
     let thread = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start thread with explicit installation id");
 
@@ -1041,7 +1096,7 @@ async fn resume_active_thread_from_rollout_returns_running_thread() {
     );
 
     let source = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start source thread");
     source.thread.ensure_rollout_materialized().await;
@@ -1103,7 +1158,7 @@ async fn resume_stopped_thread_from_rollout_spawns_new_thread() {
     );
 
     let source = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start source thread");
     source.thread.ensure_rollout_materialized().await;
@@ -1172,19 +1227,10 @@ async fn resume_stopped_thread_from_rollout_preserves_thread_source() {
     );
 
     let source = manager
-        .start_thread_with_options(StartThreadOptions {
-            config: config.clone(),
-            allow_provider_model_fallback: false,
-            initial_history: InitialHistory::New,
-            history_mode: None,
-            session_source: None,
+        .start_thread(StartThreadOptions {
             thread_source: Some(ThreadSource::User),
-            dynamic_tools: Vec::new(),
-            metrics_service_name: None,
-            parent_trace: None,
-            environments: Vec::new(),
-            thread_extension_init: Default::default(),
-            supports_openai_form_elicitation: false,
+            environments: Some(Vec::new()),
+            ..StartThreadOptions::new(config.clone())
         })
         .await
         .expect("start source thread");
@@ -1313,7 +1359,7 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
     );
 
     let source = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start source thread");
     source
@@ -1782,8 +1828,9 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
         rollout_items
             .iter()
             .filter(|item| {
-                serde_json::to_value(item).expect("serialize rollout item")
-                    == interrupted_marker_json
+                strip_response_item_ids_from_json(
+                    serde_json::to_value(item).expect("serialize rollout item"),
+                ) == interrupted_marker_json
             })
             .count(),
         1,
@@ -1986,8 +2033,9 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
         forked_rollout_items
             .iter()
             .filter(|item| {
-                serde_json::to_value(item).expect("serialize forked rollout item")
-                    == interrupted_marker_json
+                strip_response_item_ids_from_json(
+                    serde_json::to_value(item).expect("serialize forked rollout item"),
+                ) == interrupted_marker_json
             })
             .count(),
         1,
@@ -2021,8 +2069,9 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
         reforked_rollout_items
             .iter()
             .filter(|item| {
-                serde_json::to_value(item).expect("serialize re-forked rollout item")
-                    == interrupted_marker_json
+                strip_response_item_ids_from_json(
+                    serde_json::to_value(item).expect("serialize re-forked rollout item"),
+                ) == interrupted_marker_json
             })
             .count(),
         1,

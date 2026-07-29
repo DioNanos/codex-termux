@@ -4,6 +4,7 @@ use codex_core::ModelClient;
 use codex_core::NewThread;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
+use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
 use codex_core::resolve_installation_id;
 use codex_core::thread_store_from_config;
@@ -71,6 +72,7 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_failed;
 use core_test_support::responses::strip_metadata_from_json;
+use core_test_support::responses::strip_response_item_ids_from_json;
 use core_test_support::responses_metadata as test_responses_metadata;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
@@ -250,7 +252,7 @@ async fn openai_stateless_responses_requests_preserve_item_turn_metadata_across_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn non_openai_responses_requests_omit_item_passthrough_metadata() {
+async fn non_openai_responses_requests_include_item_ids_without_passthrough_metadata() {
     let server = MockServer::start().await;
     let response_mock = mount_sse_once(
         &server,
@@ -299,8 +301,8 @@ async fn non_openai_responses_requests_omit_item_passthrough_metadata() {
             "input item should omit internal chat message metadata passthrough: {item}"
         );
         assert!(
-            item.get("id").is_none(),
-            "input item should omit generated IDs: {item}"
+            item.get("id").and_then(serde_json::Value::as_str).is_some(),
+            "input item should include a generated ID: {item}"
         );
     }
 }
@@ -433,9 +435,7 @@ async fn response_item_ids_persist_across_resume_and_preserve_server_ids() -> an
         ],
     )
     .await;
-    let mut builder = test_codex().with_config(|config| {
-        let _ = config.features.enable(Feature::ItemIds);
-    });
+    let mut builder = test_codex();
     let initial = builder.build(&server).await?;
     let home = Arc::clone(&initial.home);
     let rollout_path = initial
@@ -451,9 +451,6 @@ async fn response_item_ids_persist_across_resume_and_preserve_server_ids() -> an
     })
     .await;
 
-    builder = builder.with_config(|config| {
-        let _ = config.features.enable(Feature::ItemIds);
-    });
     let resumed = builder.resume(&server, home, rollout_path).await?;
     resumed.submit_turn("after resume").await?;
 
@@ -532,9 +529,7 @@ async fn synthetic_call_output_id_is_stable_across_resumes() -> anyhow::Result<(
     )
     .await;
     let codex_home = Arc::new(TempDir::new()?);
-    let mut builder = test_codex().with_config(|config| {
-        let _ = config.features.enable(Feature::ItemIds);
-    });
+    let mut builder = test_codex();
     let first = builder
         .resume(&server, Arc::clone(&codex_home), session_path.clone())
         .await?;
@@ -550,9 +545,6 @@ async fn synthetic_call_output_id_is_stable_across_resumes() -> anyhow::Result<(
         "prompt-only repair should not be persisted to the rollout"
     );
 
-    builder = builder.with_config(|config| {
-        let _ = config.features.enable(Feature::ItemIds);
-    });
     let second = builder.resume(&server, codex_home, session_path).await?;
     second.submit_turn("second resume").await?;
 
@@ -606,7 +598,6 @@ async fn response_item_ids_are_sent_for_all_remote_v2_compaction_requests() -> a
     let test = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
-            let _ = config.features.enable(Feature::ItemIds);
             let _ = config.features.enable(Feature::RemoteCompactionV2);
         })
         .build(&server)
@@ -1459,6 +1450,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     };
 
     send_request_with_provider(provider).await;
@@ -1503,7 +1495,6 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ config.features.enabled(Feature::ItemIds),
         /*concurrent_reasoning_summaries_enabled*/
         config
             .features
@@ -1726,7 +1717,7 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
         AuthCredentialsStoreMode::File,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        &codex_login::test_support::transport_default_auth_route_config(),
     )
     .await
     .expect("Failed to load CodexAuth")
@@ -1752,7 +1743,7 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
         /*external_time_provider*/ None,
     );
     let NewThread { thread: codex, .. } = thread_manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("create new conversation");
 
@@ -2298,10 +2289,12 @@ async fn skills_use_aliases_in_developer_message_under_budget_pressure() {
         .with_config(move |config| {
             config.cwd = codex_home_path.abs();
             let user_config_path = codex_home_path.join("config.toml").abs();
-            config.config_layer_stack = ConfigLayerStack::default().with_user_config(
-                &user_config_path,
-                toml! { skills = { bundled = { enabled = false } } }.into(),
-            );
+            config.config_layer_stack = ConfigLayerStack::default()
+                .with_user_config(
+                    &user_config_path,
+                    toml! { skills = { bundled = { enabled = false } } }.into(),
+                )
+                .expect("skills user config should be valid");
             config.model_context_window = Some(12_000);
         });
     let codex = builder
@@ -3194,6 +3187,7 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     };
 
     let codex_home = TempDir::new().unwrap();
@@ -3234,7 +3228,6 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
@@ -3852,6 +3845,7 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     };
 
     // Init session
@@ -3941,6 +3935,7 @@ async fn env_var_overrides_loaded_auth() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     };
 
     // Init session
@@ -4105,7 +4100,9 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
     let tail_len = r3_tail_expected.as_array().unwrap().len();
     let actual_tail = &r3_input_array[r3_input_array.len() - tail_len..];
     assert_eq!(
-        strip_metadata_from_json(serde_json::Value::Array(actual_tail.to_vec())),
+        strip_response_item_ids_from_json(strip_metadata_from_json(serde_json::Value::Array(
+            actual_tail.to_vec(),
+        ))),
         r3_tail_expected,
         "request 3 tail mismatch",
     );
