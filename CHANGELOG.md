@@ -1,3 +1,22 @@
+# [0.146.1] - 2026-08-07
+
+Candidate Termux release synchronized to upstream OpenAI Codex `rust-v0.146.1`.
+Publication remains gated on the sanitized artifact audit and device validation.
+
+## Changed
+
+- Integrated the upstream `rust-v0.146.1` patch release (backported safer
+  cyber-model auto-review defaults). No fork-owned path was touched by the
+  merge.
+- Bumped the Cargo workspace and npm package versions to `0.146.1`.
+
+## Fixed
+
+- The Android V8 prebuild script now ships the `v8_String_WriteFlags_*`
+  compatibility aliases in the published binding, not only in the checkout used
+  to build it. Consumers fetch that file verbatim, so a prebuild produced from
+  a clean run previously failed the Android build on undeclared symbols.
+
 # [0.146.0] - 2026-07-29
 
 Candidate Termux release synchronized to final upstream OpenAI Codex

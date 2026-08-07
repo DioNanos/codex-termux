@@ -56,7 +56,7 @@ What this fork does not do:
 ## Releases and Updates
 
 - Latest GitHub release: [releases/latest](https://github.com/DioNanos/codex-termux/releases/latest)
-- Upstream base: OpenAI Codex `rust-v0.146.0`. The `0.146.0` Android package
+- Upstream base: OpenAI Codex `rust-v0.146.1`. The `0.146.1` Android package
   follows the exact-artifact release flow; npm dist-tags and GitHub Releases
   are authoritative for current publication status.
 - npm package: [`@mmmbuto/codex-cli-termux`](https://www.npmjs.com/package/@mmmbuto/codex-cli-termux)
@@ -78,7 +78,7 @@ Maintainer publish flow:
 - [Changelog](./CHANGELOG.md)
 - [Patch inventory](./patches/README.md)
 - [Building from source](./BUILDING.md)
-- The 0.146.0 on-device validation summary is pending the release artifact and
+- The 0.146.1 on-device validation summary is pending the release artifact and
   post-build device testing.
 - [Install docs](./docs/install.md)
 - [Authentication](./docs/authentication.md)

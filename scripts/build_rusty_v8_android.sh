@@ -154,6 +154,20 @@ OUT="${REPO_ROOT}/.artifacts/rusty-v8-android-${TAG}"
 mkdir -p "$OUT"
 cp "$A" "${OUT}/librusty_v8_release_aarch64-linux-android.a"
 cp "$B" "${OUT}/src_binding_release_aarch64-linux-android.rs"
+# OBSTACLE 7, second half: the patch above lands in the checkout's src/binding.rs,
+# which is what makes the crate compile HERE. The artifact we publish is the
+# GENERATED binding from gn_out, which never saw that patch — consumers fetch it
+# verbatim (scripts/fetch_rusty_v8_android.py pins its sha256), so without the
+# aliases the fork's android build fails on undeclared v8_String_WriteFlags_*.
+# The v149.2.0 artifact was fixed up by hand; do it here so it cannot be forgotten.
+if ! grep -q 'v8_String_WriteFlags_kNullTerminate' "${OUT}/src_binding_release_aarch64-linux-android.rs"; then
+  cat >> "${OUT}/src_binding_release_aarch64-linux-android.rs" <<PATCH
+
+// Compatibility aliases: v8 crate ${TAG#v} string.rs uses v8_String_WriteFlags_ prefix
+pub const v8_String_WriteFlags_kNullTerminate: WriteFlags__bindgen_ty_1 = WriteFlags_kNullTerminate;
+pub const v8_String_WriteFlags_kReplaceInvalidUtf8: WriteFlags__bindgen_ty_1 = WriteFlags_kReplaceInvalidUtf8;
+PATCH
+fi
 gzip -kf9 "${OUT}/librusty_v8_release_aarch64-linux-android.a"
 ( cd "$OUT" && sha256sum librusty_v8_release_aarch64-linux-android.a.gz src_binding_release_aarch64-linux-android.rs )
 log "artifacts in ${OUT}"
