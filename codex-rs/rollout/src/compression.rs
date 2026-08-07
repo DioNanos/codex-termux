@@ -32,12 +32,10 @@ pub fn spawn_rollout_compression_worker(codex_home: PathBuf) {
 
 /// Returns the modified time for the existing plain or compressed rollout file.
 pub(crate) async fn file_modified_time(path: &Path) -> io::Result<Option<time::OffsetDateTime>> {
-    let Some(path) = path::existing_rollout_path(path).await else {
-        return Ok(None);
-    };
-    let meta = tokio::fs::metadata(path).await?;
-    let modified = meta.modified().ok();
-    Ok(modified.map(time::OffsetDateTime::from))
+    Ok(path::existing_rollout_with_metadata(path)
+        .await
+        .and_then(|(_, metadata)| metadata.modified().ok())
+        .map(time::OffsetDateTime::from))
 }
 
 /// Opens a rollout line reader that transparently handles plain `.jsonl` and `.jsonl.zst` files.
@@ -346,6 +344,16 @@ mod worker {
     }
 
     pub(super) async fn run(codex_home: PathBuf) -> io::Result<()> {
+        let Some(_maintenance_guard) =
+            crate::try_acquire_rollout_maintenance_lock(codex_home.as_path())?
+        else {
+            metrics::run("skipped_maintenance");
+            debug!(
+                "rollout maintenance is already running for {}",
+                codex_home.display()
+            );
+            return Ok(());
+        };
         let marker = match CompressionRunMarker::try_claim(codex_home.as_path()) {
             Ok(Some(marker)) => marker,
             Ok(None) => {
@@ -936,6 +944,7 @@ pub async fn existing_rollout_path(path: &Path) -> Option<PathBuf> {
 
 mod path {
     use std::ffi::OsStr;
+    use std::fs::Metadata;
     use std::path::Path;
     use std::path::PathBuf;
 
@@ -974,15 +983,26 @@ mod path {
     }
 
     pub(super) async fn existing_rollout_path(path: &Path) -> Option<PathBuf> {
+        existing_rollout_with_metadata(path)
+            .await
+            .map(|(path, _)| path)
+    }
+
+    /// Resolves the plain rollout before its compressed sibling and retains the lookup metadata.
+    ///
+    /// Returning the metadata lets callers inspect the selected file without a second stat.
+    pub(super) async fn existing_rollout_with_metadata(path: &Path) -> Option<(PathBuf, Metadata)> {
         let plain_path = plain_rollout_path(path);
-        if matches!(tokio::fs::metadata(plain_path.as_path()).await, Ok(metadata) if metadata.is_file())
+        if let Ok(metadata) = tokio::fs::metadata(plain_path.as_path()).await
+            && metadata.is_file()
         {
-            return Some(plain_path);
+            return Some((plain_path, metadata));
         }
         let compressed_path = compressed_rollout_path(plain_path.as_path());
-        if matches!(tokio::fs::metadata(compressed_path.as_path()).await, Ok(metadata) if metadata.is_file())
+        if let Ok(metadata) = tokio::fs::metadata(compressed_path.as_path()).await
+            && metadata.is_file()
         {
-            return Some(compressed_path);
+            return Some((compressed_path, metadata));
         }
         None
     }

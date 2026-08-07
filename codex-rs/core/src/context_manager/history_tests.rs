@@ -1,4 +1,5 @@
 use super::*;
+use crate::context::APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX;
 use crate::context::UserInstructions;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSection;
@@ -550,6 +551,7 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "call-1".to_string(),
+            encrypted_function_args: None,
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
@@ -631,6 +633,7 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "call-1".to_string(),
+            encrypted_function_args: None,
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
@@ -851,6 +854,7 @@ fn remove_first_item_removes_matching_output_for_function_call() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "call-1".to_string(),
+            encrypted_function_args: None,
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
@@ -880,6 +884,7 @@ fn remove_first_item_removes_matching_call_for_output() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "call-2".to_string(),
+            encrypted_function_args: None,
             internal_chat_message_metadata_passthrough: None,
         },
     ];
@@ -1099,6 +1104,33 @@ fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
 }
 
 #[test]
+fn drop_last_n_user_turns_trims_saved_prefix_update_above_rolled_back_turn() {
+    let items = vec![
+        assistant_msg("session prefix item"),
+        user_input_text_msg("turn 1 user"),
+        assistant_msg("turn 1 assistant"),
+        developer_msg(&format!(
+            "{APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX}\n- [\"touch\"]"
+        )),
+        user_input_text_msg("turn 2 user"),
+        assistant_msg("turn 2 assistant"),
+    ];
+
+    let modalities = default_input_modalities();
+    let mut history = create_history_with_items(items);
+    history.drop_last_n_user_turns(/*num_turns*/ 1);
+
+    assert_eq!(
+        history.for_prompt(&modalities),
+        vec![
+            assistant_msg("session prefix item"),
+            user_input_text_msg("turn 1 user"),
+            assistant_msg("turn 1 assistant"),
+        ]
+    );
+}
+
+#[test]
 fn drop_last_n_user_turns_clears_reference_context_for_mixed_developer_context_bundles() {
     let items = vec![
         user_input_text_msg("turn 1 user"),
@@ -1201,6 +1233,7 @@ fn record_items_truncates_function_call_output_content() {
         },
         internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
             turn_id: Some("turn-1".to_string()),
+            ..Default::default()
         }),
     };
 
@@ -1391,6 +1424,7 @@ fn normalize_adds_missing_output_for_function_call() {
         namespace: None,
         arguments: "{}".to_string(),
         call_id: "call-x".to_string(),
+        encrypted_function_args: None,
         internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
@@ -1406,6 +1440,7 @@ fn normalize_adds_missing_output_for_function_call() {
                 namespace: None,
                 arguments: "{}".to_string(),
                 call_id: "call-x".to_string(),
+                encrypted_function_args: None,
                 internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::FunctionCallOutput {
@@ -1547,6 +1582,7 @@ fn normalize_mixed_inserts_and_removals() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "c1".to_string(),
+            encrypted_function_args: None,
             internal_chat_message_metadata_passthrough: None,
         },
         // Orphan output that should be removed
@@ -1594,6 +1630,7 @@ fn normalize_mixed_inserts_and_removals() {
                 namespace: None,
                 arguments: "{}".to_string(),
                 call_id: "c1".to_string(),
+                encrypted_function_args: None,
                 internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::FunctionCallOutput {
@@ -1649,6 +1686,7 @@ fn normalize_adds_missing_output_for_function_call_inserts_output() {
         namespace: None,
         arguments: "{}".to_string(),
         call_id: "call-x".to_string(),
+        encrypted_function_args: None,
         internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
@@ -1662,6 +1700,7 @@ fn normalize_adds_missing_output_for_function_call_inserts_output() {
                 namespace: None,
                 arguments: "{}".to_string(),
                 call_id: "call-x".to_string(),
+                encrypted_function_args: None,
                 internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::FunctionCallOutput {
@@ -1683,6 +1722,7 @@ fn for_prompt_assigns_stable_id_to_synthetic_output_without_reordering_history()
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "call-x".to_string(),
+            encrypted_function_args: None,
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
@@ -1893,6 +1933,7 @@ fn normalize_mixed_inserts_and_removals_panics_in_debug() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "c1".to_string(),
+            encrypted_function_args: None,
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
@@ -2191,6 +2232,23 @@ fn encrypted_function_output_uses_plaintext_byte_estimate() {
         + estimate_encrypted_function_output_length(encrypted_content.len()) as i64;
 
     assert_eq!(estimated, expected);
+
+    let agent_message = InterAgentCommunication::new_encrypted(
+        AgentPath::root(),
+        AgentPath::root().join("worker").expect("valid worker path"),
+        Vec::new(),
+        encrypted_content.clone(),
+        /*trigger_turn*/ true,
+    )
+    .to_model_input_item();
+    let agent_raw_len = serde_json::to_string(&agent_message).unwrap().len() as i64;
+    let expected_agent = agent_raw_len - encrypted_content.len() as i64
+        + estimate_encrypted_function_output_length(encrypted_content.len()) as i64;
+
+    assert_eq!(
+        estimate_response_item_model_visible_bytes(&agent_message),
+        expected_agent
+    );
 }
 
 #[test]

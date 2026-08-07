@@ -1,8 +1,10 @@
 use super::*;
 use crate::config::ConfigBuilder;
+use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::environment_selection::TurnEnvironmentState;
+use crate::session::turn_context::EnvironmentConfig;
 use crate::session::turn_context::TurnEnvironment;
 use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerStack;
@@ -20,6 +22,7 @@ use codex_exec_server::ReadDirectoryEntry;
 use codex_exec_server::RemoveOptions;
 use codex_extension_api::UserInstructions;
 use codex_features::Feature;
+use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
@@ -337,6 +340,12 @@ fn resolved_local_environments<const N: usize>(
                     PathUri::from_abs_path(&cwd),
                     Vec::new(),
                     /*shell*/ None,
+                    EnvironmentConfig {
+                        allow_login_shell: true,
+                        permission_profile: PermissionProfileSnapshot::legacy(
+                            PermissionProfile::read_only(),
+                        ),
+                    },
                 ))
             })
             .collect(),
@@ -572,6 +581,36 @@ fn loaded_instructions_with_only_empty_or_whitespace_entries_are_empty() {
 
     assert!(empty.is_empty());
     assert!(whitespace.is_empty());
+}
+
+/// codex-termux issue #14: `/init` writes AGENTS.md into a session that started
+/// without one, and discovery has to notice it.
+#[tokio::test]
+async fn discovery_picks_up_an_agents_md_created_mid_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
+    let environments = resolved_local_environments([("local", config.config.cwd.clone())]);
+    let manager = crate::agents_md_manager::AgentsMdManager::new(None);
+
+    manager.refresh(&config.config, &environments).await;
+    assert!(
+        manager.get_loaded().await.is_none(),
+        "there is no AGENTS.md yet, so discovery must find nothing"
+    );
+
+    fs::write(tmp.path().join("AGENTS.md"), "written by /init").unwrap();
+
+    // Same selection as before: the old cache key would short-circuit here.
+    manager.refresh(&config.config, &environments).await;
+    let loaded = manager
+        .get_loaded()
+        .await
+        .expect("the file created mid-session must be discovered");
+    assert!(
+        loaded.text().contains("written by /init"),
+        "discovery must return the new file's contents, got: {}",
+        loaded.text()
+    );
 }
 
 /// Small file within the byte-limit is returned unmodified.

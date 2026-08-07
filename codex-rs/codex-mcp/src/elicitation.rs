@@ -21,6 +21,8 @@ use async_channel::Sender;
 use codex_protocol::approvals::ElicitationRequest;
 use codex_protocol::approvals::ElicitationRequestEvent;
 use codex_protocol::mcp::RequestId as ProtocolRequestId;
+use codex_protocol::mcp_approval_meta::APPROVALS_REVIEWER_KEY;
+use codex_protocol::mcp_approval_meta::STRICT_AUTO_REVIEW_KEY;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
@@ -32,10 +34,13 @@ use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use rmcp::model::ElicitationAction;
 use rmcp::model::RequestId;
-use tokio::sync::Mutex;
+use serde_json::Value;
 use tokio::sync::oneshot;
 
 static NEXT_ELICITATION_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+
+const STRICT_AUTO_REVIEW_DECLINE_MESSAGE: &str =
+    "Strict automated review failed. Do not proceed or ask the user for approval.";
 
 #[derive(Debug, Clone)]
 pub struct ElicitationReviewRequest {
@@ -87,8 +92,25 @@ struct ActiveElicitation {
 /// the same server request ID without colliding.
 #[derive(Clone, Default)]
 pub(crate) struct ElicitationRequestRouter {
-    requests: Arc<Mutex<ResponderMap>>,
+    requests: Arc<StdMutex<ResponderMap>>,
     auto_deny: Arc<AtomicBool>,
+}
+
+struct PendingElicitationRequest {
+    router: ElicitationRequestRouter,
+    key: (String, RequestId),
+}
+
+impl Drop for PendingElicitationRequest {
+    fn drop(&mut self) {
+        let responder = self
+            .router
+            .requests
+            .lock()
+            .ok()
+            .and_then(|mut requests| requests.remove(&self.key));
+        drop(responder);
+    }
 }
 
 impl ElicitationRequestRouter {
@@ -106,11 +128,13 @@ impl ElicitationRequestRouter {
         id: RequestId,
         response: ElicitationResponse,
     ) -> Result<()> {
-        self.requests
+        let responder = self
+            .requests
             .lock()
-            .await
+            .map_err(|_| anyhow!("elicitation request router unavailable"))?
             .remove(&(server_name, id))
-            .ok_or_else(|| anyhow!("elicitation request not found"))?
+            .ok_or_else(|| anyhow!("elicitation request not found"))?;
+        responder
             .send(response)
             .map_err(|e| anyhow!("failed to send elicitation response: {e:?}"))
     }
@@ -202,6 +226,53 @@ impl ElicitationRequestManager {
                     reviewer,
                     lifecycle,
                 } = authority;
+
+                match elicitation
+                    .meta()
+                    .and_then(|meta| meta.get(STRICT_AUTO_REVIEW_KEY))
+                {
+                    Some(Value::Bool(true)) => {
+                        if matches!(
+                            approval_policy,
+                            AskForApproval::Granular(config) if !config.allows_mcp_elicitations()
+                        ) {
+                            return Ok(strict_auto_review_decline());
+                        }
+                        let Some(reviewer) = reviewer.as_ref() else {
+                            return Ok(strict_auto_review_decline());
+                        };
+                        let _active_elicitation =
+                            lifecycle.as_ref().map(ElicitationLifecycle::start);
+                        return Ok(
+                            match reviewer
+                                .review(ElicitationReviewRequest {
+                                    server_name,
+                                    request_id: id,
+                                    elicitation,
+                                })
+                                .await
+                            {
+                                Ok(Some(response))
+                                    if response.action == ElicitationAction::Accept
+                                        && response.content == Some(serde_json::json!({}))
+                                        && response
+                                            .meta
+                                            .as_ref()
+                                            .and_then(Value::as_object)
+                                            .and_then(|meta| meta.get(APPROVALS_REVIEWER_KEY))
+                                            .and_then(Value::as_str)
+                                            == Some("auto_review") =>
+                                {
+                                    response
+                                }
+                                Ok(Some(_)) | Ok(None) | Err(_) => strict_auto_review_decline(),
+                            },
+                        );
+                    }
+                    None | Some(Value::Bool(false)) => {}
+                    Some(_) => return Ok(strict_auto_review_decline()),
+                }
+
                 if mcp_permission_prompt_is_auto_approved(
                     approval_policy,
                     &permission_profile,
@@ -248,13 +319,11 @@ impl ElicitationRequestManager {
                 );
                 let routed_request_id = RequestId::String(public_request_id.clone().into());
                 let request = match elicitation {
-                    Elicitation::Mcp(
-                        rmcp::model::CreateElicitationRequestParams::FormElicitationParams {
-                            meta,
-                            message,
-                            requested_schema,
-                        },
-                    ) => ElicitationRequest::Form {
+                    Elicitation::Mcp(rmcp::model::ElicitRequestParams::FormElicitationParams {
+                        meta,
+                        message,
+                        requested_schema,
+                    }) => ElicitationRequest::Form {
                         meta: meta
                             .map(serde_json::to_value)
                             .transpose()
@@ -263,14 +332,12 @@ impl ElicitationRequestManager {
                         requested_schema: serde_json::to_value(requested_schema)
                             .context("failed to serialize MCP elicitation schema")?,
                     },
-                    Elicitation::Mcp(
-                        rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
-                            meta,
-                            message,
-                            url,
-                            elicitation_id,
-                        },
-                    ) => ElicitationRequest::Url {
+                    Elicitation::Mcp(rmcp::model::ElicitRequestParams::UrlElicitationParams {
+                        meta,
+                        message,
+                        url,
+                        elicitation_id,
+                    }) => ElicitationRequest::Url {
                         meta: meta
                             .map(serde_json::to_value)
                             .transpose()
@@ -279,6 +346,13 @@ impl ElicitationRequestManager {
                         url,
                         elicitation_id,
                     },
+                    Elicitation::Mcp(_) => {
+                        return Ok(ElicitationResponse {
+                            action: ElicitationAction::Decline,
+                            content: None,
+                            meta: None,
+                        });
+                    }
                     Elicitation::OpenAiForm {
                         meta,
                         message,
@@ -291,10 +365,16 @@ impl ElicitationRequestManager {
                 };
                 let (tx, rx) = oneshot::channel();
                 let _active_elicitation = lifecycle.as_ref().map(ElicitationLifecycle::start);
-                {
-                    let mut lock = router.requests.lock().await;
-                    lock.insert((server_name.clone(), routed_request_id), tx);
-                }
+                let request_key = (server_name.clone(), routed_request_id);
+                router
+                    .requests
+                    .lock()
+                    .map_err(|_| anyhow!("elicitation request router unavailable"))?
+                    .insert(request_key.clone(), tx);
+                let _pending_request = PendingElicitationRequest {
+                    router: router.clone(),
+                    key: request_key,
+                };
                 let _ = tx_event
                     .send(Event {
                         id: "mcp_elicitation_request".to_string(),
@@ -314,6 +394,16 @@ impl ElicitationRequestManager {
     }
 }
 
+fn strict_auto_review_decline() -> ElicitationResponse {
+    ElicitationResponse {
+        action: ElicitationAction::Decline,
+        content: None,
+        meta: Some(serde_json::json!({
+            "message": STRICT_AUTO_REVIEW_DECLINE_MESSAGE,
+        })),
+    }
+}
+
 pub(crate) fn elicitation_is_rejected_by_policy(approval_policy: AskForApproval) -> bool {
     match approval_policy {
         AskForApproval::Never => true,
@@ -327,16 +417,17 @@ type ResponderMap = HashMap<(String, RequestId), oneshot::Sender<ElicitationResp
 
 fn can_auto_accept_elicitation(elicitation: &Elicitation) -> bool {
     match elicitation {
-        Elicitation::Mcp(rmcp::model::CreateElicitationRequestParams::FormElicitationParams {
+        Elicitation::Mcp(rmcp::model::ElicitRequestParams::FormElicitationParams {
             requested_schema,
             ..
         }) => {
             // Auto-accept confirm/approval elicitations without schema requirements.
             requested_schema.properties.is_empty()
         }
-        Elicitation::Mcp(rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
-            ..
-        })
-        | Elicitation::OpenAiForm { .. } => false,
+        Elicitation::Mcp(_) | Elicitation::OpenAiForm { .. } => false,
     }
 }
+
+#[cfg(test)]
+#[path = "elicitation_tests.rs"]
+mod tests;

@@ -196,6 +196,7 @@ fn insert_rmcp_test_server(config: &mut Config, command: String, approval_mode: 
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: Some(Duration::from_secs(10)),
             tool_timeout_sec: None,
@@ -277,6 +278,7 @@ async fn pre_tool_use_blocks_mcp_tool_before_execution(
                 .expect("failed to write MCP pre tool use hook fixture");
         })
         .with_config(move |config| {
+            let _ = config.features.enable(Feature::ExecutedToolCallMetadata);
             enable_hooks_and_rmcp_server(
                 config,
                 rmcp_test_server_bin,
@@ -294,6 +296,14 @@ async fn pre_tool_use_blocks_mcp_tool_before_execution(
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
     let output_item = requests[1].function_call_output(call_id);
+    assert_eq!(
+        output_item["internal_chat_message_metadata_passthrough"]["executed_tool_calls"],
+        json!([{
+            "name": format!("{mcp_namespace}__echo"),
+            "arguments": { "message": RMCP_ECHO_MESSAGE },
+        }]),
+        "a blocked MCP request must still retain the original model-attempted call",
+    );
     let output = output_item
         .get("output")
         .and_then(Value::as_str)

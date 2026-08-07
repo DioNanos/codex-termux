@@ -223,7 +223,7 @@
               "type": "string"
             },
             "path": {
-              "$ref": "#/definitions/AbsolutePathBuf"
+              "$ref": "#/definitions/LegacyAppPathString"
             },
             "type": {
               "enum": [
@@ -901,11 +901,6 @@
           "description": "Identifier for this thread. Codex-generated thread IDs are UUIDv7.",
           "type": "string"
         },
-        "isPinned": {
-          "default": false,
-          "description": "Whether the thread has been pinned by the user.",
-          "type": "boolean"
-        },
         "modelProvider": {
           "description": "Model provider used for this thread (for example, 'openai').",
           "type": "string"
@@ -937,6 +932,27 @@
         },
         "recencyAt": {
           "description": "Unix timestamp (in seconds) used for thread recency ordering.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "section": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadSection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The independently persisted section selected for this thread, if any."
+        },
+        "sectionEnteredAt": {
+          "default": null,
+          "description": "Unix timestamp in seconds when the thread entered its current section.",
           "format": "int64",
           "type": [
             "integer",
@@ -1369,6 +1385,12 @@
                 "null"
               ]
             },
+            "readOnlyHint": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "result": {
               "anyOf": [
                 {
@@ -1704,6 +1726,13 @@
             "status": {
               "type": "string"
             },
+            "transparentBackground": {
+              "default": null,
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "type": {
               "enum": [
                 "imageGeneration"
@@ -1790,6 +1819,24 @@
           "type": "object"
         }
       ]
+    },
+    "ThreadSection": {
+      "description": "An independently persisted, user-visible thread section.",
+      "properties": {
+        "id": {
+          "description": "Opaque UUIDv7 identity that remains stable when the section is renamed.",
+          "type": "string"
+        },
+        "name": {
+          "description": "The current user-visible section name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
     },
     "ThreadSource": {
       "type": "string"

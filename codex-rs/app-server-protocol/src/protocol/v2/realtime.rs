@@ -1,3 +1,5 @@
+use crate::JsonSchema;
+use crate::TS;
 use codex_protocol::protocol::CodexResponseHandoffMode;
 use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::RealtimeAudioFrame as CoreRealtimeAudioFrame;
@@ -5,12 +7,10 @@ use codex_protocol::protocol::RealtimeConversationVersion;
 use codex_protocol::protocol::RealtimeOutputModality;
 use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::RealtimeVoicesList;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
-use ts_rs::TS;
 
 /// EXPERIMENTAL - thread realtime audio chunk.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
@@ -72,6 +72,10 @@ pub struct ThreadRealtimeStartParams {
     /// them automatically. Defaults to false.
     #[ts(optional = nullable)]
     pub client_managed_handoffs: Option<bool>,
+    /// Controls whether a realtime V3 delegation produces an acknowledgement filler.
+    /// Omitted values preserve the Realtime API's default behavior.
+    #[ts(optional = nullable)]
+    pub delegation_ack_filler: Option<bool>,
     /// Routes any transcript tail remaining at session end through Codex. Defaults to false.
     /// TODO: Remove this rollout knob once transcript-tail flushing is always enabled.
     #[ts(optional = nullable)]
@@ -106,6 +110,12 @@ pub struct ThreadRealtimeStartParams {
     /// limited to 128 items and 8,192 estimated text tokens in total.
     #[ts(optional = nullable)]
     pub initial_items: Option<Vec<ThreadRealtimeInitialItem>>,
+    /// Developer instructions given to the backing Codex model when this realtime session starts.
+    #[ts(optional = nullable)]
+    pub realtime_start_instructions: Option<String>,
+    /// Developer instructions given to the backing Codex model when this realtime session ends.
+    #[ts(optional = nullable)]
+    pub realtime_end_instructions: Option<String>,
     #[serde(
         default,
         deserialize_with = "crate::protocol::serde_helpers::deserialize_double_option",

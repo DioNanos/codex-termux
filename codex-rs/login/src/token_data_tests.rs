@@ -123,6 +123,48 @@ fn id_token_info_parses_usage_based_business_plans() {
 }
 
 #[test]
+fn id_token_info_parses_enterprise_cbp_automation_plan() {
+    let jwt = fake_jwt(serde_json::json!({
+        "email": "service-account@example.com",
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "enterprise_cbp_automation"
+        }
+    }));
+
+    let info = parse_chatgpt_jwt_claims(&jwt).expect("should parse");
+    assert_eq!(
+        info.get_chatgpt_plan_type().as_deref(),
+        Some("Enterprise (Automation)")
+    );
+    assert_eq!(
+        info.get_chatgpt_plan_type_raw().as_deref(),
+        Some("enterprise_cbp_automation")
+    );
+    assert_eq!(info.is_workspace_account(), true);
+}
+
+#[test]
+fn id_token_info_parses_self_serve_business_prolite_plan() {
+    let jwt = fake_jwt(serde_json::json!({
+        "email": "user@example.com",
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "self_serve_business_prolite"
+        }
+    }));
+
+    let info = parse_chatgpt_jwt_claims(&jwt).expect("should parse");
+    assert_eq!(
+        info.get_chatgpt_plan_type().as_deref(),
+        Some("Self Serve Business ProLite")
+    );
+    assert_eq!(
+        info.get_chatgpt_plan_type_raw().as_deref(),
+        Some("self_serve_business_prolite")
+    );
+    assert_eq!(info.is_workspace_account(), true);
+}
+
+#[test]
 fn id_token_info_handles_missing_fields() {
     let fake_jwt = fake_jwt(serde_json::json!({ "sub": "123" }));
 

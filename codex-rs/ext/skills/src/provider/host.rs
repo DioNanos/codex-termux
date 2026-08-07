@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use codex_core_skills::SkillLoadOutcome;
 use codex_skills::SkillMetadata;
 
@@ -20,7 +22,7 @@ const HOST_AUTHORITY_ID: &str = "host";
 
 /// Host-owned skill provider backed by an immutable service snapshot.
 ///
-/// Discovery and caching belong to `SkillsService`; this provider only maps a
+/// Discovery and caching belong to `HostSkillsService`; this provider only maps a
 /// snapshot into the authority-aware catalog/read contract.
 #[derive(Clone, Default)]
 pub struct HostSkillProvider;
@@ -82,6 +84,11 @@ impl SkillProvider for HostSkillProvider {
 }
 
 fn catalog_from_outcome(outcome: &SkillLoadOutcome) -> SkillCatalog {
+    let root_order_by_path = outcome
+        .skill_roots_in_discovery_order()
+        .enumerate()
+        .map(|(index, root)| (root.as_path(), index))
+        .collect::<HashMap<_, _>>();
     let mut catalog = SkillCatalog {
         entries: Vec::new(),
         warnings: outcome
@@ -99,8 +106,16 @@ fn catalog_from_outcome(outcome: &SkillLoadOutcome) -> SkillCatalog {
 
     for (skill, enabled) in outcome.skills_with_enabled() {
         let mut entry = catalog_entry_from_skill(skill, enabled);
+        if let Some(discovery_path) =
+            outcome.skill_discovery_path_for_path(&skill.path_to_skills_md)
+        {
+            entry = entry.with_display_path(discovery_path.to_string_lossy().replace('\\', "/"));
+        }
         if let Some(root) = outcome.skill_root_for_path(&skill.path_to_skills_md) {
             entry = entry.with_display_path_root(root.to_string_lossy().replace('\\', "/"));
+            if let Some(root_order) = root_order_by_path.get(root.as_path()) {
+                entry = entry.with_display_path_root_order(*root_order);
+            }
         }
         catalog.push_entry(entry);
     }

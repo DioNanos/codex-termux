@@ -1,11 +1,10 @@
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_config::types::McpServerEnvVar;
-use reqwest::ClientBuilder;
-use reqwest::header::HeaderMap;
-use reqwest::header::HeaderName;
-use reqwest::header::HeaderValue;
-use reqwest::header::USER_AGENT;
+use http::HeaderMap;
+use http::HeaderName;
+use http::HeaderValue;
+use http::header::USER_AGENT;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
@@ -42,33 +41,15 @@ fn running_on_termux() -> bool {
     env::var_os("TERMUX_VERSION").is_some()
 }
 
-/// codex-termux GitHub issue #11 fix — reqwest 0.13 (pulled in by the rmcp
-/// 1.7.0 upgrade, upstream `910578792f`) verifies TLS through
-/// `rustls-platform-verifier`, which on `target_os = "android"` requires an
-/// initialized JVM `Context` and panics with `Expect rustls-platform-verifier
-/// to be initialized` inside a plain Termux CLI process (no Activity, no
-/// JNI). Supplying explicit roots makes reqwest build its
-/// `WebPkiServerVerifier` branch instead, so the platform verifier is never
-/// constructed. The embedded Mozilla roots match the trust model of the
-/// reqwest 0.12 `rustls-tls` (webpki-roots) used elsewhere in the workspace.
-///
-/// Runtime-gated on `TERMUX_VERSION` like the issue #10 fix above — NOT
-/// `cfg!(target_os = "android")` — so current and older Termux package lines
-/// behave the same, while desktop builds keep the default platform verifier
-/// untouched.
-pub(crate) fn apply_termux_tls(builder: ClientBuilder) -> ClientBuilder {
-    if !running_on_termux() {
-        return builder;
-    }
-    builder.tls_certs_only(webpki_root_certificates())
-}
-
-fn webpki_root_certificates() -> Vec<reqwest::Certificate> {
-    webpki_root_certs::TLS_SERVER_ROOT_CERTS
-        .iter()
-        .filter_map(|der| reqwest::Certificate::from_der(der.as_ref()).ok())
-        .collect()
-}
+// The codex-termux issue #11 TLS fix used to live here: it wrapped the
+// `reqwest` client this crate built for OAuth discovery so that Termux got
+// explicit webpki roots instead of `rustls-platform-verifier`, which panics on
+// Android without a JVM `Context`. Upstream 0.147.0 removed that client — MCP
+// OAuth discovery now runs on the injected `codex-http-client`, and `reqwest`
+// is no longer a dependency of this crate — so there is nothing left here to
+// wrap and the panicking verifier is never constructed on this path. Whether
+// the replacement's native root store works under Termux is a separate
+// question about `codex-http-client`, not about this file.
 
 pub(crate) fn create_env_overlay_for_remote_mcp_server(
     extra_env: Option<HashMap<OsString, OsString>>,
@@ -160,17 +141,6 @@ pub(crate) fn build_default_headers(
     }
 
     Ok(headers)
-}
-
-pub(crate) fn apply_default_headers(
-    builder: ClientBuilder,
-    default_headers: &HeaderMap,
-) -> ClientBuilder {
-    if default_headers.is_empty() {
-        builder
-    } else {
-        builder.default_headers(default_headers.clone())
-    }
 }
 
 #[cfg(unix)]
@@ -417,28 +387,6 @@ mod tests {
                 std::env::set_var("TERMUX_VERSION", value);
             }
         }
-    }
-
-    #[test]
-    fn webpki_root_certificates_all_parse() {
-        // GitHub DioNanos/codex-termux issue #11 regression guard: every
-        // embedded Mozilla root must convert into a reqwest::Certificate,
-        // otherwise the Termux TLS trust store silently shrinks.
-        let certs = webpki_root_certificates();
-        assert!(!certs.is_empty());
-        assert_eq!(certs.len(), webpki_root_certs::TLS_SERVER_ROOT_CERTS.len());
-    }
-
-    #[test]
-    #[serial(extra_rmcp_env)]
-    fn apply_termux_tls_builds_client_on_termux() {
-        // GitHub DioNanos/codex-termux issue #11 regression guard: with the
-        // Termux gate active the client must build with explicit roots (the
-        // rustls-platform-verifier path would panic at first use on android).
-        let _guard = EnvVarGuard::set("TERMUX_VERSION", "0.118.3");
-        apply_termux_tls(ClientBuilder::new())
-            .build()
-            .expect("client with embedded webpki roots should build");
     }
 
     #[cfg(unix)]

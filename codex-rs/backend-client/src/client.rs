@@ -685,11 +685,17 @@ impl Client {
             crate::types::PlanType::Pro => AccountPlanType::Pro,
             crate::types::PlanType::ProLite => AccountPlanType::ProLite,
             crate::types::PlanType::Team => AccountPlanType::Team,
+            crate::types::PlanType::SelfServeBusinessProLite => {
+                AccountPlanType::SelfServeBusinessProLite
+            }
             crate::types::PlanType::SelfServeBusinessUsageBased => {
                 AccountPlanType::SelfServeBusinessUsageBased
             }
             crate::types::PlanType::Business => AccountPlanType::Business,
             crate::types::PlanType::Ent26 => AccountPlanType::Ent26,
+            crate::types::PlanType::EnterpriseCbpAutomation => {
+                AccountPlanType::EnterpriseCbpAutomation
+            }
             crate::types::PlanType::EnterpriseCbpUsageBased => {
                 AccountPlanType::EnterpriseCbpUsageBased
             }
@@ -732,7 +738,14 @@ mod tests {
     use wiremock::matchers::path;
 
     #[test]
-    fn map_plan_type_supports_usage_based_business_variants() {
+    fn map_plan_type_supports_business_variants() {
+        let business_prolite =
+            serde_json::from_str::<crate::types::PlanType>("\"self_serve_business_prolite\"")
+                .expect("business ProLite should deserialize");
+        assert_eq!(
+            Client::map_plan_type(business_prolite),
+            AccountPlanType::SelfServeBusinessProLite
+        );
         assert_eq!(
             Client::map_plan_type(crate::types::PlanType::SelfServeBusinessUsageBased),
             AccountPlanType::SelfServeBusinessUsageBased
@@ -740,6 +753,10 @@ mod tests {
         assert_eq!(
             Client::map_plan_type(crate::types::PlanType::EnterpriseCbpUsageBased),
             AccountPlanType::EnterpriseCbpUsageBased
+        );
+        assert_eq!(
+            Client::map_plan_type(crate::types::PlanType::EnterpriseCbpAutomation),
+            AccountPlanType::EnterpriseCbpAutomation
         );
         let ent26 = serde_json::from_str::<crate::types::PlanType>("\"ent26\"")
             .expect("ent26 backend plan should deserialize");

@@ -1,5 +1,9 @@
 mod common;
 
+#[cfg(unix)]
+#[path = "relay/version_skew.rs"]
+mod version_skew;
+
 #[path = "../src/proto/codex.exec_server.relay.v1.rs"]
 mod relay_proto;
 
@@ -31,6 +35,7 @@ use codex_exec_server::NoiseRendezvousConnectBundle;
 use codex_exec_server::NoiseRendezvousConnectProvider;
 use codex_exec_server::ProcessId;
 use codex_exec_server::RemoteEnvironmentConfig;
+use codex_exec_server_protocol::ProcessSandboxType;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_http_client::cache_system_proxy_route_for_test;
@@ -70,7 +75,7 @@ const ENVIRONMENT_ID: &str = "env-noise-relay-test";
 const EXECUTOR_REGISTRATION_ID: &str = "registration-1";
 const HARNESS_KEY_AUTHORIZATION: &str = "harness-key-authorization";
 const REGISTRY_TOKEN: &str = "registry-token";
-const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct StaticRegistryAuthProvider;
@@ -118,7 +123,7 @@ impl NoiseRendezvousConnectProvider for FreshBundleNoiseConnectProvider {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn deferred_noise_environment_connects_and_reconnects_with_fresh_bundle() -> Result<()> {
+async fn pending_noise_environment_connects_and_reconnects_after_ready_report() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let rendezvous_address = listener.local_addr()?;
     let environment_rendezvous_url =
@@ -213,11 +218,8 @@ async fn deferred_noise_environment_connects_and_reconnects_with_fresh_bundle() 
         calls: AtomicUsize::new(0),
     });
     let manager = EnvironmentManager::without_environments(http_client_factory);
-    let registration = manager
-        .register_deferred_noise_environment(ENVIRONMENT_ID.to_string(), provider.clone())?;
     let environment = manager
-        .get_environment(ENVIRONMENT_ID)
-        .context("deferred Noise environment")?;
+        .materialize_pending_noise_environment(ENVIRONMENT_ID.to_string(), provider.clone())?;
     let mut connection_state = environment
         .subscribe_connection_state()
         .context("remote environment connection state")?;
@@ -230,9 +232,21 @@ async fn deferred_noise_environment_connects_and_reconnects_with_fresh_bundle() 
             path: PathUri::parse("file:///plugins/executor-plugin")?,
         },
     }];
-    registration.complete(Ok(EnvironmentReadyInfo {
-        selected_capability_roots: selected_capability_roots.clone(),
-    }))?;
+    let reported = manager
+        .report_environment_provisioning_status(
+            ENVIRONMENT_ID.to_string(),
+            Ok(EnvironmentReadyInfo {
+                selected_capability_roots: selected_capability_roots.clone(),
+            }),
+            provider.clone(),
+        )?
+        .context("ready report should apply to the pending environment")?;
+    assert!(Arc::ptr_eq(&environment, &reported));
+    assert_eq!(provider.calls(), 0);
+    let initial_info = tokio::spawn({
+        let environment = Arc::clone(&environment);
+        async move { environment.info().await }
+    });
     let harness_websocket = accept_websocket(&listener, "harness").await?;
     assert_eq!(
         timeout(TEST_TIMEOUT, proxy_request_rx.recv()).await?,
@@ -243,9 +257,9 @@ async fn deferred_noise_environment_connects_and_reconnects_with_fresh_bundle() 
         harness_websocket,
         Arc::new(Mutex::new(Vec::new())),
     ));
-    let initial_info = timeout(TEST_TIMEOUT, environment.info())
+    let initial_info = timeout(TEST_TIMEOUT, initial_info)
         .await
-        .context("deferred Noise environment should become ready")??;
+        .context("pending Noise environment should become ready")???;
     assert_eq!(
         environment.selected_capability_roots(),
         selected_capability_roots
@@ -287,7 +301,7 @@ async fn deferred_noise_environment_connects_and_reconnects_with_fresh_bundle() 
     ));
     let recovered_info = timeout(TEST_TIMEOUT, environment.info())
         .await
-        .context("deferred Noise environment should reconnect")??;
+        .context("pending Noise environment should reconnect")??;
 
     assert_eq!(recovered_info, initial_info);
     assert_eq!(
@@ -410,6 +424,7 @@ async fn remote_environment_routes_encrypted_exec_server_rpc() -> Result<()> {
         response,
         ExecResponse {
             process_id: ProcessId::from("proc-1"),
+            sandbox_type: Some(ProcessSandboxType::None),
         }
     );
 

@@ -11,6 +11,7 @@ use super::*;
 
 fn model_with_shell_type(shell_type: ConfigShellToolType) -> ModelInfo {
     ModelInfo {
+        base_instructions: String::new(),
         slug: "test-model".to_string(),
         display_name: "Test Model".to_string(),
         description: None,
@@ -25,9 +26,10 @@ fn model_with_shell_type(shell_type: ConfigShellToolType) -> ModelInfo {
         default_service_tier: None,
         availability_nux: None,
         upgrade: None,
-        base_instructions: String::new(),
         model_messages: None,
         include_skills_usage_instructions: false,
+        include_plugin_usage_instructions: false,
+        include_apps_usage_instructions: false,
         supports_reasoning_summary_parameter: true,
         default_reasoning_summary: Default::default(),
         support_verbosity: false,

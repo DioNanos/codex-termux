@@ -149,6 +149,11 @@ impl McpRequestProcessor {
                 "No MCP server named '{name}' found."
             )));
         };
+        let redirect_mode = if server.is_agent_plugin() {
+            StreamableHttpRedirectMode::AgentPluginV1
+        } else {
+            StreamableHttpRedirectMode::Legacy
+        };
         let server = server.config();
 
         let (url, http_headers, env_http_headers) = match &server.transport {
@@ -172,10 +177,11 @@ impl McpRequestProcessor {
             })?;
 
         let discovered_scopes = if scopes.is_none() && server.scopes.is_none() {
-            discover_supported_scopes_with_http_client(
+            discover_supported_scopes(
                 &server.transport,
                 Arc::clone(&http_client),
                 codex_rmcp_client::OAuthDiscoveryTimeout::Requested,
+                redirect_mode,
             )
             .await
         } else {
@@ -183,9 +189,10 @@ impl McpRequestProcessor {
         };
         let resolved_scopes =
             resolve_oauth_scopes(scopes, server.scopes.clone(), discovered_scopes);
+        let oauth_credential_name = server.oauth_credential_name(&name);
 
-        let handle = perform_oauth_login_return_url_with_http_client(
-            &name,
+        let handle = perform_oauth_login_return_url(
+            oauth_credential_name.as_ref(),
             &url,
             mcp_config.mcp_oauth_credentials_store_mode,
             mcp_config.auth_keyring_backend_kind,
@@ -198,6 +205,7 @@ impl McpRequestProcessor {
             mcp_config.mcp_oauth_callback_port,
             mcp_config.mcp_oauth_callback_url.as_deref(),
             http_client,
+            redirect_mode,
         )
         .await
         .map_err(|err| internal_error(format!("failed to login to MCP server '{name}': {err}")))?;

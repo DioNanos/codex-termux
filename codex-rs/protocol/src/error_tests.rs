@@ -5,12 +5,10 @@ use chrono::DateTime;
 use chrono::Duration as ChronoDuration;
 use chrono::TimeZone;
 use chrono::Utc;
-use http::Response as HttpResponse;
+use codex_http_client::HttpResponse;
+use http::Response as RawHttpResponse;
+use http::StatusCode;
 use pretty_assertions::assert_eq;
-use reqwest::Response;
-use reqwest::ResponseBuilderExt;
-use reqwest::StatusCode;
-use reqwest::Url;
 use std::time::Duration;
 
 #[test]
@@ -57,6 +55,10 @@ fn retryability_preserves_error_details_distinctions() {
                 identity_error_code: None,
             }),
             true,
+        ),
+        (
+            CodexErrorDetails::ToolCollision("functions.update_plan".to_string()).into(),
+            false,
         ),
         (CodexErr::InternalServerError, true),
     ];
@@ -224,12 +226,14 @@ fn sandbox_denied_reports_stdout_when_no_stderr() {
 
 #[test]
 fn to_error_event_handles_response_stream_failed() {
-    let response = HttpResponse::builder()
+    let response = RawHttpResponse::builder()
         .status(StatusCode::TOO_MANY_REQUESTS)
-        .url(Url::parse("http://example.com").unwrap())
         .body("")
         .unwrap();
-    let source = Response::from(response).error_for_status_ref().unwrap_err();
+    let source = HttpResponse::from(response)
+        .error_for_status_ref()
+        .unwrap_err()
+        .with_url("http://example.com".parse().unwrap());
     let err = CodexErr::ResponseStreamFailed(ResponseStreamFailed {
         source,
         request_id: Some("req-123".to_string()),
@@ -336,7 +340,11 @@ fn usage_limit_reached_error_formats_team_plan() {
 
 #[test]
 fn usage_limit_reached_error_formats_business_plan_without_reset() {
-    for plan in [KnownPlan::Business, KnownPlan::Ent26] {
+    for plan in [
+        KnownPlan::Business,
+        KnownPlan::Ent26,
+        KnownPlan::EnterpriseCbpAutomation,
+    ] {
         let err = UsageLimitReachedError {
             plan_type: Some(PlanType::Known(plan)),
             resets_at: None,
@@ -349,6 +357,21 @@ fn usage_limit_reached_error_formats_business_plan_without_reset() {
             "You've hit your usage limit. To get more access now, send a request to your admin or try again later."
         );
     }
+}
+
+#[test]
+fn usage_limit_reached_error_formats_self_serve_business_prolite_plan() {
+    let err = UsageLimitReachedError {
+        plan_type: Some(PlanType::Known(KnownPlan::SelfServeBusinessProLite)),
+        resets_at: None,
+        rate_limits: Some(Box::new(rate_limit_snapshot())),
+        promo_message: None,
+        rate_limit_reached_type: None,
+    };
+    assert_eq!(
+        err.to_string(),
+        "You've hit your usage limit. To get more access now, send a request to your admin or try again later."
+    );
 }
 
 #[test]

@@ -429,6 +429,7 @@ impl ImageGenerationItem {
             status: self.status.clone(),
             revised_prompt: self.revised_prompt.clone(),
             result: self.result.clone(),
+            transparent_background: None,
             saved_path: self.saved_path.clone(),
         })
     }
@@ -473,6 +474,7 @@ impl McpToolCallItem {
             app_name: self.app_name.clone(),
             action_name: self.action_name.clone(),
             plugin_id: self.plugin_id.clone(),
+            read_only_hint: self.read_only_hint,
         })
     }
 
@@ -496,6 +498,7 @@ impl McpToolCallItem {
             app_name: self.app_name.clone(),
             action_name: self.action_name.clone(),
             plugin_id: self.plugin_id.clone(),
+            read_only_hint: self.read_only_hint,
             duration: self.duration?,
             result,
         }))

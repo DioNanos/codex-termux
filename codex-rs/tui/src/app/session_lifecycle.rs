@@ -4,6 +4,9 @@
 //! resuming/forking saved sessions, replacing ChatWidget instances, and maintaining the agent picker
 //! cache used for multi-agent navigation.
 
+use std::io;
+
+use super::agent_picker::AGENT_PICKER_VIEW_ID;
 use super::*;
 use crate::app_server_session::source_agent_path;
 use crate::app_server_session::thread_blocks_direct_input;
@@ -26,7 +29,11 @@ pub(super) struct LoadedSubagentBackfill {
 
 impl App {
     pub(super) async fn open_agent_picker(&mut self, app_server: &mut AppServerSession) {
-        let backfill = self.backfill_loaded_subagent_threads(app_server).await;
+        let backfill = if self.primary_thread_id.is_none() {
+            self.backfill_loaded_subagent_threads(app_server).await
+        } else {
+            LoadedSubagentBackfill::default()
+        };
         // V2 subagents are identified by canonical paths observed from activity events or loaded
         // thread metadata. A buffered active turn is positive liveness evidence; a completed
         // snapshot is terminal evidence. An empty store does not clear a successful spawn hint.
@@ -40,22 +47,23 @@ impl App {
             if let Some(channel) = self.thread_event_channels.get(&thread_id)
                 && channel.attachment() == ThreadEventAttachment::Live
             {
-                let (has_active_turn, has_terminal_snapshot) = {
-                    let store = channel.store.lock().await;
-                    (
-                        store.active_turn_id().is_some(),
-                        store
-                            .turns
-                            .last()
-                            .is_some_and(|turn| !matches!(turn.status, TurnStatus::InProgress)),
-                    )
+                let Ok(store) = channel.store.try_lock() else {
+                    continue;
                 };
+                let has_active_turn = store.active_turn_id().is_some();
+                let has_terminal_snapshot = store
+                    .turns
+                    .last()
+                    .is_some_and(|turn| !matches!(turn.status, TurnStatus::InProgress));
+                drop(store);
                 if has_active_turn {
                     self.agent_navigation.mark_running(thread_id);
                 } else if has_terminal_snapshot {
                     self.agent_navigation.mark_stopped(thread_id);
                 }
-            } else if !backfill.refreshed_thread_ids.contains(&thread_id) {
+            } else if self.primary_thread_id.is_none()
+                && !backfill.refreshed_thread_ids.contains(&thread_id)
+            {
                 self.refresh_agent_picker_thread_liveness(app_server, thread_id)
                     .await;
             }
@@ -76,10 +84,16 @@ impl App {
             let mut entries = Vec::new();
             for (thread_id, agent_path) in running_threads {
                 let preview = if let Some(channel) = self.thread_event_channels.get(&thread_id) {
-                    let store = channel.store.lock().await;
-                    super::agent_status_feed::AgentStatusThreadPreview::from_store(
-                        agent_path, &store,
-                    )
+                    match channel.store.try_lock() {
+                        Ok(store) => {
+                            super::agent_status_feed::AgentStatusThreadPreview::from_store(
+                                agent_path, &store,
+                            )
+                        }
+                        Err(_) => {
+                            super::agent_status_feed::AgentStatusThreadPreview::empty(agent_path)
+                        }
+                    }
                 } else {
                     super::agent_status_feed::AgentStatusThreadPreview::empty(agent_path)
                 };
@@ -105,11 +119,14 @@ impl App {
             {
                 continue;
             }
-            if !self
-                .refresh_agent_picker_thread_liveness(app_server, thread_id)
-                .await
-            {
-                continue;
+            if self.primary_thread_id.is_none() {
+                self.refresh_agent_picker_thread_liveness(app_server, thread_id)
+                    .await;
+            } else if self.agent_navigation.get(&thread_id).is_none() {
+                self.upsert_agent_picker_thread(
+                    thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
+                    /*is_closed*/ false,
+                );
             }
         }
 
@@ -117,6 +134,9 @@ impl App {
             .agent_navigation
             .has_non_primary_thread(self.primary_thread_id);
         if !self.config.features.enabled(Feature::Collab) && !has_non_primary_agent_thread {
+            if let Some(primary_thread_id) = self.primary_thread_id {
+                self.refresh_agent_picker_threads(app_server, primary_thread_id);
+            }
             self.chat_widget.open_multi_agent_enable_prompt();
             return;
         }
@@ -127,14 +147,34 @@ impl App {
             return;
         }
 
-        let mut initial_selected_idx = None;
+        let selected = self
+            .chat_widget
+            .selected_index_for_present_view(AGENT_PICKER_VIEW_ID);
+        let params = self.agent_picker_selection_view_params(selected);
+        if !self
+            .chat_widget
+            .replace_selection_view_if_present(AGENT_PICKER_VIEW_ID, params)
+        {
+            let params = self.agent_picker_selection_view_params(selected);
+            self.chat_widget.show_selection_view(params);
+        }
+        if let Some(primary_thread_id) = self.primary_thread_id {
+            self.refresh_agent_picker_threads(app_server, primary_thread_id);
+        }
+    }
+
+    pub(super) fn agent_picker_selection_view_params(
+        &self,
+        selected: Option<usize>,
+    ) -> SelectionViewParams {
+        let mut initial_selected_idx = selected;
         let items: Vec<SelectionItem> = self
             .agent_navigation
             .ordered_threads()
             .into_iter()
             .enumerate()
             .map(|(idx, (thread_id, entry))| {
-                if self.active_thread_id == Some(thread_id) {
+                if initial_selected_idx.is_none() && self.active_thread_id == Some(thread_id) {
                     initial_selected_idx = Some(idx);
                 }
                 let id = thread_id;
@@ -168,14 +208,15 @@ impl App {
             })
             .collect();
 
-        self.chat_widget.show_selection_view(SelectionViewParams {
+        SelectionViewParams {
+            view_id: Some(AGENT_PICKER_VIEW_ID),
             title: Some("Subagents".to_string()),
             subtitle: Some(AgentNavigationState::picker_subtitle()),
             footer_hint: Some(standard_popup_hint_line()),
             items,
             initial_selected_idx,
             ..Default::default()
-        });
+        }
     }
 
     pub(super) fn is_terminal_thread_read_error(err: &color_eyre::Report) -> bool {
@@ -194,6 +235,7 @@ impl App {
         err.chain().any(|cause| {
             let message = cause.to_string();
             message.contains("includeTurns is unavailable before first user message")
+                || message.contains("thread/turns/list is unavailable before first user message")
                 || message.contains("ephemeral threads do not support includeTurns")
         })
     }
@@ -342,22 +384,24 @@ impl App {
                     error = %resume_err,
                     "failed to resume live thread for selection; falling back to thread/read"
                 );
-                let (thread, turns) = match app_server
-                    .thread_read(thread_id, /*include_turns*/ true)
+                let mut thread = app_server
+                    .thread_read(thread_id, /*include_turns*/ false)
+                    .await?;
+                match app_server
+                    .hydrate_initial_thread_history(
+                        &mut thread,
+                        /*turn_cursor*/ None,
+                        /*item_cursor*/ None,
+                        Some(&self.config),
+                        crate::app_server_session::HistoryHydrationScope::Initial,
+                    )
                     .await
                 {
-                    Ok(thread) => {
-                        let turns = thread.turns.clone();
-                        (thread, turns)
-                    }
-                    Err(err) if Self::can_fallback_from_include_turns_error(&err) => {
-                        let thread = app_server
-                            .thread_read(thread_id, /*include_turns*/ false)
-                            .await?;
-                        (thread, Vec::new())
-                    }
+                    Ok(()) => {}
+                    Err(err) if Self::can_fallback_from_include_turns_error(&err) => {}
                     Err(err) => return Err(err),
-                };
+                }
+                let turns = thread.turns.clone();
                 if turns.is_empty() {
                     // A `thread/read` fallback without turns would create a blank local replay
                     // channel with no live listener attached, which blocks later real re-attach.
@@ -530,7 +574,7 @@ impl App {
         terminal: &mut crate::custom_terminal::Terminal<B>,
     ) -> Result<()>
     where
-        B: Backend + Write,
+        B: Backend<Error = io::Error> + Write,
     {
         terminal.clear_scrollback_and_visible_screen_ansi()?;
         let mut area = terminal.viewport_area;

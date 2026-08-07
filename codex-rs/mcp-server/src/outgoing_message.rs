@@ -79,18 +79,27 @@ impl OutgoingMessageSender {
         }
     }
 
-    pub(crate) async fn send_response<T: Serialize>(&self, id: RequestId, response: T) {
-        let result = match serde_json::to_value(response) {
+    pub(crate) fn send_response<T: Serialize>(&self, id: RequestId, response: T) {
+        let mut result = match serde_json::to_value(response) {
             Ok(result) => result,
             Err(err) => {
                 self.send_error(
                     id,
                     ErrorData::internal_error(format!("failed to serialize response: {err}"), None),
-                )
-                .await;
+                );
                 return;
             }
         };
+
+        // rmcp result constructors include the modern discriminator by default.
+        // This legacy server serializes responses directly, bypassing rmcp's
+        // protocol-aware response handling, so preserve the historical wire shape:
+        // https://github.com/modelcontextprotocol/rust-sdk/issues/1036
+        if let Value::Object(object) = &mut result
+            && object.get("resultType").and_then(Value::as_str) == Some("complete")
+        {
+            object.remove("resultType");
+        }
 
         let outgoing_message = OutgoingMessage::Response(OutgoingResponse { id, result });
         let _ = self.sender.send(outgoing_message);
@@ -99,7 +108,7 @@ impl OutgoingMessageSender {
     /// This is used with the MCP server, but not the more general JSON-RPC app
     /// server. Prefer [`OutgoingMessageSender::send_server_notification`] where
     /// possible.
-    pub(crate) async fn send_event_as_notification(
+    pub(crate) fn send_event_as_notification(
         &self,
         event: &Event,
         meta: Option<OutgoingNotificationMeta>,
@@ -119,17 +128,16 @@ impl OutgoingMessageSender {
 
         self.send_notification(OutgoingNotification {
             method: "codex/event".to_string(),
-            params: Some(params.clone()),
-        })
-        .await;
+            params: Some(params),
+        });
     }
 
-    pub(crate) async fn send_notification(&self, notification: OutgoingNotification) {
+    pub(crate) fn send_notification(&self, notification: OutgoingNotification) {
         let outgoing_message = OutgoingMessage::Notification(notification);
         let _ = self.sender.send(outgoing_message);
     }
 
-    pub(crate) async fn send_error(&self, id: RequestId, error: ErrorData) {
+    pub(crate) fn send_error(&self, id: RequestId, error: ErrorData) {
         let outgoing_message = OutgoingMessage::Error(OutgoingError { id, error });
         let _ = self.sender.send(outgoing_message);
     }
@@ -287,6 +295,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outgoing_tool_response_preserves_legacy_wire_format() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<OutgoingMessage>();
+        let outgoing_message_sender = OutgoingMessageSender::new(outgoing_tx);
+
+        outgoing_message_sender.send_response(
+            RequestId::Number(1),
+            rmcp::model::CallToolResult::success(Vec::new()),
+        );
+
+        let Some(OutgoingMessage::Response(response)) = outgoing_rx.recv().await else {
+            panic!("expected a tool-call response");
+        };
+        assert_eq!(response.id, RequestId::Number(1));
+        assert_eq!(response.result, json!({ "content": [], "isError": false }));
+    }
+
+    #[tokio::test]
     async fn test_send_event_as_notification() -> Result<()> {
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<OutgoingMessage>();
         let outgoing_message_sender = OutgoingMessageSender::new(outgoing_tx);
@@ -317,9 +342,7 @@ mod tests {
             }),
         };
 
-        outgoing_message_sender
-            .send_event_as_notification(&event, /*meta*/ None)
-            .await;
+        outgoing_message_sender.send_event_as_notification(&event, /*meta*/ None);
 
         let result = outgoing_rx.recv().await.unwrap();
         let OutgoingMessage::Notification(OutgoingNotification { method, params }) = result else {
@@ -370,9 +393,7 @@ mod tests {
             thread_id: None,
         };
 
-        outgoing_message_sender
-            .send_event_as_notification(&event, Some(meta))
-            .await;
+        outgoing_message_sender.send_event_as_notification(&event, Some(meta));
 
         let result = outgoing_rx.recv().await.unwrap();
         let OutgoingMessage::Notification(OutgoingNotification { method, params }) = result else {
@@ -438,9 +459,7 @@ mod tests {
             thread_id: Some(thread_id),
         };
 
-        outgoing_message_sender
-            .send_event_as_notification(&event, Some(meta))
-            .await;
+        outgoing_message_sender.send_event_as_notification(&event, Some(meta));
 
         let result = outgoing_rx.recv().await.unwrap();
         let OutgoingMessage::Notification(OutgoingNotification { method, params }) = result else {

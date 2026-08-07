@@ -204,6 +204,9 @@ impl ChatWidget {
         self.mcp_startup_pending_next_round.clear();
         self.mcp_startup_pending_next_round_saw_starting = false;
         self.update_task_running_state();
+        if self.input_queue.user_turn_pending_start {
+            self.bottom_pane.set_task_running(/*running*/ true);
+        }
         if self.bottom_pane.is_task_running() && mcp_startup_owned_status {
             self.restore_reasoning_status_header();
         }
@@ -233,11 +236,9 @@ impl ChatWidget {
 
         for name in server_names {
             match current.get(&name) {
-                Some(McpStartupStatus::Ready) => {}
                 Some(McpStartupStatus::Failed { .. }) => failed.push(name),
-                Some(McpStartupStatus::Cancelled | McpStartupStatus::Starting) | None => {
-                    cancelled.push(name);
-                }
+                Some(McpStartupStatus::Cancelled) => cancelled.push(name),
+                Some(McpStartupStatus::Ready | McpStartupStatus::Starting) | None => {}
             }
         }
 
@@ -246,6 +247,7 @@ impl ChatWidget {
         cancelled.sort();
         cancelled.dedup();
         self.finish_mcp_startup(failed, cancelled);
+        self.mcp_startup_allow_terminal_only_next_round = true;
     }
 
     pub(super) fn status_header_is_mcp_startup_owned(&self) -> bool {

@@ -74,6 +74,7 @@ fn test_model_info(
     input_modalities: Vec<InputModality>,
 ) -> ModelInfo {
     ModelInfo {
+        base_instructions: String::new(),
         slug: slug.to_string(),
         display_name: display_name.to_string(),
         description: Some(description.to_string()),
@@ -98,9 +99,10 @@ fn test_model_info(
         service_tiers: Vec::new(),
         default_service_tier: None,
         upgrade: None,
-        base_instructions: "base instructions".to_string(),
         model_messages: None,
         include_skills_usage_instructions: false,
+        include_plugin_usage_instructions: false,
+        include_apps_usage_instructions: false,
         supports_reasoning_summary_parameter: true,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
@@ -939,6 +941,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         (smaller_context_window * effective_context_window_percent) / 100;
 
     let base_model = ModelInfo {
+        base_instructions: String::new(),
         slug: large_model_slug.to_string(),
         display_name: "Larger Model".to_string(),
         description: Some("larger context window model".to_string()),
@@ -963,9 +966,10 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         service_tiers: Vec::new(),
         default_service_tier: None,
         upgrade: None,
-        base_instructions: "base instructions".to_string(),
         model_messages: None,
         include_skills_usage_instructions: false,
+        include_plugin_usage_instructions: false,
+        include_apps_usage_instructions: false,
         supports_reasoning_summary_parameter: true,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,

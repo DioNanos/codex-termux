@@ -2,9 +2,9 @@
 //! Tokio task. Separated from `message_processor.rs` to keep that file small
 //! and to make future feature-growth easier to manage.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::active_turn_registry::ActiveTurnRegistry;
 use crate::exec_approval::handle_exec_approval_request;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::OutgoingNotificationMeta;
@@ -25,10 +25,10 @@ use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::user_input::UserInput;
 use rmcp::model::CallToolResult;
-use rmcp::model::Content;
+use rmcp::model::ContentBlock;
 use rmcp::model::RequestId;
 use serde_json::json;
-use tokio::sync::Mutex;
+use uuid::Uuid;
 
 /// To adhere to MCP `tools/call` response format, include the Codex
 /// `threadId` in the `structured_content` field of the response.
@@ -40,7 +40,7 @@ pub(crate) fn create_call_tool_result_with_thread_id(
     is_error: Option<bool>,
 ) -> CallToolResult {
     let content_text = text;
-    let content = vec![Content::text(content_text.clone())];
+    let content = vec![ContentBlock::text(content_text.clone())];
     let structured_content = json!({
         "threadId": thread_id,
         "content": content_text,
@@ -61,7 +61,7 @@ pub async fn run_codex_tool_session(
     config: CodexConfig,
     outgoing: Arc<OutgoingMessageSender>,
     thread_manager: Arc<ThreadManager>,
-    running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    active_turns: Arc<ActiveTurnRegistry>,
 ) {
     let NewThread {
         thread_id,
@@ -73,10 +73,10 @@ pub async fn run_codex_tool_session(
     {
         Ok(res) => res,
         Err(e) => {
-            let result = CallToolResult::error(vec![Content::text(format!(
+            let result = CallToolResult::error(vec![ContentBlock::text(format!(
                 "Failed to start Codex session: {e}"
             ))]);
-            outgoing.send_response(id.clone(), result).await;
+            outgoing.send_response(id.clone(), result);
             return;
         }
     };
@@ -86,26 +86,20 @@ pub async fn run_codex_tool_session(
         id: "".to_string(),
         msg: EventMsg::SessionConfigured(session_configured.clone()),
     };
-    outgoing
-        .send_event_as_notification(
-            &session_configured_event,
-            Some(OutgoingNotificationMeta {
-                request_id: Some(id.clone()),
-                thread_id: Some(thread_id),
-            }),
-        )
-        .await;
+    outgoing.send_event_as_notification(
+        &session_configured_event,
+        Some(OutgoingNotificationMeta {
+            request_id: Some(id.clone()),
+            thread_id: Some(thread_id),
+        }),
+    );
 
-    // Use the original MCP request ID as the `sub_id` for the Codex submission so that
-    // any events emitted for this tool-call can be correlated with the
-    // originating `tools/call` request.
-    let sub_id = id.to_string();
-    running_requests_id_to_codex_uuid
-        .lock()
-        .await
-        .insert(id.clone(), thread_id);
+    // Preserve the legacy event ID for initial `codex` calls. Each call starts
+    // a new thread, so the thread and turn pair remains unique.
+    let turn_id = id.to_string();
+    active_turns.register(id.clone(), thread_id, turn_id.clone());
     let submission = Submission {
-        id: sub_id.clone(),
+        id: turn_id,
         op: Op::UserInput {
             items: vec![UserInput::Text {
                 text: initial_prompt.clone(),
@@ -119,6 +113,7 @@ pub async fn run_codex_tool_session(
         },
         client_user_message_id: None,
         trace: None,
+        parent_turn_id: None,
     };
 
     if let Err(e) = thread.submit_with_id(submission).await {
@@ -128,20 +123,11 @@ pub async fn run_codex_tool_session(
             format!("Failed to submit initial prompt: {e}"),
             Some(true),
         );
-        outgoing.send_response(id.clone(), result).await;
-        // unregister the id so we don't keep it in the map
-        running_requests_id_to_codex_uuid.lock().await.remove(&id);
+        active_turns.finish(&id, || outgoing.send_response(id.clone(), result));
         return;
     }
 
-    run_codex_tool_session_inner(
-        thread_id,
-        thread,
-        outgoing,
-        id,
-        running_requests_id_to_codex_uuid,
-    )
-    .await;
+    run_codex_tool_session_inner(thread_id, thread, outgoing, id, active_turns).await;
 }
 
 pub async fn run_codex_tool_session_reply(
@@ -150,23 +136,29 @@ pub async fn run_codex_tool_session_reply(
     outgoing: Arc<OutgoingMessageSender>,
     request_id: RequestId,
     prompt: String,
-    running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    active_turns: Arc<ActiveTurnRegistry>,
 ) {
-    running_requests_id_to_codex_uuid
-        .lock()
-        .await
-        .insert(request_id.clone(), thread_id);
+    // Replies share a thread, so use Core's UUIDv7 submission ID convention
+    // instead of a reusable MCP request ID.
+    let turn_id = Uuid::now_v7().to_string();
+    active_turns.register(request_id.clone(), thread_id, turn_id.clone());
     if let Err(e) = thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: prompt,
-                // MCP tool prompts are plain text with no UI element ranges.
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
+        .submit_with_id(Submission {
+            id: turn_id,
+            op: Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: prompt,
+                    // MCP tool prompts are plain text with no UI element ranges.
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
+            },
+            client_user_message_id: None,
+            trace: None,
+            parent_turn_id: None,
         })
         .await
     {
@@ -176,23 +168,13 @@ pub async fn run_codex_tool_session_reply(
             format!("Failed to submit user input: {e}"),
             Some(true),
         );
-        outgoing.send_response(request_id.clone(), result).await;
-        // unregister the id so we don't keep it in the map
-        running_requests_id_to_codex_uuid
-            .lock()
-            .await
-            .remove(&request_id);
+        active_turns.finish(&request_id, || {
+            outgoing.send_response(request_id.clone(), result);
+        });
         return;
     }
 
-    run_codex_tool_session_inner(
-        thread_id,
-        thread,
-        outgoing,
-        request_id,
-        running_requests_id_to_codex_uuid,
-    )
-    .await;
+    run_codex_tool_session_inner(thread_id, thread, outgoing, request_id, active_turns).await;
 }
 
 async fn run_codex_tool_session_inner(
@@ -200,7 +182,7 @@ async fn run_codex_tool_session_inner(
     thread: Arc<CodexThread>,
     outgoing: Arc<OutgoingMessageSender>,
     request_id: RequestId,
-    running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    active_turns: Arc<ActiveTurnRegistry>,
 ) {
     let request_id_str = request_id.to_string();
 
@@ -209,15 +191,13 @@ async fn run_codex_tool_session_inner(
     loop {
         match thread.next_event().await {
             Ok(event) => {
-                outgoing
-                    .send_event_as_notification(
-                        &event,
-                        Some(OutgoingNotificationMeta {
-                            request_id: Some(request_id.clone()),
-                            thread_id: Some(thread_id),
-                        }),
-                    )
-                    .await;
+                outgoing.send_event_as_notification(
+                    &event,
+                    Some(OutgoingNotificationMeta {
+                        request_id: Some(request_id.clone()),
+                        thread_id: Some(thread_id),
+                    }),
+                );
 
                 match event.msg {
                     EventMsg::ExecApprovalRequest(ev) => {
@@ -266,7 +246,9 @@ async fn run_codex_tool_session_inner(
                             err_event.message,
                             Some(true),
                         );
-                        outgoing.send_response(request_id.clone(), result).await;
+                        active_turns.finish(&request_id, || {
+                            outgoing.send_response(request_id.clone(), result);
+                        });
                         break;
                     }
                     EventMsg::Warning(_)
@@ -316,12 +298,9 @@ async fn run_codex_tool_session_inner(
                         let result = create_call_tool_result_with_thread_id(
                             thread_id, text, /*is_error*/ None,
                         );
-                        outgoing.send_response(request_id.clone(), result).await;
-                        // unregister the id so we don't keep it in the map
-                        running_requests_id_to_codex_uuid
-                            .lock()
-                            .await
-                            .remove(&request_id);
+                        active_turns.finish(&request_id, || {
+                            outgoing.send_response(request_id.clone(), result);
+                        });
                         break;
                     }
                     EventMsg::SessionConfigured(_) => {
@@ -414,7 +393,9 @@ async fn run_codex_tool_session_inner(
                     format!("Codex runtime error: {e}"),
                     Some(true),
                 );
-                outgoing.send_response(request_id.clone(), result).await;
+                active_turns.finish(&request_id, || {
+                    outgoing.send_response(request_id.clone(), result);
+                });
                 break;
             }
         }

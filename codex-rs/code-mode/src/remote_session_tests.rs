@@ -3,18 +3,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
 use codex_code_mode_protocol::CodeModeSessionProvider;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::RuntimeResponse;
+use codex_code_mode_protocol::host::Capability;
 use codex_code_mode_protocol::host::CapabilitySet;
 use codex_code_mode_protocol::host::ClientToHost;
+use codex_code_mode_protocol::host::DUAL_WEBSOCKET_CAPABILITY;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::HostHello;
 use codex_code_mode_protocol::host::HostRequest;
 use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::ProtocolVersion;
+use codex_code_mode_protocol::host::SESSION_RESOURCE_LIMITS_CAPABILITY;
 use codex_code_mode_protocol::host::WireCellId;
 use codex_code_mode_protocol::host::WireContentItem;
 use codex_code_mode_protocol::host::WireResult;
@@ -24,6 +28,8 @@ use codex_http_client::OutboundProxyPolicy;
 use futures::SinkExt;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 use tokio_tungstenite::accept_async;
@@ -33,65 +39,16 @@ use super::ProcessOwnedCodeModeSession;
 use super::ProcessOwnedCodeModeSessionProvider;
 use super::WebSocketCodeModeSessionProvider;
 use super::connection::ConnectionError;
-use super::resolve_host_program;
 use crate::NoopCodeModeSessionDelegate;
 
 #[test]
 fn provider_reuses_its_live_process_host() {
     let provider = ProcessOwnedCodeModeSessionProvider::default();
 
-    let first = provider.process_host().expect("owned process host");
-    let second = provider.process_host().expect("owned process host");
+    let first = provider.process_host();
+    let second = provider.process_host();
 
     assert!(Arc::ptr_eq(&first, &second));
-}
-
-#[test]
-fn host_program_override_takes_precedence() {
-    assert_eq!(
-        resolve_host_program(
-            Some("custom-code-mode-host".into()),
-            Ok(PathBuf::from("/opt/codex/bin/codex")),
-        ),
-        PathBuf::from("custom-code-mode-host")
-    );
-}
-
-#[test]
-fn host_program_is_next_to_the_main_executable_even_when_missing() {
-    let executable_name = if cfg!(windows) {
-        "codex-code-mode-host.exe"
-    } else {
-        "codex-code-mode-host"
-    };
-
-    assert_eq!(
-        resolve_host_program(
-            /*override_path*/ None,
-            Ok(PathBuf::from("/opt/codex/bin/codex")),
-        ),
-        PathBuf::from("/opt/codex/bin").join(executable_name)
-    );
-}
-
-#[test]
-fn host_program_falls_back_to_its_name_when_main_executable_is_unknown() {
-    let executable_name = if cfg!(windows) {
-        "codex-code-mode-host.exe"
-    } else {
-        "codex-code-mode-host"
-    };
-
-    assert_eq!(
-        resolve_host_program(
-            /*override_path*/ None,
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "missing executable"
-            )),
-        ),
-        PathBuf::from(executable_name)
-    );
 }
 
 #[test]
@@ -130,42 +87,6 @@ fn missing_host_error_preserves_utf8_boundaries_when_truncating_the_path() {
 }
 
 #[tokio::test]
-async fn provider_falls_back_to_in_process_session_when_host_is_missing() {
-    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
-        "codex-code-mode-host-does-not-exist".into(),
-    );
-
-    let session = provider
-        .create_session(Arc::new(NoopCodeModeSessionDelegate))
-        .await
-        .expect("missing host should fall back to an in-process session");
-    let response = session
-        .execute(ExecuteRequest {
-            tool_call_id: "call-1".to_string(),
-            enabled_tools: Vec::new(),
-            source: "text('fallback')".to_string(),
-            yield_time_ms: None,
-            max_output_tokens: None,
-        })
-        .await
-        .expect("execute fallback session")
-        .initial_response()
-        .await
-        .expect("read fallback response");
-
-    assert_eq!(
-        response,
-        RuntimeResponse::Result {
-            cell_id: codex_code_mode_protocol::CellId::new("1".to_string()),
-            content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: "fallback".to_string(),
-            }],
-            error_text: None,
-        }
-    );
-}
-
-#[tokio::test]
 async fn websocket_provider_executes_over_shared_connector() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -198,13 +119,19 @@ async fn websocket_provider_executes_over_shared_connector() {
             let request = EncodedFrame::decode_framed::<ClientToHost>(&frame)
                 .expect("websocket test host should decode a framed protocol message");
             let responses = match request {
-                ClientToHost::ClientHello(_) => vec![HostToClient::HostHello(HostHello::new(
-                    ProtocolVersion::V1,
-                    CapabilitySet::empty(),
-                ))],
+                ClientToHost::ClientHello(hello) => {
+                    let capability = Capability::new(SESSION_RESOURCE_LIMITS_CAPABILITY)
+                        .expect("session-limit capability");
+                    assert!(hello.optional_capabilities().contains(&capability));
+                    assert_eq!(hello.required_capabilities(), &CapabilitySet::empty());
+                    vec![HostToClient::HostHello(HostHello::new(
+                        ProtocolVersion::V1,
+                        CapabilitySet::empty(),
+                    ))]
+                }
                 ClientToHost::Request {
                     id,
-                    request: HostRequest::OpenSession { session_id },
+                    request: HostRequest::OpenSession { session_id, .. },
                 } => vec![HostToClient::Response {
                     id,
                     result: WireResult::Ok {
@@ -273,6 +200,32 @@ async fn websocket_provider_executes_over_shared_connector() {
         .create_session(Arc::new(NoopCodeModeSessionDelegate))
         .await
         .expect("shared websocket connector should open a code-mode session");
+    let error = provider
+        .create_session_with_limits(
+            Arc::new(NoopCodeModeSessionDelegate),
+            CodeModeSessionCellExecutionLimits {
+                max_yield_time_ms: Some(250),
+                max_heap_size_bytes: None,
+            },
+        )
+        .await
+        .err()
+        .expect("legacy host should reject a limited session");
+    assert_eq!(
+        error,
+        format!(
+            "code-mode host does not support session resource limits: missing `{SESSION_RESOURCE_LIMITS_CAPABILITY}` capability"
+        )
+    );
+    let second_session = provider
+        .create_session(Arc::new(NoopCodeModeSessionDelegate))
+        .await
+        .expect("rejecting limited sessions should preserve the shared legacy-host connection");
+    second_session
+        .shutdown()
+        .await
+        .expect("second unlimited session should shut down");
+    drop(second_session);
     let response = session
         .execute(ExecuteRequest {
             tool_call_id: "shared-websocket".to_string(),
@@ -310,20 +263,110 @@ async fn websocket_provider_executes_over_shared_connector() {
 }
 
 #[tokio::test]
-async fn provider_returns_missing_host_error_when_in_process_fallback_is_disabled() {
+async fn websocket_provider_fails_when_a_negotiated_bulk_connection_is_unavailable() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("websocket test listener should bind");
+    let websocket_url = format!(
+        "ws://{}/?access_token=shared-token",
+        listener
+            .local_addr()
+            .expect("websocket test listener should have an address")
+    );
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("websocket test host should accept the first connection");
+        let mut control = accept_async(stream)
+            .await
+            .expect("first control websocket should connect");
+        let frame = control
+            .next()
+            .await
+            .expect("first client hello")
+            .expect("first websocket frame")
+            .into_data();
+        let ClientToHost::ClientHello(hello) =
+            EncodedFrame::decode_framed(&frame).expect("decode first client hello")
+        else {
+            panic!("expected first client hello");
+        };
+        let capability =
+            Capability::new(DUAL_WEBSOCKET_CAPABILITY).expect("dual websocket capability");
+        assert!(hello.optional_capabilities().contains(&capability));
+        let session_limits_capability =
+            Capability::new(SESSION_RESOURCE_LIMITS_CAPABILITY).expect("session-limit capability");
+        assert!(
+            hello
+                .optional_capabilities()
+                .contains(&session_limits_capability)
+        );
+        let hello = HostToClient::HostHello(
+            HostHello::new(
+                ProtocolVersion::V1,
+                CapabilitySet::try_new([capability.clone()]).expect("host capabilities"),
+            )
+            .with_bulk_connection_token("fallback-token".to_string()),
+        );
+        let frame = EncodedFrame::encode(&hello).expect("encode dual host hello");
+        control
+            .send(Message::Binary(frame.into_framed_bytes().into()))
+            .await
+            .expect("send dual host hello");
+
+        let (mut bulk, _) = listener
+            .accept()
+            .await
+            .expect("websocket test host should accept the bulk connection");
+        let mut request = [0_u8; 1024];
+        let request_len = bulk
+            .read(&mut request)
+            .await
+            .expect("read bulk websocket handshake");
+        let request = std::str::from_utf8(&request[..request_len]).expect("bulk HTTP request");
+        assert!(
+            request.starts_with("GET /bulk/fallback-token?access_token=shared-token HTTP/1.1\r\n")
+        );
+        bulk.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("reject unavailable bulk websocket");
+        drop(bulk);
+        drop(control);
+    });
+
+    let provider = WebSocketCodeModeSessionProvider::new(websocket_url);
+    let error = match provider
+        .create_session(Arc::new(NoopCodeModeSessionDelegate))
+        .await
+    {
+        Ok(_) => panic!("provider should reject an unavailable negotiated bulk websocket"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("404"),
+        "unexpected negotiated bulk websocket error: {error}"
+    );
+    drop(provider);
+    timeout(Duration::from_secs(5), server)
+        .await
+        .expect("negotiated bulk websocket test host should disconnect promptly")
+        .expect("negotiated bulk websocket test host task should succeed");
+}
+
+#[tokio::test]
+async fn provider_returns_missing_host_error() {
     let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
         "codex-code-mode-host-does-not-exist".into(),
-    )
-    .without_in_process_fallback();
+    );
 
     let error = provider
         .create_session(Arc::new(NoopCodeModeSessionDelegate))
         .await
         .err()
-        .expect("missing host should fail when in-process fallback is disabled");
+        .expect("missing host should fail");
 
     assert!(error.contains("failed to spawn code-mode host codex-code-mode-host-does-not-exist"));
-    assert!(provider.process_host().is_some());
 }
 
 #[tokio::test]

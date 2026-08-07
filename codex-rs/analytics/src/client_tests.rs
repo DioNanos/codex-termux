@@ -42,8 +42,10 @@ use codex_app_server_protocol::ApprovalsReviewer as AppServerApprovalsReviewer;
 use codex_app_server_protocol::AskForApproval as AppServerAskForApproval;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
+use codex_app_server_protocol::CommandExecutionOutputDeltaNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxPolicy as AppServerSandboxPolicy;
+use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SessionSource as AppServerSessionSource;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadArchiveParams;
@@ -53,6 +55,9 @@ use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus as AppServerThreadStatus;
 use codex_app_server_protocol::Turn;
+use codex_app_server_protocol::TurnDiffUpdatedNotification;
+use codex_app_server_protocol::TurnInterruptParams;
+use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
@@ -62,6 +67,7 @@ use codex_app_server_protocol::TurnSteerResponse;
 use codex_login::AuthManager;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::test_path_buf;
+use pretty_assertions::assert_eq;
 use std::collections::HashSet;
 #[cfg(debug_assertions)]
 use std::fs;
@@ -139,6 +145,10 @@ fn sample_mcp_tool_call_event(thread_id: &str, plugin_id: Option<&str>) -> Track
                 session_id: format!("session-{thread_id}"),
                 turn_id: "turn-1".to_string(),
                 item_id: format!("item-{thread_id}"),
+                cell_id: None,
+                parent_call_id: None,
+                originating_response_id: None,
+                subsequent_response_id: None,
                 app_server_client: CodexAppServerClientMetadata {
                     product_client_id: "codex_desktop".to_string(),
                     client_name: None,
@@ -461,6 +471,20 @@ fn sample_turn_steer_request() -> ClientRequest {
     }
 }
 
+fn sample_turn_interrupt_request(turn_id: &str) -> ClientRequest {
+    ClientRequest::TurnInterrupt {
+        request_id: RequestId::Integer(3),
+        params: TurnInterruptParams {
+            thread_id: "thread-1".to_string(),
+            turn_id: turn_id.to_string(),
+        },
+    }
+}
+
+fn sample_turn_interrupt_response() -> ClientResponsePayload {
+    ClientResponsePayload::TurnInterrupt(TurnInterruptResponse {})
+}
+
 fn sample_thread_archive_request() -> ClientRequest {
     ClientRequest::ThreadArchive {
         request_id: RequestId::Integer(3),
@@ -479,7 +503,8 @@ fn sample_thread(thread_id: &str) -> Thread {
         parent_thread_id: None,
         preview: "first prompt".to_string(),
         ephemeral: false,
-        is_pinned: false,
+        section: None,
+        section_entered_at: None,
         history_mode: Default::default(),
         model_provider: "openai".to_string(),
         created_at: 1,
@@ -594,11 +619,36 @@ fn track_request_only_enqueues_analytics_relevant_requests() {
         ));
     }
 
+    client.track_request(
+        /*connection_id*/ 7,
+        RequestId::Integer(3),
+        &sample_turn_interrupt_request("turn-1"),
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(AnalyticsEventsQueueMessage::Fact(input))
+            if matches!(
+                *input,
+                AnalyticsFact::ExplicitClientInterruptRequest {
+                    ref turn_id,
+                    requested_at_ms,
+                    ..
+                } if turn_id == "turn-1" && requested_at_ms > 0
+            )
+    ));
+
     let ignored_request = sample_thread_archive_request();
     client.track_request(
         /*connection_id*/ 7,
         RequestId::Integer(3),
         &ignored_request,
+    );
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+    client.track_request(
+        /*connection_id*/ 7,
+        RequestId::Integer(4),
+        &sample_turn_interrupt_request(""),
     );
     assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
 }
@@ -613,8 +663,9 @@ fn track_response_only_enqueues_analytics_relevant_responses() {
         (RequestId::Integer(3), sample_thread_fork_response()),
         (RequestId::Integer(4), sample_turn_start_response()),
         (RequestId::Integer(5), sample_turn_steer_response()),
+        (RequestId::Integer(6), sample_turn_interrupt_response()),
     ] {
-        client.track_response(/*connection_id*/ 7, request_id, response);
+        client.track_response(/*connection_id*/ 7, request_id, &response);
         assert!(matches!(
             receiver.try_recv(),
             Ok(AnalyticsEventsQueueMessage::Fact(input))
@@ -624,9 +675,30 @@ fn track_response_only_enqueues_analytics_relevant_responses() {
 
     client.track_response(
         /*connection_id*/ 7,
-        RequestId::Integer(6),
-        ClientResponsePayload::ThreadArchive(ThreadArchiveResponse {}),
+        RequestId::Integer(7),
+        &ClientResponsePayload::ThreadArchive(ThreadArchiveResponse {}),
     );
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[cfg(unix)]
+#[test]
+fn track_response_ignores_unserializable_thread_responses() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let (client, mut receiver) = client_with_receiver();
+    let mut response = sample_thread_start_response();
+    let ClientResponsePayload::ThreadStart(thread_start) = &mut response else {
+        panic!("expected thread/start response");
+    };
+    thread_start.cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+        std::path::PathBuf::from(OsString::from_vec(vec![b'/', b'b', b'a', b'd', 0xff])),
+    )
+    .expect("non-UTF-8 Unix paths are valid absolute paths");
+
+    client.track_response(/*connection_id*/ 7, RequestId::Integer(1), &response);
+
     assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
 }
 
@@ -658,6 +730,41 @@ async fn flush_waits_for_preceding_fact_delivery() {
 #[tokio::test]
 async fn flush_is_noop_when_analytics_is_disabled() {
     AnalyticsEventsClient::disabled().flush().await;
+}
+
+#[test]
+fn track_notification_only_enqueues_analytics_relevant_notifications() {
+    let (client, mut receiver) = client_with_receiver();
+    let tracked_payload = TurnDiffUpdatedNotification {
+        thread_id: "thread-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        diff: "diff".to_string(),
+    };
+    let tracked_notification = ServerNotification::TurnDiffUpdated(tracked_payload.clone());
+
+    client.track_notification(&tracked_notification);
+
+    let Ok(AnalyticsEventsQueueMessage::Fact(input)) = receiver.try_recv() else {
+        panic!("expected analytics notification");
+    };
+    let AnalyticsFact::Notification(notification) = *input else {
+        panic!("expected analytics notification fact");
+    };
+    let ServerNotification::TurnDiffUpdated(notification) = *notification else {
+        panic!("expected turn diff notification");
+    };
+    assert_eq!(notification, tracked_payload);
+
+    let ignored_notification =
+        ServerNotification::CommandExecutionOutputDelta(CommandExecutionOutputDeltaNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "item-1".to_string(),
+            delta: "output".to_string(),
+        });
+
+    client.track_notification(&ignored_notification);
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
 }
 
 #[test]

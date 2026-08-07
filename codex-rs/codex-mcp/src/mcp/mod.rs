@@ -5,9 +5,7 @@ pub use auth::McpOAuthScopesSource;
 pub use auth::ResolvedMcpOAuthScopes;
 pub use auth::compute_auth_statuses;
 pub use auth::discover_supported_scopes;
-pub use auth::discover_supported_scopes_with_http_client;
 pub use auth::oauth_login_support;
-pub use auth::oauth_login_support_with_http_client;
 pub use auth::resolve_oauth_scopes;
 pub use auth::should_retry_without_scopes;
 
@@ -34,6 +32,7 @@ use codex_connectors::ConnectorSnapshot;
 use codex_connectors::connector_runtime_context_key;
 use codex_login::CodexAuth;
 use codex_model_provider::CHATGPT_CODEX_BASE_URL;
+use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::McpServerInfo;
 use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceTemplate;
@@ -48,6 +47,7 @@ use rmcp::model::ReadResourceResult;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::McpProtocolMode;
 use crate::ResolvedMcpCatalog;
 use crate::connection_manager::McpConnectionSet;
 use crate::runtime::McpPublicationGate;
@@ -157,6 +157,8 @@ pub struct McpConfig {
     pub prefix_mcp_tool_names: bool,
     /// MCP servers whose model-visible tool namespaces omit the `mcp__` prefix.
     pub non_prefixed_mcp_tool_servers: Vec<String>,
+    /// Protocol compatibility policy captured when this MCP configuration is created.
+    pub protocol_mode: McpProtocolMode,
     /// Client-side elicitation capabilities advertised during MCP initialization.
     pub client_elicitation_capability: ElicitationCapability,
     /// Resolved MCP registrations keyed by logical server name.
@@ -267,6 +269,38 @@ pub fn effective_mcp_servers(
     effective_mcp_servers_from_configured(configured_mcp_servers(config), config, auth)
 }
 
+fn is_trusted_chatgpt_mcp_server(
+    transport: &McpServerTransportConfig,
+    chatgpt_base_url: &str,
+) -> bool {
+    let McpServerTransportConfig::StreamableHttp { url, .. } = transport else {
+        return false;
+    };
+    let Ok(server_url) = url::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(server_url.scheme(), "http" | "https") {
+        return false;
+    }
+
+    if url::Url::parse(CHATGPT_CODEX_BASE_URL)
+        .ok()
+        .is_some_and(|chatgpt_url| server_url.origin() == chatgpt_url.origin())
+    {
+        return true;
+    }
+
+    url::Url::parse(chatgpt_base_url)
+        .ok()
+        .is_some_and(|staging_url| {
+            staging_url.scheme() == "https"
+                && staging_url.domain().is_some_and(|host| {
+                    host == "chatgpt-staging.com" || host.ends_with(".chatgpt-staging.com")
+                })
+                && server_url.origin() == staging_url.origin()
+        })
+}
+
 /// Converts a materialized server map to its auth-gated runtime view.
 ///
 /// Compatibility built-ins and extension overlays must already be reflected in
@@ -276,30 +310,25 @@ pub fn effective_mcp_servers_from_configured(
     config: &McpConfig,
     auth: Option<&CodexAuth>,
 ) -> HashMap<String, EffectiveMcpServer> {
-    let chatgpt_origin = url::Url::parse(CHATGPT_CODEX_BASE_URL)
-        .ok()
-        .map(|url| url.origin());
     let mut servers = configured_servers
         .into_iter()
         .map(|(name, mut server)| {
             match server.auth.clone() {
                 McpServerAuth::ChatGpt => {
-                    let server_origin = match &server.transport {
-                        McpServerTransportConfig::StreamableHttp { url, .. } => {
-                            url::Url::parse(url)
-                                .ok()
-                                .filter(|url| matches!(url.scheme(), "http" | "https"))
-                                .map(|url| url.origin())
-                        }
-                        McpServerTransportConfig::Stdio { .. } => None,
-                    };
-                    if server_origin.as_ref() != chatgpt_origin.as_ref() {
+                    if !is_trusted_chatgpt_mcp_server(&server.transport, &config.chatgpt_base_url) {
                         server.auth = McpServerAuth::OAuth;
                     }
                 }
                 McpServerAuth::OAuth => {}
             }
-            (name, EffectiveMcpServer::configured(server))
+            let agent_plugin = config
+                .mcp_server_catalog
+                .server(&name)
+                .is_some_and(|server| server.source().is_agent_plugin());
+            (
+                name,
+                EffectiveMcpServer::configured(server).with_agent_plugin(agent_plugin),
+            )
         })
         .collect::<HashMap<_, _>>();
     if !host_owned_codex_apps_enabled(config, auth) {
@@ -341,7 +370,7 @@ pub async fn read_mcp_resource(
             codex_apps_tools_cache,
             tool_catalog_cache,
             codex_apps_tools_cache_key: connector_runtime_context_key(auth),
-            supports_openai_form_elicitation: false,
+            client_mcp_extensions: ClientMcpExtensions::default(),
             auth: auth.cloned(),
             codex_apps_auth_manager: None,
             elicitation_reviewer: None,
@@ -418,7 +447,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
             codex_apps_tools_cache,
             tool_catalog_cache,
             codex_apps_tools_cache_key: connector_runtime_context_key(auth),
-            supports_openai_form_elicitation: false,
+            client_mcp_extensions: ClientMcpExtensions::default(),
             auth: auth.cloned(),
             codex_apps_auth_manager: None,
             elicitation_reviewer: None,
@@ -525,19 +554,21 @@ fn mcp_server_config_for_url(
     if let Some(originator) = originator {
         http_headers.insert("originator".to_string(), originator.to_string());
     }
+    let env_http_headers = None;
 
     McpServerConfig {
         transport: McpServerTransportConfig::StreamableHttp {
             url,
             bearer_token_env_var: codex_apps_mcp_bearer_token_env_var(),
             http_headers: Some(http_headers),
-            env_http_headers: None,
+            env_http_headers,
         },
         auth: auth_mode,
         environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
         enabled: true,
         required: false,
         supports_parallel_tool_calls: false,
+        omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: Some(Duration::from_secs(30)),
         tool_timeout_sec: None,

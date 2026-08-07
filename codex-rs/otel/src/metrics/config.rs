@@ -1,10 +1,21 @@
 use crate::config::OtelExporter;
 use crate::metrics::Result;
+use crate::metrics::names::API_CALL_COUNT_METRIC;
+use crate::metrics::names::API_CALL_DURATION_METRIC;
+use crate::metrics::names::TOOL_CALL_COUNT_METRIC;
+use crate::metrics::names::TOOL_CALL_DURATION_METRIC;
 use crate::metrics::validation::validate_tag_key;
 use crate::metrics::validation::validate_tag_value;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use std::collections::BTreeMap;
 use std::time::Duration;
+
+const RUNTIME_ONLY_METRICS: &[&str] = &[
+    API_CALL_COUNT_METRIC,
+    API_CALL_DURATION_METRIC,
+    TOOL_CALL_COUNT_METRIC,
+    TOOL_CALL_DURATION_METRIC,
+];
 
 #[derive(Clone, Debug)]
 pub enum MetricsExporter {
@@ -20,6 +31,7 @@ pub struct MetricsConfig {
     pub(crate) exporter: MetricsExporter,
     pub(crate) export_interval: Option<Duration>,
     pub(crate) runtime_reader: bool,
+    pub(crate) runtime_only_metrics: &'static [&'static str],
     pub(crate) default_tags: BTreeMap<String, String>,
 }
 
@@ -30,6 +42,11 @@ impl MetricsConfig {
         service_version: impl Into<String>,
         exporter: OtelExporter,
     ) -> Self {
+        let runtime_only_metrics = if matches!(exporter, OtelExporter::Statsig) {
+            RUNTIME_ONLY_METRICS
+        } else {
+            &[]
+        };
         Self {
             environment: environment.into(),
             service_name: service_name.into(),
@@ -37,6 +54,7 @@ impl MetricsConfig {
             exporter: MetricsExporter::Otlp(exporter),
             export_interval: None,
             runtime_reader: false,
+            runtime_only_metrics,
             default_tags: BTreeMap::new(),
         }
     }
@@ -55,6 +73,7 @@ impl MetricsConfig {
             exporter: MetricsExporter::InMemory(exporter),
             export_interval: None,
             runtime_reader: false,
+            runtime_only_metrics: &[],
             default_tags: BTreeMap::new(),
         }
     }

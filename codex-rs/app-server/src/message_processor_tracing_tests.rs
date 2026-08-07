@@ -276,7 +276,7 @@ fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>
 where
     F: Future<Output = Result<()>> + Send + 'static,
 {
-    const TEST_STACK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
 
     let handle = std::thread::Builder::new()
         .name(name.to_string())
@@ -450,8 +450,10 @@ async fn read_response<T: serde::de::DeserializeOwned>(
         if response.id != RequestId::Integer(request_id) {
             continue;
         }
-        return serde_json::from_value(response.result)
-            .expect("response payload should deserialize");
+        return serde_json::from_value(
+            serde_json::to_value(response.result).expect("response payload should serialize"),
+        )
+        .expect("response payload should deserialize");
     }
 }
 

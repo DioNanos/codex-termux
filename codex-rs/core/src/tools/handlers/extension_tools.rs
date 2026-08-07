@@ -6,6 +6,7 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_tools::ConversationHistory;
 use codex_tools::ExtensionTurnItem;
+use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolCall as ExtensionToolCall;
 use codex_tools::ToolEnvironment;
 use codex_tools::ToolName;
@@ -61,7 +62,23 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
 
 impl CoreToolRuntime for ExtensionToolAdapter {
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
-        matches!(payload, ToolPayload::Function { .. })
+        match payload {
+            ToolPayload::Function { .. } => true,
+            ToolPayload::Custom { .. } => match self.0.spec() {
+                ToolSpec::Freeform(_) => true,
+                ToolSpec::Namespace(namespace) => namespace.tools.iter().any(|tool| {
+                    matches!(
+                        tool,
+                        ResponsesApiNamespaceTool::Custom(tool)
+                            if tool.name == self.0.tool_name().name
+                    )
+                }),
+                ToolSpec::Function(_)
+                | ToolSpec::ToolSearch { .. }
+                | ToolSpec::WebSearch { .. } => false,
+            },
+            ToolPayload::ToolSearch { .. } => false,
+        }
     }
 }
 
@@ -286,6 +303,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn function_extensions_reject_custom_payloads() {
+        let handler = ExtensionToolAdapter::new(Arc::new(StubExtensionExecutor));
+
+        assert!(handler.matches_kind(&ToolPayload::Function {
+            arguments: "{}".to_string(),
+        }));
+        assert!(!handler.matches_kind(&ToolPayload::Custom {
+            input: "raw input".to_string(),
+        }));
+    }
+
     #[tokio::test]
     async fn exposes_generic_hook_payloads() {
         let handler = ExtensionToolAdapter::new(Arc::new(StubExtensionExecutor));
@@ -443,6 +472,7 @@ mod tests {
             status: "in_progress".to_string(),
             revised_prompt: None,
             result: String::new(),
+            transparent_background: None,
             saved_path: None,
         });
         let expected_completed_item = ExtensionItem::ImageGeneration(ImageGenerationItem {
@@ -450,6 +480,7 @@ mod tests {
             status: "completed".to_string(),
             revised_prompt: Some("A tiny blue square".to_string()),
             result: "cG5n".to_string(),
+            transparent_background: Some(true),
             saved_path: Some(expected_path.clone()),
         });
         codex_tools::TurnItemEmitter::emit_started(
@@ -471,6 +502,7 @@ mod tests {
                     status: "completed".to_string(),
                     revised_prompt: Some("A tiny blue square".to_string()),
                     result: "cG5n".to_string(),
+                    transparent_background: Some(true),
                     saved_path: Some(expected_path.clone()),
                 })],
             },

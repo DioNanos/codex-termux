@@ -1,4 +1,3 @@
-use crate::audio_preparation::estimate_audio_token_count;
 use crate::context::ContextualUserFragment;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
@@ -9,6 +8,7 @@ use crate::event_mapping::is_contextual_user_message_content;
 use crate::session::turn_context::TurnContext;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -22,6 +22,7 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::WorldStateItem;
+use codex_utils_audio::estimate_audio_token_count;
 use codex_utils_cache::BlockingLruCache;
 use codex_utils_cache::sha1_digest;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -731,28 +732,42 @@ fn audio_data_url_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
 }
 
 fn encrypted_function_output_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
-    let ResponseItem::FunctionCallOutput { output, .. } = item else {
-        return (0, 0);
-    };
-    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
-        return (0, 0);
-    };
-
-    items.iter().fold((0i64, 0i64), |acc, item| {
-        let FunctionCallOutputContentItem::EncryptedContent { encrypted_content } = item else {
-            return acc;
-        };
-        let payload_bytes = acc
-            .0
+    let mut payload_bytes = 0i64;
+    let mut replacement_bytes = 0i64;
+    let mut accumulate = |encrypted_content: &str| {
+        payload_bytes = payload_bytes
             .saturating_add(i64::try_from(encrypted_content.len()).unwrap_or(i64::MAX));
-        let replacement_bytes = acc.1.saturating_add(
+        replacement_bytes = replacement_bytes.saturating_add(
             i64::try_from(estimate_encrypted_function_output_length(
                 encrypted_content.len(),
             ))
             .unwrap_or(i64::MAX),
         );
-        (payload_bytes, replacement_bytes)
-    })
+    };
+
+    match item {
+        ResponseItem::FunctionCallOutput { output, .. } => {
+            if let FunctionCallOutputBody::ContentItems(items) = &output.body {
+                for item in items {
+                    if let FunctionCallOutputContentItem::EncryptedContent { encrypted_content } =
+                        item
+                    {
+                        accumulate(encrypted_content);
+                    }
+                }
+            }
+        }
+        ResponseItem::AgentMessage { content, .. } => {
+            for item in content {
+                if let AgentMessageInputContent::EncryptedContent { encrypted_content } = item {
+                    accumulate(encrypted_content);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    (payload_bytes, replacement_bytes)
 }
 
 fn is_model_generated_item(item: &ResponseItem) -> bool {

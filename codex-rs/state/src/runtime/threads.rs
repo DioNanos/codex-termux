@@ -33,7 +33,14 @@ SELECT
     threads.tokens_used,
     threads.first_user_message,
     threads.archived_at,
-    threads.is_pinned,
+    threads.thread_section_id AS section,
+    (
+        SELECT thread_sections.name
+        FROM thread_sections
+        WHERE thread_sections.id = threads.thread_section_id
+    ) AS section_name,
+    threads.section_position,
+    threads.section_entered_at_ms,
     threads.git_sha,
     threads.git_branch,
     threads.git_origin_url
@@ -48,6 +55,14 @@ WHERE threads.id = ?
             .transpose()
     }
 
+    /// Permanently promote a thread to paginated history without changing metadata or recency.
+    pub async fn mark_thread_paginated(&self, thread_id: ThreadId) -> anyhow::Result<bool> {
+        let result = sqlx::query("UPDATE threads SET history_mode = 'paginated' WHERE id = ?")
+            .bind(thread_id.to_string())
+            .execute(self.pool.as_ref())
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
     pub async fn get_thread_memory_mode(&self, id: ThreadId) -> anyhow::Result<Option<String>> {
         let row = sqlx::query("SELECT memory_mode FROM threads WHERE id = ?")
             .bind(id.to_string())
@@ -373,7 +388,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
                 allowed_sources,
                 model_providers,
                 cwd_filters: None,
-                is_pinned: None,
+                section: None,
                 anchor: None,
                 sort_key: crate::SortKey::UpdatedAt,
                 sort_direction: SortDirection::Desc,
@@ -498,20 +513,26 @@ ON CONFLICT(child_thread_id) DO NOTHING
                 allowed_sources,
                 model_providers,
                 cwd_filters: None,
-                is_pinned: None,
+                section: None,
                 anchor,
                 sort_key,
                 sort_direction: SortDirection::Desc,
                 search_term: None,
             },
-            sort_key == crate::SortKey::RecencyAt,
+            matches!(
+                sort_key,
+                crate::SortKey::RecencyAt | crate::SortKey::SectionPosition
+            ),
         );
         push_thread_order_and_limit(
             &mut builder,
             sort_key,
             SortDirection::Desc,
             OrderByIndex::Enabled,
-            sort_key == crate::SortKey::RecencyAt,
+            matches!(
+                sort_key,
+                crate::SortKey::RecencyAt | crate::SortKey::SectionPosition
+            ),
             limit,
         );
 
@@ -568,12 +589,14 @@ INSERT INTO threads (
     first_user_message,
     archived,
     archived_at,
-    is_pinned,
+    thread_section_id,
+    section_position,
+    section_entered_at_ms,
     git_sha,
     git_branch,
     git_origin_url,
     memory_mode
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO NOTHING
             "#,
         )
@@ -615,7 +638,9 @@ ON CONFLICT(id) DO NOTHING
         .bind(metadata.first_user_message.as_deref().unwrap_or_default())
         .bind(metadata.archived_at.is_some())
         .bind(metadata.archived_at.map(datetime_to_epoch_seconds))
-        .bind(metadata.is_pinned)
+        .bind(metadata.section.as_ref().map(|section| section.id.as_str()))
+        .bind(metadata.section_position)
+        .bind(metadata.section_entered_at.map(datetime_to_epoch_millis))
         .bind(metadata.git_sha.as_deref())
         .bind(metadata.git_branch.as_deref())
         .bind(metadata.git_origin_url.as_deref())
@@ -660,20 +685,6 @@ ON CONFLICT(id) DO NOTHING
     ) -> anyhow::Result<bool> {
         let result = sqlx::query("UPDATE threads SET name = ? WHERE id = ?")
             .bind(name)
-            .bind(thread_id.to_string())
-            .execute(self.pool.as_ref())
-            .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// Update the SQLite-owned pinned state without changing other thread metadata.
-    pub async fn update_thread_pin(
-        &self,
-        thread_id: ThreadId,
-        is_pinned: bool,
-    ) -> anyhow::Result<bool> {
-        let result = sqlx::query("UPDATE threads SET is_pinned = ? WHERE id = ?")
-            .bind(is_pinned)
             .bind(thread_id.to_string())
             .execute(self.pool.as_ref())
             .await?;
@@ -853,12 +864,14 @@ INSERT INTO threads (
     first_user_message,
     archived,
     archived_at,
-    is_pinned,
+    thread_section_id,
+    section_position,
+    section_entered_at_ms,
     git_sha,
     git_branch,
     git_origin_url,
     memory_mode
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
@@ -868,7 +881,11 @@ ON CONFLICT(id) DO UPDATE SET
     updated_at_ms = excluded.updated_at_ms,
     recency_at_ms = threads.recency_at_ms,
     source = excluded.source,
-    history_mode = excluded.history_mode,
+    -- Paginated history is a one-way promotion; stale legacy metadata must not downgrade it.
+    history_mode = CASE
+        WHEN threads.history_mode = 'paginated' THEN threads.history_mode
+        ELSE excluded.history_mode
+    END,
     thread_source = excluded.thread_source,
     agent_nickname = excluded.agent_nickname,
     agent_role = excluded.agent_role,
@@ -929,7 +946,9 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(metadata.first_user_message.as_deref().unwrap_or_default())
         .bind(metadata.archived_at.is_some())
         .bind(metadata.archived_at.map(datetime_to_epoch_seconds))
-        .bind(metadata.is_pinned)
+        .bind(metadata.section.as_ref().map(|section| section.id.as_str()))
+        .bind(metadata.section_position)
+        .bind(metadata.section_entered_at.map(datetime_to_epoch_millis))
         .bind(metadata.git_sha.as_deref())
         .bind(metadata.git_branch.as_deref())
         .bind(metadata.git_origin_url.as_deref())
@@ -1057,6 +1076,7 @@ ON CONFLICT(id) DO UPDATE SET
                 .bind(thread_id_string)
                 .execute(self.logs_pool.as_ref())
                 .await?;
+            self.thread_queue.delete_thread_queue(*thread_id).await?;
             self.memories.delete_thread_memory(*thread_id).await?;
             self.thread_goals.delete_thread_goal(*thread_id).await?;
         }
@@ -1149,9 +1169,17 @@ WITH RECURSIVE subtree(child_thread_id, parent_thread_id) AS (
         ),
         None => builder.push(" FROM threads"),
     };
-    let include_thread_id_tiebreaker =
-        relation_filter.is_some() || filters.sort_key == SortKey::RecencyAt;
-    push_thread_filters(builder, filters, include_thread_id_tiebreaker);
+    let include_thread_id_tiebreaker = relation_filter.is_some()
+        || matches!(
+            filters.sort_key,
+            SortKey::RecencyAt | SortKey::SectionPosition
+        );
+    push_thread_filters_with_preview(
+        builder,
+        filters,
+        include_thread_id_tiebreaker,
+        /*include_empty_preview*/ relation_filter.is_some(),
+    );
     match relation_filter {
         Some(crate::ThreadRelationFilter::DirectChildrenOf(parent_thread_id)) => {
             builder.push(" AND listed_edge.parent_thread_id = ");
@@ -1211,7 +1239,14 @@ SELECT
     threads.tokens_used,
     threads.first_user_message,
     threads.archived_at,
-    threads.is_pinned,
+    threads.thread_section_id AS section,
+    (
+        SELECT thread_sections.name
+        FROM thread_sections
+        WHERE thread_sections.id = threads.thread_section_id
+    ) AS section_name,
+    threads.section_position,
+    threads.section_entered_at_ms,
     threads.git_sha,
     threads.git_branch,
     threads.git_origin_url
@@ -1244,7 +1279,7 @@ pub struct ThreadFilterOptions<'a> {
     pub allowed_sources: &'a [String],
     pub model_providers: Option<&'a [String]>,
     pub cwd_filters: Option<&'a [PathBuf]>,
-    pub is_pinned: Option<bool>,
+    pub section: Option<Option<&'a str>>,
     pub anchor: Option<&'a crate::Anchor>,
     pub sort_key: SortKey,
     pub sort_direction: SortDirection,
@@ -1256,12 +1291,26 @@ pub(super) fn push_thread_filters<'a>(
     options: ThreadFilterOptions<'a>,
     include_thread_id_tiebreaker: bool,
 ) {
+    push_thread_filters_with_preview(
+        builder,
+        options,
+        include_thread_id_tiebreaker,
+        /*include_empty_preview*/ false,
+    );
+}
+
+fn push_thread_filters_with_preview<'a>(
+    builder: &mut QueryBuilder<Sqlite>,
+    options: ThreadFilterOptions<'a>,
+    include_thread_id_tiebreaker: bool,
+    include_empty_preview: bool,
+) {
     let ThreadFilterOptions {
         archived_only,
         allowed_sources,
         model_providers,
         cwd_filters,
-        is_pinned,
+        section,
         anchor,
         sort_key,
         sort_direction,
@@ -1273,10 +1322,18 @@ pub(super) fn push_thread_filters<'a>(
     } else {
         builder.push(" AND threads.archived = 0");
     }
-    builder.push(" AND threads.preview <> ''");
-    if let Some(is_pinned) = is_pinned {
-        builder.push(" AND threads.is_pinned = ");
-        builder.push_bind(is_pinned);
+    if !include_empty_preview {
+        builder.push(" AND threads.preview <> ''");
+    }
+    match section {
+        Some(Some(section)) => {
+            builder.push(" AND threads.thread_section_id = ");
+            builder.push_bind(section);
+        }
+        Some(None) => {
+            builder.push(" AND threads.thread_section_id IS NULL");
+        }
+        None => {}
     }
     if !allowed_sources.is_empty() {
         builder.push(" AND threads.source IN (");
@@ -1325,6 +1382,7 @@ pub(super) fn push_thread_filters<'a>(
             SortKey::CreatedAt => "threads.created_at_ms",
             SortKey::UpdatedAt => "threads.updated_at_ms",
             SortKey::RecencyAt => "threads.recency_at_ms",
+            SortKey::SectionPosition => "threads.section_position",
         };
         let operator = match sort_direction {
             SortDirection::Asc => ">",
@@ -1373,6 +1431,7 @@ pub(super) fn push_thread_order_and_limit(
         SortKey::CreatedAt => "threads.created_at_ms",
         SortKey::UpdatedAt => "threads.updated_at_ms",
         SortKey::RecencyAt => "threads.recency_at_ms",
+        SortKey::SectionPosition => "threads.section_position",
     };
     let order_direction = match sort_direction {
         SortDirection::Asc => "ASC",
@@ -1422,6 +1481,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
+    const CUSTOM_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf317";
     #[tokio::test]
     async fn upsert_thread_keeps_creation_memory_mode_for_existing_rows() {
         let codex_home = unique_temp_dir();
@@ -1464,7 +1524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_metadata_round_trips_history_mode() {
+    async fn thread_metadata_history_mode_does_not_downgrade() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(
             crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
@@ -1474,13 +1534,19 @@ mod tests {
         .expect("state db should initialize");
         let thread_id =
             ThreadId::from_string("00000000-0000-0000-0000-000000000124").expect("valid thread id");
-        let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
-        metadata.history_mode = ThreadHistoryMode::Paginated;
+        let metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
 
         runtime
             .upsert_thread(&metadata)
             .await
             .expect("upsert should succeed");
+
+        assert!(
+            runtime
+                .mark_thread_paginated(thread_id)
+                .await
+                .expect("mark paginated history")
+        );
 
         let metadata = runtime
             .get_thread(thread_id)
@@ -1488,84 +1554,26 @@ mod tests {
             .expect("thread should load")
             .expect("thread should exist");
         assert_eq!(metadata.history_mode, ThreadHistoryMode::Paginated);
-    }
 
-    #[tokio::test]
-    async fn thread_pin_updates_round_trip_and_survive_rollout_reconciliation() {
-        let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(
-            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
-            "test-provider".to_string(),
-        )
-        .await
-        .expect("state db should initialize");
-        let thread_id = ThreadId::new();
-        let metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+        let mut stale_metadata = metadata;
+        stale_metadata.history_mode = ThreadHistoryMode::Legacy;
         runtime
-            .upsert_thread(&metadata)
+            .upsert_thread(&stale_metadata)
             .await
-            .expect("thread insert should succeed");
-        assert!(
-            !runtime
-                .get_thread(thread_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_pinned
-        );
-
-        assert!(
-            runtime
-                .update_thread_pin(thread_id, /*is_pinned*/ true)
-                .await
-                .unwrap()
-        );
-        assert!(
+            .expect("upsert stale legacy metadata");
+        assert_eq!(
             runtime
                 .get_thread(thread_id)
                 .await
-                .unwrap()
-                .unwrap()
-                .is_pinned
-        );
-
-        runtime
-            .upsert_thread(&metadata)
-            .await
-            .expect("stale rollout metadata should reconcile");
-        assert!(
-            runtime
-                .get_thread(thread_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_pinned
-        );
-
-        assert!(
-            runtime
-                .update_thread_pin(thread_id, /*is_pinned*/ false)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !runtime
-                .get_thread(thread_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_pinned
-        );
-        assert!(
-            !runtime
-                .update_thread_pin(ThreadId::new(), /*is_pinned*/ true)
-                .await
-                .unwrap()
+                .expect("read migrated thread")
+                .expect("thread should exist")
+                .history_mode,
+            ThreadHistoryMode::Paginated
         );
     }
 
     #[tokio::test]
-    async fn list_threads_filters_pins_before_recency_pagination_and_uses_index() {
+    async fn list_threads_filters_sections_before_recency_pagination_and_uses_index() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(
             crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
@@ -1580,40 +1588,63 @@ mod tests {
         let oldest_unpinned =
             ThreadId::from_string("00000000-0000-0000-0000-000000000044").unwrap();
 
-        for (thread_id, recency_at, is_pinned) in [
-            (oldest_pinned, 1_700_000_001, true),
-            (newest_unpinned, 1_700_000_003, false),
-            (newest_pinned, 1_700_000_002, true),
-            (oldest_unpinned, 1_700_000_000, false),
+        for (thread_id, recency_at, section) in [
+            (
+                oldest_pinned,
+                1_700_000_001,
+                Some(crate::PINNED_THREAD_SECTION_ID),
+            ),
+            (newest_unpinned, 1_700_000_003, None),
+            (
+                newest_pinned,
+                1_700_000_002,
+                Some(crate::PINNED_THREAD_SECTION_ID),
+            ),
+            (oldest_unpinned, 1_700_000_000, None),
         ] {
             let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
             metadata.recency_at = DateTime::<Utc>::from_timestamp(recency_at, 0).unwrap();
-            metadata.is_pinned = is_pinned;
+            metadata.section = section.map(|id| crate::ThreadSection {
+                id: id.to_string(),
+                name: crate::PINNED_THREAD_SECTION_NAME.to_string(),
+            });
             runtime.upsert_thread(&metadata).await.unwrap();
         }
 
-        let filters = |anchor, is_pinned| ThreadFilterOptions {
+        let filters = |anchor, section| ThreadFilterOptions {
             archived_only: false,
             allowed_sources: &[],
             model_providers: None,
             cwd_filters: None,
-            is_pinned: Some(is_pinned),
+            section,
             anchor,
             sort_key: SortKey::RecencyAt,
             sort_direction: SortDirection::Desc,
             search_term: None,
         };
         let first_page = runtime
-            .list_threads(/*page_size*/ 1, filters(None, true))
+            .list_threads(
+                /*page_size*/ 1,
+                filters(None, Some(Some(crate::PINNED_THREAD_SECTION_ID))),
+            )
             .await
             .unwrap();
         assert_eq!(first_page.items.len(), 1);
         assert_eq!(first_page.items[0].id, newest_pinned);
-        assert!(first_page.items[0].is_pinned);
+        assert_eq!(
+            first_page.items[0].section,
+            Some(crate::ThreadSection {
+                id: crate::PINNED_THREAD_SECTION_ID.to_string(),
+                name: crate::PINNED_THREAD_SECTION_NAME.to_string(),
+            })
+        );
         let second_page = runtime
             .list_threads(
                 /*page_size*/ 1,
-                filters(first_page.next_anchor.as_ref(), true),
+                filters(
+                    first_page.next_anchor.as_ref(),
+                    Some(Some(crate::PINNED_THREAD_SECTION_ID)),
+                ),
             )
             .await
             .unwrap();
@@ -1621,12 +1652,12 @@ mod tests {
         assert_eq!(second_page.items[0].id, oldest_pinned);
         assert_eq!(second_page.next_anchor, None);
 
-        let unpinned_page = runtime
-            .list_threads(/*page_size*/ 10, filters(None, false))
+        let unsectioned_page = runtime
+            .list_threads(/*page_size*/ 10, filters(None, Some(None)))
             .await
             .unwrap();
         assert_eq!(
-            unpinned_page
+            unsectioned_page
                 .items
                 .iter()
                 .map(|thread| thread.id)
@@ -1634,10 +1665,28 @@ mod tests {
             vec![newest_unpinned, oldest_unpinned]
         );
 
+        let all_sections_page = runtime
+            .list_threads(/*page_size*/ 10, filters(None, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            all_sections_page
+                .items
+                .iter()
+                .map(|thread| thread.id)
+                .collect::<Vec<_>>(),
+            vec![
+                newest_unpinned,
+                newest_pinned,
+                oldest_pinned,
+                oldest_unpinned,
+            ]
+        );
+
         let mut builder = QueryBuilder::<Sqlite>::new("EXPLAIN QUERY PLAN ");
         push_list_threads_query(
             &mut builder,
-            filters(None, true),
+            filters(None, Some(Some(crate::PINNED_THREAD_SECTION_ID))),
             /*relation_filter*/ None,
             /*limit*/ 2,
         );
@@ -1652,14 +1701,112 @@ mod tests {
         assert!(
             plan_details
                 .iter()
-                .any(|detail| detail.contains("idx_threads_pinned_recency_at_ms")),
-            "pinned listing did not use its selective recency index: {plan_details:?}"
+                .any(|detail| detail.contains("idx_threads_section_recency_at_ms")),
+            "section listing did not use its selective recency index: {plan_details:?}"
         );
         assert!(
             !plan_details
                 .iter()
                 .any(|detail| detail.contains("TEMP B-TREE")),
-            "pinned listing unexpectedly sorted outside its index: {plan_details:?}"
+            "section listing unexpectedly sorted outside its index: {plan_details:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn section_position_listing_uses_stable_indexed_keyset_pagination() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state db should initialize");
+        sqlx::query("INSERT INTO thread_sections (id, name) VALUES (?, ?)")
+            .bind(CUSTOM_THREAD_SECTION_ID)
+            .bind("Custom section")
+            .execute(runtime.pool.as_ref())
+            .await
+            .expect("custom test section should be explicitly registered");
+        let first = ThreadId::from_string("00000000-0000-0000-0000-000000000061").unwrap();
+        let tied = ThreadId::from_string("00000000-0000-0000-0000-000000000062").unwrap();
+        let last = ThreadId::from_string("00000000-0000-0000-0000-000000000063").unwrap();
+
+        for (thread_id, position) in [(first, 1_000_000), (tied, 1_000_000), (last, 2_000_000)] {
+            let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+            metadata.section = Some(crate::ThreadSection {
+                id: CUSTOM_THREAD_SECTION_ID.to_string(),
+                name: "Custom section".to_string(),
+            });
+            metadata.section_position = Some(position);
+            metadata.section_entered_at = Some(metadata.updated_at);
+            runtime.upsert_thread(&metadata).await.unwrap();
+        }
+
+        let filters = |anchor| ThreadFilterOptions {
+            archived_only: false,
+            allowed_sources: &[],
+            model_providers: None,
+            cwd_filters: None,
+            section: Some(Some(CUSTOM_THREAD_SECTION_ID)),
+            anchor,
+            sort_key: SortKey::SectionPosition,
+            sort_direction: SortDirection::Asc,
+            search_term: None,
+        };
+        let first_page = runtime
+            .list_threads(/*page_size*/ 1, filters(None))
+            .await
+            .unwrap();
+        let second_page = runtime
+            .list_threads(
+                /*page_size*/ 1,
+                filters(first_page.next_anchor.as_ref()),
+            )
+            .await
+            .unwrap();
+        let third_page = runtime
+            .list_threads(
+                /*page_size*/ 1,
+                filters(second_page.next_anchor.as_ref()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            [
+                first_page.items[0].id,
+                second_page.items[0].id,
+                third_page.items[0].id
+            ],
+            [first, tied, last]
+        );
+        assert_eq!(third_page.next_anchor, None);
+
+        let mut builder = QueryBuilder::<Sqlite>::new("EXPLAIN QUERY PLAN ");
+        push_list_threads_query(
+            &mut builder,
+            filters(/*anchor*/ None),
+            /*relation_filter*/ None,
+            /*limit*/ 2,
+        );
+        let plan_details = builder
+            .build()
+            .fetch_all(runtime.pool.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+        assert!(
+            plan_details
+                .iter()
+                .any(|detail| detail.contains("idx_threads_section_position")),
+            "section-position listing did not use its selective index: {plan_details:?}"
+        );
+        assert!(
+            !plan_details
+                .iter()
+                .any(|detail| detail.contains("TEMP B-TREE")),
+            "section-position listing unexpectedly sorted outside its index: {plan_details:?}"
         );
     }
 
@@ -1847,7 +1994,7 @@ mod tests {
                     allowed_sources: &[],
                     model_providers: Some(&model_providers),
                     cwd_filters: None,
-                    is_pinned: None,
+                    section: None,
                     anchor: Some(&anchor),
                     sort_key: SortKey::UpdatedAt,
                     sort_direction: SortDirection::Asc,
@@ -1876,7 +2023,7 @@ mod tests {
                     allowed_sources: &[],
                     model_providers: Some(&model_providers),
                     cwd_filters: None,
-                    is_pinned: None,
+                    section: None,
                     anchor: page.next_anchor.as_ref(),
                     sort_key: SortKey::UpdatedAt,
                     sort_direction: SortDirection::Asc,
@@ -1933,7 +2080,7 @@ mod tests {
                     allowed_sources: &[],
                     model_providers: None,
                     cwd_filters: Some(cwd_filters.as_slice()),
-                    is_pinned: None,
+                    section: None,
                     anchor: None,
                     sort_key: SortKey::UpdatedAt,
                     sort_direction: SortDirection::Desc,
@@ -1966,7 +2113,7 @@ mod tests {
                     allowed_sources: &[],
                     model_providers: None,
                     cwd_filters: Some(cwd_filters.as_slice()),
-                    is_pinned: None,
+                    section: None,
                     anchor: first_page.next_anchor.as_ref(),
                     sort_key: SortKey::UpdatedAt,
                     sort_direction: SortDirection::Desc,
@@ -1992,7 +2139,7 @@ mod tests {
                     allowed_sources: &[],
                     model_providers: None,
                     cwd_filters: Some(&[]),
-                    is_pinned: None,
+                    section: None,
                     anchor: None,
                     sort_key: SortKey::UpdatedAt,
                     sort_direction: SortDirection::Desc,
@@ -2060,7 +2207,7 @@ mod tests {
                         allowed_sources: &[],
                         model_providers: Some(&model_providers),
                         cwd_filters,
-                        is_pinned: None,
+                        section: None,
                         anchor,
                         sort_key,
                         sort_direction: SortDirection::Desc,
@@ -2121,6 +2268,10 @@ mod tests {
             metadata.created_at =
                 DateTime::<Utc>::from_timestamp(created_at, 0).expect("valid timestamp");
             metadata.updated_at = metadata.created_at;
+            if thread_id == first_child_id {
+                metadata.preview = None;
+                metadata.first_user_message = None;
+            }
             runtime
                 .upsert_thread(&metadata)
                 .await
@@ -2157,7 +2308,7 @@ mod tests {
                 allowed_sources: &[],
                 model_providers: None,
                 cwd_filters: None,
-                is_pinned: None,
+                section: None,
                 anchor: None,
                 sort_key: SortKey::CreatedAt,
                 sort_direction: SortDirection::Desc,
@@ -2186,12 +2337,18 @@ mod tests {
             allowed_sources: &[],
             model_providers: None,
             cwd_filters: None,
-            is_pinned: None,
+            section: None,
             anchor,
             sort_key: SortKey::CreatedAt,
             sort_direction: SortDirection::Desc,
             search_term: None,
         };
+        let global_page = runtime
+            .list_threads(/*page_size*/ 10, filters(None))
+            .await
+            .expect("global thread list should succeed");
+        let mut global_ids = global_page.items.iter().map(|item| item.id);
+        assert!(!global_ids.any(|id| id == first_child_id));
         let first_page = runtime
             .list_threads_by_parent(/*page_size*/ 1, parent_id, filters(None))
             .await
@@ -2864,7 +3021,7 @@ mod tests {
                     allowed_sources: &[],
                     model_providers: None,
                     cwd_filters: None,
-                    is_pinned: None,
+                    section: None,
                     anchor: None,
                     sort_key: SortKey::RecencyAt,
                     sort_direction: SortDirection::Desc,
@@ -2897,7 +3054,7 @@ mod tests {
                     allowed_sources: &[],
                     model_providers: None,
                     cwd_filters: None,
-                    is_pinned: None,
+                    section: None,
                     anchor: first_page.next_anchor.as_ref(),
                     sort_key: SortKey::RecencyAt,
                     sort_direction: SortDirection::Desc,
@@ -2930,7 +3087,7 @@ mod tests {
                     allowed_sources: &[],
                     model_providers: None,
                     cwd_filters: None,
-                    is_pinned: None,
+                    section: None,
                     anchor: second_page.next_anchor.as_ref(),
                     sort_key: SortKey::RecencyAt,
                     sort_direction: SortDirection::Desc,
@@ -3095,6 +3252,7 @@ mod tests {
                         output_tokens: 0,
                         reasoning_output_tokens: 0,
                         total_tokens: 321,
+                        codex_rollout_budget_units: None,
                     },
                     last_token_usage: codex_protocol::protocol::TokenUsage::default(),
                     model_context_window: None,

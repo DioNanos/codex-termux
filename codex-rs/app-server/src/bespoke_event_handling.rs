@@ -16,6 +16,7 @@ use codex_app_server_protocol::AdditionalPermissionProfile as V2AdditionalPermis
 use codex_app_server_protocol::CodexErrorInfo as V2CodexErrorInfo;
 use codex_app_server_protocol::CommandAction as V2ParsedCommand;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
+use codex_app_server_protocol::CommandExecutionPresentation;
 use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
 use codex_app_server_protocol::CommandExecutionSource;
@@ -620,13 +621,17 @@ pub(crate) async fn apply_bespoke_event_handling(
             {
                 CommandExecutionApprovalPresentation::Network(network_approval_context)
             } else {
-                let command_string = shlex_join(&command);
+                let command_presentation = CommandExecutionPresentation::from_raw(
+                    &command,
+                    &parsed_cmd,
+                    &cwd.clone().into(),
+                );
                 let completion_item = CommandExecutionCompletionItem {
                     plugin_id,
                     script_path,
-                    command: command_string,
+                    command: command_presentation.command,
                     cwd: cwd.clone().into(),
-                    command_actions: command_actions.clone(),
+                    command_actions: command_presentation.command_actions,
                 };
                 CommandExecutionApprovalPresentation::Command(completion_item)
             };
@@ -637,9 +642,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                     }
                     CommandExecutionApprovalPresentation::Command(completion_item) => (
                         None,
-                        Some(completion_item.command.clone()),
+                        Some(shlex_join(&command)),
                         Some(completion_item.cwd.clone()),
-                        Some(completion_item.command_actions.clone()),
+                        Some(command_actions),
                         Some(completion_item),
                     ),
                 };
@@ -741,6 +746,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 turn_id: request.turn_id,
                 item_id: request.call_id,
                 questions,
+                is_blocking: request.is_blocking,
                 auto_resolution_ms: request.auto_resolution_ms,
             };
             let (pending_request_id, rx) = outgoing
@@ -2217,7 +2223,9 @@ mod tests {
             updated_at: created_at,
             recency_at: created_at,
             archived_at: None,
-            is_pinned: false,
+            section: None,
+            section_position: None,
+            section_entered_at: None,
             cwd: test_path_buf("/tmp").abs().into(),
             cli_version: "0.0.0".to_string(),
             source: SessionSource::Cli,
@@ -3840,6 +3848,7 @@ mod tests {
                 output_tokens: 50,
                 reasoning_output_tokens: 9,
                 total_tokens: 200,
+                codex_rollout_budget_units: None,
             },
             last_token_usage: TokenUsage {
                 input_tokens: 10,
@@ -3848,6 +3857,7 @@ mod tests {
                 output_tokens: 7,
                 reasoning_output_tokens: 1,
                 total_tokens: 23,
+                codex_rollout_budget_units: None,
             },
             model_context_window: Some(4096),
         };

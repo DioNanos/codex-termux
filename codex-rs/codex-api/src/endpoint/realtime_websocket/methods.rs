@@ -55,6 +55,7 @@ use tungstenite::protocol::WebSocketConfig;
 use url::Url;
 
 const REALTIME_WIRE_LOG_TARGET: &str = "codex_api::realtime_websocket::wire";
+const OPENAI_REALTIME_API_BASE_URL: &str = "https://api.openai.com/v1";
 
 struct WsStream {
     tx_command: mpsc::Sender<WsCommand>,
@@ -383,6 +384,7 @@ impl RealtimeWebsocketWriter {
         session_mode: RealtimeSessionMode,
         output_modality: RealtimeOutputModality,
         voice: RealtimeVoice,
+        delegation_ack_filler: Option<bool>,
     ) -> Result<(), ApiError> {
         let session_mode = normalized_session_mode(self.event_parser, session_mode);
         let message = session_update_message(
@@ -392,6 +394,7 @@ impl RealtimeWebsocketWriter {
             session_mode,
             output_modality,
             voice,
+            delegation_ack_filler,
         );
         self.send_json(&message).await
     }
@@ -696,11 +699,21 @@ fn contains_transcript_entry(entries: &[RealtimeTranscriptEntry], role: &str, te
 
 pub struct RealtimeWebsocketClient {
     provider: Provider,
+    webrtc_sideband_base_url: String,
 }
 
 impl RealtimeWebsocketClient {
     pub fn new(provider: Provider) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            webrtc_sideband_base_url: OPENAI_REALTIME_API_BASE_URL.to_string(),
+        }
+    }
+
+    /// Overrides the direct WebRTC sideband URL for local development and tests.
+    pub fn with_webrtc_sideband_base_url(mut self, base_url: String) -> Self {
+        self.webrtc_sideband_base_url = base_url;
+        self
     }
 
     pub async fn connect(
@@ -775,13 +788,7 @@ impl RealtimeWebsocketClient {
     ) -> Result<RealtimeWebsocketConnection, ApiError> {
         // Keep the parser/session query shaping from standalone realtime while replacing the model
         // query with a call_id join onto an existing WebRTC session.
-        let ws_url = websocket_url_from_api_url_for_call(
-            self.provider.base_url.as_str(),
-            self.provider.query_params.as_ref(),
-            config.event_parser,
-            config.session_mode,
-            call_id,
-        )?;
+        let ws_url = self.webrtc_sideband_url(config.event_parser, config.session_mode, call_id)?;
         self.connect_realtime_websocket_url(
             ws_url,
             config,
@@ -790,6 +797,21 @@ impl RealtimeWebsocketClient {
             /*initialize_session*/ false,
         )
         .await
+    }
+
+    fn webrtc_sideband_url(
+        &self,
+        event_parser: RealtimeEventParser,
+        session_mode: RealtimeSessionMode,
+        call_id: &str,
+    ) -> Result<Url, ApiError> {
+        websocket_url_from_api_url_for_call(
+            self.webrtc_sideband_base_url.as_str(),
+            /*query_params*/ None,
+            event_parser,
+            session_mode,
+            call_id,
+        )
     }
 
     async fn connect_realtime_websocket_url(
@@ -848,6 +870,7 @@ impl RealtimeWebsocketClient {
                     config.session_mode,
                     config.output_modality,
                     config.voice,
+                    config.delegation_ack_filler,
                 )
                 .await?;
         }
@@ -1013,6 +1036,7 @@ fn normalize_realtime_path(url: &mut Url, event_parser: RealtimeEventParser) {
 mod tests {
     use super::*;
     use crate::endpoint::realtime_websocket::protocol::RealtimeTranscriptEntry;
+    use crate::provider::RetryConfig;
     use codex_protocol::protocol::RealtimeHandoffRequested;
     use codex_protocol::protocol::RealtimeInputAudioSpeechStarted;
     use codex_protocol::protocol::RealtimeNoopRequested;
@@ -1780,6 +1804,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn webrtc_frameless_sideband_ignores_provider_base_url() {
+        let client = RealtimeWebsocketClient::new(Provider {
+            name: "chatgpt".to_string(),
+            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            query_params: None,
+            headers: HeaderMap::new(),
+            retry: RetryConfig {
+                max_attempts: 0,
+                base_delay: Duration::ZERO,
+                retry_429: false,
+                retry_5xx: false,
+                retry_transport: false,
+            },
+            stream_idle_timeout: Duration::from_secs(5),
+        });
+
+        let url = client
+            .webrtc_sideband_url(
+                RealtimeEventParser::FramelessBidi,
+                RealtimeSessionMode::Conversational,
+                "rtc_test",
+            )
+            .expect("build ws url");
+
+        assert_eq!(url.as_str(), "wss://api.openai.com/v1/live/rtc_test");
+    }
+
     #[tokio::test]
     async fn e2e_connect_and_exchange_events_against_mock_ws_server() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1970,6 +2022,7 @@ mod tests {
                 RealtimeSessionConfig {
                     instructions: "backend prompt".to_string(),
                     initial_items: Vec::new(),
+                    delegation_ack_filler: None,
                     model: Some("realtime-test-model".to_string()),
                     session_id: Some("conv_1".to_string()),
                     event_parser: RealtimeEventParser::V1,
@@ -2295,6 +2348,7 @@ mod tests {
                 RealtimeSessionConfig {
                     instructions: "backend prompt".to_string(),
                     initial_items: Vec::new(),
+                    delegation_ack_filler: None,
                     model: Some("realtime-test-model".to_string()),
                     session_id: Some("conv_1".to_string()),
                     event_parser: RealtimeEventParser::RealtimeV2,
@@ -2421,6 +2475,7 @@ mod tests {
                 RealtimeSessionConfig {
                     instructions: "backend prompt".to_string(),
                     initial_items: Vec::new(),
+                    delegation_ack_filler: None,
                     model: Some("realtime-test-model".to_string()),
                     session_id: Some("conv_1".to_string()),
                     event_parser: RealtimeEventParser::RealtimeV2,
@@ -2526,6 +2581,7 @@ mod tests {
                 RealtimeSessionConfig {
                     instructions: "backend prompt".to_string(),
                     initial_items: Vec::new(),
+                    delegation_ack_filler: None,
                     model: Some("realtime-test-model".to_string()),
                     session_id: Some("conv_1".to_string()),
                     event_parser: RealtimeEventParser::V1,
@@ -2617,6 +2673,7 @@ mod tests {
                 RealtimeSessionConfig {
                     instructions: "backend prompt".to_string(),
                     initial_items: Vec::new(),
+                    delegation_ack_filler: None,
                     model: Some("realtime-test-model".to_string()),
                     session_id: Some("conv_1".to_string()),
                     event_parser: RealtimeEventParser::V1,

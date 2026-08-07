@@ -15,9 +15,10 @@ use chrono::Datelike;
 use chrono::Local;
 use chrono::Utc;
 use codex_async_utils::CancelErr;
+use codex_http_client::HttpError;
 use codex_utils_string::truncate_middle_chars;
 use codex_utils_string::truncate_middle_with_token_budget;
-use reqwest::StatusCode;
+use http::StatusCode;
 use serde_json;
 use std::fmt;
 use std::io;
@@ -119,6 +120,9 @@ pub enum CodexErrorDetails {
     /// Invalid request.
     #[error("{0}")]
     InvalidRequest(String),
+    /// Multiple registered tools share the same effective name.
+    #[error("duplicate tool: {0}")]
+    ToolCollision(String),
     /// Invalid image.
     #[error("Image poisoning")]
     InvalidImageRequest(),
@@ -366,6 +370,7 @@ impl CodexErr {
             | CodexErrorDetails::QuotaExceeded
             | CodexErrorDetails::InvalidImageRequest()
             | CodexErrorDetails::InvalidRequest(_)
+            | CodexErrorDetails::ToolCollision(_)
             | CodexErrorDetails::RefreshTokenFailed(_)
             | CodexErrorDetails::UnsupportedOperation(_)
             | CodexErrorDetails::Sandbox(_)
@@ -470,7 +475,7 @@ impl CodexErr {
 
 #[derive(Debug)]
 pub struct ConnectionFailedError {
-    pub source: reqwest::Error,
+    pub source: HttpError,
 }
 
 impl std::fmt::Display for ConnectionFailedError {
@@ -481,7 +486,7 @@ impl std::fmt::Display for ConnectionFailedError {
 
 #[derive(Debug)]
 pub struct ResponseStreamFailed {
-    pub source: reqwest::Error,
+    pub source: HttpError,
     pub request_id: Option<String>,
 }
 
@@ -686,9 +691,11 @@ impl std::fmt::Display for UsageLimitReachedError {
             ),
             Some(PlanType::Known(
                 KnownPlan::Team
+                | KnownPlan::SelfServeBusinessProLite
                 | KnownPlan::SelfServeBusinessUsageBased
                 | KnownPlan::Business
                 | KnownPlan::Ent26
+                | KnownPlan::EnterpriseCbpAutomation
                 | KnownPlan::EnterpriseCbpUsageBased,
             )) => {
                 format!(

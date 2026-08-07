@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use codex_exec_server::FileSystemSandboxContext;
+use codex_extension_api::ExtensionMetrics;
 use codex_mcp::McpResourceClient;
 use codex_mcp::McpResourceClientCacheKey;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -14,7 +15,6 @@ use crate::catalog::SkillAuthority;
 use crate::catalog::SkillCatalog;
 use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillPackageId;
-use crate::catalog::SkillProviderError;
 use crate::catalog::SkillProviderResult;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillResourceId;
@@ -29,6 +29,7 @@ const MAX_CACHED_ORCHESTRATOR_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) struct SkillsSessionState {
     pub(crate) mcp_resources: Option<Arc<McpResourceClient>>,
+    pub(crate) extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
 }
 
 pub(crate) struct SkillsThreadState {
@@ -136,12 +137,19 @@ impl SkillsThreadState {
         providers: &SkillProviders,
         query: SkillListQuery,
     ) -> SkillCatalog {
+        let sandbox_contexts = query
+            .executor_capability_discovery
+            .as_ref()
+            .map(|discovery| discovery.sandbox_contexts().clone())
+            .unwrap_or_default();
         if let Some(cached) = self
             .executor_discovery_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .filter(|cached| cached.roots == query.executor_roots)
+            .filter(|cached| {
+                cached.roots == query.executor_roots && cached.sandbox_contexts == sandbox_contexts
+            })
         {
             return cached.catalog.clone();
         }
@@ -151,28 +159,45 @@ impl SkillsThreadState {
             .executor_discovery_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cached) = cache.as_ref().filter(|cached| cached.roots == roots) {
+        if let Some(cached) = cache
+            .as_ref()
+            .filter(|cached| cached.roots == roots && cached.sandbox_contexts == sandbox_contexts)
+        {
             return cached.catalog.clone();
         }
         *cache = Some(CachedExecutorDiscoveryCatalog {
             roots,
+            sandbox_contexts,
             catalog: discovered.clone(),
         });
         discovered
     }
 
+    #[tracing::instrument(
+        name = "skills.orchestrator.catalog_snapshot",
+        level = "info",
+        skip_all
+    )]
     pub(crate) async fn orchestrator_catalog_snapshot(
         &self,
-        mcp_resources: Option<&McpResourceClient>,
-        initialize: impl Future<Output = Result<SkillCatalog, SkillProviderError>> + Send,
+        providers: &SkillProviders,
+        query: SkillListQuery,
     ) -> SkillCatalog {
-        self.orchestrator_cache(mcp_resources)
+        if !query.include_orchestrator_skills {
+            return SkillCatalog::default();
+        }
+
+        let cache = self.orchestrator_cache(query.mcp_resources.as_deref());
+        cache
             .catalog
             .get_or_init(|| async {
-                initialize.await.unwrap_or_else(|err| SkillCatalog {
-                    warnings: vec![err.message],
-                    ..Default::default()
-                })
+                providers
+                    .list_orchestrator_for_turn(query)
+                    .await
+                    .unwrap_or_else(|err| SkillCatalog {
+                        warnings: vec![err.message],
+                        ..Default::default()
+                    })
             })
             .await
             .clone()
@@ -280,6 +305,7 @@ struct CachedExecutorCatalog {
 
 struct CachedExecutorDiscoveryCatalog {
     roots: Vec<SelectedCapabilityRoot>,
+    sandbox_contexts: HashMap<String, FileSystemSandboxContext>,
     catalog: SkillCatalog,
 }
 
@@ -360,3 +386,6 @@ pub(crate) struct SkillsTurnState {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ExecutorSkillsStepState(pub(crate) SkillCatalog);
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HostSkillsStepState(pub(crate) SkillCatalog);

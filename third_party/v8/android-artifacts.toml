@@ -24,3 +24,12 @@ repository = "DioNanos/codex-termux"
 release_tag = "rusty-v8-v149.2.0"
 archive_sha256 = "af238c22e12ccaca5cf0224863fe9d2f5cf0e1051acffee26d958858e5eb31ee"
 binding_sha256 = "3ef8ac94e16f9d2d52ab0ed57f13319f844d726f341f632c0f4684d456069d63"
+
+[versions."150.4.0"]
+source_tag = "v150.4.0"
+
+[versions."150.4.0".targets."aarch64-linux-android"]
+repository = "DioNanos/codex-termux"
+release_tag = "rusty-v8-v150.4.0"
+archive_sha256 = "58753130e13184681966ec64fdef84ee0fb85d51a6bde8e01d54700f97a353ec"
+binding_sha256 = "c87a57bbad22339684cda2759ccb1e0fe15d0edc9dc9d70a2e1d0a40f674dee7"

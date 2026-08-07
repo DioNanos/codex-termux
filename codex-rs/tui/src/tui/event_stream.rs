@@ -263,15 +263,18 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                             "failed to suspend TUI process"
                         );
                     }
-                    return Some(TuiEvent::Draw);
+                    return Some(TuiEvent::Resume);
                 }
                 Some(TuiEvent::Key(key_event))
             }
-            Event::Resize(_, _) => Some(TuiEvent::Resize),
+            Event::Resize(width, height) => {
+                Some(TuiEvent::Resize(ratatui::layout::Size { width, height }))
+            }
             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
             Event::FocusGained => {
                 self.terminal_focused.store(true, Ordering::Relaxed);
-                crate::terminal_palette::requery_default_colors();
+                // Keep the startup-cached palette: querying terminal colors here blocks the
+                // input loop, and a direct probe would discard keys typed during the refresh.
                 Some(TuiEvent::Draw)
             }
             Event::FocusLost => {
@@ -432,6 +435,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn focus_gained_preserves_already_queued_key() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        terminal_focused.store(false, Ordering::Relaxed);
+        let mut stream = make_stream(broker.clone(), draw_rx, terminal_focused.clone());
+        let expected_key = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE);
+
+        handle.send(Ok(Event::FocusGained));
+        handle.send(Ok(Event::Key(expected_key)));
+
+        assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
+        assert!(terminal_focused.load(Ordering::Relaxed));
+        assert!(matches!(
+            &*broker
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            EventBrokerState::Running(_)
+        ));
+
+        let next = timeout(Duration::from_millis(/*millis*/ 100), stream.next())
+            .await
+            .expect("focus handling discarded an already queued key");
+
+        match next {
+            Some(TuiEvent::Key(key)) => assert_eq!(key, expected_key),
+            other => panic!("expected queued key event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn draw_and_key_events_yield_both() {
         let (broker, handle, draw_tx, draw_rx, terminal_focused) = setup();
         let mut stream = make_stream(broker, draw_rx, terminal_focused);
@@ -482,7 +515,13 @@ mod tests {
         handle.send(Ok(Event::Resize(80, 24)));
 
         let next = stream.next().await;
-        assert!(matches!(next, Some(TuiEvent::Resize)));
+        assert!(matches!(
+            next,
+            Some(TuiEvent::Resize(ratatui::layout::Size {
+                width: 80,
+                height: 24
+            }))
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

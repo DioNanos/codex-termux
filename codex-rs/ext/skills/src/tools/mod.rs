@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 
+use codex_exec_server::FileSystemSandboxContext;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::JsonToolOutput;
 use codex_extension_api::ResponsesApiTool;
@@ -44,6 +46,7 @@ pub(crate) fn skill_tools(
     thread_state: Arc<SkillsThreadState>,
     orchestrator_available: bool,
     executor_query: Option<SkillListQuery>,
+    sandbox_contexts: Option<Arc<HashMap<String, FileSystemSandboxContext>>>,
     shadow_selection: Arc<ShadowSelectionExperiment>,
 ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
     let context = SkillToolContext {
@@ -52,6 +55,7 @@ pub(crate) fn skill_tools(
         thread_state,
         orchestrator_available,
         executor_query,
+        sandbox_contexts,
         executor_catalog: Arc::new(OnceCell::new()),
         shadow_selection,
     };
@@ -70,6 +74,7 @@ struct SkillToolContext {
     thread_state: Arc<SkillsThreadState>,
     orchestrator_available: bool,
     executor_query: Option<SkillListQuery>,
+    sandbox_contexts: Option<Arc<HashMap<String, FileSystemSandboxContext>>>,
     executor_catalog: Arc<OnceCell<SkillCatalog>>,
     shadow_selection: Arc<ShadowSelectionExperiment>,
 }
@@ -83,8 +88,8 @@ impl SkillToolContext {
                 }
                 self.thread_state
                     .orchestrator_catalog_snapshot(
-                        self.mcp_resources.as_deref(),
-                        self.providers.list_orchestrator_for_turn(SkillListQuery {
+                        &self.providers,
+                        SkillListQuery {
                             turn_id: turn_id.to_string(),
                             executor_roots: Vec::new(),
                             resolved_executor_roots: Vec::new(),
@@ -94,7 +99,7 @@ impl SkillToolContext {
                             include_orchestrator_skills: true,
                             mcp_resources: self.mcp_resources.clone(),
                             executor_capability_discovery: None,
-                        }),
+                        },
                     )
                     .await
             }
@@ -130,7 +135,7 @@ impl SkillToolAuthoritySelector {
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum SkillToolAuthority {
+pub(crate) enum SkillToolAuthority {
     Orchestrator,
     Executor { id: String },
 }
@@ -143,7 +148,7 @@ impl SkillToolAuthority {
         }
     }
 
-    fn from_authority(authority: &SkillAuthority) -> Option<Self> {
+    pub(crate) fn from_authority(authority: &SkillAuthority) -> Option<Self> {
         match &authority.kind {
             SkillSourceKind::Orchestrator if authority.id == CODEX_APPS_MCP_SERVER_NAME => {
                 Some(Self::Orchestrator)

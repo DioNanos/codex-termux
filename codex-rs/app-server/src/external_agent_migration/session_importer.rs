@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,12 +11,16 @@ use codex_core::config::ConfigOverrides;
 use codex_external_agent_migration::ExternalAgentConfigImportItemResult;
 use codex_external_agent_migration::record_import_error;
 use codex_external_agent_migration::sessions::CompletedExternalAgentSessionImport;
+use codex_external_agent_migration::sessions::ExistingSessionAppend;
 use codex_external_agent_migration::sessions::ExternalAgentSessionMigration;
 use codex_external_agent_migration::sessions::ImportedExternalAgentSession;
 use codex_external_agent_migration::sessions::ImportedSessionConnectorAttribution;
 use codex_external_agent_migration::sessions::PendingSessionImport;
+use codex_external_agent_migration::sessions::SessionImportTarget;
 use codex_external_agent_migration::sessions::SessionMetadataMode;
-use codex_external_agent_migration::sessions::detect_imported_cla_session_connectors;
+use codex_external_agent_migration::sessions::append_existing_session;
+use codex_external_agent_migration::sessions::append_imported_session_connector_names;
+use codex_external_agent_migration::sessions::detect_imported_cla_session_connectors_by_source_path;
 use codex_external_agent_migration::sessions::prepare_validated_session_import_with_metadata_mode;
 use codex_external_agent_migration::sessions::record_completed_session_imports;
 use codex_models_manager::manager::RefreshStrategy;
@@ -40,8 +46,19 @@ use crate::config_manager::ConfigManager;
 const SESSION_IMPORT_CONCURRENCY: usize = 5;
 
 struct CompletedSessionImport {
+    cwd: PathBuf,
     import: CompletedExternalAgentSessionImport,
     connector_attribution: Option<ImportedSessionConnectorAttribution>,
+}
+
+enum SessionImportOutcome {
+    Created(CompletedSessionImport),
+    Appended {
+        cwd: PathBuf,
+        source_path: PathBuf,
+        imported_thread_id: ThreadId,
+        title: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -49,6 +66,7 @@ pub(super) struct ExternalAgentSessionImporter {
     codex_home: PathBuf,
     connector_metadata_roots: Vec<PathBuf>,
     permits: Arc<Semaphore>,
+    append_checkpoint_permits: Arc<Semaphore>,
     thread_manager: Arc<ThreadManager>,
     thread_store: Arc<dyn ThreadStore>,
     config_manager: ConfigManager,
@@ -68,6 +86,7 @@ impl ExternalAgentSessionImporter {
             codex_home,
             connector_metadata_roots,
             permits: Arc::new(Semaphore::new(1)),
+            append_checkpoint_permits: Arc::new(Semaphore::new(1)),
             thread_manager,
             thread_store,
             config_manager,
@@ -80,6 +99,7 @@ impl ExternalAgentSessionImporter {
         sessions: Vec<ExternalAgentSessionMigration>,
         mut item_result: ExternalAgentConfigImportItemResult,
         metadata_mode: SessionMetadataMode,
+        mut connector_names_by_source_path: BTreeMap<PathBuf, Vec<String>>,
     ) -> ExternalAgentConfigImportItemResult {
         if sessions.is_empty() {
             return item_result;
@@ -107,14 +127,36 @@ impl ExternalAgentSessionImporter {
         futures::pin_mut!(import_results);
 
         let mut completed_imports = Vec::new();
+        let mut appended_connector_names_by_source_path = BTreeMap::new();
         while let Some(result) = import_results.next().await {
             match result {
-                Ok(Some(completed_import)) => {
-                    item_result.record_success(
+                Ok(Some(SessionImportOutcome::Created(completed_import))) => {
+                    item_result.record_success_with_cwd(
+                        Some(completed_import.cwd.clone()),
                         Some(completed_import.import.source_path.display().to_string()),
                         Some(completed_import.import.imported_thread_id.to_string()),
+                        completed_import.import.title.clone(),
                     );
                     completed_imports.push(completed_import);
+                }
+                Ok(Some(SessionImportOutcome::Appended {
+                    cwd,
+                    source_path,
+                    imported_thread_id,
+                    title,
+                })) => {
+                    item_result.record_success_with_cwd(
+                        Some(cwd),
+                        Some(source_path.display().to_string()),
+                        Some(imported_thread_id.to_string()),
+                        title,
+                    );
+                    if let Some(connector_names) =
+                        connector_names_by_source_path.remove(&source_path)
+                    {
+                        appended_connector_names_by_source_path
+                            .insert(source_path, connector_names);
+                    }
                 }
                 Ok(None) => {}
                 Err(failure) => {
@@ -134,38 +176,67 @@ impl ExternalAgentSessionImporter {
                 }
             }
         }
-        let connector_attributions = completed_imports
+        if let Err(err) = append_imported_session_connector_names(
+            &self.codex_home,
+            appended_connector_names_by_source_path,
+        ) {
+            record_import_error(
+                &mut item_result,
+                "session_ledger_update",
+                Some("failed_to_update_session_connector_metadata"),
+                err.to_string(),
+                /*source*/ None,
+            );
+        }
+        if completed_imports.is_empty() {
+            return item_result;
+        }
+        let connector_attributions_by_source_path = completed_imports
             .iter()
-            .filter_map(|completed_import| completed_import.connector_attribution.clone())
-            .collect::<Vec<_>>();
+            .filter_map(|completed_import| {
+                completed_import
+                    .connector_attribution
+                    .clone()
+                    .map(|attribution| (completed_import.import.source_path.clone(), attribution))
+            })
+            .collect::<BTreeMap<_, _>>();
         let connector_metadata_roots = self.connector_metadata_roots.clone();
-        let mut connector_names_by_session = match tokio::task::spawn_blocking(move || {
-            detect_imported_cla_session_connectors(
-                &connector_attributions,
-                &connector_metadata_roots,
-            )
-        })
-        .await
-        {
-            Ok(connector_names_by_session) => connector_names_by_session,
-            Err(err) => {
-                record_import_error(
-                    &mut item_result,
-                    "session_connector_detection_task",
-                    Some("session_connector_detection_task_failed"),
-                    err.to_string(),
-                    /*source*/ None,
-                );
-                Default::default()
-            }
-        };
+        let mut attributed_connector_names_by_source_path =
+            match tokio::task::spawn_blocking(move || {
+                detect_imported_cla_session_connectors_by_source_path(
+                    &connector_attributions_by_source_path,
+                    &connector_metadata_roots,
+                )
+            })
+            .await
+            {
+                Ok(connector_names_by_source_path) => connector_names_by_source_path,
+                Err(err) => {
+                    record_import_error(
+                        &mut item_result,
+                        "session_connector_detection_task",
+                        Some("session_connector_detection_task_failed"),
+                        err.to_string(),
+                        /*source*/ None,
+                    );
+                    Default::default()
+                }
+            };
         for completed_import in &mut completed_imports {
-            let Some(attribution) = &completed_import.connector_attribution else {
+            completed_import.import.connector_names = attributed_connector_names_by_source_path
+                .remove(&completed_import.import.source_path)
+                .unwrap_or_default();
+        }
+        for completed_import in &mut completed_imports {
+            let Some(connector_names) =
+                connector_names_by_source_path.remove(&completed_import.import.source_path)
+            else {
                 continue;
             };
-            completed_import.import.connector_names = connector_names_by_session
-                .remove(&attribution.session_id)
-                .unwrap_or_default();
+            completed_import
+                .import
+                .connector_names
+                .extend(connector_names);
         }
         let completed_imports = completed_imports
             .into_iter()
@@ -187,7 +258,7 @@ impl ExternalAgentSessionImporter {
         &self,
         session: ExternalAgentSessionMigration,
         metadata_mode: SessionMetadataMode,
-    ) -> Result<Option<CompletedSessionImport>, SessionImportFailure> {
+    ) -> Result<Option<SessionImportOutcome>, SessionImportFailure> {
         let source_path = session.path.clone();
         let Some(pending_import) = self
             .prepare_session_import(session, metadata_mode)
@@ -201,34 +272,92 @@ impl ExternalAgentSessionImporter {
         else {
             return Ok(None);
         };
-        let connector_attribution = pending_import
-            .source_path
+        let PendingSessionImport {
+            source_path,
+            source_content_sha256,
+            target,
+            attributed_mcp_server_ids,
+            session,
+        } = pending_import;
+        match target {
+            SessionImportTarget::New => self
+                .create_session_import(
+                    source_path,
+                    source_content_sha256,
+                    attributed_mcp_server_ids,
+                    session,
+                )
+                .await
+                .map(SessionImportOutcome::Created)
+                .map(Some),
+            SessionImportTarget::Existing {
+                thread_id,
+                expected_source_content_sha256,
+            } => {
+                let cwd = session.cwd.clone();
+                let title = session.title.clone();
+                let appended = append_existing_session(
+                    &self.codex_home,
+                    self.append_checkpoint_permits.as_ref(),
+                    self.thread_manager.as_ref(),
+                    self.thread_store.as_ref(),
+                    ExistingSessionAppend {
+                        source_path: &source_path,
+                        source_content_sha256: &source_content_sha256,
+                        expected_source_content_sha256: &expected_source_content_sha256,
+                        thread_id,
+                        source_items: &session.rollout_items,
+                    },
+                )
+                .await;
+                Ok(appended.then_some(SessionImportOutcome::Appended {
+                    cwd,
+                    source_path,
+                    imported_thread_id: thread_id,
+                    title,
+                }))
+            }
+        }
+    }
+
+    async fn create_session_import(
+        &self,
+        source_path: PathBuf,
+        source_content_sha256: String,
+        attributed_mcp_server_ids: BTreeSet<String>,
+        session: ImportedExternalAgentSession,
+    ) -> Result<CompletedSessionImport, SessionImportFailure> {
+        let connector_attribution = source_path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .map(str::trim)
             .filter(|session_id| !session_id.is_empty())
             .map(|session_id| ImportedSessionConnectorAttribution {
                 session_id: session_id.to_string(),
-                server_ids: pending_import.attributed_mcp_server_ids,
+                server_ids: attributed_mcp_server_ids,
             });
+        let cwd = session.cwd.clone();
+        let title = session.title.clone();
         let imported_thread_id =
-            self.persist_session(pending_import.session)
+            self.persist_session(session)
                 .await
                 .map_err(|failure| SessionImportFailure {
-                    source_path: pending_import.source_path.clone(),
+                    source_path: source_path.clone(),
                     message: failure.message,
                     stage: "session_persist",
                     sub_error_type: failure.sub_error_type,
                 })?;
-        Ok(Some(CompletedSessionImport {
+        Ok(CompletedSessionImport {
+            cwd,
             import: CompletedExternalAgentSessionImport {
-                source_path: pending_import.source_path,
-                source_content_sha256: pending_import.source_content_sha256,
+                source_path,
+                source_content_sha256,
                 imported_thread_id,
                 connector_names: Vec::new(),
+                title,
             },
             connector_attribution,
-        }))
+        })
     }
 
     async fn prepare_session_import(

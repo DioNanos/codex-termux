@@ -1007,7 +1007,8 @@ async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Re
 }
 
 #[tokio::test]
-async fn list_threads_db_enabled_drops_missing_rollout_paths() -> std::io::Result<()> {
+async fn list_threads_db_enabled_preserves_metadata_for_missing_rollout_paths()
+-> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
 
@@ -1047,11 +1048,34 @@ async fn list_threads_db_enabled_drops_missing_rollout_paths() -> std::io::Resul
         .await
         .expect("state db upsert should succeed");
 
+    let valid_uuid = Uuid::from_u128(9011);
+    let valid_thread_id = ThreadId::from_string(&valid_uuid.to_string()).expect("valid thread id");
+    let valid_path = write_session_file(home.path(), "2025-01-02T13-00-00", valid_uuid)?;
+    let valid_created_at = chrono::Utc
+        .with_ymd_and_hms(2025, 1, 2, 13, 0, 0)
+        .single()
+        .expect("valid datetime");
+    let mut valid_builder = codex_state::ThreadMetadataBuilder::new(
+        valid_thread_id,
+        valid_path.clone(),
+        valid_created_at,
+        SessionSource::Cli,
+    );
+    valid_builder.model_provider = Some(config.model_provider_id.clone());
+    valid_builder.cwd = home.path().to_path_buf();
+    let mut valid_metadata = valid_builder.build(config.model_provider_id.as_str());
+    valid_metadata.first_user_message = Some("Older valid thread".to_string());
+    valid_metadata.preview = valid_metadata.first_user_message.clone();
+    runtime
+        .upsert_thread(&valid_metadata)
+        .await
+        .expect("state db upsert should succeed");
+
     let default_provider = config.model_provider_id.clone();
     let page = RolloutRecorder::list_threads(
         Some(runtime.clone()),
         &config,
-        /*page_size*/ 10,
+        /*page_size*/ 1,
         /*cursor*/ None,
         ThreadSortKey::CreatedAt,
         SortDirection::Desc,
@@ -1062,12 +1086,18 @@ async fn list_threads_db_enabled_drops_missing_rollout_paths() -> std::io::Resul
         /*search_term*/ None,
     )
     .await?;
-    assert_eq!(page.items.len(), 0);
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].path, valid_path);
     let stored_path = runtime
         .find_rollout_path_by_id(thread_id, Some(false))
         .await
         .expect("state db lookup should succeed");
-    assert_eq!(stored_path, None);
+    assert_eq!(stored_path, Some(metadata.rollout_path.clone()));
+    let stored_metadata = runtime
+        .get_thread(thread_id)
+        .await
+        .expect("state db lookup should succeed");
+    assert_eq!(stored_metadata, Some(metadata));
     Ok(())
 }
 
@@ -1407,7 +1437,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         thread_id: Some(filesystem_thread_id),
         first_user_message: Some("filesystem message".to_string()),
         preview: Some("filesystem preview".to_string()),
-        is_pinned: false,
+        section: None,
         cwd: None,
         git_branch: Some("filesystem-branch".to_string()),
         git_sha: Some("filesystem-sha".to_string()),
@@ -1428,7 +1458,10 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         thread_id: Some(state_thread_id),
         first_user_message: Some("state message".to_string()),
         preview: Some("state preview".to_string()),
-        is_pinned: true,
+        section: Some(codex_state::ThreadSection {
+            id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
+            name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+        }),
         cwd: Some(PathBuf::from("/tmp/state-cwd")),
         git_branch: Some("state-branch".to_string()),
         git_sha: Some("state-sha".to_string()),
@@ -1449,7 +1482,13 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
 
     assert_eq!(item.path, filesystem_path);
     assert_eq!(item.thread_id, Some(filesystem_thread_id));
-    assert!(item.is_pinned);
+    assert_eq!(
+        item.section,
+        Some(codex_state::ThreadSection {
+            id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
+            name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+        })
+    );
     assert_eq!(
         item.first_user_message.as_deref(),
         Some("filesystem message")

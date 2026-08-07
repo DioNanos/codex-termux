@@ -283,7 +283,6 @@ fn test_model_info(slug: &str, priority: i32, supports_fast_mode: bool) -> Model
         "default_service_tier": null,
         "availability_nux": null,
         "upgrade": null,
-        "base_instructions": "base instructions",
         "default_reasoning_summary": "none",
         "support_verbosity": false,
         "default_verbosity": null,
@@ -719,6 +718,7 @@ pub(super) fn handle_image_generation_end(
                 status: status.into(),
                 revised_prompt,
                 result: String::new(),
+                transparent_background: None,
                 saved_path,
             }),
         }),
@@ -1173,7 +1173,7 @@ pub(super) async fn assert_shift_left_edits_most_recent_queued_message_for_termi
 ) {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.queued_message_edit_hint_binding =
-        Some(queued_message_edit_binding_for_terminal(terminal_info));
+        Some(queued_message_edit_binding_for_terminal(terminal_info).into());
     chat.bottom_pane
         .set_queued_message_edit_binding(chat.queued_message_edit_hint_binding);
 
@@ -1354,12 +1354,15 @@ pub(super) fn plugins_test_summary(
             path: plugins_test_absolute_path(&format!("plugins/{name}")),
         },
         installed,
+        installed_at: None,
         enabled,
         install_policy,
         install_policy_source: None,
         must_show_installation_interstitial: None,
         auth_policy: PluginAuthPolicy::OnInstall,
         availability: PluginAvailability::Available,
+        disabled_reason: None,
+        eligible_plan_types: None,
         interface: Some(plugins_test_interface(
             display_name,
             description,
@@ -1385,12 +1388,15 @@ pub(super) fn plugins_test_remote_summary(
         share_context: None,
         source: PluginSource::Remote,
         installed,
+        installed_at: None,
         enabled: true,
         install_policy: PluginInstallPolicy::Available,
         install_policy_source: None,
         must_show_installation_interstitial: None,
         auth_policy: PluginAuthPolicy::OnInstall,
         availability: PluginAvailability::Available,
+        disabled_reason: None,
+        eligible_plan_types: None,
         interface: Some(plugins_test_interface(
             display_name,
             description,

@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use codex_extension_api::ExtensionData;
 use futures::future::BoxFuture;
 use tokio::select;
 use tokio::sync::Notify;
@@ -36,8 +35,6 @@ use crate::state::RunningTask;
 use crate::state::TaskKind;
 use codex_analytics::TurnProfileFact;
 use codex_analytics::TurnTokenUsageFact;
-use codex_login::AuthManager;
-use codex_models_manager::manager::SharedModelsManager;
 use codex_otel::SessionTelemetry;
 use codex_otel::TURN_E2E_DURATION_METRIC;
 use codex_otel::TURN_MEMORY_METRIC;
@@ -68,6 +65,11 @@ const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100;
 const TASK_COMPACT_METRIC: &str = "codex.task.compact";
 
 pub(crate) type SessionTaskResult = CodexResult<Option<String>>;
+
+pub(crate) enum MailboxParentProvenance {
+    Ignore,
+    Attribute,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InterruptedTurnHistoryMarker {
@@ -171,38 +173,6 @@ fn bool_tag(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
-/// Thin wrapper that exposes the parts of [`Session`] task runners need.
-#[derive(Clone)]
-pub(crate) struct SessionTaskContext {
-    session: Arc<Session>,
-    turn_extension_data: Arc<ExtensionData>,
-}
-
-impl SessionTaskContext {
-    pub(crate) fn new(session: Arc<Session>, turn_extension_data: Arc<ExtensionData>) -> Self {
-        Self {
-            session,
-            turn_extension_data,
-        }
-    }
-
-    pub(crate) fn clone_session(&self) -> Arc<Session> {
-        Arc::clone(&self.session)
-    }
-
-    pub(crate) fn turn_extension_data(&self) -> Arc<ExtensionData> {
-        Arc::clone(&self.turn_extension_data)
-    }
-
-    pub(crate) fn auth_manager(&self) -> Arc<AuthManager> {
-        Arc::clone(&self.session.services.auth_manager)
-    }
-
-    pub(crate) fn models_manager(&self) -> SharedModelsManager {
-        Arc::clone(&self.session.services.models_manager)
-    }
-}
-
 /// Async task that drives a [`Session`] turn.
 ///
 /// Implementations encapsulate a specific Codex workflow (regular chat,
@@ -231,7 +201,7 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
     /// lifecycle instead.
     fn run(
         self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
+        session: Arc<Session>,
         ctx: Arc<TurnContext>,
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
@@ -244,7 +214,7 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
     /// [`Session::abort_all_tasks`] cancels the task.
     fn abort(
         &self,
-        session: Arc<SessionTaskContext>,
+        session: Arc<Session>,
         ctx: Arc<TurnContext>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
@@ -260,17 +230,13 @@ pub(crate) trait AnySessionTask: Send + Sync + 'static {
 
     fn run(
         self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
+        session: Arc<Session>,
         ctx: Arc<TurnContext>,
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
     ) -> BoxFuture<'static, SessionTaskResult>;
 
-    fn abort<'a>(
-        &'a self,
-        session: Arc<SessionTaskContext>,
-        ctx: Arc<TurnContext>,
-    ) -> BoxFuture<'a, ()>;
+    fn abort<'a>(&'a self, session: Arc<Session>, ctx: Arc<TurnContext>) -> BoxFuture<'a, ()>;
 }
 
 impl<T> AnySessionTask for T
@@ -287,7 +253,7 @@ where
 
     fn run(
         self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
+        session: Arc<Session>,
         ctx: Arc<TurnContext>,
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
@@ -301,11 +267,7 @@ where
         ))
     }
 
-    fn abort<'a>(
-        &'a self,
-        session: Arc<SessionTaskContext>,
-        ctx: Arc<TurnContext>,
-    ) -> BoxFuture<'a, ()> {
+    fn abort<'a>(&'a self, session: Arc<Session>, ctx: Arc<TurnContext>) -> BoxFuture<'a, ()> {
         Box::pin(SessionTask::abort(self, session, ctx))
     }
 }
@@ -319,7 +281,8 @@ impl Session {
     ) {
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        self.start_task(turn_context, input, task).await;
+        self.start_task(turn_context, input, task, MailboxParentProvenance::Ignore)
+            .await;
     }
 
     pub(crate) async fn start_task<T: SessionTask>(
@@ -327,6 +290,7 @@ impl Session {
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
+        mailbox_parent_provenance: MailboxParentProvenance,
     ) {
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
@@ -350,7 +314,13 @@ impl Session {
             .await
             .clear_turn(&turn_context.sub_id);
 
-        let pending_items = self.input_queue.get_pending_input(&self.active_turn).await;
+        let (pending_items, parent_turn_id) =
+            self.input_queue.get_pending_input(&self.active_turn).await;
+        if let (MailboxParentProvenance::Attribute, Some(id)) =
+            (mailbox_parent_provenance, parent_turn_id)
+        {
+            turn_context.turn_metadata_state.set_parent_turn_id(id);
+        }
         let turn_state = {
             let mut active = self.active_turn.lock().await;
             let turn = active.get_or_insert_with(ActiveTurn::default);
@@ -364,7 +334,6 @@ impl Session {
         self.emit_turn_start_lifecycle(turn_context.as_ref(), &token_usage_at_turn_start)
             .await;
 
-        let turn_extension_data = Arc::clone(&turn_context.extension_data);
         let mut active = self.active_turn.lock().await;
         let turn = active.get_or_insert_with(ActiveTurn::default);
         debug_assert!(turn.task.is_none());
@@ -373,10 +342,7 @@ impl Session {
             &turn_context.session_source,
         );
         let done_clone = Arc::clone(&done);
-        let session_ctx = Arc::new(SessionTaskContext::new(
-            Arc::clone(self),
-            Arc::clone(&turn_extension_data),
-        ));
+        let session = Arc::clone(self);
         let ctx = Arc::clone(&turn_context);
         let task_for_run = Arc::clone(&task);
         let task_input = input;
@@ -404,14 +370,14 @@ impl Session {
                 let ctx_for_finish = Arc::clone(&ctx);
                 let task_result = task_for_run
                     .run(
-                        Arc::clone(&session_ctx),
+                        Arc::clone(&session),
                         ctx,
                         task_input,
                         task_cancellation_token.child_token(),
                     )
                     .instrument(trace_span!("session_task.run"))
                     .await;
-                let sess = session_ctx.clone_session();
+                let sess = Arc::clone(&session);
                 if let Err(err) = sess.flush_rollout().await {
                     warn!("failed to flush rollout before completing turn: {err}");
                     sess.send_event(
@@ -444,7 +410,6 @@ impl Session {
             task,
             cancellation_token,
             turn_context: Arc::clone(&turn_context),
-            turn_extension_data,
             _agent_execution_guard: agent_execution_guard,
             _timer: timer,
         };
@@ -502,8 +467,13 @@ impl Session {
         let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
-            .await;
+        self.start_task(
+            turn_context,
+            Vec::new(),
+            RegularTask::new(),
+            MailboxParentProvenance::Attribute,
+        )
+        .await;
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
@@ -589,6 +559,17 @@ impl Session {
             }
             Err(err) => {
                 warn!(%err, "session task returned an unexpected error");
+                self.emit_turn_error_lifecycle(
+                    turn_context.as_ref(),
+                    err.to_codex_protocol_error(),
+                )
+                .await;
+                self.track_turn_codex_error(turn_context.as_ref(), &err);
+                self.send_event(
+                    turn_context.as_ref(),
+                    EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
+                )
+                .await;
                 (None, None)
             }
         };
@@ -697,6 +678,7 @@ impl Session {
                 total_tokens: (total_token_usage.total_tokens
                     - token_usage_at_turn_start.total_tokens)
                     .max(0),
+                codex_rollout_budget_units: None,
             };
             let current_span = Span::current();
             current_span.record(
@@ -888,12 +870,8 @@ impl Session {
 
         task.handle.abort();
 
-        let session_ctx = Arc::new(SessionTaskContext::new(
-            Arc::clone(self),
-            Arc::clone(&task.turn_extension_data),
-        ));
         session_task
-            .abort(session_ctx, Arc::clone(&task.turn_context))
+            .abort(Arc::clone(self), Arc::clone(&task.turn_context))
             .await;
 
         if reason == TurnAbortReason::Interrupted

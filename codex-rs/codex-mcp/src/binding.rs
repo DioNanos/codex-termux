@@ -1,4 +1,4 @@
-//! Immutable MCP state bound to one model sampling request.
+//! Immutable MCP catalog and execution handles.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -26,7 +26,7 @@ use crate::rmcp_client::ManagedClient;
 use crate::server::McpServerMetadata;
 use crate::tools::ToolInfo;
 
-/// The exact tool catalog and execution handles for one model sampling request.
+/// The exact tool catalog and execution handles shared by compatible sampling steps.
 pub struct McpBinding {
     connections: Arc<McpConnectionSet>,
     clients: Arc<McpBindingClients>,
@@ -75,7 +75,7 @@ impl McpBinding {
         self.plugins_available
     }
 
-    /// Returns the frozen catalog advertised for this sampling request.
+    /// Returns the frozen catalog captured for this binding.
     pub fn tools(&self) -> &[ToolInfo] {
         &self.tools
     }
@@ -96,7 +96,11 @@ impl McpBinding {
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourcesResult> {
-        self.clients.list_resources(server, params).await
+        if self.clients.client(server).is_some() {
+            self.clients.list_resources(server, params).await
+        } else {
+            self.connections.list_resources(server, params).await
+        }
     }
 
     pub async fn list_all_resources(
@@ -111,7 +115,13 @@ impl McpBinding {
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourceTemplatesResult> {
-        self.clients.list_resource_templates(server, params).await
+        if self.clients.client(server).is_some() {
+            self.clients.list_resource_templates(server, params).await
+        } else {
+            self.connections
+                .list_resource_templates(server, params)
+                .await
+        }
     }
 
     pub async fn list_all_resource_templates(
@@ -128,7 +138,11 @@ impl McpBinding {
         server: &str,
         params: ReadResourceRequestParams,
     ) -> Result<ReadResourceResult> {
-        self.clients.read_resource(server, params).await
+        if self.clients.client(server).is_some() {
+            self.clients.read_resource(server, params).await
+        } else {
+            self.connections.read_resource(server, params).await
+        }
     }
 }
 
@@ -244,7 +258,7 @@ impl PreparedMcpCall {
     }
 
     /// Runs irreversible call preparation and execution under the authority of
-    /// this call's exact catalog revision.
+    /// this call's exact catalog revision and the extensions owned by the Codex session.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "catalog replacement must remain serialized with call preparation and execution"
@@ -274,7 +288,7 @@ impl PreparedMcpCall {
     }
 }
 
-fn call_tool_result_from_rmcp(result: rmcp::model::CallToolResult) -> CallToolResult {
+pub(crate) fn call_tool_result_from_rmcp(result: rmcp::model::CallToolResult) -> CallToolResult {
     let content = result
         .content
         .into_iter()

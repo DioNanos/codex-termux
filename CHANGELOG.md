@@ -1,7 +1,47 @@
+# [0.147.0] - 2026-08-07
+
+Termux release synchronized to the upstream OpenAI Codex `rust-v0.147.0` stable
+release, published on the `latest` channel.
+
+## Changed
+
+- Integrated upstream `rust-v0.147.0`. Upstream tagged it a day after
+  `0.147.0-alpha.13`; the two are siblings off the same parent and differ only
+  in the workspace version, so the fork tracks the stable directly.
+- Moved the Android V8 prebuild to `150.4.0`, matching the `v8 = "=150.4.0"` the
+  upstream workspace now requires.
+- Bumped the Cargo workspace and npm package versions to `0.147.0`.
+
+## Fixed
+
+- An `AGENTS.md` created during a session — which is what `/init` does — is now
+  discovered. Discovery cached its result under the environment selection, which
+  does not change when a file appears, so the session kept reporting that none
+  existed (issue #14).
+- The model catalog parses again. Upstream added its own legacy
+  `base_instructions` key whose serializer also flattens `ModelInfo`, so with the
+  fork field serialized too the catalog carried the key twice. The field is now
+  outside serde.
+- Models whose catalog entry ships no instruction template get the fork's
+  fallback instructions again. The merge had replaced that branch with upstream's,
+  which returns an empty string; a behavioural test now fails if it is emptied
+  again.
+- Pairing reports how to start the daemon when none is listening.
+
+## Removed
+
+- The Termux TLS root patch (#24). Upstream removed the last `reqwest` client
+  this crate built for itself, and the dependency went with it, so the guard no
+  longer compiled. MCP OAuth discovery now runs on the injected
+  `codex-http-client`, which never constructs the platform verifier that panics
+  on Android. Whether that path's native root store works under Termux has not
+  been measured on a device.
+
 # [0.146.1] - 2026-08-07
 
-Candidate Termux release synchronized to upstream OpenAI Codex `rust-v0.146.1`.
-Publication remains gated on the sanitized artifact audit and device validation.
+Termux release synchronized to upstream OpenAI Codex `rust-v0.146.1`. Published
+on the `next` channel; `latest` moved to `0.147.0`. (This entry originally read
+as a gated candidate; it is amended here to record what was actually shipped.)
 
 ## Changed
 

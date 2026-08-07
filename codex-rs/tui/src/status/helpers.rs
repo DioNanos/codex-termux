@@ -2,13 +2,13 @@ use crate::exec_command::relativize_to_home;
 use crate::legacy_core::config::Config;
 use crate::status::StatusAccountDisplay;
 use crate::text_formatting;
+use crate::width::display_width;
 use chrono::DateTime;
 use chrono::Local;
 use codex_protocol::account::PlanType;
 use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use std::path::Path;
-use unicode_width::UnicodeWidthStr;
 
 fn normalize_agents_display_path(path: &Path) -> String {
     dunce::simplified(path).display().to_string()
@@ -97,7 +97,9 @@ pub(crate) fn compose_account_display(
 }
 
 pub(crate) fn plan_type_display_name(plan_type: PlanType) -> String {
-    if plan_type.is_team_like() {
+    if plan_type == PlanType::EnterpriseCbpAutomation {
+        "Enterprise (Automation)".to_string()
+    } else if plan_type.is_team_like() {
         "Business".to_string()
     } else if plan_type.is_business_like() {
         "Enterprise".to_string()
@@ -164,7 +166,7 @@ pub(crate) fn format_directory_display(directory: &Path, max_width: Option<usize
         if max_width == 0 {
             return String::new();
         }
-        if UnicodeWidthStr::width(formatted.as_str()) > max_width {
+        if display_width(&formatted) > max_width {
             return text_formatting::center_truncate_path(&formatted, max_width);
         }
     }
@@ -219,8 +221,10 @@ mod tests {
             (PlanType::Pro, "Pro"),
             (PlanType::ProLite, "Pro Lite"),
             (PlanType::Team, "Business"),
+            (PlanType::SelfServeBusinessProLite, "Business"),
             (PlanType::SelfServeBusinessUsageBased, "Business"),
             (PlanType::Business, "Enterprise"),
+            (PlanType::EnterpriseCbpAutomation, "Enterprise (Automation)"),
             (PlanType::EnterpriseCbpUsageBased, "Enterprise"),
             (PlanType::Enterprise, "Enterprise"),
             (PlanType::Edu, "Edu"),
@@ -230,6 +234,15 @@ mod tests {
         for (plan_type, expected) in cases {
             assert_eq!(plan_type_display_name(plan_type), expected);
         }
+    }
+
+    #[test]
+    fn format_directory_display_truncates_halfwidth_sound_marks() {
+        let directory = Path::new("workspace").join("ｶﾞ").join("project");
+        let max_width = display_width(directory.to_string_lossy().as_ref()) - 1;
+        let formatted = format_directory_display(&directory, Some(max_width));
+
+        insta::assert_snapshot!(formatted.replace('\\', "/"), @"workspace/…/project");
     }
 
     #[tokio::test]

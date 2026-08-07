@@ -104,6 +104,7 @@ use crate::protocol::INITIALIZED_METHOD;
 use crate::protocol::InitializeParams;
 use crate::protocol::InitializeResponse;
 use crate::protocol::ProcessOutputChunk;
+use crate::protocol::ProcessSandboxType;
 use crate::protocol::ProcessSignal;
 use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
@@ -211,6 +212,7 @@ struct OrderedSessionEvents {
 pub(crate) struct Session {
     client: ExecServerClient,
     process_id: ProcessId,
+    sandbox_type: Option<ProcessSandboxType>,
     state: Arc<SessionState>,
 }
 
@@ -609,6 +611,10 @@ pub enum ExecServerError {
     HttpRequest(String),
     #[error("exec-server protocol error: {0}")]
     Protocol(String),
+    #[error(
+        "environment `{environment_id}` is already registered with a different provisioning mode"
+    )]
+    ProvisioningModeConflict { environment_id: String },
     #[error("exec-server rejected request ({code}): {message}")]
     Server { code: i64, message: String },
     #[error("environment registry request failed ({status}{code_suffix}): {message}", code_suffix = .code.as_ref().map(|code| format!(", {code}")).unwrap_or_default())]
@@ -876,7 +882,31 @@ impl ExecServerClient {
     pub(crate) async fn start_process(
         &self,
         params: ExecParams,
+        network_policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     ) -> Result<Session, ExecServerError> {
+        let policy_decision_timeout_ms = params
+            .network_proxy
+            .as_ref()
+            .and_then(|launch| launch.policy_decision_timeout_ms);
+        let network_policy_controller = match (
+            network_policy_decider.as_ref(),
+            policy_decision_timeout_ms,
+        ) {
+            (None, None) => None,
+            (Some(decider), Some(timeout_ms)) if timeout_ms > 0 => {
+                Some(NetworkPolicyDecisionController {
+                    decider: Arc::clone(decider),
+                    timeout: Duration::from_millis(timeout_ms),
+                })
+            }
+            _ => {
+                return Err(ExecServerError::Protocol(
+                    "network policy decision callback timeout must match the configured decider and be nonzero"
+                        .to_string(),
+                ));
+            }
+        };
+
         loop {
             let rpc_client = self.rpc_client().await?;
             if !self.inner.begin_process_start(&rpc_client) {
@@ -885,6 +915,11 @@ impl ExecServerClient {
 
             let process_id = params.process_id.clone();
             let state = Arc::new(SessionState::new(/*recoverable*/ false));
+            if let Some(controller) = network_policy_controller.as_ref() {
+                state
+                    .network_policy_controller
+                    .store(Some(Arc::new(controller.clone())));
+            }
             if let Err(error) = self.inner.insert_session(&process_id, Arc::clone(&state)) {
                 self.inner.finish_process_start();
                 return Err(error);
@@ -907,11 +942,12 @@ impl ExecServerClient {
                     .call_rpc::<_, ExecResponse>(&rpc_client, EXEC_METHOD, &params)
                     .await
                 {
-                    Ok(_) => {
+                    Ok(response) => {
                         state.recoverable.store(true, Ordering::Release);
                         let session = Session {
                             client: client.clone(),
                             process_id: process_id.clone(),
+                            sandbox_type: response.sandbox_type,
                             state: Arc::clone(&state),
                         };
                         // Wait for caller receipt so cancellation after send still triggers cleanup.
@@ -961,6 +997,7 @@ impl ExecServerClient {
         Ok(Session {
             client: self.clone(),
             process_id: process_id.clone(),
+            sandbox_type: None,
             state,
         })
     }
@@ -1311,6 +1348,10 @@ impl Session {
         &self.process_id
     }
 
+    pub(crate) fn sandbox_type(&self) -> Option<ProcessSandboxType> {
+        self.sandbox_type
+    }
+
     pub(crate) fn subscribe_wake(&self) -> watch::Receiver<u64> {
         self.state.subscribe()
     }
@@ -1384,7 +1425,12 @@ impl Session {
 
     pub(crate) async fn terminate(&self) -> Result<(), ExecServerError> {
         self.client.terminate(&self.process_id).await?;
+        self.cancel_network_policy_decisions();
         Ok(())
+    }
+
+    pub(crate) fn cancel_network_policy_decisions(&self) {
+        self.state.network_policy_cancelled.cancel();
     }
 
     pub(crate) async fn unregister(&self) {
@@ -1628,6 +1674,7 @@ mod tests {
     use crate::protocol::INITIALIZED_METHOD;
     use crate::protocol::InitializeResponse;
     use crate::protocol::ProcessOutputChunk;
+    use crate::protocol::ProcessSandboxType;
     use crate::protocol::ReadResponse;
     use crate::protocol::WriteParams;
     use crate::protocol::WriteResponse;
@@ -1699,6 +1746,7 @@ mod tests {
                     id: request.id,
                     result: serde_json::to_value(ExecResponse {
                         process_id: params.process_id,
+                        sandbox_type: Some(ProcessSandboxType::LinuxSeccomp),
                     })
                     .expect("process start response should serialize"),
                 }),
@@ -1733,26 +1781,33 @@ mod tests {
         let process_id = ProcessId::from("trace-process");
 
         let session = client
-            .start_process(ExecParams {
-                process_id: process_id.clone(),
-                argv: vec!["true".to_string()],
-                cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
-                    .expect("cwd URI"),
-                env_policy: None,
-                env: HashMap::new(),
-                tty: false,
-                pipe_stdin: false,
-                arg0: None,
-                sandbox: None,
-                enforce_managed_network: false,
-                managed_network: None,
-                network_proxy: None,
-            })
+            .start_process(
+                ExecParams {
+                    process_id: process_id.clone(),
+                    argv: vec!["true".to_string()],
+                    cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
+                        .expect("cwd URI"),
+                    env_policy: None,
+                    env: HashMap::new(),
+                    tty: false,
+                    pipe_stdin: false,
+                    arg0: None,
+                    sandbox: None,
+                    enforce_managed_network: false,
+                    managed_network: None,
+                    network_proxy: None,
+                },
+                /*network_policy_decider*/ None,
+            )
             .instrument(parent_span)
             .await
             .expect("process start should succeed");
 
         assert_eq!(session.process_id(), &process_id);
+        assert_eq!(
+            session.sandbox_type(),
+            Some(ProcessSandboxType::LinuxSeccomp)
+        );
         let trace = server.await.expect("server task").expect("trace context");
         let expected_traceparent = expected_trace
             .traceparent

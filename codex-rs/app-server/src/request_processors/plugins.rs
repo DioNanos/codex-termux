@@ -11,6 +11,8 @@ use codex_config::types::McpServerConfig;
 use codex_core_plugins::OPENAI_CURATED_MARKETPLACE_NAME;
 use codex_core_plugins::PluginListBackgroundTaskOptions;
 use codex_core_plugins::is_openai_curated_marketplace_name;
+use codex_core_plugins::loader::load_configured_plugin_mcp_servers;
+use codex_core_plugins::manifest::is_agent_plugin_manifest;
 use codex_core_plugins::remote::REMOTE_CREATED_BY_ME_MARKETPLACE_NAME;
 use codex_core_plugins::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
 use codex_core_plugins::remote::REMOTE_WORKSPACE_MARKETPLACE_NAME;
@@ -24,12 +26,25 @@ use codex_core_plugins::remote::is_valid_remote_plugin_id;
 use codex_core_plugins::remote::validate_remote_plugin_id;
 use codex_core_plugins::remote_bundle::RemotePluginBundleInstallError;
 use codex_mcp::McpOAuthLoginSupport;
+use codex_mcp::McpRuntimeContext;
 use codex_mcp::oauth_login_support;
 use codex_mcp::should_retry_without_scopes;
 use codex_plugin::PluginId;
 use codex_plugin::PluginTelemetryMetadata;
 use codex_protocol::auth::AuthMode as DomainAuthMode;
+use codex_rmcp_client::OAuthDiscoveryTimeout;
+use codex_rmcp_client::StreamableHttpRedirectMode;
 use codex_rmcp_client::perform_oauth_login_silent;
+
+mod search;
+
+fn plugin_redirect_mode(plugin_root: &Path) -> StreamableHttpRedirectMode {
+    if is_agent_plugin_manifest(plugin_root) {
+        StreamableHttpRedirectMode::AgentPluginV1
+    } else {
+        StreamableHttpRedirectMode::Legacy
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct PluginRequestProcessor {
@@ -174,6 +189,7 @@ fn convert_configured_marketplace_plugin_to_plugin_summary(
         version: None,
         local_version: plugin.local_version,
         installed: plugin.installed,
+        installed_at: None,
         enabled: plugin.enabled,
         name: plugin.name,
         share_context,
@@ -183,15 +199,22 @@ fn convert_configured_marketplace_plugin_to_plugin_summary(
         must_show_installation_interstitial: None,
         auth_policy: plugin.policy.authentication.into(),
         availability: PluginAvailability::Available,
+        disabled_reason: None,
+        eligible_plan_types: None,
         interface: plugin.interface.map(local_plugin_interface_to_info),
         keywords: plugin.keywords,
     }
 }
 
-fn remote_installed_plugin_visible_marketplaces(config: &Config) -> Vec<&'static str> {
+fn remote_installed_plugin_visible_marketplaces(
+    config: &Config,
+    use_remote_global_catalog: bool,
+) -> Vec<&'static str> {
     let mut marketplaces = Vec::new();
-    if config.features.enabled(Feature::RemotePlugin) {
+    if use_remote_global_catalog {
         marketplaces.push(REMOTE_GLOBAL_MARKETPLACE_NAME);
+    }
+    if config.features.enabled(Feature::RemotePlugin) {
         marketplaces.push(REMOTE_CREATED_BY_ME_MARKETPLACE_NAME);
     }
     marketplaces.push(REMOTE_WORKSPACE_MARKETPLACE_NAME);
@@ -831,11 +854,14 @@ impl PluginRequestProcessor {
         {
             return Ok(empty_response());
         }
-        plugins_manager.set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
+        let auth_mode = auth.as_ref().map(CodexAuth::api_auth_mode);
+        plugins_manager.set_auth_mode(auth_mode);
 
         let plugins_input = config.plugins_config_input();
+        let use_remote_global_catalog = config.features.enabled(Feature::RemotePlugin)
+            && auth_mode.is_some_and(DomainAuthMode::uses_codex_backend);
         let remote_installed_plugin_visible_marketplaces =
-            remote_installed_plugin_visible_marketplaces(&config);
+            remote_installed_plugin_visible_marketplaces(&config, use_remote_global_catalog);
         plugins_manager.maybe_start_remote_installed_plugin_bundle_sync(
             &plugins_input,
             auth.clone(),
@@ -861,10 +887,7 @@ impl PluginRequestProcessor {
             )
             .await,
         );
-        filter_openai_curated_installed_conflicts(
-            &mut data,
-            config.features.enabled(Feature::RemotePlugin),
-        );
+        filter_openai_curated_installed_conflicts(&mut data, use_remote_global_catalog);
 
         Ok(PluginInstalledResponse {
             marketplaces: data,
@@ -1118,12 +1141,15 @@ impl PluginRequestProcessor {
                         share_context,
                         source: marketplace_plugin_source_to_info(outcome.plugin.source),
                         installed: outcome.plugin.installed,
+                        installed_at: None,
                         enabled: outcome.plugin.enabled,
                         install_policy: outcome.plugin.policy.installation.into(),
                         install_policy_source: None,
                         must_show_installation_interstitial: None,
                         auth_policy: outcome.plugin.policy.authentication.into(),
                         availability: PluginAvailability::Available,
+                        disabled_reason: None,
+                        eligible_plan_types: None,
                         interface: outcome.plugin.interface.map(local_plugin_interface_to_info),
                         keywords: outcome.plugin.keywords,
                     },
@@ -1515,14 +1541,23 @@ impl PluginRequestProcessor {
 
         self.on_effective_plugins_changed();
 
-        let plugin_mcp_servers = load_plugin_mcp_servers(
+        let plugin_mcp_servers = load_configured_plugin_mcp_servers(
             result.installed_path.as_path(),
             auth.as_ref().map(CodexAuth::auth_mode),
+            &result.plugin_id,
+            &config.config_layer_stack,
+            config.codex_home.as_path(),
         )
         .await;
         if !plugin_mcp_servers.is_empty() {
-            self.start_plugin_mcp_oauth_logins(&config, plugin_mcp_servers)
-                .await;
+            let redirect_mode = plugin_redirect_mode(result.installed_path.as_path());
+            self.start_plugin_mcp_oauth_logins(
+                &config,
+                &result.plugin_id,
+                plugin_mcp_servers,
+                redirect_mode,
+            )
+            .await;
         }
 
         let plugin_app_declarations = load_plugin_apps(result.installed_path.as_path()).await;
@@ -1689,14 +1724,23 @@ impl PluginRequestProcessor {
         self.analytics_events_client
             .track_plugin_installed(plugin_metadata);
 
-        let plugin_mcp_servers = load_plugin_mcp_servers(
+        let plugin_mcp_servers = load_configured_plugin_mcp_servers(
             result.installed_path.as_path(),
             auth.as_ref().map(CodexAuth::auth_mode),
+            &result.plugin_id,
+            &config.config_layer_stack,
+            config.codex_home.as_path(),
         )
         .await;
         if !plugin_mcp_servers.is_empty() {
-            self.start_plugin_mcp_oauth_logins(&config, plugin_mcp_servers)
-                .await;
+            let redirect_mode = plugin_redirect_mode(result.installed_path.as_path());
+            self.start_plugin_mcp_oauth_logins(
+                &config,
+                &result.plugin_id,
+                plugin_mcp_servers,
+                redirect_mode,
+            )
+            .await;
         }
 
         let is_chatgpt_auth = auth.as_ref().is_some_and(CodexAuth::is_chatgpt_auth);
@@ -1845,10 +1889,44 @@ impl PluginRequestProcessor {
     async fn start_plugin_mcp_oauth_logins(
         &self,
         config: &Config,
-        plugin_mcp_servers: HashMap<String, McpServerConfig>,
+        plugin_id: &PluginId,
+        mut plugin_mcp_servers: HashMap<String, McpServerConfig>,
+        redirect_mode: StreamableHttpRedirectMode,
     ) {
+        let plugin_id = plugin_id.as_key();
+        config.apply_plugin_mcp_server_requirements(&plugin_id, &mut plugin_mcp_servers);
+        let runtime_context = McpRuntimeContext::new(
+            self.thread_manager.environment_manager(),
+            config.cwd.to_path_buf(),
+        );
         for (name, server) in plugin_mcp_servers {
-            let oauth_config = match oauth_login_support(&server.transport).await {
+            if !server.enabled {
+                continue;
+            }
+            if !server.is_local_environment() {
+                warn!(
+                    plugin = %plugin_id,
+                    server = %name,
+                    environment_id = %server.environment_id,
+                    "skipping plugin MCP OAuth for an unowned environment"
+                );
+                continue;
+            }
+            let http_client = match runtime_context.resolve_http_client(&name, &server) {
+                Ok(http_client) => http_client,
+                Err(err) => {
+                    warn!("failed to resolve MCP runtime for plugin install {name}: {err}");
+                    continue;
+                }
+            };
+            let login_support = oauth_login_support(
+                &server.transport,
+                Arc::clone(&http_client),
+                OAuthDiscoveryTimeout::LOCAL,
+                redirect_mode,
+            )
+            .await;
+            let oauth_config = match login_support {
                 McpOAuthLoginSupport::Supported(config) => config,
                 McpOAuthLoginSupport::Unsupported => continue,
                 McpOAuthLoginSupport::Unknown(err) => {
@@ -1871,12 +1949,14 @@ impl PluginRequestProcessor {
             let callback_url = config.mcp_oauth_callback_url.clone();
             let outgoing = Arc::clone(&self.outgoing);
             let notification_name = name.clone();
+            let oauth_credential_name = server.oauth_credential_name(&name).into_owned();
             let thread_manager = Arc::clone(&self.thread_manager);
+            let http_client = Arc::clone(&http_client);
 
             tokio::spawn(async move {
                 let oauth_client_id = server.oauth_client_id();
                 let first_attempt = perform_oauth_login_silent(
-                    &name,
+                    &oauth_credential_name,
                     &oauth_config.url,
                     store_mode,
                     keyring_backend_kind,
@@ -1887,13 +1967,15 @@ impl PluginRequestProcessor {
                     server.oauth_resource.as_deref(),
                     callback_port,
                     callback_url.as_deref(),
+                    Arc::clone(&http_client),
+                    redirect_mode,
                 )
                 .await;
 
                 let final_result = match first_attempt {
                     Err(err) if should_retry_without_scopes(&resolved_scopes, &err) => {
                         perform_oauth_login_silent(
-                            &name,
+                            &oauth_credential_name,
                             &oauth_config.url,
                             store_mode,
                             keyring_backend_kind,
@@ -1904,6 +1986,8 @@ impl PluginRequestProcessor {
                             server.oauth_resource.as_deref(),
                             callback_port,
                             callback_url.as_deref(),
+                            http_client,
+                            redirect_mode,
                         )
                         .await
                     }
@@ -2187,12 +2271,17 @@ fn remote_plugin_summary_to_info(summary: RemoteCatalogPluginSummary) -> PluginS
             .map(remote_plugin_share_context_to_info),
         source: PluginSource::Remote,
         installed: summary.installed,
+        installed_at: summary
+            .installed_at
+            .map(|installed_at| installed_at.timestamp()),
         enabled: summary.enabled,
         install_policy: summary.install_policy,
         install_policy_source: summary.install_policy_source,
         must_show_installation_interstitial: summary.must_show_installation_interstitial,
         auth_policy: summary.auth_policy,
         availability: summary.availability,
+        disabled_reason: summary.disabled_reason,
+        eligible_plan_types: summary.eligible_plan_types,
         interface: summary.interface,
         keywords: summary.keywords,
     }

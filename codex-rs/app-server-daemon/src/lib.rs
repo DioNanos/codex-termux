@@ -219,10 +219,25 @@ pub async fn enable_remote_control_on_socket(
     .await
 }
 
+/// Pairing attaches to a daemon that is already up; unlike `remote-control start`
+/// it never starts one. When nothing is listening, the transport error only names
+/// a socket path, which tells the user nothing about what to do next.
+fn ensure_pairing_daemon_socket(socket_path: &Path) -> Result<()> {
+    if socket_path.exists() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "no app-server is listening at {}. Pairing attaches to a running daemon and \
+         does not start one: run `remote-control start` first, then pair again.",
+        socket_path.display()
+    ))
+}
+
 /// Starts a manual pairing session through an already-running daemon app-server.
 pub async fn start_remote_control_pairing() -> Result<RemoteControlPairingStartResponse> {
     ensure_supported_platform()?;
     let daemon = Daemon::from_environment()?;
+    ensure_pairing_daemon_socket(&daemon.socket_path)?;
     remote_control_client::start_pairing(&daemon.socket_path).await
 }
 
@@ -882,9 +897,32 @@ mod tests {
     use super::RestartIfRunningOutcome;
     use super::RestartMode;
     use super::UpdaterRefreshMode;
+    use super::ensure_pairing_daemon_socket;
     use super::restart_decision;
     use super::should_reexec_updater;
     use crate::client::ProbeInfo;
+
+    #[test]
+    fn pairing_without_a_running_daemon_says_how_to_start_one() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let socket_path = temp_dir.path().join("app-server-control.sock");
+
+        let error = ensure_pairing_daemon_socket(&socket_path)
+            .expect_err("pairing must refuse when no daemon socket exists");
+        let message = error.to_string();
+        assert!(
+            message.contains("remote-control start"),
+            "the error must name the command that fixes it, got: {message}"
+        );
+        assert!(
+            message.contains(&socket_path.display().to_string()),
+            "the error must name the socket it looked for, got: {message}"
+        );
+
+        std::fs::write(&socket_path, b"").expect("create socket placeholder");
+        ensure_pairing_daemon_socket(&socket_path)
+            .expect("pairing must proceed once something is listening");
+    }
 
     #[test]
     fn remote_control_status_uses_camel_case_json() {

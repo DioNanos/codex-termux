@@ -15,6 +15,7 @@ use std::time::Duration;
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
 use codex_exec_server::Environment;
+use codex_protocol::mcp::ClientMcpExtensions;
 use lru::LruCache;
 use rmcp::model::ElicitationCapability;
 use sha1::Digest;
@@ -51,6 +52,7 @@ struct ToolCatalogCacheEntry {
 #[derive(Default)]
 struct ToolCatalogCacheState {
     snapshot: Option<ToolCatalogSnapshot>,
+    optional_startup_deadline: Option<Instant>,
     last_accepted_generation: u64,
     disabled_by_server: bool,
 }
@@ -77,7 +79,7 @@ impl McpToolCatalogCache {
         runtime_context: &McpRuntimeContext,
         resolved_environment: Option<&Arc<Environment>>,
         client_elicitation_capability: &ElicitationCapability,
-        supports_openai_form_elicitation: bool,
+        client_mcp_extensions: &ClientMcpExtensions,
     ) -> Option<McpToolCatalogCacheContext> {
         let identity = ToolCatalogIdentity::new(
             server_name,
@@ -85,7 +87,7 @@ impl McpToolCatalogCache {
             runtime_context,
             resolved_environment,
             client_elicitation_capability,
-            supports_openai_form_elicitation,
+            client_mcp_extensions,
         )?;
         let entry = lock_unpoisoned(&self.entries)
             .get_or_insert(identity, || Arc::new(ToolCatalogCacheEntry::default()))
@@ -106,6 +108,21 @@ impl Default for ToolCatalogCacheEntry {
 impl McpToolCatalogCacheContext {
     pub(crate) fn has_tools(&self) -> bool {
         self.current_tools().is_some()
+    }
+
+    pub(crate) fn optional_startup_deadline(&self, default_deadline: Instant) -> Instant {
+        let mut state = lock_unpoisoned(&self.entry.state);
+        if state.disabled_by_server
+            || state
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.published_at.elapsed() <= TOOL_CATALOG_CACHE_TTL)
+        {
+            return default_deadline;
+        }
+        *state
+            .optional_startup_deadline
+            .get_or_insert(default_deadline)
     }
 
     pub(crate) fn current_tools(&self) -> Option<Vec<ToolInfo>> {
@@ -147,6 +164,7 @@ impl McpToolCatalogCacheContext {
             tool.tool.annotations = None;
         }
         state.last_accepted_generation = ticket.generation;
+        state.optional_startup_deadline = None;
         state.snapshot = Some(ToolCatalogSnapshot {
             tools,
             published_at: Instant::now(),
@@ -201,12 +219,12 @@ impl ToolCatalogIdentity {
         runtime_context: &McpRuntimeContext,
         environment: Option<&Arc<Environment>>,
         client_elicitation_capability: &ElicitationCapability,
-        supports_openai_form_elicitation: bool,
+        client_mcp_extensions: &ClientMcpExtensions,
     ) -> Option<Self> {
         let transport = ToolCatalogTransportIdentity::new(
             config,
             client_elicitation_capability,
-            supports_openai_form_elicitation,
+            client_mcp_extensions,
         )?;
         Some(Self {
             server_name: server_name.to_string(),
@@ -230,7 +248,7 @@ impl ToolCatalogTransportIdentity {
     fn new(
         config: &McpServerConfig,
         client_elicitation_capability: &ElicitationCapability,
-        supports_openai_form_elicitation: bool,
+        client_mcp_extensions: &ClientMcpExtensions,
     ) -> Option<Self> {
         let McpServerTransportConfig::Stdio {
             command,
@@ -265,7 +283,7 @@ impl ToolCatalogTransportIdentity {
                 cwd,
                 &config.environment_id,
                 client_elicitation_capability,
-                supports_openai_form_elicitation,
+                client_mcp_extensions.iter().collect::<BTreeMap<_, _>>(),
             ))
             .ok()?,
         );

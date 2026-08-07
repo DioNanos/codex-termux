@@ -5,7 +5,7 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
-use codex_core_skills::render_available_skills_body;
+use codex_core_skills::MAX_SKILL_PROMPT_BYTES;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_string::approx_token_count;
 use codex_utils_string::take_bytes_at_char_boundary;
@@ -13,12 +13,11 @@ use codex_utils_string::take_bytes_at_char_boundary;
 use crate::catalog::SkillCatalog;
 use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillSourceKind;
+use crate::catalog_prompt::render_available_skills_body;
 use crate::fragments::AvailableSkillsInstructions;
 
 const DEFAULT_SKILL_METADATA_CHAR_BUDGET: usize = 8_000;
-const MAX_SKILL_METADATA_TOKEN_BUDGET: usize = 4_000;
 const SKILL_METADATA_CONTEXT_WINDOW_PERCENT: usize = 2;
-const MAX_MAIN_PROMPT_BYTES: usize = 8_000;
 const MAX_CATALOG_SKILL_DESCRIPTION_CHARS: usize = 1_024;
 const TRUNCATED_SKILL_DESCRIPTION_SUFFIX: &str = "...";
 const SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS: usize = 100;
@@ -31,13 +30,6 @@ pub(crate) const MAX_SKILL_PATH_BYTES: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SkillCatalogRenderPolicy {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used by the host renderer compatibility path in a follow-up"
-        )
-    )]
     CoreCompatible,
     ExtensionCompatible,
 }
@@ -88,7 +80,7 @@ pub(crate) enum SkillMetadataBudget {
     Characters(usize),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct SkillRenderReport {
     pub(crate) total_count: usize,
     pub(crate) included_count: usize,
@@ -121,7 +113,7 @@ impl SkillRenderReport {
             .then(|| SKILL_DESCRIPTION_TRUNCATED_WARNING.to_string())
     }
 
-    fn average_truncated_description_chars(&self) -> usize {
+    pub(crate) fn average_truncated_description_chars(&self) -> usize {
         if self.total_count == 0 || self.truncated_description_chars == 0 {
             return 0;
         }
@@ -132,7 +124,7 @@ impl SkillRenderReport {
     }
 }
 
-pub(crate) fn capped_skill_metadata_budget(context_window: Option<i64>) -> SkillMetadataBudget {
+pub(crate) fn skill_metadata_budget(context_window: Option<i64>) -> SkillMetadataBudget {
     context_window
         .and_then(|window| usize::try_from(window).ok())
         .filter(|window| *window > 0)
@@ -141,7 +133,7 @@ pub(crate) fn capped_skill_metadata_budget(context_window: Option<i64>) -> Skill
                 window
                     .saturating_mul(SKILL_METADATA_CONTEXT_WINDOW_PERCENT)
                     .saturating_div(100)
-                    .clamp(1, MAX_SKILL_METADATA_TOKEN_BUDGET),
+                    .max(1),
             )
         })
         .unwrap_or(SkillMetadataBudget::Characters(
@@ -158,7 +150,7 @@ fn metadata_line_cost(budget: SkillMetadataBudget, line: &str) -> usize {
 }
 
 impl SkillMetadataBudget {
-    fn limit(self) -> usize {
+    pub(crate) fn limit(self) -> usize {
         match self {
             Self::Tokens(limit) | Self::Characters(limit) => limit,
         }
@@ -256,7 +248,6 @@ impl<'a> SkillLine<'a> {
 
 struct RenderedSkillLine {
     line: String,
-    truncated_description_chars: usize,
 }
 
 struct RenderedSkillLines {
@@ -266,14 +257,13 @@ struct RenderedSkillLines {
     truncated_description_count: usize,
 }
 
-struct DescriptionBudgetLine<'a> {
-    line: &'a SkillLine<'a>,
+struct DescriptionBudgetLine {
     description_char_count: usize,
     extra_costs: Vec<usize>,
 }
 
-impl<'a> DescriptionBudgetLine<'a> {
-    fn new(line: &'a SkillLine<'a>, budget: SkillMetadataBudget) -> Self {
+impl DescriptionBudgetLine {
+    fn new(line: &SkillLine<'_>, budget: SkillMetadataBudget) -> Self {
         let minimum_line = line.render_minimum();
         let minimum_chars = minimum_line.chars().count().saturating_add(1);
         let minimum_bytes = minimum_line.len().saturating_add(1);
@@ -297,92 +287,114 @@ impl<'a> DescriptionBudgetLine<'a> {
         }
 
         Self {
-            line,
             description_char_count,
             extra_costs,
         }
     }
 }
 
+#[derive(Clone, Copy)]
+enum SkillLineAllocation {
+    Omitted,
+    DescriptionChars(usize),
+}
+
 fn render_skill_lines(
     skill_lines: Vec<SkillLine<'_>>,
     budget: SkillMetadataBudget,
 ) -> RenderedSkillLines {
+    let allocations = allocate_skill_lines(&skill_lines, budget);
+    render_allocated_skill_lines(&skill_lines, &allocations)
+}
+
+fn allocate_skill_lines(
+    skill_lines: &[SkillLine<'_>],
+    budget: SkillMetadataBudget,
+) -> Vec<SkillLineAllocation> {
     let full_cost = skill_lines.iter().fold(0usize, |used, line| {
         used.saturating_add(line.full_cost(budget))
     });
     if full_cost <= budget.limit() {
-        return RenderedSkillLines {
-            lines: skill_lines
-                .iter()
-                .map(|line| RenderedSkillLine {
-                    line: line.render_full(),
-                    truncated_description_chars: 0,
-                })
-                .collect(),
-            omitted_count: 0,
-            truncated_description_chars: 0,
-            truncated_description_count: 0,
-        };
+        return skill_lines
+            .iter()
+            .map(|line| SkillLineAllocation::DescriptionChars(line.description_char_count()))
+            .collect();
     }
 
     let minimum_cost = skill_lines.iter().fold(0usize, |used, line| {
         used.saturating_add(line.minimum_cost(budget))
     });
     if minimum_cost <= budget.limit() {
-        let lines = render_lines_with_description_budget(
+        return allocate_description_chars(
             budget,
-            &skill_lines,
+            skill_lines,
             budget.limit().saturating_sub(minimum_cost),
-        );
-        let (truncated_description_chars, truncated_description_count) =
-            sum_description_truncation(&lines);
-        return RenderedSkillLines {
-            lines,
-            omitted_count: 0,
-            truncated_description_chars,
-            truncated_description_count,
-        };
+        )
+        .into_iter()
+        .map(SkillLineAllocation::DescriptionChars)
+        .collect();
     }
 
-    let mut included = Vec::new();
     let mut used = 0usize;
-    let mut omitted = 0usize;
+    skill_lines
+        .iter()
+        .map(|line| {
+            let next_used = used.saturating_add(line.minimum_cost(budget));
+            if next_used <= budget.limit() {
+                used = next_used;
+                SkillLineAllocation::DescriptionChars(0)
+            } else {
+                SkillLineAllocation::Omitted
+            }
+        })
+        .collect()
+}
+
+fn render_allocated_skill_lines(
+    skill_lines: &[SkillLine<'_>],
+    allocations: &[SkillLineAllocation],
+) -> RenderedSkillLines {
+    let mut lines = Vec::new();
+    let mut omitted_count = 0usize;
     let mut truncated_description_chars = 0usize;
     let mut truncated_description_count = 0usize;
-    for line in skill_lines {
+    for (line, allocation) in skill_lines.iter().zip(allocations) {
         let description_char_count = line.description_char_count();
-        let rendered = line.render_minimum();
-        let next_used = used.saturating_add(line.minimum_cost(budget));
-        if next_used <= budget.limit() {
-            used = next_used;
-            included.push(RenderedSkillLine {
-                line: rendered,
-                truncated_description_chars: description_char_count,
-            });
-        } else {
-            omitted = omitted.saturating_add(1);
-        }
-
-        truncated_description_chars =
-            truncated_description_chars.saturating_add(description_char_count);
-        if description_char_count > 0 {
-            truncated_description_count = truncated_description_count.saturating_add(1);
+        match allocation {
+            SkillLineAllocation::Omitted => {
+                omitted_count = omitted_count.saturating_add(1);
+                truncated_description_chars =
+                    truncated_description_chars.saturating_add(description_char_count);
+                if description_char_count > 0 {
+                    truncated_description_count = truncated_description_count.saturating_add(1);
+                }
+            }
+            SkillLineAllocation::DescriptionChars(description_chars) => {
+                let truncated_chars = description_char_count.saturating_sub(*description_chars);
+                if truncated_chars > 0 {
+                    truncated_description_chars =
+                        truncated_description_chars.saturating_add(truncated_chars);
+                    truncated_description_count = truncated_description_count.saturating_add(1);
+                }
+                lines.push(RenderedSkillLine {
+                    line: line.render_with_description_chars(*description_chars),
+                });
+            }
         }
     }
     RenderedSkillLines {
-        lines: included,
-        omitted_count: omitted,
+        lines,
+        omitted_count,
         truncated_description_chars,
         truncated_description_count,
     }
 }
 
-fn render_lines_with_description_budget(
+fn allocate_description_chars(
     budget: SkillMetadataBudget,
     skill_lines: &[SkillLine<'_>],
     limit: usize,
-) -> Vec<RenderedSkillLine> {
+) -> Vec<usize> {
     let budget_lines = skill_lines
         .iter()
         .map(|line| DescriptionBudgetLine::new(line, budget))
@@ -416,31 +428,7 @@ fn render_lines_with_description_budget(
         }
     }
 
-    budget_lines
-        .iter()
-        .zip(char_allocations)
-        .map(|(line, description_chars)| RenderedSkillLine {
-            line: line.line.render_with_description_chars(description_chars),
-            truncated_description_chars: line
-                .description_char_count
-                .saturating_sub(description_chars),
-        })
-        .collect()
-}
-
-fn sum_description_truncation(rendered: &[RenderedSkillLine]) -> (usize, usize) {
-    rendered
-        .iter()
-        .fold((0usize, 0usize), |(chars, count), line| {
-            if line.truncated_description_chars == 0 {
-                (chars, count)
-            } else {
-                (
-                    chars.saturating_add(line.truncated_description_chars),
-                    count.saturating_add(1),
-                )
-            }
-        })
+    char_allocations
 }
 
 struct RenderedCatalog {
@@ -452,7 +440,15 @@ struct RenderedCatalog {
 pub(crate) struct AvailableSkillsRender {
     skill_root_lines: Vec<String>,
     skill_lines: Vec<String>,
+    preserve_empty_fragment: bool,
     pub(crate) report: SkillRenderReport,
+}
+
+#[derive(Default)]
+pub(crate) struct RenderedSkillCatalogs {
+    pub(crate) executor: Option<AvailableSkillsRender>,
+    pub(crate) orchestrator: Option<AvailableSkillsRender>,
+    pub(crate) host: Option<AvailableSkillsRender>,
 }
 
 impl AvailableSkillsRender {
@@ -460,7 +456,7 @@ impl AvailableSkillsRender {
         self,
         include_skills_usage_instructions: bool,
     ) -> Option<AvailableSkillsInstructions> {
-        (!self.skill_lines.is_empty()).then(|| {
+        (self.preserve_empty_fragment || !self.skill_lines.is_empty()).then(|| {
             AvailableSkillsInstructions::from_skill_lines(
                 self.skill_root_lines,
                 self.skill_lines,
@@ -513,8 +509,340 @@ pub(crate) fn render_available_skills(
     Some(AvailableSkillsRender {
         skill_root_lines: selected.skill_root_lines,
         skill_lines: selected.skill_lines,
+        preserve_empty_fragment: policy == SkillCatalogRenderPolicy::CoreCompatible,
         report: selected.report,
     })
+}
+
+pub(crate) fn render_combined_available_skills(
+    executor_catalog: &SkillCatalog,
+    orchestrator_catalog: &SkillCatalog,
+    host_catalog: &SkillCatalog,
+    budget: SkillMetadataBudget,
+) -> RenderedSkillCatalogs {
+    let mut executor_entries = executor_catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.is_model_visible())
+        .collect::<Vec<_>>();
+    let mut orchestrator_entries = orchestrator_catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.is_model_visible())
+        .collect::<Vec<_>>();
+    let mut host_entries = host_catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.is_model_visible())
+        .collect::<Vec<_>>();
+    SkillCatalogRenderPolicy::ExtensionCompatible.order_entries(&mut executor_entries);
+    SkillCatalogRenderPolicy::ExtensionCompatible.order_entries(&mut orchestrator_entries);
+    SkillCatalogRenderPolicy::CoreCompatible.order_entries(&mut host_entries);
+    let nonempty_catalog_count = [
+        !executor_entries.is_empty(),
+        !orchestrator_entries.is_empty(),
+        !host_entries.is_empty(),
+    ]
+    .into_iter()
+    .filter(|nonempty| *nonempty)
+    .count();
+    if nonempty_catalog_count <= 1 {
+        return RenderedSkillCatalogs {
+            executor: render_available_skills(
+                executor_catalog,
+                SkillCatalogRenderPolicy::ExtensionCompatible,
+                budget,
+            ),
+            orchestrator: render_available_skills(
+                orchestrator_catalog,
+                SkillCatalogRenderPolicy::ExtensionCompatible,
+                budget,
+            ),
+            host: render_available_skills(
+                host_catalog,
+                SkillCatalogRenderPolicy::CoreCompatible,
+                budget,
+            ),
+        };
+    }
+
+    let absolute = render_combined_lines(
+        executor_entries
+            .iter()
+            .map(|entry| SkillLine::new(entry, SkillCatalogRenderPolicy::ExtensionCompatible))
+            .collect(),
+        orchestrator_entries
+            .iter()
+            .map(|entry| SkillLine::new(entry, SkillCatalogRenderPolicy::ExtensionCompatible))
+            .collect(),
+        host_entries
+            .iter()
+            .map(|entry| SkillLine::new(entry, SkillCatalogRenderPolicy::CoreCompatible))
+            .collect(),
+        budget,
+        Vec::new(),
+    );
+    let selected = if combined_catalog_fully_rendered(&absolute) {
+        absolute
+    } else if let Some(aliased) = build_aliased_combined_catalog(
+        &executor_entries,
+        &orchestrator_entries,
+        &host_entries,
+        budget,
+    ) && combined_render_is_better(&aliased, &absolute, budget)
+    {
+        aliased
+    } else {
+        absolute
+    };
+
+    RenderedSkillCatalogs {
+        executor: Some(selected.executor),
+        orchestrator: Some(selected.orchestrator),
+        host: Some(selected.host),
+    }
+}
+
+struct CombinedAvailableSkillsRender {
+    executor: AvailableSkillsRender,
+    orchestrator: AvailableSkillsRender,
+    host: AvailableSkillsRender,
+}
+
+fn render_combined_lines(
+    executor_lines: Vec<SkillLine<'_>>,
+    orchestrator_lines: Vec<SkillLine<'_>>,
+    host_lines: Vec<SkillLine<'_>>,
+    budget: SkillMetadataBudget,
+    host_skill_root_lines: Vec<String>,
+) -> CombinedAvailableSkillsRender {
+    let executor_end = executor_lines.len();
+    let orchestrator_end = executor_end.saturating_add(orchestrator_lines.len());
+    let mut lines = executor_lines;
+    lines.extend(orchestrator_lines);
+    lines.extend(host_lines);
+    let mut allocations = allocate_skill_lines(&lines, budget);
+    let omission_marker = reserve_non_host_omission_marker(
+        &lines,
+        executor_end,
+        orchestrator_end,
+        budget,
+        &mut allocations,
+    );
+    let (executor_omission_marker, orchestrator_omission_marker) =
+        if executor_end == orchestrator_end {
+            (omission_marker, None)
+        } else {
+            (None, omission_marker)
+        };
+
+    CombinedAvailableSkillsRender {
+        executor: render_combined_group(
+            &lines[..executor_end],
+            &allocations[..executor_end],
+            Vec::new(),
+            executor_omission_marker,
+        ),
+        orchestrator: render_combined_group(
+            &lines[executor_end..orchestrator_end],
+            &allocations[executor_end..orchestrator_end],
+            Vec::new(),
+            orchestrator_omission_marker,
+        ),
+        host: render_combined_group(
+            &lines[orchestrator_end..],
+            &allocations[orchestrator_end..],
+            host_skill_root_lines,
+            /*omission_marker*/ None,
+        ),
+    }
+}
+
+fn render_combined_group(
+    skill_lines: &[SkillLine<'_>],
+    allocations: &[SkillLineAllocation],
+    skill_root_lines: Vec<String>,
+    omission_marker: Option<String>,
+) -> AvailableSkillsRender {
+    let RenderedSkillLines {
+        mut lines,
+        omitted_count,
+        truncated_description_chars,
+        truncated_description_count,
+    } = render_allocated_skill_lines(skill_lines, allocations);
+    if let Some(marker) = omission_marker {
+        lines.push(RenderedSkillLine { line: marker });
+    }
+    AvailableSkillsRender {
+        skill_root_lines,
+        skill_lines: lines.into_iter().map(|rendered| rendered.line).collect(),
+        preserve_empty_fragment: false,
+        report: SkillRenderReport {
+            total_count: skill_lines.len(),
+            included_count: skill_lines.len().saturating_sub(omitted_count),
+            omitted_count,
+            truncated_description_chars,
+            truncated_description_count,
+        },
+    }
+}
+
+fn build_aliased_combined_catalog(
+    executor_entries: &[&SkillCatalogEntry],
+    orchestrator_entries: &[&SkillCatalogEntry],
+    host_entries: &[&SkillCatalogEntry],
+    budget: SkillMetadataBudget,
+) -> Option<CombinedAvailableSkillsRender> {
+    let plan = build_alias_plan(host_entries, budget)?;
+    if plan.table_cost >= budget.limit() {
+        return None;
+    }
+
+    let adjusted_limit = budget.limit().saturating_sub(plan.table_cost);
+    let adjusted_budget = match budget {
+        SkillMetadataBudget::Tokens(_) => SkillMetadataBudget::Tokens(adjusted_limit),
+        SkillMetadataBudget::Characters(_) => SkillMetadataBudget::Characters(adjusted_limit),
+    };
+    let executor_lines = executor_entries
+        .iter()
+        .map(|entry| SkillLine::new(entry, SkillCatalogRenderPolicy::ExtensionCompatible))
+        .collect();
+    let orchestrator_lines = orchestrator_entries
+        .iter()
+        .map(|entry| SkillLine::new(entry, SkillCatalogRenderPolicy::ExtensionCompatible))
+        .collect();
+    let host_lines = host_entries
+        .iter()
+        .map(|entry| {
+            SkillLine::with_locator(
+                entry,
+                SkillCatalogRenderPolicy::CoreCompatible,
+                render_skill_path_with_aliases(entry, &plan),
+            )
+        })
+        .collect();
+    Some(render_combined_lines(
+        executor_lines,
+        orchestrator_lines,
+        host_lines,
+        adjusted_budget,
+        plan.skill_root_lines,
+    ))
+}
+
+fn combined_catalog_fully_rendered(rendered: &CombinedAvailableSkillsRender) -> bool {
+    [&rendered.executor, &rendered.orchestrator, &rendered.host]
+        .into_iter()
+        .all(|catalog| {
+            catalog.report.omitted_count == 0 && catalog.report.truncated_description_chars == 0
+        })
+}
+
+fn combined_render_is_better(
+    candidate: &CombinedAvailableSkillsRender,
+    current: &CombinedAvailableSkillsRender,
+    budget: SkillMetadataBudget,
+) -> bool {
+    let priority = |rendered: &CombinedAvailableSkillsRender| {
+        (
+            rendered.executor.report.included_count,
+            rendered.orchestrator.report.included_count,
+            rendered.host.report.included_count,
+        )
+    };
+    if priority(candidate) != priority(current) {
+        return priority(candidate) > priority(current);
+    }
+
+    let truncated_chars = |rendered: &CombinedAvailableSkillsRender| {
+        [&rendered.executor, &rendered.orchestrator, &rendered.host]
+            .into_iter()
+            .fold(0usize, |total, catalog| {
+                total.saturating_add(catalog.report.truncated_description_chars)
+            })
+    };
+    if truncated_chars(candidate) != truncated_chars(current) {
+        return truncated_chars(candidate) < truncated_chars(current);
+    }
+
+    combined_available_skills_cost(budget, candidate)
+        < combined_available_skills_cost(budget, current)
+}
+
+fn combined_available_skills_cost(
+    budget: SkillMetadataBudget,
+    rendered: &CombinedAvailableSkillsRender,
+) -> usize {
+    [&rendered.executor, &rendered.orchestrator, &rendered.host]
+        .into_iter()
+        .fold(0usize, |used, catalog| {
+            let root_cost = if !catalog.skill_root_lines.is_empty() {
+                aliased_metadata_overhead_cost(budget, &catalog.skill_root_lines)
+            } else {
+                Default::default()
+            };
+            catalog
+                .skill_lines
+                .iter()
+                .fold(used.saturating_add(root_cost), |used, line| {
+                    used.saturating_add(metadata_line_cost(budget, line))
+                })
+        })
+}
+
+fn reserve_non_host_omission_marker(
+    skill_lines: &[SkillLine<'_>],
+    executor_end: usize,
+    orchestrator_end: usize,
+    budget: SkillMetadataBudget,
+    allocations: &mut [SkillLineAllocation],
+) -> Option<String> {
+    loop {
+        let omitted_count = allocations[..orchestrator_end]
+            .iter()
+            .filter(|allocation| matches!(allocation, SkillLineAllocation::Omitted))
+            .count();
+        if omitted_count == 0 {
+            return None;
+        }
+
+        let marker = omission_marker(omitted_count);
+        let used = allocated_skill_lines_cost(skill_lines, allocations, budget);
+        if used.saturating_add(metadata_line_cost(budget, &marker)) <= budget.limit() {
+            return Some(marker);
+        }
+
+        let index = (orchestrator_end..allocations.len())
+            .rev()
+            .chain((executor_end..orchestrator_end).rev())
+            .chain((0..executor_end).rev())
+            .find(|index| {
+                matches!(
+                    allocations[*index],
+                    SkillLineAllocation::DescriptionChars(_)
+                )
+            })?;
+        allocations[index] = SkillLineAllocation::Omitted;
+    }
+}
+
+fn allocated_skill_lines_cost(
+    skill_lines: &[SkillLine<'_>],
+    allocations: &[SkillLineAllocation],
+    budget: SkillMetadataBudget,
+) -> usize {
+    skill_lines
+        .iter()
+        .zip(allocations)
+        .fold(0usize, |used, (line, allocation)| match allocation {
+            SkillLineAllocation::Omitted => used,
+            SkillLineAllocation::DescriptionChars(description_chars) => {
+                used.saturating_add(metadata_line_cost(
+                    budget,
+                    &line.render_with_description_chars(*description_chars),
+                ))
+            }
+        })
 }
 
 fn render_catalog(
@@ -538,10 +866,7 @@ fn render_catalog(
         loop {
             let marker = omission_marker(omitted);
             if total_cost.saturating_add(metadata_line_cost(budget, &marker)) <= budget.limit() {
-                rendered_lines.push(RenderedSkillLine {
-                    line: marker,
-                    truncated_description_chars: 0,
-                });
+                rendered_lines.push(RenderedSkillLine { line: marker });
                 break;
             }
             let Some(rendered) = rendered_lines.pop() else {
@@ -631,7 +956,10 @@ fn build_alias_plan(
     let mut alias_root_by_display_root = HashMap::new();
     let mut alias_roots = Vec::new();
     let mut seen = HashSet::new();
-    for entry in entries {
+    let mut alias_ordered_entries = entries.to_vec();
+    alias_ordered_entries
+        .sort_by_key(|entry| entry.display_path_root_order().unwrap_or(usize::MAX));
+    for entry in alias_ordered_entries {
         if entry.authority.kind != SkillSourceKind::Host {
             continue;
         }
@@ -819,7 +1147,7 @@ pub(crate) fn truncate_catalog_skill_description(description: &str) -> Cow<'_, s
 }
 
 pub(crate) fn truncate_main_prompt_contents(contents: &str) -> (String, bool) {
-    truncate_utf8_to_bytes(contents, MAX_MAIN_PROMPT_BYTES)
+    truncate_utf8_to_bytes(contents, MAX_SKILL_PROMPT_BYTES)
 }
 
 pub(crate) fn truncate_utf8_to_bytes(contents: &str, max_bytes: usize) -> (String, bool) {

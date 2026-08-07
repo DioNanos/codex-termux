@@ -31,8 +31,18 @@ impl AgentsMdManager {
     #[tracing::instrument(name = "agents_md.refresh", skip_all)]
     pub(crate) async fn refresh(&self, config: &Config, environments: &TurnEnvironmentSnapshot) {
         let selections = environments.to_selections();
-        if self.cache.lock().await.selections.as_ref() == Some(&selections) {
-            return;
+        {
+            let cache = self.cache.lock().await;
+            // The environment selection is not the only input: the files on disk
+            // are one too. A session that started without AGENTS.md and then had
+            // one created — which is exactly what `/init` does — kept reporting
+            // that none existed, because the selection had not changed
+            // (codex-termux#14). Re-run discovery while nothing has been found;
+            // it is a bounded set of path probes, and it stops costing anything
+            // as soon as instructions exist.
+            if cache.selections.as_ref() == Some(&selections) && cache.loaded.is_some() {
+                return;
+            }
         }
 
         let loaded =

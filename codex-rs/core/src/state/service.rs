@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
-use crate::SkillsService;
+use crate::HostSkillsService;
 use crate::agent::AgentControl;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::attestation::AttestationProvider;
@@ -15,6 +14,7 @@ use crate::environment_selection::ThreadEnvironments;
 use crate::exec_policy::ExecPolicyManager;
 use crate::guardian::GuardianRejectionCircuitBreaker;
 use crate::mcp::McpManager;
+use crate::tools::ExecutedToolCallRecorder;
 use crate::tools::code_mode::CodeModeService;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::network_approval::NetworkApprovalService;
@@ -28,11 +28,13 @@ use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ExtensionRegistry;
 use codex_hooks::Hooks;
+use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthManager;
 use codex_mcp::McpRuntime;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_otel::SessionTelemetry;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::mcp::ClientMcpExtensions;
 use codex_rollout::state_db::StateDbHandle;
 use codex_rollout_trace::ThreadTraceContext;
 use codex_thread_store::LiveThread;
@@ -56,19 +58,22 @@ pub(crate) struct SessionServices {
     pub(crate) show_raw_agent_reasoning: bool,
     pub(crate) exec_policy: Arc<ExecPolicyManager>,
     pub(crate) auth_manager: Arc<AuthManager>,
+    /// Upload-only clients shared across turns without logging signed blob URLs.
+    pub(crate) openai_file_upload_client_pool: RouteAwareClientPool,
     pub(crate) models_manager: SharedModelsManager,
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) tool_approvals: Mutex<ApprovalStore>,
     pub(crate) guardian_rejection_circuit_breaker: Mutex<GuardianRejectionCircuitBreaker>,
     pub(crate) runtime_handle: Handle,
-    pub(crate) skills_service: Arc<SkillsService>,
+    pub(crate) skills_service: Arc<HostSkillsService>,
     pub(crate) agents_md_manager: Arc<AgentsMdManager>,
     pub(crate) plugins_manager: Arc<PluginsManager>,
     pub(crate) mcp_manager: Arc<McpManager>,
     pub(crate) extensions: Arc<ExtensionRegistry<crate::config::Config>>,
     pub(crate) session_extension_data: ExtensionData,
     pub(crate) thread_extension_data: ExtensionData,
-    pub(crate) supports_openai_form_elicitation: AtomicBool,
+    /// MCP extensions fixed when this session is created.
+    pub(crate) client_mcp_extensions: ClientMcpExtensions,
     /// Raw capability selections for this thread. Each model step resolves them against its
     /// current executor environments before using them.
     pub(crate) selected_capability_roots: Vec<SelectedCapabilityRoot>,
@@ -85,6 +90,7 @@ pub(crate) struct SessionServices {
     pub(crate) time_provider: Arc<dyn TimeProvider>,
     /// Session-scoped model client shared across turns.
     pub(crate) model_client: ModelClient,
+    pub(crate) executed_tool_calls: Option<Arc<ExecutedToolCallRecorder>>,
     pub(crate) code_mode_service: CodeModeService,
     pub(crate) tool_search_handler_cache: ToolSearchHandlerCache,
     pub(crate) turn_environments: Arc<ThreadEnvironments>,

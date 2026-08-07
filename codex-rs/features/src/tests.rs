@@ -28,6 +28,23 @@ fn under_development_features_are_disabled_by_default() {
 }
 
 #[test]
+fn tool_registry_config_is_not_a_feature_toggle() {
+    let features: FeaturesToml =
+        toml::from_str("[tool_registry]\nerror_on_tool_collisions = true\n")
+            .expect("tool registry settings should deserialize");
+
+    assert_eq!(
+        features.tool_registry,
+        Some(crate::ToolRegistryConfigToml {
+            error_on_tool_collisions: Some(true),
+        })
+    );
+    assert!(features.entries().is_empty());
+    assert!(crate::is_known_feature_key("tool_registry"));
+    assert_eq!(feature_for_key("tool_registry"), None);
+}
+
+#[test]
 fn executor_capability_discovery_is_an_opt_in_map_feature() {
     let mut features = Features::with_defaults();
     assert!(!features.enabled(Feature::ExecutorCapabilityDiscovery));
@@ -444,6 +461,7 @@ usage_hint_enabled = false
 usage_hint_text = "Custom delegation guidance."
 root_agent_usage_hint_text = "Root guidance."
 subagent_usage_hint_text = "Subagent guidance."
+subagent_developer_instructions = "Delegate carefully."
 multi_agent_mode_hint_text = "Custom mode guidance."
 tool_namespace = "agents"
 hide_spawn_agent_metadata = true
@@ -470,6 +488,7 @@ non_code_mode_only = true
             usage_hint_text: Some("Custom delegation guidance.".to_string()),
             root_agent_usage_hint_text: Some("Root guidance.".to_string()),
             subagent_usage_hint_text: Some("Subagent guidance.".to_string()),
+            subagent_developer_instructions: Some("Delegate carefully.".to_string()),
             multi_agent_mode_hint_text: Some("Custom mode guidance.".to_string()),
             tool_namespace: Some("agents".to_string()),
             hide_spawn_agent_metadata: Some(true),
@@ -531,6 +550,9 @@ fn materialize_resolved_enabled_writes_all_features_and_preserves_custom_config(
     features.enable(Feature::RespectSystemProxy);
 
     let mut features_toml = FeaturesToml {
+        tool_registry: Some(crate::ToolRegistryConfigToml {
+            error_on_tool_collisions: Some(true),
+        }),
         code_mode_host: Some(FeatureToml::Config(crate::CodeModeHostConfigToml {
             enabled: Some(false),
             disable_in_process_fallback: Some(true),
@@ -538,6 +560,7 @@ fn materialize_resolved_enabled_writes_all_features_and_preserves_custom_config(
         multi_agent_v2: Some(FeatureToml::Config(crate::MultiAgentV2ConfigToml {
             enabled: Some(false),
             min_wait_timeout_ms: Some(2500),
+            subagent_developer_instructions: Some("Delegate carefully.".to_string()),
             ..Default::default()
         })),
         network_proxy: Some(FeatureToml::Config(crate::NetworkProxyConfigToml {
@@ -557,7 +580,14 @@ fn materialize_resolved_enabled_writes_all_features_and_preserves_custom_config(
 
     features_toml.materialize_resolved_enabled(&features);
 
+    assert_eq!(
+        features_toml.tool_registry,
+        Some(crate::ToolRegistryConfigToml {
+            error_on_tool_collisions: Some(true),
+        })
+    );
     let entries = features_toml.entries();
+    assert!(!entries.contains_key("tool_registry"));
     for spec in crate::FEATURES {
         assert_eq!(
             entries.get(spec.key),
@@ -578,6 +608,7 @@ fn materialize_resolved_enabled_writes_all_features_and_preserves_custom_config(
         Some(FeatureToml::Config(crate::MultiAgentV2ConfigToml {
             enabled: Some(true),
             min_wait_timeout_ms: Some(2500),
+            subagent_developer_instructions: Some("Delegate carefully.".to_string()),
             ..Default::default()
         }))
     );

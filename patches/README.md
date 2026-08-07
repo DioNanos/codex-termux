@@ -182,14 +182,21 @@ required to publish a working Android Termux package.
   / openai/codex#27801.)
 
 ### Patch #20 - Android code-mode (real, upstream-aligned)
-- Files: `codex-rs/code-mode/src/lib.rs`, `codex-rs/code-mode/Cargo.toml`
-- The Android code-mode stub was reverted in `0.136.0`. `code-mode` now uses
-  the real upstream `runtime`/`service` with the in-process V8 runtime on
-  Android too: the fork-owned `runtime_stub.rs`/`service_stub.rs` were removed,
-  `code-mode/Cargo.toml` carries `v8 = { workspace = true }` ungated, and
-  `code-mode/src/lib.rs` matches upstream. This relies on the fork-owned
-  `aarch64-linux-android` `rusty_v8` prebuild (see Patch #22), so `exec`/`wait`
-  code-mode is no longer a no-op on the published Termux package.
+- Files: `codex-rs/code-mode-runtime/Cargo.toml`,
+  `codex-rs/code-mode-host/Cargo.toml`, `codex-rs/code-mode/Cargo.toml`
+- The Android code-mode stub was reverted in `0.136.0`. `code-mode` uses the
+  real upstream runtime with the in-process V8 engine on Android too: the
+  fork-owned `runtime_stub.rs`/`service_stub.rs` were removed and V8 is pulled
+  in ungated. This relies on the fork-owned `aarch64-linux-android` `rusty_v8`
+  prebuild (see Patch #22), so `exec`/`wait` code-mode is no longer a no-op on
+  the published Termux package.
+- **Anchors moved at `rust-v0.147.0`**: upstream extracted the V8 runtime from
+  `code-mode` into the new `code-mode-runtime` crate, so `v8 = { workspace =
+  true }` no longer appears in `code-mode/Cargo.toml`. Nothing about the
+  guarantee changed — `code-mode-runtime` carries V8 with no `target_os` gate
+  and `code-mode-host` depends on it unconditionally — but the
+  `verify-patches.sh` check had to follow the code. A check that fails because
+  the code moved is a check to repoint, not to delete.
 
 ### Patch #21 - Android cross-build vendored OpenSSL
 - File: `codex-rs/core/Cargo.toml`
@@ -236,23 +243,33 @@ required to publish a working Android Termux package.
   internal `test-report/**` device logs; `verify-patches.sh` enforces the full
   versus sanitized-tree contract explicitly.
 
-### Patch #24 - Termux TLS roots (no rustls-platform-verifier panic)
-- Files: `codex-rs/rmcp-client/Cargo.toml`,
-  `codex-rs/rmcp-client/src/utils.rs`,
-  `codex-rs/rmcp-client/src/auth_status.rs`
-- reqwest 0.13 (rmcp 1.7.0 upgrade) routes TLS verification through
-  `rustls-platform-verifier`, which on `target_os = "android"` requires an
-  initialized JVM Context and panics with
+### Patch #24 - Termux TLS roots (RETIRED at rust-v0.147.0)
+- **What it did**: reqwest 0.13 (pulled in by the rmcp 1.7.0 upgrade) routes TLS
+  verification through `rustls-platform-verifier`, which on
+  `target_os = "android"` requires an initialized JVM Context and panics with
   `Expect rustls-platform-verifier to be initialized` in a plain Termux CLI
-  process at the first TLS handshake (issue #11). `apply_termux_tls()`
-  supplies the embedded Mozilla roots (`webpki-root-certs`) via
-  `ClientBuilder::tls_certs_only()`, runtime-gated on `TERMUX_VERSION` (same
-  convention as Patch dealing with issue #10), so reqwest builds its
-  `WebPkiServerVerifier` and never constructs the platform verifier. The
-  custom-CA preconfigured backend path keeps precedence; desktop targets are
-  untouched. Upstream now routes the OAuth-login and streamable-HTTP MCP paths
-  through the injected reqwest 0.12 adapters, so only `auth_status.rs` still
-  constructs the reqwest 0.13 client that needs this fork guard.
+  process at the first TLS handshake (issue #11). `apply_termux_tls()` supplied
+  the embedded Mozilla roots (`webpki-root-certs`) via
+  `ClientBuilder::tls_certs_only()`, runtime-gated on `TERMUX_VERSION`, so
+  reqwest built its `WebPkiServerVerifier` and never constructed the platform
+  verifier.
+- **Retired**: upstream moved these paths onto the injected reqwest 0.12
+  adapters one at a time, and rust-v0.147.0 removed the last reqwest 0.13
+  client this crate built for itself — `discover_streamable_http_oauth_with_headers`
+  was folded into `discover_streamable_http_oauth_with_headers_and_http_client`,
+  which takes an `Arc<dyn HttpClient>` from `codex-http-client`. With the client
+  gone, `reqwest` is no longer a dependency of `codex-rmcp-client` at all: the
+  guard did not merely become redundant, it stopped compiling. It was removed
+  along with `webpki-root-certs` and its two tests.
+- **What is not settled**: this only establishes that the *panic* is unreachable
+  on this path. `codex-http-client` builds with `rustls-tls-native-roots`, and
+  whether the native trust store is populated under Termux has not been measured
+  on a device — a failure there would surface as a TLS connection error, not a
+  panic. That question belongs to `codex-http-client`, not to this patch.
+- `verify-patches.sh` still checks #24, but inverted: it now asserts that
+  `codex-rs/rmcp-client/Cargo.toml` has no direct `reqwest` dependency. Should
+  one reappear, an Android-panicking client is back and the guard must be
+  restored with it.
 
 ### Patch #25 - Plugin hook-file description compatibility
 - Files: `codex-rs/config/src/hook_config.rs`,
@@ -275,3 +292,14 @@ Run from repo root:
 ```bash
 bash verify-patches.sh
 ```
+
+### Patch #27 - Pairing tells the user how to start the daemon
+- Files: `codex-rs/app-server-daemon/src/lib.rs`
+- `remote-control pair` attaches to a daemon that is already running and never
+  starts one. With nothing listening the user only saw a transport error naming
+  a socket path, which does not say what to do next. The guard refuses early and
+  names both the missing socket and the command that fixes it.
+- Reported as issue #15. Upstream does not treat this as a defect, but it is a
+  Termux user's first contact with remote control, so it belongs in the fork.
+- Covered by `pairing_without_a_running_daemon_says_how_to_start_one`, which
+  exercises the behaviour rather than reading the source.

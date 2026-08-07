@@ -11,6 +11,7 @@ use codex_features::FeaturesToml;
 use codex_features::MultiAgentV2ConfigToml;
 use codex_features::RolloutBudgetConfigToml;
 use codex_features::TokenBudgetConfigToml;
+use codex_features::ToolRegistryConfigToml;
 use codex_protocol::ThreadId;
 
 use crate::config::Config;
@@ -153,11 +154,18 @@ fn save_config_resolved_fields(
         .features
         .get_or_insert_with(FeaturesToml::default);
     features.materialize_resolved_enabled(config.features.get());
+    if config.tool_registry.error_on_tool_collisions || features.tool_registry.is_some() {
+        features.tool_registry = Some(ToolRegistryConfigToml {
+            error_on_tool_collisions: Some(config.tool_registry.error_on_tool_collisions),
+        });
+    }
     let mut multi_agent_v2: MultiAgentV2ConfigToml =
         resolved_config_to_toml(&config.multi_agent_v2, "features.multi_agent_v2")?;
     multi_agent_v2.enabled = Some(config.features.enabled(Feature::MultiAgentV2));
     features.multi_agent_v2 = Some(FeatureToml::Config(multi_agent_v2));
-    if let Some(token_budget) = config.token_budget.as_ref() {
+    if let Some(token_budget) = config.token_budget.as_ref()
+        && super::token_budget::has_explicit_settings(config)
+    {
         let mut token_budget: TokenBudgetConfigToml =
             resolved_config_to_toml(token_budget, "features.token_budget")?;
         token_budget.enabled = Some(config.features.enabled(Feature::TokenBudget));
@@ -260,7 +268,11 @@ mod tests {
     async fn lock_contains_prompts_and_materializes_features() {
         let mut sc = crate::session::tests::make_session_configuration_for_tests().await;
         let mut config = (*sc.original_config_do_not_use).clone();
+        config.tool_registry.error_on_tool_collisions = true;
+        config.multi_agent_v2.subagent_developer_instructions =
+            Some("Locked subagent developer instructions.".to_string());
         config.token_budget = Some(crate::config::TokenBudgetConfig {
+            mode: codex_features::TokenBudgetMode::Thread,
             reminder_threshold_tokens: Some(16_000),
             reminder_message_template: "Locked reminder: {n_remaining} tokens.".to_string(),
             guidance_message: Some("Locked context-window guidance.".to_string()),
@@ -314,6 +326,12 @@ mod tests {
             .features
             .as_ref()
             .expect("lock should materialize feature states");
+        assert_eq!(
+            features.tool_registry,
+            Some(ToolRegistryConfigToml {
+                error_on_tool_collisions: Some(true),
+            })
+        );
         let feature_entries = features.entries();
         for spec in codex_features::FEATURES {
             assert_eq!(
@@ -344,15 +362,17 @@ mod tests {
                 min_wait_timeout_ms: Some(_),
                 max_wait_timeout_ms: Some(_),
                 default_wait_timeout_ms: Some(_),
+                subagent_developer_instructions: Some(instructions),
                 hide_spawn_agent_metadata: Some(_),
                 ..
-            })
+            }) if instructions == "Locked subagent developer instructions."
         ));
 
         assert_eq!(
             features.token_budget,
             Some(FeatureToml::Config(TokenBudgetConfigToml {
                 enabled: Some(true),
+                mode: Some(codex_features::TokenBudgetMode::Thread),
                 reminder_threshold_tokens: Some(16_000),
                 reminder_message_template: Some(
                     "Locked reminder: {n_remaining} tokens.".to_string()
@@ -385,6 +405,31 @@ mod tests {
         );
 
         assert_eq!(lockfile.version, crate::config_lock::CONFIG_LOCK_VERSION);
+    }
+
+    #[tokio::test]
+    async fn lock_preserves_model_owned_token_budget_defaults() {
+        let mut sc = crate::session::tests::make_session_configuration_for_tests().await;
+        let mut config = (*sc.original_config_do_not_use).clone();
+        config.token_budget = Some(crate::config::TokenBudgetConfig::default());
+        config
+            .features
+            .enable(Feature::TokenBudget)
+            .expect("token_budget should be enableable in tests");
+        sc.original_config_do_not_use = Arc::new(config);
+
+        let lockfile = sc.to_config_lockfile_toml().expect("lock should serialize");
+        let features = lockfile
+            .config
+            .features
+            .as_ref()
+            .expect("lock should materialize feature states");
+
+        assert_eq!(
+            features.token_budget.as_ref(),
+            Some(&FeatureToml::Enabled(true))
+        );
+        assert_eq!(features.tool_registry, None);
     }
 
     #[tokio::test]

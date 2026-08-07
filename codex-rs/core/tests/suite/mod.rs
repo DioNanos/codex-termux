@@ -72,6 +72,7 @@ mod hooks;
 #[cfg(not(target_os = "windows"))]
 mod hooks_mcp;
 mod image_rollout;
+mod injected_models_cache;
 mod items;
 mod json_result;
 mod live_cli;
@@ -151,6 +152,7 @@ mod unified_exec_process_events;
 #[cfg(unix)]
 mod unified_exec_zsh_fork_approvals;
 mod unstable_features_warning;
+mod user_message_admission;
 mod user_notification;
 mod user_shell_cmd;
 mod view_image;

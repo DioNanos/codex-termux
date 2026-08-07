@@ -1,7 +1,9 @@
 use super::ConversationMessage;
 use super::ImportedExternalAgentSession;
 use super::MessageRole;
-use super::records::read_session_import_with_cwd;
+use super::SessionRecordFormat;
+use super::records_cla;
+use super::records_cur;
 use super::summarize_for_label;
 use super::title::IMPORTED_SESSION_FALLBACK_TITLE;
 use super::title::SessionTitleCandidates;
@@ -22,21 +24,27 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 
-const EXTERNAL_SESSION_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
+pub(super) const EXTERNAL_SESSION_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
 
 #[cfg(test)]
 fn load_session_for_import(path: &Path) -> io::Result<Option<ImportedExternalAgentSession>> {
-    Ok(
-        load_session_for_import_with_content_sha256(path, /*fallback_cwd*/ None)?
-            .map(|(session, _content_sha256, _attributed_mcp_server_ids)| session),
-    )
+    Ok(load_session_for_import_with_content_sha256(
+        path,
+        SessionRecordFormat::Cla,
+        /*fallback_cwd*/ None,
+    )?
+    .map(|(session, _content_sha256, _attributed_mcp_server_ids)| session))
 }
 
 pub(crate) fn load_session_for_import_with_content_sha256(
     path: &Path,
+    record_format: SessionRecordFormat,
     fallback_cwd: Option<&Path>,
 ) -> io::Result<Option<(ImportedExternalAgentSession, String, BTreeSet<String>)>> {
-    let parsed = read_session_import_with_cwd(path, fallback_cwd)?;
+    let parsed = match record_format {
+        SessionRecordFormat::Cla => records_cla::read_session_import(path)?,
+        SessionRecordFormat::Cur => records_cur::read_session_import(path, fallback_cwd)?,
+    };
     let Some(cwd) = parsed.cwd else {
         return Ok(None);
     };
@@ -74,7 +82,7 @@ pub(crate) fn load_session_for_import_with_content_sha256(
     )))
 }
 
-fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<RolloutItem> {
+pub(super) fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<RolloutItem> {
     let mut items = Vec::new();
     let mut current_turn = None;
     let mut response_item_bytes = 0i64;

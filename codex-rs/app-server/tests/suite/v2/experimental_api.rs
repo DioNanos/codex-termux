@@ -44,6 +44,7 @@ async fn mock_experimental_method_requires_experimental_api_capability() -> Resu
                 request_attestation: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
+                extensions: None,
             }),
         )
         .await?;
@@ -80,6 +81,7 @@ async fn realtime_conversation_start_requires_experimental_api_capability() -> R
                 request_attestation: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
+                extensions: None,
             }),
         )
         .await?;
@@ -90,6 +92,7 @@ async fn realtime_conversation_start_requires_experimental_api_capability() -> R
     let request_id = mcp
         .send_thread_realtime_start_request(ThreadRealtimeStartParams {
             client_managed_handoffs: None,
+            delegation_ack_filler: None,
             flush_transcript_tail_on_session_end: None,
             codex_responses_as_items: None,
             codex_response_item_prefix: None,
@@ -100,6 +103,8 @@ async fn realtime_conversation_start_requires_experimental_api_capability() -> R
             output_modality: RealtimeOutputModality::Audio,
             include_startup_context: None,
             initial_items: None,
+            realtime_start_instructions: None,
+            realtime_end_instructions: None,
             prompt: Some(Some("hello".to_string())),
             realtime_session_id: None,
             transport: None,
@@ -133,6 +138,7 @@ async fn thread_memory_mode_set_requires_experimental_api_capability() -> Result
                 request_attestation: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
+                extensions: None,
             }),
         )
         .await?;
@@ -172,6 +178,7 @@ async fn thread_settings_update_requires_experimental_api_capability() -> Result
                 request_attestation: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
+                extensions: None,
             }),
         )
         .await?;
@@ -211,6 +218,7 @@ async fn realtime_webrtc_start_requires_experimental_api_capability() -> Result<
                 request_attestation: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
+                extensions: None,
             }),
         )
         .await?;
@@ -221,6 +229,7 @@ async fn realtime_webrtc_start_requires_experimental_api_capability() -> Result<
     let request_id = mcp
         .send_thread_realtime_start_request(ThreadRealtimeStartParams {
             client_managed_handoffs: None,
+            delegation_ack_filler: None,
             flush_transcript_tail_on_session_end: None,
             codex_responses_as_items: None,
             codex_response_item_prefix: None,
@@ -231,6 +240,8 @@ async fn realtime_webrtc_start_requires_experimental_api_capability() -> Result<
             output_modality: RealtimeOutputModality::Audio,
             include_startup_context: None,
             initial_items: None,
+            realtime_start_instructions: None,
+            realtime_end_instructions: None,
             prompt: Some(Some("hello".to_string())),
             realtime_session_id: None,
             transport: Some(ThreadRealtimeStartTransport::Webrtc {
@@ -267,6 +278,7 @@ async fn thread_start_mock_field_requires_experimental_api_capability() -> Resul
                 request_attestation: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
+                extensions: None,
             }),
         )
         .await?;
@@ -309,6 +321,7 @@ async fn thread_start_without_dynamic_tools_allows_without_experimental_api_capa
                 request_attestation: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
+                extensions: None,
             }),
         )
         .await?;
@@ -350,6 +363,7 @@ async fn thread_start_granular_approval_policy_requires_experimental_api_capabil
                 request_attestation: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
+                extensions: None,
             }),
         )
         .await?;

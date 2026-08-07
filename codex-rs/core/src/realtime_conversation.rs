@@ -92,6 +92,7 @@ const REALTIME_STARTUP_CONTEXT_TOKEN_BUDGET: usize = 5_300;
 const REALTIME_ASSISTANT_OUTPUT_TOKEN_BUDGET: usize = 1_000;
 const REALTIME_INITIAL_ITEMS_MAX_COUNT: usize = 128;
 const REALTIME_INITIAL_ITEMS_MAX_TOKENS: usize = 8_192;
+const REALTIME_MODE_INSTRUCTIONS_MAX_TOKENS: usize = 8_192;
 const HANDOFF_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 const HANDOFF_STREAM_TRUNCATION_MARKER: &str = "\n…output truncated…\n";
 const AGENT_FINAL_MESSAGE_PREFIX: &str = "\"Agent Final Message\":\n\n";
@@ -122,6 +123,13 @@ enum RealtimeFanoutTaskStop {
 
 pub(crate) struct RealtimeConversationManager {
     state: Mutex<Option<ConversationState>>,
+    mode_instructions: Mutex<Option<RealtimeModeInstructions>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RealtimeModeInstructions {
+    pub(crate) start: Option<String>,
+    pub(crate) end: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -458,6 +466,7 @@ struct ConversationState {
 
 struct RealtimeStart {
     api_provider: ApiProvider,
+    realtime_sideband_base_url: Option<String>,
     extra_headers: Option<HeaderMap>,
     client_managed_handoffs: bool,
     flush_transcript_tail_on_session_end: bool,
@@ -483,7 +492,12 @@ impl RealtimeConversationManager {
     pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(None),
+            mode_instructions: Mutex::new(None),
         }
+    }
+
+    pub(crate) async fn mode_instructions(&self) -> Option<RealtimeModeInstructions> {
+        self.mode_instructions.lock().await.clone()
     }
 
     pub(crate) async fn running_state(&self) -> Option<()> {
@@ -503,7 +517,11 @@ impl RealtimeConversationManager {
         )
     }
 
-    async fn start(&self, start: RealtimeStart) -> CodexResult<RealtimeStartOutput> {
+    async fn start(
+        &self,
+        start: RealtimeStart,
+        mode_instructions: RealtimeModeInstructions,
+    ) -> CodexResult<RealtimeStartOutput> {
         let previous_state = {
             let mut guard = self.state.lock().await;
             guard.take()
@@ -512,12 +530,15 @@ impl RealtimeConversationManager {
             stop_conversation_state(state, RealtimeFanoutTaskStop::Await).await;
         }
 
-        self.start_inner(start).await
+        let output = self.start_inner(start).await?;
+        *self.mode_instructions.lock().await = Some(mode_instructions);
+        Ok(output)
     }
 
     async fn start_inner(&self, start: RealtimeStart) -> CodexResult<RealtimeStartOutput> {
         let RealtimeStart {
             api_provider,
+            realtime_sideband_base_url,
             extra_headers,
             client_managed_handoffs,
             flush_transcript_tail_on_session_end,
@@ -569,6 +590,10 @@ impl RealtimeConversationManager {
         };
 
         let client = RealtimeWebsocketClient::new(api_provider);
+        let client = match realtime_sideband_base_url {
+            Some(base_url) => client.with_webrtc_sideband_base_url(base_url),
+            None => client,
+        };
         let (task, sdp) = if let Some(sdp) = sdp {
             let call = model_client
                 .create_realtime_call_with_headers(
@@ -1090,6 +1115,7 @@ pub(crate) async fn handle_start(
 
 struct PreparedRealtimeConversationStart {
     api_provider: ApiProvider,
+    realtime_sideband_base_url: Option<String>,
     extra_headers: Option<HeaderMap>,
     client_managed_handoffs: bool,
     flush_transcript_tail_on_session_end: bool,
@@ -1097,6 +1123,8 @@ struct PreparedRealtimeConversationStart {
     codex_response_item_prefix: Option<String>,
     codex_response_handoff_mode: CodexResponseHandoffMode,
     codex_response_handoff_channel_prefixes: Option<BTreeMap<String, Vec<String>>>,
+    realtime_start_instructions: Option<String>,
+    realtime_end_instructions: Option<String>,
     realtime_call_api_provider: Option<ApiProvider>,
     requested_realtime_session_id: Option<String>,
     version: RealtimeWsVersion,
@@ -1127,7 +1155,8 @@ async fn prepare_realtime_start(
         .clone()
         .unwrap_or(ConversationStartTransport::Websocket);
     let mut api_provider = provider.to_api_provider(Some(AuthMode::ApiKey))?;
-    if let Some(realtime_ws_base_url) = &config.experimental_realtime_ws_base_url {
+    let realtime_sideband_base_url = config.experimental_realtime_ws_base_url.clone();
+    if let Some(realtime_ws_base_url) = &realtime_sideband_base_url {
         api_provider.base_url = realtime_ws_base_url.clone();
     }
     let realtime_call_api_provider =
@@ -1182,6 +1211,7 @@ async fn prepare_realtime_start(
     ));
     Ok(PreparedRealtimeConversationStart {
         api_provider,
+        realtime_sideband_base_url,
         extra_headers: Some(extra_headers),
         client_managed_handoffs: params.client_managed_handoffs,
         flush_transcript_tail_on_session_end: params.flush_transcript_tail_on_session_end,
@@ -1189,6 +1219,8 @@ async fn prepare_realtime_start(
         codex_response_item_prefix: params.codex_response_item_prefix,
         codex_response_handoff_mode: params.codex_response_handoff_mode,
         codex_response_handoff_channel_prefixes: params.codex_response_handoff_channel_prefixes,
+        realtime_start_instructions: params.realtime_start_instructions,
+        realtime_end_instructions: params.realtime_end_instructions,
         realtime_call_api_provider,
         requested_realtime_session_id,
         version,
@@ -1220,6 +1252,25 @@ pub(crate) async fn build_realtime_session_config(
     version: RealtimeWsVersion,
     configured_voice: ConfiguredRealtimeVoice,
 ) -> CodexResult<RealtimeSessionConfig> {
+    for (name, instructions) in [
+        (
+            "realtime start instructions",
+            params.realtime_start_instructions.as_deref(),
+        ),
+        (
+            "realtime end instructions",
+            params.realtime_end_instructions.as_deref(),
+        ),
+    ] {
+        if instructions.is_some_and(|instructions| {
+            approx_token_count(instructions) > REALTIME_MODE_INSTRUCTIONS_MAX_TOKENS
+        }) {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{name} must not exceed {REALTIME_MODE_INSTRUCTIONS_MAX_TOKENS} estimated tokens"
+            )));
+        }
+    }
+
     let config = sess.get_config().await;
     let prompt = prepare_realtime_backend_prompt(
         params.prompt.clone(),
@@ -1306,6 +1357,7 @@ pub(crate) async fn build_realtime_session_config(
     Ok(RealtimeSessionConfig {
         instructions: prompt,
         initial_items: params.initial_items.clone(),
+        delegation_ack_filler: params.delegation_ack_filler,
         model,
         session_id: Some(
             params
@@ -1381,6 +1433,7 @@ async fn handle_start_inner(
 ) -> CodexResult<()> {
     let PreparedRealtimeConversationStart {
         api_provider,
+        realtime_sideband_base_url,
         extra_headers,
         client_managed_handoffs,
         flush_transcript_tail_on_session_end,
@@ -1388,6 +1441,8 @@ async fn handle_start_inner(
         codex_response_item_prefix,
         codex_response_handoff_mode,
         codex_response_handoff_channel_prefixes,
+        realtime_start_instructions,
+        realtime_end_instructions,
         realtime_call_api_provider,
         requested_realtime_session_id,
         version,
@@ -1399,8 +1454,13 @@ async fn handle_start_inner(
         ConversationStartTransport::Websocket => None,
         ConversationStartTransport::Webrtc { sdp } => Some(sdp),
     };
+    let mode_instructions = RealtimeModeInstructions {
+        start: realtime_start_instructions,
+        end: realtime_end_instructions,
+    };
     let start = RealtimeStart {
         api_provider,
+        realtime_sideband_base_url,
         extra_headers,
         client_managed_handoffs,
         flush_transcript_tail_on_session_end,
@@ -1413,7 +1473,7 @@ async fn handle_start_inner(
         model_client: sess.services.model_client.clone(),
         sdp,
     };
-    let start_output = sess.conversation.start(start).await?;
+    let start_output = sess.conversation.start(start, mode_instructions).await?;
 
     info!("realtime conversation started");
 

@@ -15,6 +15,7 @@ use codex_app_server_protocol::CancelLoginAccountParams;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::LoginAccountParams;
 use codex_app_server_protocol::LoginAccountResponse;
+use codex_login::AuthConfig;
 use codex_login::read_openai_api_key_from_env;
 use codex_protocol::auth::AuthMode;
 use crossterm::event::KeyCode;
@@ -52,6 +53,9 @@ use crate::motion::shimmer_text;
 use crate::onboarding::keys;
 use crate::onboarding::onboarding_screen::KeyboardHandler;
 use crate::onboarding::onboarding_screen::StepStateProvider;
+use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::mark_buffer_hyperlinks;
+use crate::terminal_hyperlinks::visible_lines;
 use crate::tui::FrameRequester;
 
 /// Marks buffer cells that have cyan+underlined style as an OSC 8 hyperlink.
@@ -231,7 +235,7 @@ pub(crate) struct AuthModeWidget {
     pub sign_in_state: Arc<RwLock<SignInState>>,
     pub login_status: LoginStatus,
     pub app_server_request_handle: AppServerRequestHandle,
-    pub forced_login_method: Option<ForcedLoginMethod>,
+    pub auth_config: AuthConfig,
     pub animations_enabled: bool,
     pub animations_suppressed: Cell<bool>,
 }
@@ -305,11 +309,13 @@ impl AuthModeWidget {
     }
 
     fn is_api_login_allowed(&self) -> bool {
-        !matches!(self.forced_login_method, Some(ForcedLoginMethod::Chatgpt))
+        self.auth_config
+            .is_login_method_allowed(ForcedLoginMethod::Api)
     }
 
     fn is_chatgpt_login_allowed(&self) -> bool {
-        !matches!(self.forced_login_method, Some(ForcedLoginMethod::Api))
+        self.auth_config
+            .is_login_method_allowed(ForcedLoginMethod::Chatgpt)
     }
 
     fn displayed_sign_in_options(&self) -> Vec<SignInOption> {
@@ -544,50 +550,51 @@ impl AuthModeWidget {
     }
 
     fn render_chatgpt_success_message(&self, area: Rect, buf: &mut Buffer) {
+        let mut docs_line = HyperlinkLine::new(Line::from("  For more details see the ").dim());
+        docs_line.push_span(
+            "Codex docs".underlined(),
+            Some("https://developers.openai.com/codex/security"),
+        );
+        let mut preferences_line =
+            HyperlinkLine::new(Line::from("  Uses your plan's rate limits and ").dim());
+        preferences_line.push_span(
+            "training data preferences".underlined(),
+            Some("https://chatgpt.com/#settings"),
+        );
+
         let lines = vec![
-            "✓ Signed in with your ChatGPT account"
-                .fg(Color::Green)
-                .into(),
+            HyperlinkLine::new(
+                "✓ Signed in with your ChatGPT account"
+                    .fg(Color::Green)
+                    .into(),
+            ),
             "".into(),
             "  Before you start:".into(),
             "".into(),
             "  Decide how much autonomy you want to grant Codex".into(),
-            Line::from(vec![
-                "  For more details see the ".into(),
-                crate::terminal_hyperlinks::osc8_hyperlink(
-                    "https://developers.openai.com/codex/security",
-                    "Codex docs",
-                )
-                .underlined(),
-            ])
-            .dim(),
+            docs_line,
             "".into(),
             "  Codex can make mistakes".into(),
-            "  Review the code it writes and commands it runs"
-                .dim()
-                .into(),
+            HyperlinkLine::new(
+                "  Review the code it writes and commands it runs"
+                    .dim()
+                    .into(),
+            ),
             "".into(),
             "  Powered by your ChatGPT account".into(),
-            Line::from(vec![
-                "  Uses your plan's rate limits and ".into(),
-                crate::terminal_hyperlinks::osc8_hyperlink(
-                    "https://chatgpt.com/#settings",
-                    "training data preferences",
-                )
-                .underlined(),
-            ])
-            .dim(),
+            preferences_line,
             "".into(),
-            Line::from(vec![
+            HyperlinkLine::new(Line::from(vec![
                 "  Press ".fg(Color::Cyan),
                 self.confirm_binding().into(),
                 " to continue".fg(Color::Cyan),
-            ]),
+            ])),
         ];
 
-        Paragraph::new(lines)
+        Paragraph::new(visible_lines(lines.clone()))
             .wrap(Wrap { trim: false })
             .render(area, buf);
+        mark_buffer_hyperlinks(buf, area, &lines, /*scroll_rows*/ 0);
     }
 
     fn render_chatgpt_success(&self, area: Rect, buf: &mut Buffer) {
@@ -1025,9 +1032,6 @@ mod tests {
     use codex_app_server_client::InProcessClientStartArgs;
     use codex_arg0::Arg0DispatchPaths;
     use codex_cloud_config::cloud_config_bundle_loader_for_storage;
-    use codex_config::types::AuthCredentialsStoreMode;
-    use codex_login::AuthKeyringBackendKind;
-
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -1055,7 +1059,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let auth_route_config = config.auth_route_config();
+        let mut auth_config = config.auth_config();
         let client = InProcessAppServerClient::start(InProcessClientStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
             config: Arc::new(config),
@@ -1063,12 +1067,8 @@ mod tests {
             loader_overrides: Default::default(),
             strict_config: false,
             cloud_config_bundle: cloud_config_bundle_loader_for_storage(
-                codex_home_path.clone(),
+                auth_config.clone(),
                 /*enable_codex_api_key_env*/ false,
-                AuthCredentialsStoreMode::File,
-                AuthKeyringBackendKind::default(),
-                "https://chatgpt.com/backend-api/".to_string(),
-                auth_route_config,
             )
             .await,
             feedback: codex_feedback::CodexFeedback::new(),
@@ -1090,6 +1090,7 @@ mod tests {
         })
         .await
         .unwrap();
+        auth_config.forced_login_method = Some(ForcedLoginMethod::Chatgpt);
         let widget = AuthModeWidget {
             request_frame: FrameRequester::test_dummy(),
             highlighted_mode: SignInOption::ChatGpt,
@@ -1097,7 +1098,7 @@ mod tests {
             sign_in_state: Arc::new(RwLock::new(SignInState::PickMode)),
             login_status: LoginStatus::NotAuthenticated,
             app_server_request_handle: AppServerRequestHandle::InProcess(client.request_handle()),
-            forced_login_method: Some(ForcedLoginMethod::Chatgpt),
+            auth_config,
             animations_enabled: true,
             animations_suppressed: std::cell::Cell::new(false),
         };
@@ -1252,6 +1253,69 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_success_message_renders_osc8_hyperlinks() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (widget, _tmp) = runtime.block_on(widget_forced_chatgpt());
+        let area = Rect::new(0, 0, 80, 14);
+        let mut buf = Buffer::empty(area);
+
+        widget.render_chatgpt_success_message(area, &mut buf);
+
+        assert_eq!(
+            collect_osc8_chars(&buf, area, "https://developers.openai.com/codex/security"),
+            "Codex docs"
+        );
+        assert_eq!(
+            collect_osc8_chars(&buf, area, "https://chatgpt.com/#settings"),
+            "training data preferences"
+        );
+        assert_eq!(
+            (0..37).map(|x| buf[(x, 5)].modifier).collect::<Vec<_>>(),
+            [
+                vec![Modifier::DIM; 27],
+                vec![Modifier::DIM | Modifier::UNDERLINED; 10],
+            ]
+            .concat()
+        );
+        assert_eq!(
+            (0..60).map(|x| buf[(x, 11)].modifier).collect::<Vec<_>>(),
+            [
+                vec![Modifier::DIM; 35],
+                vec![Modifier::DIM | Modifier::UNDERLINED; 25],
+            ]
+            .concat()
+        );
+
+        let visible = (area.top()..area.bottom())
+            .map(|y| {
+                let row = (area.left()..area.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>();
+                crate::terminal_hyperlinks::strip_osc8(&row)
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        insta::assert_snapshot!(visible, @r###"
+        ✓ Signed in with your ChatGPT account
+
+          Before you start:
+
+          Decide how much autonomy you want to grant Codex
+          For more details see the Codex docs
+
+          Codex can make mistakes
+          Review the code it writes and commands it runs
+
+          Powered by your ChatGPT account
+          Uses your plan's rate limits and training data preferences
+
+          Press enter to continue
+        "###);
+    }
+
+    #[test]
     fn auth_widget_suppresses_animations_when_device_code_is_visible() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (widget, _tmp) = runtime.block_on(widget_forced_chatgpt());
@@ -1292,6 +1356,7 @@ mod tests {
             login_id: Some("login-1".to_string()),
             success: true,
             error: None,
+            onboarding_entrypoint: None,
         });
 
         assert!(matches!(

@@ -23,6 +23,13 @@ pub type ToolInvocationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<JsonValue, String>> + Send + 'a>>;
 pub type NotificationFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
+/// Optional resource limits shared by every cell in one code-mode session.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CodeModeSessionCellExecutionLimits {
+    pub max_yield_time_ms: Option<u64>,
+    pub max_heap_size_bytes: Option<usize>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct CellId(String);
 
@@ -104,6 +111,34 @@ pub trait CodeModeSessionDelegate: Send + Sync {
     fn cell_closed(&self, cell_id: &CellId);
 }
 
+/// A session delegate for clients that do not expose nested tools or notifications.
+pub struct NoopCodeModeSessionDelegate;
+
+impl CodeModeSessionDelegate for NoopCodeModeSessionDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        _invocation: CodeModeNestedToolCall,
+        cancellation_token: CancellationToken,
+    ) -> ToolInvocationFuture<'a> {
+        Box::pin(async move {
+            cancellation_token.cancelled().await;
+            Err("code mode nested tools are unavailable".to_string())
+        })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
+}
+
 /// A durable code-mode session owned by one Codex thread.
 ///
 /// Cells executed in the same session share stored values. Separate sessions
@@ -127,10 +162,33 @@ pub trait CodeModeSession: Send + Sync {
 /// Implementations may share a remote host process across all sessions created
 /// by one provider.
 pub trait CodeModeSessionProvider: Send + Sync {
+    /// Reports whether this provider can execute code without starting its host.
+    fn availability(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn create_session<'a>(
         &'a self,
         delegate: Arc<dyn CodeModeSessionDelegate>,
     ) -> CodeModeSessionProviderFuture<'a>;
+
+    /// Creates a session whose cells share the supplied execution limits.
+    ///
+    /// Existing providers remain compatible with unlimited sessions, but must
+    /// explicitly implement this method before accepting non-default limits.
+    fn create_session_with_limits<'a>(
+        &'a self,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
+        limits: CodeModeSessionCellExecutionLimits,
+    ) -> CodeModeSessionProviderFuture<'a> {
+        if limits == CodeModeSessionCellExecutionLimits::default() {
+            self.create_session(delegate)
+        } else {
+            Box::pin(async {
+                Err("code-mode session provider does not support resource limits".to_string())
+            })
+        }
+    }
 }
 
 #[cfg(test)]

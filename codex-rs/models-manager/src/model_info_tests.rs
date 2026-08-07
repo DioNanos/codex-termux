@@ -3,6 +3,8 @@ use crate::ModelsManagerConfig;
 use codex_protocol::config_types::Personality;
 use codex_protocol::openai_models::ApprovalMessages;
 use codex_protocol::openai_models::AutoReviewMessages;
+use codex_protocol::openai_models::CollaborationModeMessages;
+use codex_protocol::openai_models::ModelTokenBudgetConfig;
 use codex_protocol::openai_models::PermissionMessages;
 use pretty_assertions::assert_eq;
 
@@ -15,13 +17,34 @@ fn config_with_personality(personality: Option<Personality>) -> ModelsManagerCon
 }
 
 #[test]
-fn base_instruction_override_preserves_catalog_approval_messages() {
+fn base_instruction_override_is_literal_and_preserves_catalog_messages() {
+    let override_instructions = "override {{ personality }}";
     let mut model = model_info_from_slug("unknown-model");
     let approvals = ApprovalMessages {
         on_request: Some("user approvals".to_string()),
         on_request_auto_review: Some("auto approvals".to_string()),
-        never: None,
-        unless_trusted: None,
+        never: Some("never approvals".to_string()),
+        unless_trusted: Some("unless-trusted approvals".to_string()),
+    };
+    let collaboration_modes = CollaborationModeMessages {
+        default: Some("default instructions".to_string()),
+        plan: Some("plan instructions".to_string()),
+    };
+    let auto_review = AutoReviewMessages {
+        policy: Some("review policy".to_string()),
+        policy_template: Some("review policy template".to_string()),
+    };
+    let permissions = PermissionMessages {
+        danger_full_access: Some("danger".to_string()),
+        workspace_write: Some(String::new()),
+        read_only: None,
+    };
+    let token_budget = ModelTokenBudgetConfig {
+        reminder_threshold_tokens: 128,
+        reminder_message_template: "budget reminder".to_string(),
+        guidance_message: "budget guidance".to_string(),
+        auto_compact_fallback_prompt: "compact prompt".to_string(),
+        auto_compact_fallback_buffer_tokens: 64,
     };
     model.model_messages = Some(ModelMessages {
         instructions_template: Some("template".to_string()),
@@ -31,11 +54,13 @@ fn base_instruction_override_preserves_catalog_approval_messages() {
             personality_pragmatic: Some("pragmatic".to_string()),
         }),
         approvals: Some(approvals.clone()),
-        auto_review: None,
-        permissions: None,
+        collaboration_modes: Some(collaboration_modes.clone()),
+        auto_review: Some(auto_review.clone()),
+        permissions: Some(permissions.clone()),
+        token_budget: Some(token_budget.clone()),
     });
     let config = ModelsManagerConfig {
-        base_instructions: Some("override".to_string()),
+        base_instructions: Some(override_instructions.to_string()),
         ..Default::default()
     };
 
@@ -44,17 +69,23 @@ fn base_instruction_override_preserves_catalog_approval_messages() {
     assert_eq!(
         updated.model_messages,
         Some(ModelMessages {
-            instructions_template: None,
+            instructions_template: Some(override_instructions.to_string()),
             instructions_variables: None,
             approvals: Some(approvals),
-            auto_review: None,
-            permissions: None,
+            collaboration_modes: Some(collaboration_modes),
+            auto_review: Some(auto_review),
+            permissions: Some(permissions),
+            token_budget: Some(token_budget),
         })
+    );
+    assert_eq!(
+        updated.get_model_instructions(/*personality*/ None),
+        override_instructions
     );
 }
 
 #[test]
-fn disabled_personality_preserves_catalog_approval_messages() {
+fn disabled_personality_bakes_default_and_preserves_catalog_approval_messages() {
     let mut model = model_info_from_slug("unknown-model");
     let approvals = ApprovalMessages {
         on_request: Some("user approvals".to_string()),
@@ -63,11 +94,17 @@ fn disabled_personality_preserves_catalog_approval_messages() {
         unless_trusted: None,
     };
     model.model_messages = Some(ModelMessages {
-        instructions_template: Some("template".to_string()),
-        instructions_variables: None,
+        instructions_template: Some("before {{ personality }} after".to_string()),
+        instructions_variables: Some(ModelInstructionsVariables {
+            personality_default: Some("default".to_string()),
+            personality_friendly: Some("friendly".to_string()),
+            personality_pragmatic: Some("pragmatic".to_string()),
+        }),
         approvals: Some(approvals.clone()),
+        collaboration_modes: None,
         auto_review: None,
         permissions: None,
+        token_budget: None,
     });
     let config = ModelsManagerConfig {
         personality_enabled: false,
@@ -79,80 +116,42 @@ fn disabled_personality_preserves_catalog_approval_messages() {
     assert_eq!(
         updated.model_messages,
         Some(ModelMessages {
-            instructions_template: None,
+            instructions_template: Some("before default after".to_string()),
             instructions_variables: None,
             approvals: Some(approvals),
+            collaboration_modes: None,
             auto_review: None,
             permissions: None,
+            token_budget: None,
         })
     );
 }
 
 #[test]
-fn base_instruction_override_preserves_catalog_auto_review_messages() {
-    let mut model = model_info_from_slug("unknown-model");
-    let auto_review = AutoReviewMessages {
-        policy: Some("review policy".to_string()),
-        policy_template: Some("review policy template".to_string()),
-    };
-    model.model_messages = Some(ModelMessages {
-        instructions_template: Some("template".to_string()),
-        instructions_variables: None,
-        approvals: None,
-        auto_review: Some(auto_review.clone()),
-        permissions: None,
-    });
+fn disabled_personality_uses_plain_base_instructions_for_local_personality_models() {
     let config = ModelsManagerConfig {
-        base_instructions: Some("override".to_string()),
+        personality_enabled: false,
+        personality: Some(Personality::Friendly),
         ..Default::default()
     };
 
-    let updated = with_config_overrides(model, &config);
+    for slug in ["gpt-5.2-codex", "exp-codex-personality"] {
+        let updated = with_config_overrides(model_info_from_slug(slug), &config);
 
-    assert_eq!(
-        updated.model_messages,
-        Some(ModelMessages {
-            instructions_template: None,
-            instructions_variables: None,
-            approvals: None,
-            auto_review: Some(auto_review),
-            permissions: None,
-        })
-    );
-}
-
-#[test]
-fn base_instruction_override_preserves_catalog_permission_messages() {
-    let mut model = model_info_from_slug("unknown-model");
-    let permissions = PermissionMessages {
-        danger_full_access: Some("danger".to_string()),
-        workspace_write: Some(String::new()),
-        read_only: None,
-    };
-    model.model_messages = Some(ModelMessages {
-        instructions_template: Some("template".to_string()),
-        instructions_variables: None,
-        approvals: None,
-        auto_review: None,
-        permissions: Some(permissions.clone()),
-    });
-    let config = ModelsManagerConfig {
-        base_instructions: Some("override".to_string()),
-        ..Default::default()
-    };
-
-    let updated = with_config_overrides(model, &config);
-
-    assert_eq!(
-        updated.model_messages,
-        Some(ModelMessages {
-            instructions_template: None,
-            instructions_variables: None,
-            approvals: None,
-            auto_review: None,
-            permissions: Some(permissions),
-        })
-    );
+        assert_eq!(
+            updated.model_messages,
+            Some(ModelMessages {
+                instructions_template: Some(BASE_INSTRUCTIONS.to_string()),
+                instructions_variables: None,
+                approvals: None,
+                collaboration_modes: None,
+                auto_review: None,
+                permissions: None,
+                token_budget: None,
+            }),
+            "unexpected model messages for {slug}"
+        );
+    }
 }
 
 #[test]
@@ -180,13 +179,14 @@ fn personality_none_strips_catalog_instruction_sources_through_the_next_h1() {
 
     for (instructions, expected) in cases {
         let mut model = model_info_from_slug("unknown-model");
-        model.base_instructions = instructions.to_string();
         model.model_messages = Some(ModelMessages {
             instructions_template: Some(instructions.to_string()),
             instructions_variables: None,
             approvals: None,
+            collaboration_modes: None,
             auto_review: None,
             permissions: None,
+            token_budget: None,
         });
 
         let updated = with_config_overrides(model, &config);
@@ -196,8 +196,11 @@ fn personality_none_strips_catalog_instruction_sources_through_the_next_h1() {
             .and_then(|messages| messages.instructions_template.as_deref());
 
         assert_eq!(
-            (updated.base_instructions.as_str(), instructions_template),
-            (expected, Some(expected))
+            (
+                updated.get_model_instructions(Some(Personality::None)),
+                instructions_template
+            ),
+            (expected.to_string(), Some(expected))
         );
     }
 }
@@ -217,13 +220,28 @@ fn baked_personality_section_is_preserved_without_enabled_explicit_none() {
 
     for config in configs {
         let mut model = model_info_from_slug("unknown-model");
-        model.base_instructions = instructions.to_string();
+        model
+            .model_messages
+            .as_mut()
+            .expect("fallback model messages")
+            .instructions_template = Some(instructions.to_string());
 
         assert_eq!(
-            with_config_overrides(model, &config).base_instructions,
+            with_config_overrides(model, &config).get_model_instructions(config.personality),
             instructions
         );
     }
+}
+
+#[test]
+fn unknown_model_uses_builtin_instruction_template() {
+    let model = model_info_from_slug("unknown-model");
+
+    assert_eq!(
+        model.get_model_instructions(/*personality*/ None),
+        BASE_INSTRUCTIONS
+    );
+    assert!(model.used_fallback_model_metadata);
 }
 
 #[test]
@@ -279,8 +297,10 @@ fn catalog_template_allows_missing_base_instructions() {
         instructions_template: Some("catalog template".to_string()),
         instructions_variables: None,
         approvals: None,
+        collaboration_modes: None,
         auto_review: None,
         permissions: None,
+        token_budget: None,
     });
 
     let config = ModelsManagerConfig {
@@ -301,8 +321,10 @@ fn disabling_personality_restores_fallback_after_template_removal() {
         instructions_template: Some("catalog template".to_string()),
         instructions_variables: None,
         approvals: None,
+        collaboration_modes: None,
         auto_review: None,
         permissions: None,
+        token_budget: None,
     });
     let config = ModelsManagerConfig {
         personality_enabled: false,

@@ -1,7 +1,9 @@
+use super::FreeformTool;
 use super::LoadableToolSpec;
 use super::ResponsesApiNamespace;
 use super::ResponsesApiNamespaceTool;
 use super::ResponsesApiTool;
+use super::agent_plugin_mcp_tool_to_responses_api_tool;
 use super::dynamic_tool_to_responses_api_tool;
 use super::mcp_tool_to_deferred_responses_api_tool;
 use super::tool_definition_to_responses_api_tool;
@@ -12,6 +14,35 @@ use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::BTreeMap;
+
+#[test]
+fn freeform_tool_deferral_matches_function_tool_wire_shape() {
+    let mut expected_wire_shape = json!({
+        "name": "apply_patch",
+        "description": "Apply a patch",
+        "format": {
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": "start: \"patch\"",
+        },
+    });
+
+    let mut tool: FreeformTool = serde_json::from_value(expected_wire_shape.clone())
+        .expect("deserialize legacy freeform tool");
+
+    assert_eq!(tool.defer_loading, None);
+    assert_eq!(
+        serde_json::to_value(&tool).expect("serialize eager freeform tool"),
+        expected_wire_shape
+    );
+
+    tool.defer_loading = Some(true);
+    expected_wire_shape["defer_loading"] = json!(true);
+    assert_eq!(
+        serde_json::to_value(tool).expect("serialize deferred freeform tool"),
+        expected_wire_shape
+    );
+}
 
 #[test]
 fn tool_definition_to_responses_api_tool_omits_false_defer_loading() {
@@ -121,6 +152,46 @@ fn mcp_tool_to_deferred_responses_api_tool_sets_defer_loading() {
             output_schema: None,
         }
     );
+}
+
+#[test]
+fn agent_plugin_mcp_tool_uses_fallback_for_oversized_schema() {
+    let properties: serde_json::Map<String, serde_json::Value> = (0..1_024)
+        .map(|index| (format!("property_{index}"), json!({"type": "string"})))
+        .collect();
+    let tool = rmcp::model::Tool::new(
+        "oversized",
+        "Large schema",
+        std::sync::Arc::new(rmcp::model::object(json!({
+            "type": "object",
+            "properties": properties,
+        }))),
+    );
+
+    assert_eq!(
+        agent_plugin_mcp_tool_to_responses_api_tool(&ToolName::from("oversized"), &tool)
+            .expect("Agent Plugin MCP tool should use a fallback schema")
+            .parameters,
+        JsonSchema::object(BTreeMap::new(), /*required*/ None, Some(true.into()))
+    );
+}
+
+#[test]
+fn legacy_mcp_tool_accepts_oversized_schema() {
+    let properties: serde_json::Map<String, serde_json::Value> = (0..1_024)
+        .map(|index| (format!("property_{index}"), json!({"type": "string"})))
+        .collect();
+    let tool = rmcp::model::Tool::new(
+        "oversized",
+        "Large legacy schema",
+        std::sync::Arc::new(rmcp::model::object(json!({
+            "type": "object",
+            "properties": properties,
+        }))),
+    );
+
+    super::mcp_tool_to_responses_api_tool(&ToolName::from("oversized"), &tool)
+        .expect("legacy MCP conversion must preserve existing acceptance");
 }
 
 #[test]

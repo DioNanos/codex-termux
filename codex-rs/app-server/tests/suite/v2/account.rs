@@ -21,6 +21,7 @@ use codex_app_server_protocol::CancelLoginAccountStatus;
 use codex_app_server_protocol::ChatgptAuthTokensRefreshReason;
 use codex_app_server_protocol::ChatgptAuthTokensRefreshResponse;
 use codex_app_server_protocol::ClientInfo;
+use codex_app_server_protocol::DesktopOnboardingEntrypoint;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAccountResponse;
 use codex_app_server_protocol::GetAuthStatusParams;
@@ -351,6 +352,51 @@ async fn logout_account_succeeds_when_config_reload_fails() -> Result<()> {
     );
     assert_eq!(load_file_auth(codex_home.path())?, None);
     assert_account_updated(&mut mcp, /*auth_mode*/ None).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_enforces_local_auth_requirements_before_cloud_fetch() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mock_server = MockServer::start().await;
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            chatgpt_base_url: Some(format!("{}/backend-api", mock_server.uri())),
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        "allowed_login_methods = [\"api\"]\n",
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .plan_type("enterprise")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123")
+            .account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    assert!(
+        mock_server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty(),
+        "disallowed ChatGPT auth must not fetch cloud requirements"
+    );
+
+    assert_eq!(read_account(&mut mcp).await?.account, None);
 
     Ok(())
 }
@@ -1115,6 +1161,7 @@ async fn login_amazon_bedrock_replaces_primary_auth_and_persists_provider() -> R
             login_id: None,
             success: true,
             error: None,
+            onboarding_entrypoint: None,
         }
     );
     assert_account_updated(&mut mcp, Some(AuthMode::BedrockApiKey)).await?;
@@ -2103,7 +2150,7 @@ async fn login_account_chatgpt_redirects_to_hosted_success_page() -> Result<()> 
         .await?;
     let login: LoginAccountResponse =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
-    let LoginAccountResponse::Chatgpt { auth_url, .. } = login else {
+    let LoginAccountResponse::Chatgpt { login_id, auth_url } = login else {
         bail!("unexpected login response: {login:?}");
     };
     let auth_url = Url::parse(&auth_url)?;
@@ -2119,15 +2166,49 @@ async fn login_account_chatgpt_redirects_to_hosted_success_page() -> Result<()> 
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
-    let response = client
-        .get(format!("{callback_url}?code=test-code&state={state}"))
-        .send()
-        .await?;
+    let token_redirect_uri = callback_url.clone();
+    let mut callback_url = Url::parse(&callback_url)?;
+    let callback_state = format!("{state}.onboarding_entrypoint=life_sciences");
+    callback_url
+        .query_pairs_mut()
+        .append_pair("code", "test-code")
+        .append_pair("state", &callback_state);
+    let response = client.get(callback_url).send().await?;
 
     assert_eq!(response.status(), 302);
     assert_eq!(
         response.headers()["location"].to_str()?,
         "http://localhost:3000/codex/open-app?source=login&app_brand=chatgpt"
+    );
+    let requests = mock_server
+        .received_requests()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("failed to read OAuth requests"))?;
+    let token_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/oauth/token")
+        .ok_or_else(|| anyhow::anyhow!("missing OAuth token request"))?;
+    let token_form: std::collections::HashMap<_, _> =
+        url::form_urlencoded::parse(&token_request.body)
+            .into_owned()
+            .collect();
+    assert_eq!(token_form.get("redirect_uri"), Some(&token_redirect_uri),);
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("account/login/completed"),
+    )
+    .await??;
+    let ServerNotification::AccountLoginCompleted(payload) = notification.try_into()? else {
+        bail!("unexpected notification")
+    };
+    assert_eq!(
+        payload,
+        AccountLoginCompletedNotification {
+            login_id: Some(login_id),
+            success: true,
+            error: None,
+            onboarding_entrypoint: Some(DesktopOnboardingEntrypoint::LifeSciences),
+        }
     );
     Ok(())
 }
@@ -2592,6 +2673,52 @@ async fn get_account_with_chatgpt() -> Result<()> {
         requires_openai_auth: true,
     };
     assert_eq!(received, expected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_account_with_business_prolite_returns_plan_type() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            requires_openai_auth: Some(true),
+            ..Default::default()
+        },
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("access-chatgpt")
+            .email("user@example.com")
+            .plan_type("self_serve_business_prolite"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
+        .send_get_account_request(GetAccountParams {
+            refresh_token: false,
+        })
+        .await?;
+    let received: GetAccountResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    assert_eq!(
+        received,
+        GetAccountResponse {
+            account: Some(Account::Chatgpt {
+                email: Some("user@example.com".to_string()),
+                plan_type: AccountPlanType::SelfServeBusinessProLite,
+            }),
+            requires_openai_auth: true,
+        }
+    );
     Ok(())
 }
 

@@ -16,8 +16,8 @@ use super::selection_popup_common::render_menu_surface;
 use super::selection_popup_common::wrap_styled_line;
 use crate::app_event_sender::AppEventSender;
 use crate::clipboard_paste::normalize_pasted_search_query;
-use crate::key_hint::KeyBinding;
 use crate::key_hint::KeyBindingListExt;
+use crate::key_hint::ShortcutHint;
 use crate::key_hint::is_plain_text_key_event;
 use crate::keymap::ListKeymap;
 use crate::render::renderable::ColumnRenderable;
@@ -135,7 +135,7 @@ pub(crate) struct SelectionItem {
     pub name_prefix_spans: Vec<Span<'static>>,
     pub toggle: Option<SelectionToggle>,
     pub toggle_placeholder: Option<&'static str>,
-    pub display_shortcut: Option<KeyBinding>,
+    pub display_shortcut: Option<ShortcutHint>,
     pub description: Option<String>,
     pub selected_description: Option<String>,
     pub is_current: bool,
@@ -487,6 +487,11 @@ impl ListSelectionView {
             .selected_actual_idx()
             .filter(|actual_idx| self.enabled_actual_idx(*actual_idx).is_some())
             .or_else(|| {
+                self.initial_selected_idx
+                    .take()
+                    .filter(|actual_idx| self.enabled_actual_idx(*actual_idx).is_some())
+            })
+            .or_else(|| {
                 (!self.is_searchable)
                     .then(|| {
                         self.active_items()
@@ -494,11 +499,6 @@ impl ListSelectionView {
                             .position(|item| item.is_current && Self::item_is_enabled(item))
                     })
                     .flatten()
-            })
-            .or_else(|| {
-                self.initial_selected_idx
-                    .take()
-                    .filter(|actual_idx| self.enabled_actual_idx(*actual_idx).is_some())
             });
 
         if self.is_searchable && !self.search_query.is_empty() {
@@ -950,6 +950,10 @@ impl ListSelectionView {
 }
 
 impl BottomPaneView for ListSelectionView {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         // Searchable lists reserve printable characters for query input. This
         // keeps vim-style plain j/k/h/l useful in non-search lists without
@@ -2567,6 +2571,41 @@ mod tests {
             "list_selection_narrow_width_preserves_rows",
             render_lines_with_width(&view, /*width*/ 24)
         );
+    }
+
+    #[test]
+    fn snapshot_narrow_width_counts_halfwidth_sound_marks() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let items = vec![
+            SelectionItem {
+                name: "abｶﾞc".to_string(),
+                description: Some("dakuten description".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "aﾊﾟc".to_string(),
+                description: Some("handakuten description".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+        let view = new_view(
+            SelectionViewParams {
+                title: Some("Halfwidth sound marks".to_string()),
+                items,
+                ..Default::default()
+            },
+            tx,
+        );
+
+        let rendered = format!(
+            "width 20:\n{}\n\nwidth 24:\n{}",
+            render_lines_with_width(&view, /*width*/ 20),
+            render_lines_with_width(&view, /*width*/ 24)
+        );
+        assert_snapshot!("list_selection_halfwidth_sound_marks_narrow", rendered);
     }
 
     #[test]

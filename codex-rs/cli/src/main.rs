@@ -68,6 +68,7 @@ use state_db_recovery as local_state_db;
 
 use codex_config::LoaderOverrides;
 use codex_core::build_models_manager;
+use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::edit::ConfigEditsBuilder;
@@ -103,6 +104,10 @@ use codex_terminal_detection::TerminalName;
     override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct MultitoolCli {
+    /// Enable process-only PSP routing for first-party ChatGPT requests.
+    #[arg(long, global = true, hide = true)]
+    psp: bool,
+
     #[clap(flatten)]
     pub config_overrides: CliConfigOverrides,
 
@@ -568,6 +573,14 @@ struct ExecServerCommand {
     #[arg(long = "strict-config", default_value_t = false)]
     strict_config: bool,
 
+    /// Maximum number of requests to process concurrently on each connection.
+    #[arg(
+        long = "concurrent-requests",
+        value_name = "COUNT",
+        default_value = "1"
+    )]
+    request_dispatch_mode: codex_exec_server::RequestDispatchMode,
+
     /// Transport endpoint URL. Supported values: `ws://IP:PORT` (default), `stdio`, `stdio://`.
     #[arg(long = "listen", value_name = "URL", conflicts_with = "remote")]
     listen: Option<String>,
@@ -587,6 +600,14 @@ struct ExecServerCommand {
     /// Use Agent Identity auth from CODEX_ACCESS_TOKEN for remote registration.
     #[arg(long = "use-agent-identity-auth", requires = "remote")]
     use_agent_identity_auth: bool,
+
+    /// Exit when the parent-owned standard-input pipe closes.
+    #[arg(
+        long = "exit-on-stdin-close",
+        env = codex_exec_server::CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE_ENV_VAR,
+        requires_if("true", "remote")
+    )]
+    exit_on_stdin_close: bool,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -968,12 +989,14 @@ async fn cli_main(
     remote_control_disabled: bool,
 ) -> anyhow::Result<()> {
     let MultitoolCli {
+        psp,
         config_overrides: mut root_config_overrides,
         feature_toggles,
         remote,
         mut interactive,
         subcommand,
     } = MultitoolCli::parse();
+    interactive.psp = psp;
 
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;
@@ -981,6 +1004,9 @@ async fn cli_main(
     let root_remote = remote.remote;
     let root_remote_auth_token_env = remote.remote_auth_token_env;
     let root_strict_config = interactive.strict_config;
+    interactive
+        .shared
+        .take_auto_review_config_overrides(&mut root_config_overrides);
     reject_root_strict_config_for_subcommand(root_strict_config, &subcommand)?;
     if let Some(subcommand) = subcommand.as_ref() {
         profile_v2_for_subcommand(&interactive, subcommand)?;
@@ -1010,6 +1036,7 @@ async fn cli_main(
             exec_cli
                 .shared
                 .inherit_exec_root_options(&interactive.shared);
+            exec_cli.psp = psp;
             exec_cli.strict_config |= root_strict_config;
             prepend_config_flags(
                 &mut exec_cli.config_overrides,
@@ -1030,6 +1057,7 @@ async fn cli_main(
             exec_cli
                 .shared
                 .inherit_exec_root_options(&interactive.shared);
+            exec_cli.psp = psp;
             exec_cli.command = Some(ExecCommand::Review(review_args));
             exec_cli.strict_config = strict_config || root_strict_config;
             prepend_config_flags(
@@ -1139,6 +1167,7 @@ async fn cli_main(
                                 codex_app_server::RemoteControlStartupMode::ResolvePersisted
                             }
                         },
+                        psp,
                         ..Default::default()
                     };
                     codex_app_server::run_main_with_transport_options(
@@ -1241,6 +1270,7 @@ async fn cli_main(
                 remote_control_cli,
                 arg0_paths.clone(),
                 root_config_overrides,
+                psp,
             )
             .await?;
         }
@@ -1723,10 +1753,28 @@ async fn run_exec_server_command(
         if let Some(name) = cmd.name {
             remote_config.name = name;
         }
+        remote_config.request_dispatch_mode = cmd.request_dispatch_mode;
         let remote_config = remote_config.with_telemetry(telemetry);
-        exec_server_telemetry::run_until_shutdown(async move {
-            codex_exec_server::run_remote_environment(remote_config, runtime_paths).await
-        })
+        let parent_lifetime = if cmd.exit_on_stdin_close {
+            exec_server_telemetry::ParentLifetime::StdinPipe
+        } else {
+            exec_server_telemetry::ParentLifetime::Independent
+        };
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        exec_server_telemetry::run_until_shutdown(
+            async move {
+                codex_exec_server::run_remote_environment_until_shutdown(
+                    remote_config,
+                    runtime_paths,
+                    async move {
+                        let _ = shutdown_receiver.await;
+                    },
+                )
+                .await
+            },
+            parent_lifetime,
+            exec_server_telemetry::ShutdownBehavior::Graceful(shutdown_sender),
+        )
         .await?;
         Ok(())
     } else {
@@ -1748,15 +1796,20 @@ async fn run_exec_server_command(
         let listen_url = cmd
             .listen
             .unwrap_or_else(|| codex_exec_server::DEFAULT_LISTEN_URL.to_string());
-        exec_server_telemetry::run_until_shutdown(async move {
-            codex_exec_server::run_main_with_telemetry(
-                &listen_url,
-                runtime_paths,
-                telemetry,
-                http_client_factory,
-            )
-            .await
-        })
+        exec_server_telemetry::run_until_shutdown(
+            async move {
+                codex_exec_server::run_main_with_telemetry(
+                    &listen_url,
+                    runtime_paths,
+                    telemetry,
+                    http_client_factory,
+                    cmd.request_dispatch_mode,
+                )
+                .await
+            },
+            exec_server_telemetry::ParentLifetime::Independent,
+            exec_server_telemetry::ShutdownBehavior::Immediate,
+        )
         .await
         .map_err(anyhow::Error::from_boxed)
     }
@@ -1768,16 +1821,19 @@ async fn load_exec_server_remote_auth_provider(
     use_agent_identity_auth: bool,
 ) -> anyhow::Result<codex_api::SharedAuthProvider> {
     if use_agent_identity_auth {
-        let agent_identity_jwt = read_codex_access_token_from_env().ok_or_else(|| {
+        read_codex_access_token_from_env().ok_or_else(|| {
             anyhow::anyhow!("CODEX_ACCESS_TOKEN is required when --use-agent-identity-auth is set")
         })?;
-        let auth_route_config = config.auth_route_config();
-        let auth = CodexAuth::from_agent_identity_jwt(
-            &agent_identity_jwt,
-            Some(&config.chatgpt_base_url),
-            &auth_route_config,
-        )
-        .await?;
+        let auth = AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
+            .await
+            .auth()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Agent Identity authentication is unavailable"))?;
+        if !matches!(auth, CodexAuth::AgentIdentity(_)) {
+            anyhow::bail!(
+                "CODEX_ACCESS_TOKEN did not provide permitted Agent Identity authentication"
+            );
+        }
         return Ok(codex_model_provider::auth_provider_from_auth(&auth));
     }
 
@@ -2027,6 +2083,16 @@ async fn run_debug_prompt_input_command(
         config.chatgpt_base_url.clone(),
         config.http_client_factory(),
     );
+    codex_skills_extension::install(&mut extensions, |config: &Config| {
+        codex_skills_extension::SkillsExtensionConfig {
+            include_instructions: config.include_skill_instructions,
+            bundled_skills_enabled: config.bundled_skills_enabled(),
+            orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+            shadow_selection_enabled: config
+                .features
+                .enabled(codex_features::Feature::SkillSearch),
+        }
+    });
     let prompt_input = codex_core::build_prompt_input(
         config,
         input,
@@ -2530,13 +2596,19 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         approval_policy,
         web_search,
         prompt,
-        config_overrides,
+        mut config_overrides,
         ..
     } = subcommand_cli;
+    let subcommand_auto_review = shared.auto_review;
     interactive
         .shared
         .apply_subcommand_overrides(shared.into_inner());
-    if let Some(approval) = approval_policy {
+    interactive
+        .shared
+        .take_auto_review_config_overrides(&mut config_overrides);
+    if subcommand_auto_review {
+        interactive.approval_policy = None;
+    } else if let Some(approval) = approval_policy {
         interactive.approval_policy = Some(approval);
     }
     if web_search {
@@ -2658,12 +2730,16 @@ mod tests {
     fn finalize_resume_from_args(args: &[&str]) -> TuiCli {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
-            interactive,
-            config_overrides: root_overrides,
+            psp: _,
+            mut interactive,
+            config_overrides: mut root_overrides,
             subcommand,
             feature_toggles: _,
             remote: _,
         } = cli;
+        interactive
+            .shared
+            .take_auto_review_config_overrides(&mut root_overrides);
 
         let Subcommand::Resume(ResumeCommand {
             session_id,
@@ -2692,12 +2768,16 @@ mod tests {
     fn finalize_fork_from_args(args: &[&str]) -> TuiCli {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
-            interactive,
-            config_overrides: root_overrides,
+            psp: _,
+            mut interactive,
+            config_overrides: mut root_overrides,
             subcommand,
             feature_toggles: _,
             remote: _,
         } = cli;
+        interactive
+            .shared
+            .take_auto_review_config_overrides(&mut root_overrides);
 
         let Subcommand::Fork(ForkCommand {
             session_id,
@@ -2714,9 +2794,26 @@ mod tests {
         finalize_fork_interactive(interactive, root_overrides, session_id, last, all, fork_cli)
     }
 
+    fn finalize_exec_from_args(args: &[&str]) -> ExecCli {
+        let mut cli = MultitoolCli::try_parse_from(args).expect("parse");
+        cli.interactive
+            .shared
+            .take_auto_review_config_overrides(&mut cli.config_overrides);
+        let Some(Subcommand::Exec(mut exec)) = cli.subcommand else {
+            panic!("expected exec subcommand");
+        };
+        exec.shared
+            .inherit_exec_root_options(&cli.interactive.shared);
+        prepend_config_flags(&mut exec.config_overrides, cli.config_overrides);
+        exec.shared
+            .take_auto_review_config_overrides(&mut exec.config_overrides);
+        exec
+    }
+
     fn finalize_archive_from_args(args: &[&str]) -> (String, TuiCli, InteractiveRemoteOptions) {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
+            psp: _,
             interactive,
             config_overrides: root_overrides,
             subcommand,
@@ -2879,6 +2976,157 @@ mod tests {
         .expect_err("conflicting permission flags should be rejected");
 
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn approve_for_me_configures_interactive_mode() {
+        for flag in ["--approve-for-me", "--not-so-yolo"] {
+            let mut cli = MultitoolCli::try_parse_from(["codex", flag]).expect("parse flag");
+
+            assert!(cli.interactive.auto_review);
+            cli.interactive
+                .shared
+                .take_auto_review_config_overrides(&mut cli.interactive.config_overrides);
+            assert_eq!(
+                cli.interactive.config_overrides.raw_overrides,
+                vec![
+                    r#"approvals_reviewer="auto_review""#.to_string(),
+                    r#"approval_policy="on-request""#.to_string(),
+                    r#"sandbox_mode="workspace-write""#.to_string(),
+                ]
+            );
+            assert!(!cli.interactive.auto_review);
+        }
+    }
+
+    #[test]
+    fn not_so_yolo_alias_is_hidden_from_help() {
+        for args in [&["codex", "--help"][..], &["codex", "exec", "--help"][..]] {
+            let help = help_from_args(args);
+
+            assert!(!help.contains("--not-so-yolo"), "{help}");
+        }
+    }
+
+    #[test]
+    fn approve_for_me_defaults_propagate_from_root_to_exec() {
+        let exec = finalize_exec_from_args(&["codex", "--approve-for-me", "exec", "summarize"]);
+
+        assert_eq!(
+            exec.config_overrides.raw_overrides,
+            vec![
+                r#"approvals_reviewer="auto_review""#.to_string(),
+                r#"approval_policy="on-request""#.to_string(),
+                r#"sandbox_mode="workspace-write""#.to_string(),
+            ]
+        );
+        assert!(exec.sandbox_mode.is_none());
+    }
+
+    #[test]
+    fn later_exec_sandbox_partially_overrides_approve_for_me() {
+        let exec = finalize_exec_from_args(&[
+            "codex",
+            "--approve-for-me",
+            "exec",
+            "--sandbox",
+            "read-only",
+        ]);
+
+        assert_matches!(
+            exec.sandbox_mode,
+            Some(codex_utils_cli::SandboxModeCliArg::ReadOnly)
+        );
+        assert_eq!(
+            exec.config_overrides.raw_overrides,
+            vec![
+                r#"approvals_reviewer="auto_review""#.to_string(),
+                r#"approval_policy="on-request""#.to_string(),
+                r#"sandbox_mode="workspace-write""#.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn later_approve_for_me_overrides_root_exec_sandbox() {
+        let exec = finalize_exec_from_args(&[
+            "codex",
+            "--sandbox",
+            "read-only",
+            "exec",
+            "--approve-for-me",
+        ]);
+
+        assert!(exec.sandbox_mode.is_none());
+        assert_eq!(
+            exec.config_overrides.raw_overrides,
+            vec![
+                r#"approvals_reviewer="auto_review""#.to_string(),
+                r#"approval_policy="on-request""#.to_string(),
+                r#"sandbox_mode="workspace-write""#.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn later_resume_approval_policy_partially_overrides_approve_for_me() {
+        let interactive = finalize_resume_from_args(&[
+            "codex",
+            "--approve-for-me",
+            "resume",
+            "--ask-for-approval",
+            "never",
+        ]);
+
+        assert_matches!(
+            interactive.approval_policy,
+            Some(codex_utils_cli::ApprovalModeCliArg::Never)
+        );
+        assert_eq!(
+            interactive.config_overrides.raw_overrides,
+            vec![
+                r#"approvals_reviewer="auto_review""#.to_string(),
+                r#"approval_policy="on-request""#.to_string(),
+                r#"sandbox_mode="workspace-write""#.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn later_approve_for_me_overrides_root_tui_approval_policy() {
+        let interactive = finalize_resume_from_args(&[
+            "codex",
+            "--ask-for-approval",
+            "never",
+            "resume",
+            "--approve-for-me",
+        ]);
+
+        assert!(interactive.approval_policy.is_none());
+        assert_eq!(
+            interactive.config_overrides.raw_overrides,
+            vec![
+                r#"approvals_reviewer="auto_review""#.to_string(),
+                r#"approval_policy="on-request""#.to_string(),
+                r#"sandbox_mode="workspace-write""#.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn approve_for_me_conflicts_with_explicit_interactive_permissions() {
+        for conflicting_args in [
+            vec!["--sandbox", "read-only"],
+            vec!["--ask-for-approval", "on-request"],
+            vec!["--dangerously-bypass-approvals-and-sandbox"],
+        ] {
+            let mut args = vec!["codex", "--approve-for-me"];
+            args.extend(conflicting_args);
+
+            let error =
+                MultitoolCli::try_parse_from(args).expect_err("permission flags should conflict");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 
     fn app_server_from_args(args: &[&str]) -> AppServerCommand {
@@ -3192,34 +3440,6 @@ mod tests {
         let remove_result =
             MultitoolCli::try_parse_from(["codex", "marketplace", "remove", "debug"]);
         assert!(remove_result.is_err());
-    }
-
-    #[test]
-    fn full_auto_no_longer_parses_at_top_level() {
-        let result = MultitoolCli::try_parse_from(["codex", "--full-auto"]);
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn exec_full_auto_reports_migration_path() {
-        let cli = MultitoolCli::try_parse_from(["codex", "exec", "--full-auto", "summarize"])
-            .expect("exec should accept removed flag long enough to report a migration path");
-        let Some(Subcommand::Exec(exec)) = cli.subcommand else {
-            panic!("expected exec subcommand");
-        };
-
-        assert_eq!(
-            exec.removed_full_auto_warning(),
-            Some("warning: `--full-auto` is deprecated; use `--sandbox workspace-write` instead.")
-        );
-    }
-
-    #[test]
-    fn sandbox_full_auto_no_longer_parses() {
-        let result = MultitoolCli::try_parse_from(["codex", "sandbox", "--full-auto", "--"]);
-
-        assert!(result.is_err());
     }
 
     fn sample_exit_info(conversation_id: Option<&str>, thread_name: Option<&str>) -> AppExitInfo {
@@ -3820,6 +4040,19 @@ mod tests {
         })
         .expect_err("empty env vars should be rejected");
         assert!(err.to_string().contains("is empty"));
+    }
+
+    #[test]
+    fn psp_is_a_global_runtime_argument() {
+        for args in [
+            ["codex", "--psp"].as_slice(),
+            ["codex", "app-server", "--psp"].as_slice(),
+            ["codex", "remote-control", "--psp"].as_slice(),
+        ] {
+            let cli = MultitoolCli::try_parse_from(args).expect("parse runtime PSP flag");
+            assert!(cli.psp);
+            assert!(cli.config_overrides.raw_overrides.is_empty());
+        }
     }
 
     #[test]

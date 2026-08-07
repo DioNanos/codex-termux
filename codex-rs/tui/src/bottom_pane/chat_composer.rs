@@ -171,6 +171,7 @@
 //!
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
+use crate::key_hint::ShortcutHint;
 use crate::key_hint::has_ctrl_or_alt;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::ui_consts::FOOTER_INDENT_COLS;
@@ -192,6 +193,7 @@ use ratatui::text::Span;
 use ratatui::widgets::Block;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::StatefulWidgetRef;
+use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
 
 use codex_protocol::openai_models::ReasoningEffort;
@@ -247,9 +249,11 @@ use crate::bottom_pane::paste_burst::FlushResult;
 use crate::history_cell::sanitize_user_text;
 use crate::key_hint::KeyBindingListExt;
 use crate::keymap::EditorKeymap;
+use crate::keymap::KeymapContext;
+use crate::keymap::KeymapContextSet;
 use crate::keymap::RuntimeKeymap;
 use crate::keymap::VimNormalKeymap;
-use crate::keymap::primary_binding;
+use crate::keymap::user_bindings;
 use crate::onboarding::mark_underlined_hyperlink;
 use crate::render::Insets;
 use crate::render::RectExt;
@@ -616,6 +620,7 @@ impl ChatComposer {
                 flash: None,
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                context_window_pending: false,
                 collaboration_mode_indicator: None,
                 goal_status_indicator: None,
                 ide_context_active: false,
@@ -624,19 +629,24 @@ impl ChatComposer {
                 status_line_enabled: false,
                 side_conversation_context_label: None,
                 active_agent_label: None,
-                external_editor_key: Some(key_hint::ctrl(KeyCode::Char('g'))),
-                show_transcript_key: Some(key_hint::ctrl(KeyCode::Char('t'))),
+                external_editor_key: default_keymap
+                    .primary_hint(KeymapContext::Global, "open_external_editor"),
+                show_transcript_key: default_keymap
+                    .primary_hint(KeymapContext::Global, "open_transcript"),
                 insert_newline_key: footer_insert_newline_key(
                     &default_keymap.editor.insert_newline,
                     use_shift_enter_hint,
-                ),
-                queue_key: Some(key_hint::plain(KeyCode::Tab)),
-                toggle_shortcuts_key: Some(key_hint::plain(KeyCode::Char('?'))),
-                history_search_key: primary_binding(
-                    &default_keymap.composer.history_search_previous,
-                ),
-                reasoning_down_key: primary_binding(&default_keymap.chat.decrease_reasoning_effort),
-                reasoning_up_key: primary_binding(&default_keymap.chat.increase_reasoning_effort),
+                )
+                .map(ShortcutHint::from),
+                queue_key: default_keymap.primary_hint(KeymapContext::Composer, "queue"),
+                toggle_shortcuts_key: default_keymap
+                    .primary_hint(KeymapContext::Composer, "toggle_shortcuts"),
+                history_search_key: default_keymap
+                    .primary_hint(KeymapContext::Composer, "history_search_previous"),
+                reasoning_down_key: default_keymap
+                    .primary_hint(KeymapContext::Chat, "decrease_reasoning_effort"),
+                reasoning_up_key: default_keymap
+                    .primary_hint(KeymapContext::Chat, "increase_reasoning_effort"),
             },
             has_focus: has_input_focus,
             frame_requester: None,
@@ -841,17 +851,39 @@ impl ChatComposer {
         self.editor_keymap = keymap.editor.clone();
         self.vim_normal_keymap = keymap.vim_normal.clone();
         self.draft.textarea.set_keymap_bindings(keymap);
-        self.footer.external_editor_key = primary_binding(&keymap.app.open_external_editor);
-        self.footer.show_transcript_key = primary_binding(&keymap.app.open_transcript);
-        self.footer.insert_newline_key = footer_insert_newline_key(
-            &keymap.editor.insert_newline,
-            self.footer.use_shift_enter_hint,
-        );
-        self.footer.queue_key = primary_binding(&keymap.composer.queue);
-        self.footer.toggle_shortcuts_key = primary_binding(&keymap.composer.toggle_shortcuts);
-        self.footer.history_search_key = primary_binding(&keymap.composer.history_search_previous);
-        self.footer.reasoning_down_key = primary_binding(&keymap.chat.decrease_reasoning_effort);
-        self.footer.reasoning_up_key = primary_binding(&keymap.chat.increase_reasoning_effort);
+        self.footer.external_editor_key =
+            keymap.primary_hint(KeymapContext::Global, "open_external_editor");
+        self.footer.show_transcript_key =
+            keymap.primary_hint(KeymapContext::Global, "open_transcript");
+        self.footer.insert_newline_key =
+            match keymap.primary_hint(KeymapContext::Editor, "insert_newline") {
+                hint @ Some(ShortcutHint::Chord { .. }) => hint,
+                _ => footer_insert_newline_key(
+                    &keymap.editor.insert_newline,
+                    self.footer.use_shift_enter_hint,
+                )
+                .map(ShortcutHint::from),
+            };
+        self.footer.queue_key = keymap.primary_hint(KeymapContext::Composer, "queue");
+        self.footer.toggle_shortcuts_key =
+            keymap.primary_hint(KeymapContext::Composer, "toggle_shortcuts");
+        self.footer.history_search_key =
+            keymap.primary_hint(KeymapContext::Composer, "history_search_previous");
+        self.footer.reasoning_down_key =
+            keymap.primary_hint(KeymapContext::Chat, "decrease_reasoning_effort");
+        self.footer.reasoning_up_key =
+            keymap.primary_hint(KeymapContext::Chat, "increase_reasoning_effort");
+    }
+
+    /// Return the contexts whose handlers can consume the next composer key.
+    pub(crate) fn keymap_contexts(&self) -> KeymapContextSet {
+        if self.history_search.is_some() {
+            return KeymapContextSet::new(KeymapContext::Composer);
+        }
+        if !self.draft.input_enabled || self.popups.active() {
+            return KeymapContextSet::default();
+        }
+        KeymapContextSet::new(KeymapContext::Composer).with(self.draft.textarea.keymap_context())
     }
 
     pub fn set_collaboration_mode_indicator(
@@ -1322,10 +1354,14 @@ impl ChatComposer {
     }
 
     fn right_footer_line_with_context(&self) -> Line<'static> {
-        let mut line = context_window_line(
-            self.footer.context_window_percent,
-            self.footer.context_window_used_tokens,
-        );
+        let mut line = if self.footer.context_window_pending {
+            Line::default()
+        } else {
+            context_window_line(
+                self.footer.context_window_percent,
+                self.footer.context_window_used_tokens,
+            )
+        };
         if let Some(vim_mode) = self.vim_mode_indicator_span() {
             line.spans.push(" | ".dim());
             line.spans.push(vim_mode);
@@ -3678,7 +3714,7 @@ impl ChatComposer {
                 queue: self.footer.queue_key,
                 insert_newline: self.footer.insert_newline_key,
                 external_editor: self.footer.external_editor_key,
-                edit_previous: Some(key_hint::plain(KeyCode::Esc)),
+                edit_previous: Some(key_hint::plain(KeyCode::Esc).into()),
                 show_transcript: self.footer.show_transcript_key,
                 history_search: self.footer.history_search_key,
                 reasoning_down: self.footer.reasoning_down_key,
@@ -4187,6 +4223,10 @@ impl ChatComposer {
         self.footer.context_window_used_tokens = used_tokens;
     }
 
+    pub(crate) fn set_context_window_pending(&mut self, pending: bool) {
+        self.footer.context_window_pending = pending;
+    }
+
     pub(crate) fn set_esc_backtrack_hint(&mut self, show: bool) {
         self.footer.esc_backtrack_hint = show;
         if show {
@@ -4246,6 +4286,7 @@ fn footer_insert_newline_key(
     bindings: &[KeyBinding],
     enhanced_keys_supported: bool,
 ) -> Option<KeyBinding> {
+    let bindings = user_bindings(bindings);
     let shift_enter = key_hint::shift(KeyCode::Enter);
     if enhanced_keys_supported && bindings.contains(&shift_enter) {
         return Some(shift_enter);
@@ -4665,7 +4706,7 @@ impl ChatComposer {
                         }
                     } else if self.footer.flash_visible() {
                         if let Some(flash) = self.footer.flash.as_ref() {
-                            flash.line.render(inset_footer_hint_area(hint_rect), buf);
+                            Widget::render(&flash.line, inset_footer_hint_area(hint_rect), buf);
                         }
                     } else if let Some(items) = active_footer_hint_override {
                         render_footer_hint_items(hint_rect, buf, items);
@@ -4703,11 +4744,11 @@ impl ChatComposer {
             }
         }
         let style = user_message_style();
-        Block::default().style(style).render_ref(composer_rect, buf);
+        Block::default().style(style).render(composer_rect, buf);
         if !remote_images_rect.is_empty() {
             Paragraph::new(self.attachments.remote_image_lines())
                 .style(style)
-                .render_ref(remote_images_rect, buf);
+                .render(remote_images_rect, buf);
         }
         if !textarea_rect.is_empty() {
             let prompt = if self.draft.input_enabled {
@@ -4780,8 +4821,7 @@ impl ChatComposer {
             };
             if !textarea_rect.is_empty() {
                 let placeholder = Span::from(text).dim();
-                Line::from(vec![placeholder])
-                    .render_ref(textarea_rect.inner(Margin::new(0, 0)), buf);
+                Line::from(vec![placeholder]).render(textarea_rect.inner(Margin::new(0, 0)), buf);
             }
         }
         if matches!(self.popups.active, ActivePopup::None)
@@ -4848,6 +4888,50 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[test]
+    fn shortcut_footer_displays_configured_chords() {
+        use codex_config::types::KeybindingSpec;
+        use codex_config::types::KeybindingsSpec;
+        use codex_config::types::TuiKeymap;
+
+        let mut config = TuiKeymap::default();
+        config.global.open_external_editor = Some(KeybindingsSpec::One(KeybindingSpec(
+            "ctrl-g ctrl-g".to_string(),
+        )));
+        config.editor.insert_newline = Some(KeybindingsSpec::One(KeybindingSpec(
+            "ctrl-x enter".to_string(),
+        )));
+        let keymap = RuntimeKeymap::from_config(&config).expect("valid composer chords");
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_keymap_bindings(&keymap);
+        composer.footer.mode = FooterMode::ShortcutOverlay;
+
+        let hints = composer.footer_props().key_hints;
+        assert_eq!(
+            hints.external_editor,
+            Some(ShortcutHint::Chord {
+                prefix: key_hint::ctrl(KeyCode::Char('g')),
+                completion: key_hint::ctrl(KeyCode::Char('g')),
+            })
+        );
+        assert_eq!(
+            hints.insert_newline,
+            Some(ShortcutHint::Chord {
+                prefix: key_hint::ctrl(KeyCode::Char('x')),
+                completion: key_hint::plain(KeyCode::Enter),
+            })
+        );
+
+        snapshot_composer_state(
+            "footer_mode_configured_key_chords",
+            /*enhanced_keys_supported*/ false,
+            |composer| {
+                composer.set_keymap_bindings(&keymap);
+                composer.footer.mode = FooterMode::ShortcutOverlay;
+            },
+        );
     }
 
     #[test]
@@ -6637,6 +6721,7 @@ mod tests {
         composer.set_plugin_mentions(Some(vec![PluginCapabilitySummary {
             config_name: "sample@test".to_string(),
             display_name: "Sample Plugin".to_string(),
+            plugin_namespace: None,
             description: None,
             has_skills: true,
             mcp_server_names: vec!["sample".to_string()],
@@ -6689,6 +6774,7 @@ mod tests {
         PluginCapabilitySummary {
             config_name: format!("{name}@test"),
             display_name: name.to_string(),
+            plugin_namespace: None,
             description: Some(description.to_string()),
             has_skills: false,
             mcp_server_names: vec![name.to_string()],
@@ -7361,6 +7447,7 @@ mod tests {
         composer.set_plugin_mentions(Some(vec![PluginCapabilitySummary {
             config_name: "google-calendar@debug".to_string(),
             display_name: "Google Calendar".to_string(),
+            plugin_namespace: None,
             description: Some(
                 "Connect Google Calendar for scheduling, availability, and event management."
                     .to_string(),
@@ -7413,6 +7500,7 @@ mod tests {
                 composer.set_plugin_mentions(Some(vec![PluginCapabilitySummary {
                     config_name: "sample@test".to_string(),
                     display_name: "Sample Plugin".to_string(),
+                    plugin_namespace: None,
                     description: Some(
                         "Plugin that includes the Figma MCP server and Skills for common workflows"
                             .to_string(),
@@ -7438,6 +7526,7 @@ mod tests {
                 composer.set_plugin_mentions(Some(vec![PluginCapabilitySummary {
                     config_name: "sample@test".to_string(),
                     display_name: "Sample Plugin".to_string(),
+                    plugin_namespace: None,
                     description: Some("Plugin with skills and an MCP server".to_string()),
                     has_skills: true,
                     mcp_server_names: vec!["sample".to_string()],
@@ -7545,6 +7634,7 @@ mod tests {
                 composer.set_plugin_mentions(Some(vec![PluginCapabilitySummary {
                 config_name: "google-calendar@debug".to_string(),
                 display_name: "Google Calendar".to_string(),
+                plugin_namespace: None,
                 description: Some(
                     "Connect Google Calendar for scheduling, availability, and event management."
                         .to_string(),
@@ -8113,6 +8203,7 @@ mod tests {
             composer.set_plugin_mentions(Some(vec![PluginCapabilitySummary {
                 config_name: "sample@test".to_string(),
                 display_name: "sample".to_string(),
+                plugin_namespace: None,
                 description: None,
                 has_skills: true,
                 mcp_server_names: vec!["sample".to_string()],

@@ -1,8 +1,11 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use codex_core_skills::HostSkillsSnapshot;
+use crate::HostSkillsSnapshot;
 use codex_core_skills::injection::HostSkillsCatalogInWorldState;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
+use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
+use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_extension_api::ConfigContributor;
@@ -11,6 +14,7 @@ use codex_extension_api::ContextualUserFragment;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionFuture;
+use codex_extension_api::ExtensionMetrics;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ExtensionWarning;
 use codex_extension_api::PromptFragment;
@@ -36,31 +40,36 @@ use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillSourceKind;
 use crate::fragments::AvailableSkillsInstructions;
-use crate::fragments::ExecutorSkillResourceAccess;
 use crate::fragments::SkillInstructions;
+use crate::fragments::SkillResourceAccess;
 use crate::provider::HostSkillProvider;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillReadRequest;
+use crate::render::AvailableSkillsRender;
 use crate::render::MAX_SKILL_NAME_BYTES;
 use crate::render::MAX_SKILL_PATH_BYTES;
 use crate::render::SkillCatalogRenderPolicy;
 use crate::render::SkillMetadataBudget;
-use crate::render::capped_skill_metadata_budget;
+use crate::render::SkillRenderReport;
 use crate::render::render_available_skills;
+use crate::render::skill_metadata_budget;
 use crate::render::truncate_main_prompt_contents;
 use crate::render::truncate_utf8_to_bytes;
+use crate::render_observability::CatalogSurface;
+use crate::render_observability::record_catalog_render;
 use crate::selection::collect_explicit_skill_mentions;
 use crate::shadow_selection_experiment::ShadowSelectionExperiment;
 use crate::sources::SkillProviders;
-use crate::state::EmittedCatalogBudgetWarnings;
 use crate::state::ExecutorSkillsStepState;
+use crate::state::HostSkillsStepState;
 use crate::state::SkillsSessionState;
 use crate::state::SkillsThreadState;
 use crate::state::SkillsTurnState;
+use crate::tools::SkillToolAuthority;
 use crate::tools::skill_tools;
 use crate::warnings::bounded_warnings;
-use crate::world_state::executor_skills_world_state_section;
-use crate::world_state::host_skills_world_state_section;
+use crate::world_state_catalogs::CatalogContext;
+use crate::world_state_catalogs::CatalogStatus;
 
 struct SkillsExtension<C> {
     providers: SkillProviders,
@@ -76,14 +85,39 @@ struct RenderedCatalog {
 }
 
 fn render_catalog(
+    extension_metrics: Option<&dyn ExtensionMetrics>,
+    catalog_surface: CatalogSurface,
     catalog: &SkillCatalog,
     include_skills_usage_instructions: bool,
     policy: SkillCatalogRenderPolicy,
     budget: SkillMetadataBudget,
 ) -> RenderedCatalog {
-    let Some(rendered) = render_available_skills(catalog, policy, budget) else {
+    render_prepared_catalog(
+        extension_metrics,
+        catalog_surface,
+        include_skills_usage_instructions,
+        budget,
+        render_available_skills(catalog, policy, budget),
+    )
+}
+
+fn render_prepared_catalog(
+    extension_metrics: Option<&dyn ExtensionMetrics>,
+    catalog_surface: CatalogSurface,
+    include_skills_usage_instructions: bool,
+    budget: SkillMetadataBudget,
+    rendered: Option<AvailableSkillsRender>,
+) -> RenderedCatalog {
+    let Some(rendered) = rendered else {
+        record_catalog_render(
+            extension_metrics,
+            catalog_surface,
+            budget,
+            &SkillRenderReport::default(),
+        );
         return RenderedCatalog::default();
     };
+    record_catalog_render(extension_metrics, catalog_surface, budget, &rendered.report);
     let warning_message = rendered.report.warning_message();
     let fragment = rendered.into_fragment(include_skills_usage_instructions);
     RenderedCatalog {
@@ -91,6 +125,10 @@ fn render_catalog(
         warning_message,
     }
 }
+
+#[cfg(test)]
+#[path = "extension_tests.rs"]
+mod tests;
 
 impl<C> ThreadLifecycleContributor<C> for SkillsExtension<C>
 where
@@ -100,6 +138,7 @@ where
         Box::pin(async move {
             input.session_store.insert(SkillsSessionState {
                 mcp_resources: input.mcp_resource_client.clone(),
+                extension_metrics: input.extension_metrics.clone(),
             });
             let orchestrator_skills_available = !input
                 .environments
@@ -163,7 +202,7 @@ where
                         host_snapshot: None,
                         include_host_skills: false,
                         include_bundled_skills: config.bundled_skills_enabled,
-                        include_orchestrator_skills: thread_state.orchestrator_skills_enabled(),
+                        include_orchestrator_skills: false,
                         mcp_resources: session_store
                             .get::<SkillsSessionState>()
                             .and_then(|state| state.mcp_resources.clone()),
@@ -178,11 +217,16 @@ where
             let include_usage = thread_store
                 .get::<ModelInfo>()
                 .is_some_and(|model_info| model_info.include_skills_usage_instructions);
+            let extension_metrics = session_store
+                .get::<SkillsSessionState>()
+                .and_then(|state| state.extension_metrics.clone());
             let rendered = render_catalog(
+                extension_metrics.as_deref(),
+                CatalogSurface::ThreadContext,
                 &catalog,
                 include_usage,
                 SkillCatalogRenderPolicy::ExtensionCompatible,
-                capped_skill_metadata_budget(/*context_window*/ None),
+                skill_metadata_budget(/*context_window*/ None),
             );
             if let Some(message) = rendered.warning_message {
                 self.emit_warning(thread_store.level_id(), /*turn_id*/ None, message);
@@ -200,75 +244,19 @@ where
         input: WorldStateContributionInput<'a>,
     ) -> ExtensionFuture<'a, Vec<WorldStateSectionContribution>> {
         Box::pin(async move {
-            let Some(thread_state) = input.thread_store.get::<SkillsThreadState>() else {
+            let Some(context) =
+                CatalogContext::new(&self.providers, Arc::clone(&self.event_sink), input)
+            else {
                 return Vec::new();
             };
-            let config = thread_state.config();
-            let catalog = thread_state
-                .executor_catalog_snapshot(
-                    &self.providers,
-                    SkillListQuery {
-                        turn_id: input.turn_id.to_string(),
-                        executor_roots: input.ready_selected_capability_roots.to_vec(),
-                        resolved_executor_roots: Vec::new(),
-                        host_snapshot: None,
-                        include_host_skills: false,
-                        include_bundled_skills: config.bundled_skills_enabled,
-                        include_orchestrator_skills: false,
-                        mcp_resources: input
-                            .session_store
-                            .get::<SkillsSessionState>()
-                            .and_then(|state| state.mcp_resources.clone()),
-                        executor_capability_discovery: input.executor_capability_discovery.cloned(),
-                    },
-                )
-                .await;
-            input
-                .turn_store
-                .insert(ExecutorSkillsStepState(catalog.clone()));
-            let model_info = input.thread_store.get::<ModelInfo>();
-            let include_usage = model_info
-                .as_deref()
-                .is_some_and(|model_info| model_info.include_skills_usage_instructions);
-            let context_window = model_info
-                .as_deref()
-                .and_then(ModelInfo::resolved_context_window);
-            let metadata_budget = capped_skill_metadata_budget(context_window);
-            let rendered = if config.include_instructions {
-                render_catalog(
-                    &catalog,
-                    include_usage,
-                    SkillCatalogRenderPolicy::ExtensionCompatible,
-                    metadata_budget,
-                )
-            } else {
-                RenderedCatalog::default()
-            };
-            if let Some(message) = rendered.warning_message
-                && input
-                    .turn_store
-                    .get_or_init(EmittedCatalogBudgetWarnings::default)
-                    .insert(&message)
-            {
-                self.emit_warning(input.thread_store.level_id(), Some(input.turn_id), message);
-            }
-            let executor_body = rendered.fragment.map(|fragment| fragment.body());
-            let mut sections = vec![executor_skills_world_state_section(
-                executor_body,
-                config.include_instructions,
-            )];
-            if let Some(host_snapshot) = input.turn_store.get::<HostSkillsSnapshot>()
-                && self.providers.has_host_provider()
-            {
-                input.turn_store.insert(HostSkillsCatalogInWorldState);
-                sections.push(host_skills_world_state_section(
-                    &host_snapshot,
-                    config.include_instructions,
-                    include_usage,
-                    metadata_budget,
-                ));
-            }
-            sections
+            let catalogs = context.discover_catalogs().await;
+
+            context
+                .render_catalogs(catalogs)
+                .into_iter()
+                .filter(|catalog| catalog.status != CatalogStatus::Unavailable)
+                .map(|catalog| context.build_world_state_section(catalog))
+                .collect()
         })
     }
 }
@@ -282,7 +270,12 @@ where
         session_store: &ExtensionData,
         thread_store: &ExtensionData,
     ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
-        self.build_skill_tools(session_store, thread_store, /*executor_query*/ None)
+        self.build_skill_tools(
+            session_store,
+            thread_store,
+            /*executor_query*/ None,
+            /*sandbox_contexts*/ None,
+        )
     }
 
     fn tools_for_step(
@@ -307,9 +300,16 @@ where
             include_bundled_skills: false,
             include_orchestrator_skills: false,
             mcp_resources: None,
-            executor_capability_discovery: None,
+            executor_capability_discovery: step_store
+                .get::<ExecutorCapabilityDiscoverySnapshot>()
+                .map(|discovery| discovery.as_ref().clone()),
         });
-        self.build_skill_tools(session_store, thread_store, executor_query)
+        self.build_skill_tools(
+            session_store,
+            thread_store,
+            executor_query,
+            step_store.get::<HashMap<String, FileSystemSandboxContext>>(),
+        )
     }
 }
 
@@ -346,6 +346,7 @@ where
     fn contribute<'a>(
         &'a self,
         input: TurnInputContext,
+        extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
         session_store: &'a ExtensionData,
         thread_store: &'a ExtensionData,
         turn_store: &'a ExtensionData,
@@ -362,18 +363,18 @@ where
             let host_snapshot = turn_store.get::<HostSkillsSnapshot>();
             let host_catalog_in_world_state =
                 turn_store.get::<HostSkillsCatalogInWorldState>().is_some();
+            let host_skills = turn_store.get::<HostSkillsStepState>();
             let query = SkillListQuery {
                 turn_id: input.turn_id.clone(),
                 executor_roots: Vec::new(),
                 resolved_executor_roots: Vec::new(),
                 host_snapshot: host_snapshot.clone(),
-                include_host_skills: !host_catalog_in_world_state,
+                include_host_skills: host_skills.is_none() && !host_catalog_in_world_state,
                 include_bundled_skills: config.bundled_skills_enabled,
                 include_orchestrator_skills: thread_state.orchestrator_skills_enabled(),
                 mcp_resources: mcp_resources.clone(),
                 executor_capability_discovery: None,
             };
-            let host_query = query.clone();
             let mut catalog = turn_store
                 .get::<ExecutorSkillsStepState>()
                 .map(|executor_skills| executor_skills.0.clone())
@@ -386,22 +387,24 @@ where
             let selected_entries = collect_explicit_skill_mentions(&input.user_input, &catalog);
             let shadow_selection_turn = if config.shadow_selection_enabled {
                 let mut shadow_catalog = catalog.clone();
-                if host_catalog_in_world_state && host_snapshot.is_some() {
-                    shadow_catalog.extend(self.providers.list_host_for_turn(host_query).await);
+                if let Some(host_skills) = host_skills {
+                    shadow_catalog.extend(host_skills.0.clone());
                 }
-                Some(
-                    self.shadow_selection
-                        .run(&input.user_input, &shadow_catalog),
-                )
+                let shadow_selected_entries =
+                    collect_explicit_skill_mentions(&input.user_input, &shadow_catalog);
+                Some(self.shadow_selection.run(
+                    &input.user_input,
+                    &shadow_catalog,
+                    &shadow_selected_entries,
+                    host_snapshot.as_deref(),
+                ))
             } else {
                 None
             };
             thread_state
                 .replace_shadow_selection_turn(input.turn_id.clone(), shadow_selection_turn);
             let mut fragments: Vec<Box<dyn ContextualUserFragment + Send>> = Vec::new();
-            if config.include_instructions
-                && turn_store.get::<HostSkillsCatalogInWorldState>().is_none()
-            {
+            if config.include_instructions && !host_catalog_in_world_state {
                 let mut turn_catalog = catalog.clone();
                 turn_catalog.entries.retain(|entry| {
                     entry.authority.kind != SkillSourceKind::Executor
@@ -414,8 +417,10 @@ where
                 let context_window = model_info
                     .as_deref()
                     .and_then(ModelInfo::resolved_context_window);
-                let metadata_budget = capped_skill_metadata_budget(context_window);
+                let metadata_budget = skill_metadata_budget(context_window);
                 let rendered = render_catalog(
+                    extension_metrics.as_deref(),
+                    CatalogSurface::TurnInput,
                     &turn_catalog,
                     include_usage,
                     SkillCatalogRenderPolicy::ExtensionCompatible,
@@ -465,10 +470,11 @@ where
                             )
                             .0,
                             contents,
-                            executor_resource_access: (!entry.prompt_visible
-                                && entry.authority.kind == SkillSourceKind::Executor)
-                                .then(|| ExecutorSkillResourceAccess {
-                                    authority_id: entry.authority.id.clone(),
+                            resource_access: (!entry.prompt_visible)
+                                .then_some(&entry.authority)
+                                .and_then(SkillToolAuthority::from_authority)
+                                .map(|authority| SkillResourceAccess {
+                                    authority,
                                     package: entry.id.0.clone(),
                                     main_resource: entry.main_prompt.as_str().to_string(),
                                 }),
@@ -529,6 +535,7 @@ impl<C> SkillsExtension<C> {
         session_store: &ExtensionData,
         thread_store: &ExtensionData,
         executor_query: Option<SkillListQuery>,
+        sandbox_contexts: Option<Arc<HashMap<String, FileSystemSandboxContext>>>,
     ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
         let Some(thread_state) = thread_store.get::<SkillsThreadState>() else {
             return Vec::new();
@@ -547,6 +554,7 @@ impl<C> SkillsExtension<C> {
             thread_state,
             orchestrator_available,
             executor_query,
+            sandbox_contexts,
             Arc::clone(&self.shadow_selection),
         )
     }
@@ -559,17 +567,12 @@ impl<C> SkillsExtension<C> {
     ) -> SkillCatalog {
         let include_orchestrator_skills = query.include_orchestrator_skills;
         let orchestrator_query = query.clone();
-        let mcp_resources = orchestrator_query.mcp_resources.clone();
         query.include_orchestrator_skills = false;
 
         let mut catalog = self.providers.list_for_turn(query).await;
         if include_orchestrator_skills {
             let orchestrator_catalog = thread_state
-                .orchestrator_catalog_snapshot(
-                    mcp_resources.as_deref(),
-                    self.providers
-                        .list_orchestrator_for_turn(orchestrator_query),
-                )
+                .orchestrator_catalog_snapshot(&self.providers, orchestrator_query)
                 .await;
             catalog.extend(orchestrator_catalog);
         }
@@ -592,6 +595,7 @@ impl<C> SkillsExtension<C> {
                     package: entry.id.clone(),
                     resource: entry.main_prompt.clone(),
                     resolved_executor_roots: Vec::new(),
+                    sandbox: None,
                     host_snapshot,
                     mcp_resources,
                 },

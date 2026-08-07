@@ -23,13 +23,18 @@ pub use tool_catalog::tool_is_model_visible;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::McpServerSource;
+use crate::binding::call_tool_result_from_rmcp;
 use crate::elicitation::ElicitationRequestManager;
 use crate::elicitation::ElicitationRequestRouter;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::ToolPluginProvenance;
+use crate::pagination::MAX_CODEX_APPS_TOOL_CATALOG_ITEMS;
+use crate::pagination::MAX_MCP_CATALOG_ITEMS;
 use crate::rmcp_client::AsyncManagedClient;
 use crate::rmcp_client::DEFAULT_TOOL_TIMEOUT;
 use crate::rmcp_client::ManagedClient;
@@ -123,6 +128,7 @@ struct McpServerView {
     metadata: McpServerMetadata,
     tool_filter: ToolFilter,
     tool_timeout: Option<Duration>,
+    catalog_item_limit: usize,
 }
 
 impl McpServerView {
@@ -144,6 +150,7 @@ impl McpServerView {
 pub(crate) struct McpConnectionSet {
     servers: HashMap<String, McpServerView>,
     required_servers: Vec<String>,
+    optional_startup_deadline: OnceLock<tokio::time::Instant>,
     tool_catalog_revision: Arc<RwLock<u64>>,
     codex_apps_tools_override: RwLock<Option<Vec<ToolInfo>>>,
     codex_apps_refresh_lock: Mutex<()>,
@@ -174,7 +181,7 @@ impl McpConnectionSet {
             codex_apps_tools_cache,
             tool_catalog_cache,
             codex_apps_tools_cache_key,
-            supports_openai_form_elicitation,
+            client_mcp_extensions,
             auth,
             codex_apps_auth_manager,
             elicitation_reviewer,
@@ -187,6 +194,7 @@ impl McpConnectionSet {
         let codex_home = config.codex_home.clone();
         let prefix_mcp_tool_names = config.prefix_mcp_tool_names;
         let non_prefixed_mcp_tool_servers = config.non_prefixed_mcp_tool_servers.clone();
+        let protocol_mode = config.protocol_mode;
         let client_elicitation_capability = config.client_elicitation_capability.clone();
         let tool_plugin_provenance = crate::mcp::tool_plugin_provenance(&config);
         let auth = auth.as_ref();
@@ -233,6 +241,21 @@ impl McpConnectionSet {
             .into_iter()
             .filter(|(_, server)| server.enabled())
         {
+            let is_host_owned_codex_apps = server_name == CODEX_APPS_MCP_SERVER_NAME
+                && config.mcp_server_catalog.server(&server_name).is_some_and(
+                    |server| match server.source() {
+                        McpServerSource::Compatibility { .. } => true,
+                        McpServerSource::Extension { id } => id == "hosted_plugin_runtime",
+                        McpServerSource::Plugin(_)
+                        | McpServerSource::SelectedPlugin(_)
+                        | McpServerSource::Config => false,
+                    },
+                );
+            let catalog_item_limit = if is_host_owned_codex_apps {
+                MAX_CODEX_APPS_TOOL_CATALOG_ITEMS
+            } else {
+                MAX_MCP_CATALOG_ITEMS
+            };
             let metadata = McpServerMetadata::from(&server);
             let configured_config = server.config().clone();
             let configured_tool_filter = ToolFilter::from_config(&configured_config);
@@ -253,8 +276,8 @@ impl McpConnectionSet {
                 } => bearer_token_env_var.is_some(),
                 McpServerTransportConfig::Stdio { .. } => false,
             };
-            let shares_codex_apps_tools_cache =
-                should_share_codex_apps_tools_cache(&server_name, uses_env_bearer_token);
+            let shares_codex_apps_tools_cache = is_host_owned_codex_apps
+                && should_share_codex_apps_tools_cache(&server_name, uses_env_bearer_token);
             let codex_apps_tools_cache_context = shares_codex_apps_tools_cache.then(|| {
                 codex_apps_tools_cache
                     .context(codex_home.clone(), codex_apps_tools_cache_key.clone())
@@ -290,8 +313,28 @@ impl McpConnectionSet {
                 shares_codex_apps_tools_cache
                     .then(|| (codex_home.clone(), codex_apps_tools_cache_key.clone())),
                 client_elicitation_capability.clone(),
-                supports_openai_form_elicitation,
+                client_mcp_extensions.clone(),
             );
+            let expected_protocol_mode = match &configured_config.transport {
+                McpServerTransportConfig::StreamableHttp { .. } => Some(protocol_mode),
+                McpServerTransportConfig::Stdio { .. }
+                    if protocol_mode == crate::McpProtocolMode::Legacy =>
+                {
+                    Some(crate::McpProtocolMode::Legacy)
+                }
+                McpServerTransportConfig::Stdio { env, .. } => match env
+                    .as_ref()
+                    .and_then(|variables| variables.get("CODEX_MCP_PROTOCOL_VERSION"))
+                {
+                    None => Some(crate::McpProtocolMode::Legacy),
+                    Some(version)
+                        if version == rmcp::model::ProtocolVersion::V_2026_07_28.as_str() =>
+                    {
+                        Some(protocol_mode)
+                    }
+                    Some(_) => None,
+                },
+            };
             if let Some(previous_view) =
                 reusable_previous.and_then(|previous| previous.servers.get(&server_name))
             {
@@ -299,7 +342,11 @@ impl McpConnectionSet {
                 if connection
                     .reusable_client(&connection_identity)
                     .await
-                    .is_some()
+                    .is_some_and(|client| {
+                        previous_view.catalog_item_limit == catalog_item_limit
+                            && expected_protocol_mode
+                                .is_some_and(|expected| client.client.protocol_mode() == expected)
+                    })
                 {
                     servers.insert(
                         server_name.clone(),
@@ -308,6 +355,7 @@ impl McpConnectionSet {
                             metadata,
                             tool_filter: configured_tool_filter,
                             tool_timeout: configured_tool_timeout,
+                            catalog_item_limit,
                         },
                     );
                     reused_ready.push(server_name);
@@ -324,7 +372,7 @@ impl McpConnectionSet {
                     &runtime_context,
                     environment.as_ref(),
                     &client_elicitation_capability,
-                    supports_openai_form_elicitation,
+                    &client_mcp_extensions,
                 )
             } else {
                 None
@@ -345,7 +393,9 @@ impl McpConnectionSet {
                 resolved_environment,
                 runtime_auth_provider,
                 client_elicitation_capability.clone(),
-                supports_openai_form_elicitation,
+                client_mcp_extensions.clone(),
+                protocol_mode,
+                catalog_item_limit,
             );
             servers.insert(
                 server_name.clone(),
@@ -357,6 +407,7 @@ impl McpConnectionSet {
                     metadata,
                     tool_filter: configured_tool_filter,
                     tool_timeout: configured_tool_timeout,
+                    catalog_item_limit,
                 },
             );
             let tx_event = tx_event.clone();
@@ -392,7 +443,9 @@ impl McpConnectionSet {
                                     env_http_headers,
                                 } => {
                                     match determine_streamable_http_auth_status_from_credentials(
-                                        &server_name,
+                                        configured_config
+                                            .oauth_credential_name(&server_name)
+                                            .as_ref(),
                                         url,
                                         bearer_token_env_var.as_deref(),
                                         http_headers.clone(),
@@ -458,6 +511,7 @@ impl McpConnectionSet {
         let manager = Self {
             servers,
             required_servers,
+            optional_startup_deadline: OnceLock::new(),
             tool_catalog_revision: Arc::new(RwLock::new(0)),
             codex_apps_tools_override: RwLock::new(None),
             codex_apps_refresh_lock: Mutex::new(()),
@@ -515,6 +569,7 @@ impl McpConnectionSet {
         Self {
             servers: HashMap::new(),
             required_servers: Vec::new(),
+            optional_startup_deadline: OnceLock::new(),
             tool_catalog_revision: Arc::new(RwLock::new(0)),
             codex_apps_tools_override: RwLock::new(None),
             codex_apps_refresh_lock: Mutex::new(()),
@@ -537,6 +592,13 @@ impl McpConnectionSet {
 
     pub(crate) fn contains_server(&self, server_name: &str) -> bool {
         self.servers.contains_key(server_name)
+    }
+
+    pub(crate) async fn wait_for_server_startup(&self, server_name: &str) -> bool {
+        let Some(view) = self.servers.get(server_name) else {
+            return false;
+        };
+        view.connection.client.ready_transport().is_some() || view.connection.client().await.is_ok()
     }
 
     /// Stop all MCP clients owned by this manager and terminate stdio server processes.
@@ -606,28 +668,13 @@ impl McpConnectionSet {
             .client()
             .await
             .context("failed to get client")?;
-
         let result: rmcp::model::CallToolResult = client
             .client
             .call_tool(tool.to_string(), arguments, meta, view.tool_timeout)
             .await
             .with_context(|| format!("tool call failed for `{server}/{tool}`"))?;
 
-        let content = result
-            .content
-            .into_iter()
-            .map(|content| {
-                serde_json::to_value(content)
-                    .unwrap_or_else(|_| serde_json::Value::String("<content>".to_string()))
-            })
-            .collect();
-
-        Ok(CallToolResult {
-            content,
-            structured_content: result.structured_content,
-            is_error: result.is_error,
-            meta: result.meta.and_then(|meta| serde_json::to_value(meta).ok()),
-        })
+        Ok(call_tool_result_from_rmcp(result))
     }
 
     /// Returns presentation metadata from the current connection.

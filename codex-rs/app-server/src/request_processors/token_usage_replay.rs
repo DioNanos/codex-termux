@@ -12,7 +12,6 @@
 use std::sync::Arc;
 
 use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
@@ -58,10 +57,10 @@ pub(super) async fn send_thread_token_usage_update_to_connection(
 
 pub(super) fn restored_token_usage_turn_id(
     rollout_items: &[RolloutItem],
-    thread: &Thread,
+    turns: &[Turn],
 ) -> String {
-    latest_token_usage_turn_id_from_rollout_items(rollout_items, thread.turns.as_slice())
-        .unwrap_or_else(|| latest_token_usage_turn_id(thread))
+    latest_token_usage_turn_id_from_rollout_items(rollout_items, turns)
+        .unwrap_or_else(|| latest_token_usage_turn_id(turns))
 }
 
 /// Identifies the turn that was active when the latest `TokenCount` record appeared.
@@ -80,6 +79,10 @@ fn latest_token_usage_turn_id_from_rollout_items(
         builder.handle_rollout_item(item);
     }
 
+    if turns.is_empty() {
+        return builder.active_turn_id_if_explicit();
+    }
+
     let active_turn_id = builder.active_turn_id()?;
     if turns.iter().any(|turn| turn.id == active_turn_id) {
         Some(active_turn_id.to_string())
@@ -96,13 +99,12 @@ fn latest_token_usage_turn_id_from_rollout_items(
 /// Normal replay derives the owner from the rollout position of the latest
 /// `TokenCount` event. This fallback only preserves a stable wire shape for
 /// unusual histories where that rollout information cannot be read.
-fn latest_token_usage_turn_id(thread: &Thread) -> String {
-    thread
-        .turns
+fn latest_token_usage_turn_id(turns: &[Turn]) -> String {
+    turns
         .iter()
         .rev()
         .find(|turn| matches!(turn.status, TurnStatus::Completed | TurnStatus::Failed))
-        .or_else(|| thread.turns.last())
+        .or_else(|| turns.last())
         .map(|turn| turn.id.clone())
         .unwrap_or_default()
 }
@@ -136,6 +138,16 @@ mod tests {
         assert_eq!(
             latest_token_usage_turn_id_from_rollout_items(&rollout_items, turns.as_slice()),
             Some("rebuilt-turn-id".to_string())
+        );
+    }
+
+    #[test]
+    fn replay_attribution_rejects_suffix_generated_turn_ids() {
+        let rollout_items = token_usage_history();
+
+        assert_eq!(
+            latest_token_usage_turn_id_from_rollout_items(&rollout_items, /*turns*/ &[]),
+            None
         );
     }
 

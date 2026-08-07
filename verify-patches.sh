@@ -266,12 +266,18 @@ printf "Patch #20 (Android Code-Mode real, upstream-aligned): "
 # 0.136.0: the Android code-mode stub was reverted. code-mode now uses the real
 # in-process V8 runtime on Android too (stub files removed, v8 enabled for all
 # targets), relying on the fork-owned aarch64-linux-android rusty_v8 prebuild.
+#
+# rust-v0.147.0 moved the V8 runtime out of code-mode into the new
+# code-mode-runtime crate, so the anchors moved with it. The property asserted is
+# unchanged: no stubs anywhere, no target_os gate, and v8 pulled in
+# unconditionally by whichever crate owns the runtime.
 if [ ! -f codex-rs/code-mode/src/runtime_stub.rs ] \
   && [ ! -f codex-rs/code-mode/src/service_stub.rs ] \
-  && ! grep -q 'mod runtime_stub' codex-rs/code-mode/src/lib.rs \
-  && ! grep -q 'mod service_stub' codex-rs/code-mode/src/lib.rs \
-  && ! grep -q 'cfg(not(target_os = "android"))' codex-rs/code-mode/Cargo.toml \
-  && grep -q 'v8 = { workspace = true }' codex-rs/code-mode/Cargo.toml; then
+  && ! grep -rq 'runtime_stub\|service_stub' codex-rs/code-mode/src codex-rs/code-mode-runtime/src \
+  && ! grep -q 'target_os = "android"' codex-rs/code-mode/Cargo.toml \
+  && ! grep -q 'target_os = "android"' codex-rs/code-mode-runtime/Cargo.toml \
+  && grep -q '^v8 = { workspace = true' codex-rs/code-mode-runtime/Cargo.toml \
+  && grep -q 'codex-code-mode-runtime = { workspace = true }' codex-rs/code-mode-host/Cargo.toml; then
   pass
 else
   fail
@@ -327,18 +333,23 @@ else
   fail
 fi
 
-printf "Patch #24 (Termux TLS Roots, no rustls-platform-verifier panic): "
-# Since upstream rust-v0.143.0-alpha.x the OAuth and streamable-HTTP MCP paths no
-# longer build their own reqwest-0.13 client in perform_oauth_login.rs/rmcp_client.rs;
-# they route all HTTP through the injected reqwest-0.12 codex_exec_server::ReqwestHttpClient
-# (OAuthHttpClientAdapter / StreamableHttpClientAdapter), which does not construct
-# rustls-platform-verifier and therefore cannot hit the Android panic. The only remaining
-# reqwest-0.13 ClientBuilder is auth_status.rs, which keeps apply_termux_tls. Protection is
-# intact; we verify it where a 0.13 client is actually built (utils.rs + auth_status.rs).
-if grep -q "apply_termux_tls" codex-rs/rmcp-client/src/utils.rs \
+printf "Patch #24 (Termux TLS roots, RETIRED at rust-v0.147.0 — guard inverted): "
+# The trend the earlier note tracked reached its end. Upstream moved the OAuth and
+# streamable-HTTP MCP paths onto the injected reqwest-0.12 adapters one at a time,
+# and rust-v0.147.0 removed the last reqwest-0.13 client this crate built itself
+# (discover_streamable_http_oauth_with_headers). Discovery now runs on the injected
+# codex-http-client, which never constructs rustls-platform-verifier, so the Android
+# panic is unreachable here; apply_termux_tls had nothing left to wrap and reqwest is
+# no longer a dependency of this crate, so it was removed with it.
+#
+# So this no longer checks that the guard is present — it checks the condition that
+# makes its absence safe. If rmcp-client ever takes a direct reqwest dependency again,
+# a client that can hit the Android panic is back and the guard must come back with it.
+if ! grep -qE '^[[:space:]]*reqwest[[:space:]]*=' codex-rs/rmcp-client/Cargo.toml; then
+  pass
+elif grep -q "apply_termux_tls" codex-rs/rmcp-client/src/utils.rs \
   && grep -q "tls_certs_only" codex-rs/rmcp-client/src/utils.rs \
-  && grep -q "webpki-root-certs" codex-rs/rmcp-client/Cargo.toml \
-  && grep -q "apply_termux_tls" codex-rs/rmcp-client/src/auth_status.rs; then
+  && grep -q "webpki-root-certs" codex-rs/rmcp-client/Cargo.toml; then
   pass
 else
   fail
@@ -355,12 +366,41 @@ else
 fi
 
 printf "Patch #26 (Model Catalog Instruction Fallback): "
-if grep -B1 -F 'pub base_instructions: String' codex-rs/protocol/src/openai_models.rs | grep -Fq '#[serde(default)]' \
+# rust-v0.147.0: upstream added its own legacy `base_instructions` layer
+# (`ModelInfoWithLegacyBaseInstructions*`), which flattens `ModelInfo` and declares
+# a `base_instructions` key of its own. With the fork field also serialized the
+# catalog JSON carried the key twice and stopped parsing, so the field moved to
+# `#[serde(skip)]`. This check used to require `#[serde(default)]` — the pre-0.147
+# form — which means it went red on the correct code and would have gone green on
+# the shape that reintroduces the duplicate-field bug. It now asserts the two
+# halves the patch actually rests on: the field stays out of serde, and
+# `get_model_instructions()` still falls back to it instead of returning an empty
+# string.
+#
+# The fallback half is anchored to a behavioural test rather than to the source
+# text: `get_model_instructions_falls_back_to_base_instructions_when_template_missing`
+# gives the field a value and asserts it comes back, so an else branch quietly
+# emptied out fails the gate even if the string this check greps for survives
+# somewhere else in the file.
+if grep -B1 -F 'pub base_instructions: String' codex-rs/protocol/src/openai_models.rs | grep -Fq '#[serde(skip)]' \
+  && grep -q 'self.base_instructions.clone()' codex-rs/protocol/src/openai_models.rs \
+  && grep -q 'fn get_model_instructions_falls_back_to_base_instructions_when_template_missing' codex-rs/protocol/src/openai_models.rs \
+  && ! grep -q 'returning empty instructions' codex-rs/protocol/src/openai_models.rs \
   && grep -q 'ensure_catalog_instructions(&mut model)' codex-rs/models-manager/src/model_info.rs \
   && grep -q 'model catalog omitted usable instructions' codex-rs/models-manager/src/model_info.rs \
   && grep -q 'missing_catalog_instructions_use_builtin_fallback' codex-rs/models-manager/src/model_info_tests.rs \
   && grep -q 'catalog_template_allows_missing_base_instructions' codex-rs/models-manager/src/model_info_tests.rs \
   && grep -q 'explicit_empty_base_instruction_override_is_preserved' codex-rs/models-manager/src/model_info_tests.rs; then
+  pass
+else
+  fail
+fi
+
+printf "Patch #27 (Pairing Names The Daemon Command): "
+if grep -q 'fn ensure_pairing_daemon_socket' codex-rs/app-server-daemon/src/lib.rs \
+  && grep -q 'ensure_pairing_daemon_socket(&daemon.socket_path)?' codex-rs/app-server-daemon/src/lib.rs \
+  && grep -q 'run `remote-control start` first' codex-rs/app-server-daemon/src/lib.rs \
+  && grep -q 'pairing_without_a_running_daemon_says_how_to_start_one' codex-rs/app-server-daemon/src/lib.rs; then
   pass
 else
   fail

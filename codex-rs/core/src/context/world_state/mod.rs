@@ -1,10 +1,13 @@
 mod agents_md;
 mod apps_instructions;
 mod collaboration_mode;
+mod compact_permissions;
+mod context_window_guidance;
 mod environment;
 mod environments_instructions;
 mod model;
 mod multi_agent_mode;
+mod multi_agent_usage_hint;
 mod permissions;
 mod personality;
 mod plugins_instructions;
@@ -32,10 +35,13 @@ use std::fmt;
 pub(crate) use agents_md::AgentsMdState;
 pub(crate) use apps_instructions::AppsInstructionsState;
 pub(crate) use collaboration_mode::CollaborationModeState;
+pub(crate) use compact_permissions::CompactPermissionsState;
+pub(crate) use context_window_guidance::ContextWindowGuidanceState;
 pub(crate) use environment::EnvironmentsState;
 pub(crate) use environments_instructions::EnvironmentsInstructionsState;
 pub(crate) use model::ModelInstructionsState;
 pub(crate) use multi_agent_mode::MultiAgentModeState;
+pub(crate) use multi_agent_usage_hint::MultiAgentUsageHintState;
 pub(crate) use permissions::PermissionsState;
 pub(crate) use personality::PersonalityState;
 pub(crate) use plugins_instructions::PluginsInstructionsState;
@@ -85,7 +91,7 @@ impl<S: WorldStateSection> ErasedWorldStateSection for S {
     }
 
     fn matches_legacy_fragment(&self, role: &str, text: &str) -> bool {
-        S::matches_legacy_fragment(role, text)
+        WorldStateSection::matches_current_legacy_fragment(self, role, text)
     }
 
     fn has_retained_fragment_matcher(&self) -> bool {
@@ -215,6 +221,11 @@ pub(crate) trait WorldStateSection: Send + Sync + 'static {
         false
     }
 
+    /// Recognizes legacy fragments whose identity depends on this section's current value.
+    fn matches_current_legacy_fragment(&self, role: &str, text: &str) -> bool {
+        Self::matches_legacy_fragment(role, text)
+    }
+
     /// Whether retained history must still contain this section's rendered fragment.
     fn has_retained_fragment_matcher() -> bool {
         false
@@ -309,8 +320,14 @@ impl WorldState {
             !self.sections.contains_key(id),
             "duplicate world-state section ID: {id}"
         );
-        self.sections
-            .insert(id, Box::new(ExtensionWorldStateSection(section)));
+        let section = Box::new(ExtensionWorldStateSection(section));
+        if id == "host_skills"
+            && let Some(index) = self.sections.get_index_of(PermissionsState::ID)
+        {
+            self.sections.shift_insert(index, id, section);
+        } else {
+            self.sections.insert(id, section);
+        }
     }
 
     pub(crate) fn snapshot(&self) -> WorldStateSnapshot {

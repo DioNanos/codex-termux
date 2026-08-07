@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::JsonSchema;
+use crate::TS;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ReasoningSummary;
@@ -16,10 +18,8 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
-use ts_rs::TS;
 
 use crate::protocol::common::AuthMode;
 use crate::protocol::v2::ForcedChatgptWorkspaceIds;
@@ -50,13 +50,19 @@ pub struct InitializeCapabilities {
     /// Opt into `attestation/generate` requests for upstream `x-oai-attestation`.
     #[serde(default)]
     pub request_attestation: bool,
-    /// Allow downstream MCP servers to request OpenAI extended form elicitations.
+    /// Legacy opt-in for the `openai/form` MCP extension.
+    ///
+    /// New clients should declare `openai/form` in [`Self::extensions`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mcp_server_openai_form_elicitation: bool,
     /// Exact notification method names that should be suppressed for this
     /// connection (for example `thread/started`).
     #[ts(optional = nullable)]
     pub opt_out_notification_methods: Option<Vec<String>>,
+    /// MCP extension settings declared by the app-server client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub extensions: Option<HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

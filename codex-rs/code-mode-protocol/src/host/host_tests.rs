@@ -22,6 +22,7 @@ use super::ProtocolVersion;
 use super::RequestId;
 use super::SessionId;
 use super::SupportedProtocolVersions;
+use super::TransportLane;
 use super::WireCellId;
 use super::WireContentItem;
 use super::WireExecuteRequest;
@@ -29,11 +30,13 @@ use super::WireImageDetail;
 use super::WireNestedToolCall;
 use super::WireResult;
 use super::WireRuntimeResponse;
+use super::WireSessionCellExecutionLimits;
 use super::WireToolDefinition;
 use super::WireToolKind;
 use super::WireToolName;
 use super::WireWaitOutcome;
 use super::WireWaitRequest;
+use crate::CodeModeSessionCellExecutionLimits;
 use crate::ExecuteRequest;
 
 fn session_id() -> SessionId {
@@ -70,6 +73,130 @@ where
         serde_json::from_value::<T>(encoded).expect("deserialize"),
         message
     );
+}
+
+#[test]
+fn dual_websocket_hello_preserves_the_pairing_token() {
+    assert_wire_round_trip(
+        HostToClient::HostHello(
+            HostHello::new(
+                ProtocolVersion::V1,
+                CapabilitySet::try_new([capability("dual-websocket-v1")])
+                    .expect("valid capabilities"),
+            )
+            .with_bulk_connection_token("pairing-token".to_string()),
+        ),
+        json!({
+            "type": "connection/ready",
+            "selectedVersion": 1,
+            "capabilities": ["dual-websocket-v1"],
+            "bulkConnectionToken": "pairing-token",
+        }),
+    );
+}
+
+#[test]
+fn message_families_use_dedicated_transport_lanes() {
+    for (message, lane) in [
+        (
+            ClientToHost::CancelRequest {
+                id: request_id(/*value*/ 1),
+            },
+            TransportLane::Control,
+        ),
+        (
+            ClientToHost::DelegateResponse {
+                id: delegate_request_id(/*value*/ 1),
+                result: WireResult::Ok {
+                    value: DelegateResponse::NotificationDelivered,
+                },
+            },
+            TransportLane::Control,
+        ),
+        (
+            ClientToHost::DelegateResponse {
+                id: delegate_request_id(/*value*/ 2),
+                result: WireResult::Ok {
+                    value: DelegateResponse::ToolResult {
+                        result: json!({ "value": "tool result" }),
+                    },
+                },
+            },
+            TransportLane::Bulk,
+        ),
+        (
+            ClientToHost::DelegateResponse {
+                id: delegate_request_id(/*value*/ 3),
+                result: WireResult::Err {
+                    message: "delegate failed".to_string(),
+                },
+            },
+            TransportLane::Bulk,
+        ),
+    ] {
+        assert_eq!(message.transport_lane(), lane);
+        assert!(message.allows_transport_lane(lane));
+        assert!(!message.allows_transport_lane(match lane {
+            TransportLane::Control => TransportLane::Bulk,
+            TransportLane::Bulk => TransportLane::Control,
+        }));
+    }
+
+    for (message, lane) in [
+        (
+            HostToClient::Response {
+                id: request_id(/*value*/ 1),
+                result: WireResult::Err {
+                    message: "x".repeat(128 * 1024),
+                },
+            },
+            TransportLane::Control,
+        ),
+        (
+            HostToClient::DelegateRequest {
+                id: delegate_request_id(/*value*/ 1),
+                session_id: session_id(),
+                request: DelegateRequest::Notify {
+                    call_id: "call-1".to_string(),
+                    cell_id: cell_id("cell-1"),
+                    text: "important".to_string(),
+                },
+            },
+            TransportLane::Control,
+        ),
+        (
+            HostToClient::DelegateRequest {
+                id: delegate_request_id(/*value*/ 2),
+                session_id: session_id(),
+                request: DelegateRequest::InvokeTool {
+                    invocation: WireNestedToolCall {
+                        cell_id: cell_id("cell-1"),
+                        runtime_tool_call_id: "runtime-call-1".to_string(),
+                        tool_name: WireToolName {
+                            name: "tool".to_string(),
+                            namespace: None,
+                        },
+                        tool_kind: WireToolKind::Function,
+                        input: None,
+                    },
+                },
+            },
+            TransportLane::Bulk,
+        ),
+        (
+            HostToClient::CancelDelegateRequest {
+                id: delegate_request_id(/*value*/ 1),
+            },
+            TransportLane::Bulk,
+        ),
+    ] {
+        assert_eq!(message.transport_lane(), lane);
+        assert!(message.allows_transport_lane(lane));
+        assert!(!message.allows_transport_lane(match lane {
+            TransportLane::Control => TransportLane::Bulk,
+            TransportLane::Bulk => TransportLane::Control,
+        }));
+    }
 }
 
 fn execute_request() -> WireExecuteRequest {
@@ -239,6 +366,61 @@ fn handshake_v1_variants_are_pinned() {
 }
 
 #[test]
+fn open_session_serializes_optional_cell_execution_limits() {
+    assert_wire_round_trip(
+        HostRequest::OpenSession {
+            session_id: session_id(),
+            cell_execution_limits: Some(WireSessionCellExecutionLimits {
+                max_yield_time_ms: Some(250),
+                max_heap_size_bytes: Some(16 * 1024 * 1024),
+            }),
+        },
+        json!({
+            "method": "session/open",
+            "sessionId": "session-1",
+            "cellExecutionLimits": {
+                "maxYieldTimeMs": 250,
+                "maxHeapSizeBytes": 16 * 1024 * 1024,
+            },
+        }),
+    );
+}
+
+#[test]
+fn session_cell_execution_limits_convert_between_domain_and_wire() {
+    let domain_limits = CodeModeSessionCellExecutionLimits {
+        max_yield_time_ms: Some(250),
+        max_heap_size_bytes: Some(16_usize * 1024 * 1024),
+    };
+    let wire_limits = WireSessionCellExecutionLimits {
+        max_yield_time_ms: Some(250),
+        max_heap_size_bytes: Some(16_u64 * 1024 * 1024),
+    };
+
+    assert_eq!(
+        WireSessionCellExecutionLimits::try_from(domain_limits.clone())
+            .expect("domain limits convert to wire limits"),
+        wire_limits
+    );
+    assert_eq!(
+        CodeModeSessionCellExecutionLimits::try_from(wire_limits)
+            .expect("wire limits convert to domain limits"),
+        domain_limits
+    );
+}
+
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn session_cell_execution_limits_reject_heap_sizes_that_exceed_usize() {
+    let wire_limits = WireSessionCellExecutionLimits {
+        max_yield_time_ms: None,
+        max_heap_size_bytes: Some(u64::from(u32::MAX) + 1),
+    };
+
+    assert!(CodeModeSessionCellExecutionLimits::try_from(wire_limits).is_err());
+}
+
+#[test]
 fn client_to_host_v1_variants_are_pinned() {
     let execute_request = execute_request();
     for (id, request, encoded_request) in [
@@ -246,6 +428,7 @@ fn client_to_host_v1_variants_are_pinned() {
             request_id(/*value*/ 1),
             HostRequest::OpenSession {
                 session_id: session_id(),
+                cell_execution_limits: None,
             },
             json!({ "method": "session/open", "sessionId": "session-1" }),
         ),
@@ -682,6 +865,17 @@ fn every_nested_v1_object_rejects_unknown_fields() {
             "method": "session/open",
             "sessionId": "session-1",
             "unexpected": true,
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<HostRequest>(json!({
+            "method": "session/open",
+            "sessionId": "session-1",
+            "cellExecutionLimits": {
+                "maxYieldTimeMs": 250,
+                "unexpected": true,
+            },
         }))
         .is_err()
     );

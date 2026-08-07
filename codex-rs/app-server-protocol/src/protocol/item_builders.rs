@@ -35,13 +35,31 @@ use codex_protocol::protocol::PatchApplyEndEvent;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::review_format::REVIEW_FALLBACK_MESSAGE;
 use codex_protocol::review_format::render_review_output_text;
+use codex_secrets::redact_secrets;
 use codex_shell_command::parse_command::parse_command;
 use codex_shell_command::parse_command::shlex_join;
-use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::warn;
+
+/// Client-facing command and parsed actions projected from a raw command.
+pub struct CommandExecutionPresentation {
+    /// Shell-formatted command with recognizable secrets redacted.
+    pub command: String,
+    /// Parsed command actions with recognizable secrets redacted.
+    pub command_actions: Vec<CommandAction>,
+}
+
+impl CommandExecutionPresentation {
+    /// Projects a raw command into its client-facing representation.
+    pub fn from_raw(command: &[String], parsed_cmd: &[ParsedCommand], cwd: &PathUri) -> Self {
+        Self {
+            command: redact_secrets(shlex_join(command)),
+            command_actions: command_actions_for_path_uri(parsed_cmd, cwd),
+        }
+    }
+}
 
 pub(crate) fn review_output_text(output: Option<&ReviewOutputEvent>) -> String {
     output
@@ -76,17 +94,18 @@ pub fn build_file_change_end_item(payload: &PatchApplyEndEvent) -> ThreadItem {
 }
 
 pub fn build_command_execution_begin_item(payload: &ExecCommandBeginEvent) -> ThreadItem {
-    let command_actions = command_actions_for_path_uri(&payload.parsed_cmd, &payload.cwd);
+    let presentation =
+        CommandExecutionPresentation::from_raw(&payload.command, &payload.parsed_cmd, &payload.cwd);
     ThreadItem::CommandExecution {
         id: payload.call_id.clone(),
         plugin_id: payload.plugin_id.clone(),
         script_path: payload.script_path.clone(),
-        command: shlex_join(&payload.command),
+        command: presentation.command,
         cwd: payload.cwd.clone().into(),
         process_id: payload.process_id.clone(),
         source: payload.source.into(),
         status: CommandExecutionStatus::InProgress,
-        command_actions,
+        command_actions: presentation.command_actions,
         aggregated_output: None,
         exit_code: None,
         duration_ms: None,
@@ -100,64 +119,64 @@ pub fn build_command_execution_end_item(payload: &ExecCommandEndEvent) -> Thread
         Some(payload.aggregated_output.clone())
     };
     let duration_ms = i64::try_from(payload.duration.as_millis()).unwrap_or(i64::MAX);
-    let command_actions = command_actions_for_path_uri(&payload.parsed_cmd, &payload.cwd);
+    let presentation =
+        CommandExecutionPresentation::from_raw(&payload.command, &payload.parsed_cmd, &payload.cwd);
 
     ThreadItem::CommandExecution {
         id: payload.call_id.clone(),
         plugin_id: payload.plugin_id.clone(),
         script_path: payload.script_path.clone(),
-        command: shlex_join(&payload.command),
+        command: presentation.command,
         cwd: payload.cwd.clone().into(),
         process_id: payload.process_id.clone(),
         source: payload.source.into(),
         status: (&payload.status).into(),
-        command_actions,
+        command_actions: presentation.command_actions,
         aggregated_output,
         exit_code: Some(payload.exit_code),
         duration_ms: Some(duration_ms),
     }
 }
 
-pub(crate) fn command_actions_for_path_uri(
-    parsed_cmd: &[ParsedCommand],
-    cwd: &PathUri,
-) -> Vec<CommandAction> {
-    // TODO(anp): Carry PathUri into CommandAction so foreign Read actions retain resolved paths.
-    // Until then, omit those actions rather than project a foreign cwd onto the host.
-    let native_cwd = if cwd.infer_path_convention() == Some(PathConvention::native()) {
-        cwd.to_abs_path().ok()
-    } else {
-        None
-    };
-
+fn command_actions_for_path_uri(parsed_cmd: &[ParsedCommand], cwd: &PathUri) -> Vec<CommandAction> {
     parsed_cmd
         .iter()
         .cloned()
         .filter_map(|parsed| match parsed {
-            ParsedCommand::Read { cmd, name, path } => match native_cwd.as_ref() {
-                Some(native_cwd) => Some(CommandAction::Read {
-                    command: cmd,
-                    name,
-                    path: native_cwd.join(path),
-                }),
-                None => {
-                    warn!(
-                        command = cmd,
-                        %cwd,
-                        "omitting read command action whose path cannot be resolved against a foreign cwd"
-                    );
-                    None
+            ParsedCommand::Read { cmd, name, path } => {
+                // Resolve against the executor's URI, not the app-server's filesystem. POSIX
+                // non-UTF-8 paths are percent-encoded, not opaque. Expanding `~` or resolving a
+                // genuinely opaque cwd would require executor-native state unavailable here.
+                match cwd.join(path.to_string_lossy().as_ref()) {
+                    Ok(path) => Some(CommandAction::Read {
+                        command: redact_secrets(cmd),
+                        name,
+                        path: path.into(),
+                    }),
+                    Err(error) => {
+                        warn!(
+                            command = cmd,
+                            %cwd,
+                            file_path = %path.display(),
+                            %error,
+                            "omitting read action: invalid file path or cwd"
+                        );
+                        None
+                    }
                 }
-            },
-            ParsedCommand::ListFiles { cmd, path } => {
-                Some(CommandAction::ListFiles { command: cmd, path })
             }
-            ParsedCommand::Search { cmd, query, path } => Some(CommandAction::Search {
-                command: cmd,
-                query,
+            ParsedCommand::ListFiles { cmd, path } => Some(CommandAction::ListFiles {
+                command: redact_secrets(cmd),
                 path,
             }),
-            ParsedCommand::Unknown { cmd } => Some(CommandAction::Unknown { command: cmd }),
+            ParsedCommand::Search { cmd, query, path } => Some(CommandAction::Search {
+                command: redact_secrets(cmd),
+                query: query.map(redact_secrets),
+                path,
+            }),
+            ParsedCommand::Unknown { cmd } => Some(CommandAction::Unknown {
+                command: redact_secrets(cmd),
+            }),
         })
         .collect()
 }

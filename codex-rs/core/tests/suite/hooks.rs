@@ -2005,12 +2005,6 @@ async fn resumed_thread_runs_resume_then_compact_session_start_hooks() -> Result
             trust_discovered_hooks(config);
         });
     let initial = builder.build(&server).await?;
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .context("rollout path")?;
 
     initial.submit_turn("hello before resume").await?;
     assert_eq!(responses_mock.requests().len(), 1);
@@ -2019,7 +2013,7 @@ async fn resumed_thread_runs_resume_then_compact_session_start_hooks() -> Result
         config.model_auto_compact_token_limit = Some(limit);
         trust_discovered_hooks(config);
     });
-    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
+    let resumed = resume_builder.restart(&server, &initial).await?;
     resumed.submit_turn("hello after resume").await?;
 
     let requests = responses_mock.requests();
@@ -2129,12 +2123,6 @@ async fn resumed_thread_keeps_stop_continuation_prompt_in_history() -> Result<()
         })
         .with_config(trust_discovered_hooks);
     let initial = initial_builder.build(&server).await?;
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     initial.submit_turn("tell me something").await?;
 
@@ -2151,7 +2139,7 @@ async fn resumed_thread_keeps_stop_continuation_prompt_in_history() -> Result<()
     .await;
 
     let mut resume_builder = test_codex().with_config(trust_discovered_hooks);
-    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
+    let resumed = resume_builder.restart(&server, &initial).await?;
 
     resumed.submit_turn("and now continue").await?;
 
@@ -2996,8 +2984,9 @@ async fn pre_tool_use_blocks_shell_command_before_execution() -> Result<()> {
 
     let server = start_mock_server().await;
     let call_id = "pretooluse-shell-command";
-    let marker = std::env::temp_dir().join("pretooluse-shell-command-marker");
-    let command = format!("printf blocked > {}", marker.display());
+    let marker_dir = TempDir::new()?;
+    let marker = marker_dir.path().join("pretooluse-shell-command-marker");
+    let command = format!("git init --quiet {}", marker.display());
     let args = serde_json::json!({ "command": command });
     let responses = mount_sse_sequence(
         &server,
@@ -3028,10 +3017,6 @@ async fn pre_tool_use_blocks_shell_command_before_execution() -> Result<()> {
         .with_config(trust_discovered_hooks);
     let test = builder.build(&server).await?;
 
-    if marker.exists() {
-        fs::remove_file(&marker).context("remove leftover pre tool use marker")?;
-    }
-
     test.submit_turn_with_permission_profile(
         "run the blocked shell command",
         PermissionProfile::Disabled,
@@ -3054,8 +3039,8 @@ async fn pre_tool_use_blocks_shell_command_before_execution() -> Result<()> {
         "blocked tool output should surface the blocked command",
     );
     assert!(
-        !marker.exists(),
-        "blocked command should not create marker file"
+        !marker.join(".git").is_dir(),
+        "blocked command should not initialize the marker repository"
     );
 
     let hook_inputs = read_pre_tool_use_hook_inputs(test.codex_home_path())?;
@@ -3251,7 +3236,7 @@ impl BashRewriteSurface {
     fn original_command(self, marker: &Path) -> String {
         match self {
             BashRewriteSurface::ExecCommand | BashRewriteSurface::ShellCommand => {
-                format!("printf original > {}", marker.display())
+                format!("git init --quiet {}", marker.display())
             }
         }
     }
@@ -3259,7 +3244,7 @@ impl BashRewriteSurface {
     fn rewritten_command(self, marker: &Path) -> String {
         match self {
             BashRewriteSurface::ExecCommand | BashRewriteSurface::ShellCommand => {
-                format!("printf rewritten > {}", marker.display())
+                format!("git init {}", marker.display())
             }
         }
     }
@@ -3282,8 +3267,9 @@ async fn assert_pre_tool_use_rewrites_bash_surface(surface: BashRewriteSurface) 
     let server = start_mock_server().await;
     let slug = surface.slug();
     let call_id = format!("pretooluse-{slug}-rewrite");
-    let original_marker = std::env::temp_dir().join(format!("pretooluse-{slug}-original-marker"));
-    let rewritten_marker = std::env::temp_dir().join(format!("pretooluse-{slug}-rewritten-marker"));
+    let marker_dir = TempDir::new()?;
+    let original_marker = marker_dir.path().join("original");
+    let rewritten_marker = marker_dir.path().join("rewritten");
     let original_command = surface.original_command(&original_marker);
     let rewritten_command = surface.rewritten_command(&rewritten_marker);
     let responses = mount_sse_sequence(
@@ -3312,13 +3298,6 @@ async fn assert_pre_tool_use_rewrites_bash_surface(surface: BashRewriteSurface) 
         .with_config(move |config| surface.configure(config));
     let test = builder.build(&server).await?;
 
-    if original_marker.exists() {
-        fs::remove_file(&original_marker).context("remove stale original pre tool marker")?;
-    }
-    if rewritten_marker.exists() {
-        fs::remove_file(&rewritten_marker).context("remove stale rewritten pre tool marker")?;
-    }
-
     test.submit_turn_with_permission_profile(
         &format!("run the rewritten {slug} command"),
         PermissionProfile::Disabled,
@@ -3329,12 +3308,12 @@ async fn assert_pre_tool_use_rewrites_bash_surface(surface: BashRewriteSurface) 
     assert_eq!(requests.len(), 2);
     requests[1].function_call_output(&call_id);
     assert!(
-        !original_marker.exists(),
+        !original_marker.join(".git").is_dir(),
         "original {slug} command should not execute after rewrite"
     );
-    assert_eq!(
-        fs::read_to_string(&rewritten_marker).context("read rewritten pre tool marker")?,
-        "rewritten"
+    assert!(
+        rewritten_marker.join(".git").is_dir(),
+        "rewritten {slug} command should initialize the marker repository"
     );
 
     let hook_inputs = read_pre_tool_use_hook_inputs(test.codex_home_path())?;
@@ -3364,13 +3343,10 @@ async fn pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution() 
     let original_marker = marker_dir.path().join("original");
     let rewritten_marker = marker_dir.path().join("rewritten");
     let original_command = format!(
-        "printf original > {}; printf original-result",
+        "git init --quiet {}; git version",
         original_marker.display()
     );
-    let rewritten_command = format!(
-        "printf rewritten > {}; printf rewritten-result",
-        rewritten_marker.display()
-    );
+    let rewritten_command = format!("git init {}; git version", rewritten_marker.display());
     let original_command_json =
         serde_json::to_string(&original_command).context("serialize original command")?;
     let code = format!(
@@ -3420,21 +3396,16 @@ text(output.output);
     let output_item = requests[1].custom_tool_call_output(call_id);
     let output = code_mode_custom_tool_output_text(&output_item);
     assert!(
-        output.contains("rewritten-result"),
+        output.contains("git version"),
         "code mode should receive the rewritten command result"
     );
     assert!(
-        !output.contains("original-result"),
-        "code mode should not receive the original command result"
-    );
-    assert!(
-        !original_marker.exists(),
+        !original_marker.join(".git").is_dir(),
         "original nested shell command should not execute after rewrite"
     );
-    assert_eq!(
-        fs::read_to_string(&rewritten_marker)
-            .context("read rewritten code mode pre tool marker")?,
-        "rewritten"
+    assert!(
+        rewritten_marker.join(".git").is_dir(),
+        "rewritten nested command should initialize the marker repository"
     );
 
     let hook_inputs = read_pre_tool_use_hook_inputs(test.codex_home_path())?;

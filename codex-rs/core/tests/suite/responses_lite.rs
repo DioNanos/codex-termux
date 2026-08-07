@@ -129,7 +129,19 @@ async fn responses_lite_uses_input_items_for_instructions_and_tools() -> Result<
     );
 
     let tools = additional_tools(&body)?;
-    assert!(!tools.is_empty());
+    let functions_namespaces = tools
+        .iter()
+        .filter(|tool| tool["type"] == "namespace" && tool["name"] == "functions")
+        .collect::<Vec<_>>();
+    assert_eq!(functions_namespaces.len(), 1);
+    assert_eq!(functions_namespaces[0]["description"], "");
+    assert!(has_namespaced_tool(tools, "functions", "wait"));
+    assert!(has_namespaced_tool(tools, "functions", "exec"));
+    assert!(
+        tools
+            .iter()
+            .all(|tool| { !matches!(tool["type"].as_str(), Some("function" | "custom")) })
+    );
     let client_metadata = body["client_metadata"]
         .as_object()
         .context("Responses request should include client metadata")?;
@@ -343,8 +355,7 @@ async fn responses_lite_does_not_expose_disabled_standalone_web_search_for_opted
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_lite_does_not_expose_standalone_web_search_for_opted_in_bedrock_provider()
--> Result<()> {
+async fn responses_lite_does_not_expose_standalone_web_search_for_bedrock_provider() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -373,7 +384,7 @@ async fn responses_lite_does_not_expose_standalone_web_search_for_opted_in_bedro
             config.model_provider.name = "Amazon Bedrock".to_string();
             config.model_provider.requires_openai_auth = false;
             config.model_provider.http_headers = None;
-            config.model_provider.supports_standalone_web_search = true;
+            config.model_provider.supports_standalone_web_search = false;
         });
     let test = builder.build(&server).await?;
 

@@ -45,6 +45,50 @@ pub struct TrackEventsContext {
     pub product_client_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodeModeToolCallFact {
+    CellStarted {
+        thread_id: String,
+        turn_id: String,
+        call_id: String,
+        cell_id: String,
+    },
+    ChildStarted {
+        thread_id: String,
+        turn_id: String,
+        call_id: String,
+        cell_id: String,
+    },
+    CellClosed {
+        thread_id: String,
+        turn_id: String,
+        cell_id: String,
+    },
+    SamplingResponseCompleted {
+        thread_id: String,
+        turn_id: String,
+        response_id: String,
+        tool_call_ids: Vec<String>,
+    },
+    Completed {
+        thread_id: String,
+        turn_id: String,
+        call_id: String,
+        cell_id: Option<String>,
+        tool_name: String,
+        started_at_ms: u64,
+        completed_at_ms: u64,
+        status: CodeModeToolCallStatus,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeModeToolCallStatus {
+    Completed,
+    Failed,
+    Interrupted,
+}
+
 pub fn build_track_events_context(
     model_slug: String,
     thread_id: String,
@@ -57,6 +101,35 @@ pub fn build_track_events_context(
         turn_id,
         product_client_id,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDetailSetting {
+    High,
+    Original,
+}
+
+/// Measurements for one successfully decoded image at the point where Codex prepares it for
+/// durable conversation history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ImagePreparationMetadata {
+    /// Set for images embedded in message content.
+    pub message_role: Option<String>,
+    /// Set to the originating call ID for tool-output images. This joins to the `item_id` on
+    /// existing tool events for tool type and provenance.
+    pub item_id: Option<String>,
+    pub effective_detail: ImageDetailSetting,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub prepared_width: u32,
+    pub prepared_height: u32,
+}
+
+#[derive(Clone)]
+pub struct ImagePreparationFact {
+    pub turn_id: String,
+    pub metadata: ImagePreparationMetadata,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -374,6 +447,12 @@ pub(crate) enum AnalyticsFact {
         request_id: RequestId,
         request: Box<ClientRequest>,
     },
+    ExplicitClientInterruptRequest {
+        connection_id: u64,
+        request_id: RequestId,
+        turn_id: String,
+        requested_at_ms: u64,
+    },
     ClientResponse {
         connection_id: u64,
         request_id: RequestId,
@@ -410,6 +489,7 @@ pub(crate) enum AnalyticsFact {
 }
 
 pub(crate) enum CustomAnalyticsFact {
+    CodeModeToolCall(CodeModeToolCallFact),
     SubAgentThreadStarted(SubAgentThreadStartedInput),
     Compaction(Box<CodexCompactionEvent>),
     Goal(Box<CodexGoalEvent>),
@@ -418,6 +498,7 @@ pub(crate) enum CustomAnalyticsFact {
     TurnTokenUsage(Box<TurnTokenUsageFact>),
     TurnProfile(Box<TurnProfileFact>),
     TurnCodexError(Box<TurnCodexErrorFact>),
+    ImagePreparation(Box<ImagePreparationFact>),
     SkillInvoked(SkillInvokedInput),
     AppMentioned(AppMentionedInput),
     AppUsed(AppUsedInput),

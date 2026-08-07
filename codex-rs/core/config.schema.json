@@ -389,7 +389,7 @@
       "additionalProperties": false,
       "properties": {
         "disable_in_process_fallback": {
-          "description": "Fail instead of running embedded V8 when the standalone host is unavailable.",
+          "description": "Keep code mode fail-closed when the standalone host is unavailable.",
           "type": "boolean"
         },
         "enabled": {
@@ -531,6 +531,9 @@
             "exec_permission_approvals": {
               "type": "boolean"
             },
+            "executed_tool_call_metadata": {
+              "type": "boolean"
+            },
             "executor_capability_discovery": {
               "type": "boolean"
             },
@@ -565,6 +568,9 @@
               "type": "boolean"
             },
             "image_generation": {
+              "type": "boolean"
+            },
+            "image_resize_notice": {
               "type": "boolean"
             },
             "imagegenext": {
@@ -631,6 +637,9 @@
               "type": "boolean"
             },
             "realtime_conversation": {
+              "type": "boolean"
+            },
+            "recommended_plugins": {
               "type": "boolean"
             },
             "remote_compaction_v2": {
@@ -720,6 +729,9 @@
             "tool_call_mcp_elicitation": {
               "type": "boolean"
             },
+            "tool_registry": {
+              "$ref": "#/definitions/ToolRegistryConfigToml"
+            },
             "tool_search": {
               "type": "boolean"
             },
@@ -751,6 +763,9 @@
               "type": "boolean"
             },
             "use_linux_sandbox_bwrap": {
+              "type": "boolean"
+            },
+            "view_image": {
               "type": "boolean"
             },
             "web_search": {
@@ -1421,7 +1436,7 @@
           "type": "array"
         }
       ],
-      "description": "One action binding value in config.\n\nThis accepts either:\n\n1. A single key spec string (`\"ctrl-a\"`). 2. A list of key spec strings (`[\"ctrl-a\", \"alt-a\"]`).\n\nAn empty list explicitly unbinds the action in that scope. Because an explicit empty list is still a configured value, runtime resolution must not fall through to global or built-in defaults for that action."
+      "description": "One action binding value in config.\n\nThis accepts either:\n\n1. A single key or chord string (`\"ctrl-a\"` or `\"ctrl-x ctrl-s\"`). 2. A list of alternative bindings (`[\"ctrl-a\", \"ctrl-x ctrl-s\"]`).\n\nAn empty list explicitly unbinds the action in that scope. Because an explicit empty list is still a configured value, runtime resolution must not fall through to global or built-in defaults for that action."
     },
     "LegacyAppPathString": {
       "type": "string"
@@ -1849,6 +1864,10 @@
           "type": "boolean"
         },
         "root_agent_usage_hint_text": {
+          "type": "string"
+        },
+        "subagent_developer_instructions": {
+          "description": "Overrides inherited developer instructions for subagents without role-specific instructions.",
           "type": "string"
         },
         "subagent_usage_hint_text": {
@@ -2682,6 +2701,13 @@
           "default": null,
           "type": "string"
         },
+        "omit_tools_from": {
+          "default": null,
+          "items": {
+            "$ref": "#/definitions/ToolExposureSurface"
+          },
+          "type": "array"
+        },
         "required": {
           "default": null,
           "type": "boolean"
@@ -3096,6 +3122,14 @@
           "maxLength": 2000,
           "type": "string"
         },
+        "mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TokenBudgetMode"
+            }
+          ],
+          "description": "Select whether context-window metadata identifies the thread or agent name."
+        },
         "reminder_message_template": {
           "description": "Reminder template. `{n_remaining}` is replaced with the tokens remaining before auto-compaction.",
           "maxLength": 2000,
@@ -3107,6 +3141,50 @@
           "format": "int64",
           "minimum": 1.0,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "TokenBudgetMode": {
+      "description": "Identity included in the context-window developer message.",
+      "enum": [
+        "thread",
+        "name"
+      ],
+      "type": "string"
+    },
+    "ToolExposureSurface": {
+      "description": "A model-facing surface on which a tool can be exposed.",
+      "oneOf": [
+        {
+          "description": "Nested tools available to Code Mode scripts.",
+          "enum": [
+            "code_mode"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Tools discovered later through tool search.",
+          "enum": [
+            "deferred"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Tools present in the model's initial tool list.",
+          "enum": [
+            "direct"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ToolRegistryConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "error_on_tool_collisions": {
+          "description": "Fail the turn when multiple tools share the same effective name.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -5084,6 +5162,9 @@
         "exec_permission_approvals": {
           "type": "boolean"
         },
+        "executed_tool_call_metadata": {
+          "type": "boolean"
+        },
         "executor_capability_discovery": {
           "type": "boolean"
         },
@@ -5118,6 +5199,9 @@
           "type": "boolean"
         },
         "image_generation": {
+          "type": "boolean"
+        },
+        "image_resize_notice": {
           "type": "boolean"
         },
         "imagegenext": {
@@ -5184,6 +5268,9 @@
           "type": "boolean"
         },
         "realtime_conversation": {
+          "type": "boolean"
+        },
+        "recommended_plugins": {
           "type": "boolean"
         },
         "remote_compaction_v2": {
@@ -5273,6 +5360,9 @@
         "tool_call_mcp_elicitation": {
           "type": "boolean"
         },
+        "tool_registry": {
+          "$ref": "#/definitions/ToolRegistryConfigToml"
+        },
         "tool_search": {
           "type": "boolean"
         },
@@ -5304,6 +5394,9 @@
           "type": "boolean"
         },
         "use_linux_sandbox_bwrap": {
+          "type": "boolean"
+        },
+        "view_image": {
           "type": "boolean"
         },
         "web_search": {

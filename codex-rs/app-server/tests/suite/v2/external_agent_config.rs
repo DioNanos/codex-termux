@@ -279,7 +279,7 @@ async fn external_agent_config_secondary_source_imports_session_and_plugin_end_t
                 "message": {
                     "content": [{
                         "type": "text",
-                        "text": "<user_query>first request</user_query>"
+                        "text": "<cursor_commands>\n/verify\n</cursor_commands>\n<timestamp>2026-07-26T18:00:00Z</timestamp>\n<user_query>first request</user_query>"
                     }]
                 }
             })
@@ -414,7 +414,7 @@ source = {:?}
             model_providers: None,
             source_kinds: None,
             archived: None,
-            is_pinned: None,
+            section_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
@@ -654,6 +654,7 @@ async fn external_agent_config_records_externally_completed_import_history() -> 
             "cwd": "/repo",
             "source": "/source/session.jsonl",
             "target": "thread-1",
+            "title": null,
         }])
     );
     assert_eq!(entry.failures, Vec::new());
@@ -1563,7 +1564,7 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
                 "type": "assistant",
                 "cwd": &project_root,
                 "timestamp": source_updated_at_text,
-                "attributionMcpServer": "gmail-server",
+                "attributionMcpServer": "gmail",
                 "message": { "content": "first answer" },
             })
             .to_string(),
@@ -1627,7 +1628,6 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
         session_success.item_type,
         ExternalAgentConfigMigrationItemType::Sessions
     );
-    assert_eq!(session_success.cwd, None);
     let session_source = std::fs::canonicalize(&session_path)?.display().to_string();
     assert_eq!(
         session_success.source.as_deref(),
@@ -1655,6 +1655,13 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
             source: ExternalAgentImportedConnectorSource::RemoteMcpServersConfig,
         }]
     );
+    let imported_session = response
+        .data
+        .iter()
+        .flat_map(|history| history.successes.iter())
+        .find(|success| success.item_type == ExternalAgentConfigMigrationItemType::Sessions)
+        .expect("imported session history should be available");
+    assert_eq!(imported_session.title.as_deref(), Some("Fix auth flow"));
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
@@ -1665,7 +1672,7 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
             model_providers: None,
             source_kinds: None,
             archived: None,
-            is_pinned: None,
+            section_id: None,
             cwd: None,
             use_state_db_only: true,
             search_term: None,
@@ -1852,7 +1859,7 @@ required = true
             model_providers: None,
             source_kinds: None,
             archived: None,
-            is_pinned: None,
+            section_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
@@ -1936,7 +1943,7 @@ async fn external_agent_config_import_accepts_detected_session_payload_after_res
             model_providers: None,
             source_kinds: None,
             archived: None,
-            is_pinned: None,
+            section_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
@@ -2017,7 +2024,7 @@ async fn external_agent_config_import_skips_already_imported_session_versions() 
             model_providers: None,
             source_kinds: None,
             archived: None,
-            is_pinned: None,
+            section_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
@@ -2144,7 +2151,7 @@ async fn external_agent_config_import_returns_before_background_session_import_f
             model_providers: None,
             source_kinds: None,
             archived: None,
-            is_pinned: None,
+            section_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
@@ -2259,7 +2266,7 @@ async fn external_agent_config_import_compacts_huge_session_before_first_follow_
             model_providers: None,
             source_kinds: None,
             archived: None,
-            is_pinned: None,
+            section_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,

@@ -10,37 +10,36 @@ use codex_otel::sanitize_metric_tag_value;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_plugins::PluginSkillRoot;
+use std::collections::HashSet;
+use tokio::sync::Mutex;
 
 pub use codex_core_skills::SkillError;
 pub use codex_core_skills::SkillLoadOutcome;
-pub use codex_core_skills::SkillRenderReport;
-pub use codex_core_skills::SkillsLoadInput;
-pub use codex_core_skills::SkillsService;
-pub use codex_core_skills::build_available_skills;
 pub use codex_core_skills::build_skill_name_counts;
 pub use codex_core_skills::config_rules;
-pub use codex_core_skills::default_skill_metadata_budget;
 pub use codex_core_skills::detect_implicit_skill_invocation_for_command;
 pub use codex_core_skills::filter_skill_load_outcome_for_product;
 pub use codex_core_skills::injection;
 pub use codex_core_skills::injection::SkillInjections;
 pub use codex_core_skills::injection::build_skill_injections;
-pub use codex_core_skills::injection::collect_explicit_skill_mentions;
 pub use codex_core_skills::loader;
 pub use codex_core_skills::model;
 pub use codex_core_skills::remote;
-pub use codex_core_skills::render;
-pub use codex_core_skills::render::SkillRenderSideEffects;
-pub use codex_core_skills::service;
-pub use codex_core_skills::system;
 pub use codex_skills::SkillMetadata;
 pub use codex_skills::SkillPolicy;
+pub use codex_skills::collect_explicit_skill_mentions;
+pub use codex_skills_extension::HostSkillsLoadInput;
+pub use codex_skills_extension::HostSkillsService;
+pub use codex_skills_extension::bundled_skills_enabled_from_stack;
+
+#[derive(Debug, Default)]
+struct ImplicitSkillInvocations(Mutex<HashSet<String>>);
 
 pub(crate) fn skills_load_input_from_config(
     config: &Config,
     effective_skill_roots: Vec<PluginSkillRoot>,
-) -> SkillsLoadInput {
-    SkillsLoadInput::new(
+) -> HostSkillsLoadInput {
+    HostSkillsLoadInput::new(
         config.cwd.clone(),
         effective_skill_roots,
         config.config_layer_stack.clone(),
@@ -55,7 +54,7 @@ pub(crate) async fn maybe_emit_implicit_skill_invocation(
     workdir: &AbsolutePathBuf,
 ) {
     let Some(candidate) = detect_implicit_skill_invocation_for_command(
-        turn_context.turn_skills.snapshot.outcome(),
+        turn_context.skills_snapshot().outcome(),
         command,
         workdir,
     ) else {
@@ -79,11 +78,10 @@ pub(crate) async fn maybe_emit_implicit_skill_invocation(
     let skill_name = invocation.skill_name.clone();
     let seen_key = format!("{skill_scope}:{skill_path}:{skill_name}");
     let inserted = {
-        let mut seen_skills = turn_context
-            .turn_skills
-            .implicit_invocation_seen_skills
-            .lock()
-            .await;
+        let skill_invocations = turn_context
+            .extension_data
+            .get_or_init(ImplicitSkillInvocations::default);
+        let mut seen_skills = skill_invocations.0.lock().await;
         seen_skills.insert(seen_key)
     };
     if !inserted {

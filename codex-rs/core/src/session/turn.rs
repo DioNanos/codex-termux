@@ -11,7 +11,6 @@ use crate::client_common::ResponseEvent;
 use crate::collect_explicit_skill_mentions;
 use crate::compact::InitialContextInjection;
 use crate::compact::run_inline_auto_compact_task;
-use crate::compact::should_use_remote_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
@@ -28,7 +27,6 @@ use crate::injection::ToolMentionKind;
 use crate::injection::app_id_from_path;
 use crate::injection::tool_kind_for_path;
 use crate::mcp_skill_dependencies::maybe_prompt_and_install_mcp_dependencies;
-use crate::mcp_tool_exposure::build_mcp_tool_runtimes;
 use crate::mentions::build_connector_slug_counts;
 use crate::mentions::build_skill_name_counts;
 use crate::mentions::collect_explicit_app_ids;
@@ -58,11 +56,9 @@ use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::registry::ToolArgumentDiffConsumer;
-use crate::tools::router::ToolRouterParams;
 use crate::tools::router::ToolSuggestCandidates;
 use crate::tools::router::ToolSuggestPresentation;
-use crate::tools::router::extension_tool_executors;
-use crate::tools::spec_plan::search_tool_enabled;
+use crate::tools::spec_plan::build_tool_router;
 use crate::tools::spec_plan::tool_suggest_enabled;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::turn_timing::record_turn_ttft_metric;
@@ -74,6 +70,7 @@ use codex_analytics::InvocationType;
 use codex_analytics::TurnResolvedConfigFact;
 use codex_analytics::build_track_events_context;
 use codex_async_utils::OrCancelExt;
+use codex_connectors::AppToolPolicyEvaluator;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
 use codex_extension_api::ExtensionData;
@@ -82,7 +79,8 @@ use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
-use codex_mcp::ToolInfo;
+use codex_login::CodexAuth;
+use codex_model_provider::RemoteCompactionSupport;
 use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
@@ -111,6 +109,7 @@ use codex_protocol::protocol::SafetyBufferingEvent;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
+use codex_tools::DiscoverableTool;
 use codex_tools::ToolName;
 use codex_tools::filter_request_plugin_install_discoverable_tools_for_client;
 use codex_utils_path_uri::PathUri;
@@ -151,7 +150,6 @@ const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_tok
 pub(crate) async fn run_turn(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
-    turn_extension_data: Arc<codex_extension_api::ExtensionData>,
     input: Vec<TurnInput>,
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
@@ -174,6 +172,9 @@ pub(crate) async fn run_turn(
             run_hooks_and_record_inputs(&sess, &turn_context, &input).await;
             return Err(err);
         }
+        if matches!(err.details(), CodexErrorDetails::ToolCollision(_)) {
+            return Err(err);
+        }
         let error = err.to_codex_protocol_error();
         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
             .await;
@@ -181,9 +182,26 @@ pub(crate) async fn run_turn(
         return Ok(None);
     }
 
+    let user_input = turn_user_input(&input);
+    let (required_servers, mentioned_plugins) =
+        match required_mcp_servers_for_input(&sess, turn_context.as_ref(), &user_input)
+            .or_cancel(&cancellation_token)
+            .await
+        {
+            Ok(requirements) => requirements,
+            Err(err) => {
+                run_hooks_and_record_inputs(&sess, &turn_context, &input).await;
+                return Err(err.into());
+            }
+        };
+
     // run_turn owns the step used to seed context and make the first sampling request.
     let first_step_context = match sess
-        .capture_step_context(Arc::clone(&turn_context), &cancellation_token)
+        .capture_step_context_with_required_mcp_servers(
+            Arc::clone(&turn_context),
+            &cancellation_token,
+            &required_servers,
+        )
         .await
     {
         Ok(step_context) => step_context,
@@ -194,15 +212,17 @@ pub(crate) async fn run_turn(
         Err(err) => return Err(err),
     };
     // Keep the exact model-visible state used by this turn and its inline compactions.
-    let (mut world_state, display_roots) = tokio::join!(
+    let (world_state, display_roots) = tokio::join!(
         sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
         turn_diff_display_roots(first_step_context.as_ref()),
     );
+    let mut world_state = world_state?;
 
     let Some((injection_items, explicitly_enabled_connectors)) = build_skills_and_plugins(
         &sess,
         first_step_context.as_ref(),
-        &input,
+        &user_input,
+        &mentioned_plugins,
         &cancellation_token,
     )
     .await
@@ -254,7 +274,10 @@ pub(crate) async fn run_turn(
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
         let pending_input = if can_drain_pending_input {
-            sess.input_queue.get_pending_input(&sess.active_turn).await
+            sess.input_queue
+                .get_pending_input(&sess.active_turn)
+                .await
+                .0
         } else {
             Vec::new()
         };
@@ -274,9 +297,25 @@ pub(crate) async fn run_turn(
         // Capture once so context, advertised tools, and tool calls share one request view.
         let step_context = match next_step_context.take() {
             Some(step_context) => step_context,
-            None => {
+            None if pending_input.is_empty() => {
                 sess.capture_step_context(Arc::clone(&turn_context), &cancellation_token)
                     .await?
+            }
+            None => {
+                let pending_user_input = turn_user_input(&pending_input);
+                let (required_servers, _) = required_mcp_servers_for_input(
+                    &sess,
+                    turn_context.as_ref(),
+                    &pending_user_input,
+                )
+                .or_cancel(&cancellation_token)
+                .await?;
+                sess.capture_step_context_with_required_mcp_servers(
+                    Arc::clone(&turn_context),
+                    &cancellation_token,
+                    &required_servers,
+                )
+                .await?
             }
         };
         let sampling_request_result: CodexResult<_> = async {
@@ -289,7 +328,7 @@ pub(crate) async fn run_turn(
 
             world_state = sess
                 .record_step_world_state_if_changed(&world_state, step_context.as_ref())
-                .await;
+                .await?;
 
             // Construct the input that we will send to the model.
             let sampling_request_input: Vec<ResponseItem> = async {
@@ -308,7 +347,7 @@ pub(crate) async fn run_turn(
             run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),
-                Arc::clone(&turn_extension_data),
+                Arc::clone(&turn_context.extension_data),
                 Arc::clone(&turn_diff_tracker),
                 &mut client_session,
                 &responses_metadata,
@@ -565,11 +604,124 @@ pub(crate) async fn run_hooks_and_record_inputs(
     blocked_input && !accepted_user_input
 }
 
+fn turn_user_input(input: &[TurnInput]) -> Vec<UserInput> {
+    input
+        .iter()
+        .filter_map(|item| match item {
+            TurnInput::UserInput { content, .. } => Some(content.as_slice()),
+            TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => None,
+        })
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+async fn required_mcp_servers_for_input(
+    sess: &Arc<Session>,
+    turn_context: &TurnContext,
+    user_input: &[UserInput],
+) -> (Vec<String>, Vec<crate::plugins::PluginCapabilitySummary>) {
+    if crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
+        return (Vec::new(), Vec::new());
+    }
+
+    // Plugin capabilities depend on authentication, so project them only after
+    // the runtime has aligned the plugin manager with its current account.
+    sess.refresh_mcp_if_dirty().await;
+    let loaded_plugins = sess
+        .services
+        .plugins_manager
+        .plugins_for_config(&turn_context.config.plugins_config_input())
+        .await;
+    let current_config = sess.services.mcp_runtime.current_config();
+    let mentioned_plugins =
+        collect_explicit_plugin_mentions(user_input, loaded_plugins.capability_summaries());
+    let mut required_servers = mentioned_plugins
+        .iter()
+        .flat_map(|plugin| plugin.mcp_server_names.iter().cloned())
+        .collect::<HashSet<_>>();
+
+    let messages = user_input
+        .iter()
+        .filter_map(|input| match input {
+            UserInput::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mentions = collect_tool_mentions_from_messages(&messages);
+    let paths = user_input
+        .iter()
+        .filter_map(|input| match input {
+            UserInput::Mention { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .chain(mentions.paths);
+    required_servers.extend(paths.filter_map(|path| {
+        path.strip_prefix("mcp://")
+            .filter(|server| !server.is_empty())
+            .map(str::to_string)
+    }));
+
+    let connector_slug_counts = if turn_context.apps_enabled() && !mentions.plain_names.is_empty() {
+        let cached_connectors =
+            connectors::list_cached_accessible_connectors_from_mcp_tools(&turn_context.config)
+                .await;
+        let accessible_connectors = match cached_connectors {
+            Some(connectors) => connectors,
+            None => sess
+                .services
+                .mcp_runtime
+                .current_binding()
+                .await
+                .map(|binding| connectors::accessible_connectors_from_mcp_tools(binding.tools()))
+                .unwrap_or_default(),
+        };
+        let connector_ids = current_config
+            .iter()
+            .flat_map(|config| config.connector_snapshot.connector_ids())
+            .map(|connector_id| connector_id.0.clone());
+        build_connector_slug_counts(
+            &codex_connectors::merge::merge_plugin_connectors_with_accessible(
+                connector_ids,
+                accessible_connectors,
+            ),
+        )
+    } else {
+        HashMap::new()
+    };
+    let skills_snapshot = turn_context.skills_snapshot();
+    let skills_outcome = skills_snapshot.outcome();
+    let mentioned_skills =
+        collect_explicit_skill_mentions(user_input, skills_outcome, &connector_slug_counts);
+    for skill in mentioned_skills {
+        if let Some(dependencies) = skill.dependencies {
+            required_servers.extend(
+                dependencies
+                    .tools
+                    .into_iter()
+                    .filter(|tool| tool.r#type.eq_ignore_ascii_case("mcp"))
+                    .map(|tool| tool.value),
+            );
+        }
+        if let Some(plugin_id) = skill.plugin_id.as_deref()
+            && let Some(plugin) = loaded_plugins
+                .capability_summaries()
+                .iter()
+                .find(|plugin| plugin.config_name == plugin_id)
+        {
+            required_servers.extend(plugin.mcp_server_names.iter().cloned());
+        }
+    }
+
+    (required_servers.into_iter().collect(), mentioned_plugins)
+}
+
 #[instrument(level = "trace", skip_all)]
 async fn build_skills_and_plugins(
     sess: &Arc<Session>,
     step_context: &StepContext,
-    input: &[TurnInput],
+    user_input: &[UserInput],
+    mentioned_plugins: &[crate::plugins::PluginCapabilitySummary],
     cancellation_token: &CancellationToken,
 ) -> Option<(Vec<ResponseItem>, HashSet<String>)> {
     let turn_context = step_context.turn.as_ref();
@@ -579,38 +731,20 @@ async fn build_skills_and_plugins(
         return Some((Vec::new(), HashSet::new()));
     }
 
-    let user_input = input
-        .iter()
-        .filter_map(|item| match item {
-            TurnInput::UserInput { content, .. } => Some(content.as_slice()),
-            TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => None,
-        })
-        .flatten()
-        .cloned()
-        .collect::<Vec<_>>();
     let tracking = build_track_events_context(
         turn_context.model_info.slug.clone(),
         sess.thread_id.to_string(),
         turn_context.sub_id.clone(),
         turn_context.originator.clone(),
     );
-    let loaded_plugins = sess
-        .services
-        .plugins_manager
-        .plugins_for_config(&turn_context.config.plugins_config_input())
-        .await;
-    // Structured plugin:// mentions are resolved from the current session's
-    // enabled plugins, then converted into turn-scoped guidance below.
-    let mentioned_plugins =
-        collect_explicit_plugin_mentions(&user_input, loaded_plugins.capability_summaries());
     let connector_snapshot = step_context.mcp.config().connector_snapshot.clone();
     let mcp_tools = if turn_context.apps_enabled() || !mentioned_plugins.is_empty() {
         // Plugin mentions need raw MCP/app inventory even when app tools
         // are normally hidden so we can describe the plugin's currently
         // usable capabilities for this turn.
-        step_context.mcp.tools().to_vec()
+        step_context.mcp.tools()
     } else {
-        Vec::new()
+        &[]
     };
     let available_connectors = if turn_context.apps_enabled() {
         let connectors = codex_connectors::merge::merge_plugin_connectors_with_accessible(
@@ -618,25 +752,23 @@ async fn build_skills_and_plugins(
                 .connector_ids()
                 .iter()
                 .map(|connector_id| connector_id.0.clone()),
-            connectors::accessible_connectors_from_mcp_tools(&mcp_tools),
+            connectors::accessible_connectors_from_mcp_tools(mcp_tools),
         );
-        connectors::with_app_enabled_state(connectors, &turn_context.config)
+        AppToolPolicyEvaluator::new(&turn_context.config.config_layer_stack)
+            .apply_app_enabled_state(connectors)
     } else {
         Vec::new()
     };
-    let skills_outcome = turn_context.turn_skills.snapshot.outcome();
+    let skills_snapshot = turn_context.skills_snapshot();
+    let skills_outcome = skills_snapshot.outcome();
     let connector_slug_counts = build_connector_slug_counts(&available_connectors);
     let extension_injection_items =
-        build_extension_turn_input_items(sess, step_context, &user_input, cancellation_token)
+        build_extension_turn_input_items(sess, step_context, user_input, cancellation_token)
             .await?;
     let skill_name_counts_lower =
         build_skill_name_counts(&skills_outcome.skills, &skills_outcome.disabled_paths).1;
-    let mentioned_skills = collect_explicit_skill_mentions(
-        &user_input,
-        &skills_outcome.skills,
-        &skills_outcome.disabled_paths,
-        &connector_slug_counts,
-    );
+    let mentioned_skills =
+        collect_explicit_skill_mentions(user_input, skills_outcome, &connector_slug_counts);
     maybe_prompt_and_install_mcp_dependencies(
         sess,
         turn_context,
@@ -675,9 +807,8 @@ async fn build_skills_and_plugins(
         &available_connectors,
         &skill_name_counts_lower,
     );
-    let plugin_items =
-        build_plugin_injections(&mentioned_plugins, &mcp_tools, &available_connectors);
-    let mut explicitly_enabled_connectors = collect_explicit_app_ids(&user_input);
+    let plugin_items = build_plugin_injections(mentioned_plugins, mcp_tools, &available_connectors);
+    let mut explicitly_enabled_connectors = collect_explicit_app_ids(user_input);
     explicitly_enabled_connectors.extend(skill_connector_ids);
     let connector_names_by_id = available_connectors
         .iter()
@@ -696,7 +827,7 @@ async fn build_skills_and_plugins(
     sess.services
         .analytics_events_client
         .track_app_mentioned(tracking.clone(), mentioned_app_invocations);
-    for summary in &mentioned_plugins {
+    for summary in mentioned_plugins {
         if let Some(plugin) = sess
             .services
             .plugins_manager
@@ -760,12 +891,15 @@ async fn build_extension_turn_input_items(
         user_input: user_input.to_vec(),
         environments,
     };
+    let extension_metrics =
+        super::extension_metrics::from_session_telemetry(turn_context.session_telemetry.clone());
 
     let mut items = Vec::new();
     for contributor in contributors {
         let contributed_fragments = contributor
             .contribute(
                 input.clone(),
+                Some(Arc::clone(&extension_metrics)),
                 &sess.services.session_extension_data,
                 &sess.services.thread_extension_data,
                 turn_context.extension_data.as_ref(),
@@ -832,7 +966,7 @@ async fn track_turn_resolved_config_analytics(
                 .service_tier
                 .as_deref()
                 .and_then(ServiceTier::from_request_value),
-            approval_policy: turn_context.approval_policy.value(),
+            approval_policy: turn_context.approval_policy(),
             approvals_reviewer: turn_context.config.approvals_reviewer,
             sandbox_network_access: turn_context.network_sandbox_policy().is_enabled(),
             collaboration_mode: turn_context.mode,
@@ -1032,11 +1166,12 @@ async fn run_auto_compact(
         return Ok(());
     }
 
-    if should_use_remote_compact_task(turn_context.provider.info()) {
-        if turn_context
-            .config
-            .features
-            .enabled(Feature::RemoteCompactionV2)
+    match turn_context.provider.capabilities().remote_compaction {
+        RemoteCompactionSupport::V2
+            if turn_context
+                .config
+                .features
+                .enabled(Feature::RemoteCompactionV2) =>
         {
             emit_compact_metric(
                 &sess.services.session_telemetry,
@@ -1053,37 +1188,39 @@ async fn run_auto_compact(
                 phase,
             )
             .await?;
-            return Ok(());
         }
-        emit_compact_metric(
-            &sess.services.session_telemetry,
-            "remote",
-            /*manual*/ false,
-        );
-        run_inline_remote_auto_compact_task(
-            Arc::clone(sess),
-            step_context,
-            fallback_step_context,
-            client_session.turn_state(),
-            initial_context_injection,
-            reason,
-            phase,
-        )
-        .await?;
-    } else {
-        emit_compact_metric(
-            &sess.services.session_telemetry,
-            "local",
-            /*manual*/ false,
-        );
-        run_inline_auto_compact_task(
-            Arc::clone(sess),
-            Arc::clone(turn_context),
-            initial_context_injection,
-            reason,
-            phase,
-        )
-        .await?;
+        RemoteCompactionSupport::V1 | RemoteCompactionSupport::V2 => {
+            emit_compact_metric(
+                &sess.services.session_telemetry,
+                "remote",
+                /*manual*/ false,
+            );
+            run_inline_remote_auto_compact_task(
+                Arc::clone(sess),
+                step_context,
+                fallback_step_context,
+                client_session.turn_state(),
+                initial_context_injection,
+                reason,
+                phase,
+            )
+            .await?;
+        }
+        RemoteCompactionSupport::Unsupported => {
+            emit_compact_metric(
+                &sess.services.session_telemetry,
+                "local",
+                /*manual*/ false,
+            );
+            run_inline_auto_compact_task(
+                Arc::clone(sess),
+                Arc::clone(turn_context),
+                initial_context_injection,
+                reason,
+                phase,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -1184,7 +1321,6 @@ async fn run_sampling_request(
     let base_instructions = sess.get_base_instructions().await;
 
     let tool_runtime = ToolCallRuntime::new(
-        Arc::clone(&router),
         Arc::clone(&sess),
         Arc::clone(&step_context),
         Arc::clone(&turn_diff_tracker),
@@ -1192,13 +1328,13 @@ async fn run_sampling_request(
     let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
         &sess,
         Arc::clone(&step_context),
-        Arc::clone(&router),
         Arc::clone(&turn_diff_tracker),
     );
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
     let mut initial_input = Some(input);
     let mut original_input = None;
+    let mut executed_tool_calls_by_output = HashMap::new();
     loop {
         let prompt_input = if let Some(input) = initial_input.take() {
             input
@@ -1207,6 +1343,13 @@ async fn run_sampling_request(
                 .await
                 .for_prompt(&turn_context.model_info.input_modalities)
         };
+        let mut prompt_input = prompt_input;
+        if let Some(executed_tool_calls) = sess.services.executed_tool_calls.as_ref()
+            && executed_tool_calls
+                .attach_pending_to_prompt(&mut prompt_input, &mut executed_tool_calls_by_output)
+        {
+            codex_protocol::models::bound_executed_tool_calls_for_prompt(&mut prompt_input);
+        }
         let prompt = build_prompt(
             prompt_input,
             router.as_ref(),
@@ -1267,59 +1410,29 @@ async fn run_sampling_request(
     }
 }
 
-#[instrument(level = "trace",
-    skip_all,
-    fields(
-        turn_id = %turn_context.sub_id,
-        model = %turn_context.model_info.slug,
-        apps_enabled = turn_context.apps_enabled()
-    )
-)]
-pub(crate) async fn built_tools(
+pub(crate) struct PreparedToolRecommendations {
+    auth: Option<CodexAuth>,
+    endpoint_candidates: Option<Vec<DiscoverableTool>>,
+}
+
+#[instrument(level = "trace", skip_all)]
+pub(crate) async fn prepare_tool_recommendations(
     sess: &Session,
     turn_context: &TurnContext,
-    environments: &TurnEnvironmentSnapshot,
-    mcp: &codex_mcp::McpBinding,
-    step_store: &ExtensionData,
-) -> (Vec<ToolInfo>, Arc<ToolRouter>) {
-    let all_mcp_tools = mcp.tools().to_vec();
+) -> PreparedToolRecommendations {
     let loaded_plugins = sess
         .services
         .plugins_manager
         .plugins_for_config(&turn_context.config.plugins_config_input())
         .instrument(trace_span!("built_tools.load_plugins"))
         .await;
-    let connector_snapshot = mcp.config().connector_snapshot.clone();
-
-    let apps_enabled = turn_context.apps_enabled();
-    let accessible_connectors =
-        apps_enabled.then(|| connectors::accessible_connectors_from_mcp_tools(&all_mcp_tools));
-    let accessible_connectors_with_enabled_state =
-        accessible_connectors.as_ref().map(|connectors| {
-            connectors::with_app_enabled_state(connectors.clone(), &turn_context.config)
-        });
-    let connectors = if apps_enabled {
-        let connectors = codex_connectors::merge::merge_plugin_connectors_with_accessible(
-            connector_snapshot
-                .connector_ids()
-                .iter()
-                .map(|connector_id| connector_id.0.clone()),
-            accessible_connectors.clone().unwrap_or_default(),
-        );
-        Some(connectors::with_app_enabled_state(
-            connectors,
-            &turn_context.config,
-        ))
-    } else {
-        None
-    };
     let tool_suggest_is_enabled = tool_suggest_enabled(turn_context);
     let auth = if tool_suggest_is_enabled {
         sess.services.auth_manager.auth().await
     } else {
         None
     };
-    let endpoint_recommended_plugin_candidates = if tool_suggest_is_enabled {
+    let endpoint_candidates = if tool_suggest_is_enabled {
         let plugins_config = turn_context.config.plugins_config_input();
         sess.services
             .plugins_manager
@@ -1334,6 +1447,40 @@ pub(crate) async fn built_tools(
     } else {
         None
     };
+
+    PreparedToolRecommendations {
+        auth,
+        endpoint_candidates,
+    }
+}
+
+#[instrument(level = "trace",
+    skip_all,
+    fields(
+        turn_id = %turn_context.sub_id,
+        model = %turn_context.model_info.slug,
+        apps_enabled = turn_context.apps_enabled()
+    )
+)]
+pub(crate) async fn built_tools(
+    sess: &Session,
+    turn_context: &TurnContext,
+    environments: &TurnEnvironmentSnapshot,
+    mcp: &codex_mcp::McpBinding,
+    step_store: &ExtensionData,
+    prepared_recommendations: PreparedToolRecommendations,
+) -> CodexResult<Arc<ToolRouter>> {
+    let all_mcp_tools = mcp.tools();
+    let connector_snapshot = mcp.config().connector_snapshot.clone();
+
+    let apps_enabled = turn_context.apps_enabled();
+    let accessible_connectors =
+        apps_enabled.then(|| connectors::accessible_connectors_from_mcp_tools(all_mcp_tools));
+    let tool_suggest_is_enabled = tool_suggest_enabled(turn_context);
+    let PreparedToolRecommendations {
+        auth,
+        endpoint_candidates: endpoint_recommended_plugin_candidates,
+    } = prepared_recommendations;
     let tool_suggest_candidates =
         if let Some(recommended_plugin_candidates) = endpoint_recommended_plugin_candidates {
             Some(ToolSuggestCandidates {
@@ -1348,9 +1495,7 @@ pub(crate) async fn built_tools(
                 .collect::<Vec<_>>();
             async {
                 if apps_enabled && tool_suggest_is_enabled {
-                    if let Some(accessible_connectors) =
-                        accessible_connectors_with_enabled_state.as_ref()
-                    {
+                    if let Some(accessible_connectors) = accessible_connectors.as_ref() {
                         match connectors::list_tool_suggest_discoverable_tools_with_auth(
                             &turn_context.config,
                             sess.services.plugins_manager.as_ref(),
@@ -1385,29 +1530,15 @@ pub(crate) async fn built_tools(
             .instrument(trace_span!("built_tools.load_discoverable_tools"))
             .await
         };
-    let mcp_tool_runtimes = build_mcp_tool_runtimes(
-        &all_mcp_tools,
-        connectors.as_deref(),
-        &turn_context.config,
-        search_tool_enabled(turn_context),
-    );
-    let tool_router = Arc::new(ToolRouter::from_context(
+    Ok(Arc::new(build_tool_router(
+        sess,
         turn_context,
         environments,
         mcp,
-        ToolRouterParams {
-            tool_runtimes: mcp_tool_runtimes,
-            tool_suggest_candidates,
-            extension_tool_executors: extension_tool_executors(sess, step_store),
-            wait_for_environment_tool_config: sess
-                .services
-                .thread_extension_data
-                .get::<crate::WaitForEnvironmentToolConfig>(),
-            dynamic_tools: turn_context.dynamic_tools.as_slice(),
-        },
-        &sess.services.tool_search_handler_cache,
-    ));
-    (all_mcp_tools, tool_router)
+        apps_enabled,
+        step_store,
+        tool_suggest_candidates.as_ref(),
+    )?))
 }
 
 #[derive(Debug)]
@@ -2015,7 +2146,7 @@ async fn try_run_sampling_request(
 ) -> CodexResult<SamplingRequestResult> {
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
-        approval_policy = turn_context.approval_policy.value(),
+        approval_policy = turn_context.approval_policy(),
         sandbox_policy = &turn_context.sandbox_policy(),
         effort = turn_context.reasoning_effort,
         auth_mode = sess.services.auth_manager.auth_mode(),
@@ -2057,6 +2188,8 @@ async fn try_run_sampling_request(
     )> = None;
     let mut should_emit_turn_diff = false;
     let mut should_emit_token_count = false;
+    const MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE: usize = 256;
+    let mut analytics_tool_call_ids = Vec::new();
     let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
     let plan_mode = turn_context.mode == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
@@ -2112,6 +2245,22 @@ async fn try_run_sampling_request(
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(mut item) => {
                 assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
+                if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
+                    let call_id = match &item {
+                        ResponseItem::FunctionCall { call_id, .. }
+                        | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
+                        ResponseItem::ToolSearchCall { call_id, .. }
+                        | ResponseItem::LocalShellCall { call_id, .. } => call_id.as_deref(),
+                        ResponseItem::WebSearchCall { id, .. }
+                        | ResponseItem::ImageGenerationCall { id, .. } => {
+                            id.as_ref().map(codex_protocol::ResponseItemId::as_str)
+                        }
+                        _ => None,
+                    };
+                    if let Some(call_id) = call_id {
+                        analytics_tool_call_ids.push(call_id.to_string());
+                    }
+                }
                 if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
                     && let Ok(Some(event)) = consumer.finish()
                 {
@@ -2343,6 +2492,16 @@ async fn try_run_sampling_request(
                 token_usage,
                 end_turn,
             } => {
+                sess.services
+                    .analytics_events_client
+                    .track_code_mode_tool_call(
+                        codex_analytics::CodeModeToolCallFact::SamplingResponseCompleted {
+                            thread_id: sess.thread_id.to_string(),
+                            turn_id: turn_context.sub_id.clone(),
+                            response_id: response_id.clone(),
+                            tool_call_ids: std::mem::take(&mut analytics_tool_call_ids),
+                        },
+                    );
                 flush_assistant_text_segments_all(
                     &sess,
                     &turn_context,

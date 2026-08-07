@@ -595,6 +595,7 @@ mod tests {
                 turn_id: turn_id.to_string(),
                 item_id: call_id.to_string(),
                 questions: Vec::new(),
+                is_blocking: true,
                 auto_resolution_ms: None,
             },
         }
@@ -702,8 +703,12 @@ mod tests {
         assert_eq!(snapshot.events.len(), 1);
         assert!(matches!(
             snapshot.events.first(),
-            Some(ThreadBufferedEvent::Request(ServerRequest::ToolRequestUserInput { params, .. }))
-                if params.item_id == "call-1"
+            Some(ThreadBufferedEvent::Request(request))
+                if matches!(
+                    request.as_ref(),
+                    ServerRequest::ToolRequestUserInput { params, .. }
+                        if params.item_id == "call-1"
+                )
         ));
     }
 
@@ -738,7 +743,11 @@ mod tests {
             snapshot.events.iter().all(|event| {
                 !matches!(
                     event,
-                    ThreadBufferedEvent::Request(ServerRequest::ToolRequestUserInput { .. })
+                    ThreadBufferedEvent::Request(request)
+                        if matches!(
+                            request.as_ref(),
+                            ServerRequest::ToolRequestUserInput { .. }
+                        )
                 )
             }),
             "server-resolved request_user_input prompt should not replay on thread switch"
@@ -783,9 +792,11 @@ mod tests {
             snapshot.events.iter().all(|event| {
                 !matches!(
                     event,
-                    ThreadBufferedEvent::Request(
-                        ServerRequest::CommandExecutionRequestApproval { .. }
-                    )
+                    ThreadBufferedEvent::Request(request)
+                        if matches!(
+                            request.as_ref(),
+                            ServerRequest::CommandExecutionRequestApproval { .. }
+                        )
                 )
             }),
             "server-resolved exec approval prompt should not replay on thread switch"
@@ -810,8 +821,12 @@ mod tests {
         assert_eq!(snapshot.events.len(), 1);
         assert!(matches!(
             snapshot.events.first(),
-            Some(ThreadBufferedEvent::Request(ServerRequest::ToolRequestUserInput { params, .. }))
-                if params.item_id == "call-2"
+            Some(ThreadBufferedEvent::Request(request))
+                if matches!(
+                    request.as_ref(),
+                    ServerRequest::ToolRequestUserInput { params, .. }
+                        if params.item_id == "call-2"
+                )
         ));
     }
 
@@ -832,8 +847,12 @@ mod tests {
         assert_eq!(snapshot.events.len(), 1);
         assert!(matches!(
             snapshot.events.first(),
-            Some(ThreadBufferedEvent::Request(ServerRequest::ToolRequestUserInput { params, .. }))
-                if params.item_id == "call-2"
+            Some(ThreadBufferedEvent::Request(request))
+                if matches!(
+                    request.as_ref(),
+                    ServerRequest::ToolRequestUserInput { params, .. }
+                        if params.item_id == "call-2"
+                )
         ));
     }
 
@@ -869,8 +888,12 @@ mod tests {
         assert!(snapshot.events.iter().all(|event| {
             !matches!(
                 event,
-                ThreadBufferedEvent::Request(ServerRequest::CommandExecutionRequestApproval { .. })
-                    | ThreadBufferedEvent::Request(ServerRequest::FileChangeRequestApproval { .. })
+                ThreadBufferedEvent::Request(request)
+                    if matches!(
+                        request.as_ref(),
+                        ServerRequest::CommandExecutionRequestApproval { .. }
+                            | ServerRequest::FileChangeRequestApproval { .. }
+                    )
             )
         }));
     }
@@ -935,7 +958,11 @@ mod tests {
         assert!(store.snapshot().events.iter().all(|event| {
             !matches!(
                 event,
-                ThreadBufferedEvent::Request(ServerRequest::CommandExecutionRequestApproval { .. })
+                ThreadBufferedEvent::Request(request)
+                    if matches!(
+                        request.as_ref(),
+                        ServerRequest::CommandExecutionRequestApproval { .. }
+                    )
             )
         }));
     }

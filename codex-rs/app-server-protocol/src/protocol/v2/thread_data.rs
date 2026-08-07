@@ -2,20 +2,22 @@ use super::CodexErrorInfo;
 use super::ThreadItem;
 use super::ThreadStatus;
 use super::TurnStatus;
+use crate::JsonSchema;
+use crate::TS;
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::protocol::SessionSource as CoreSessionSource;
 use codex_protocol::protocol::SubAgentSource as CoreSubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode as CoreThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource as CoreThreadSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use schemars::JsonSchema;
+#[cfg(test)]
 use schemars::r#gen::SchemaGenerator;
+#[cfg(test)]
 use schemars::schema::Schema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::path::PathBuf;
 use thiserror::Error;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -103,6 +105,7 @@ pub enum ThreadSource {
     MemoryConsolidation,
 }
 
+#[cfg(test)]
 impl JsonSchema for ThreadSource {
     fn schema_name() -> String {
         "ThreadSource".to_string()
@@ -164,6 +167,17 @@ pub struct GitInfo {
     pub origin_url: Option<String>,
 }
 
+/// An independently persisted, user-visible thread section.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSection {
+    /// Opaque UUIDv7 identity that remains stable when the section is renamed.
+    pub id: String,
+    /// The current user-visible section name.
+    pub name: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -183,9 +197,13 @@ pub struct Thread {
     pub preview: String,
     /// Whether the thread is ephemeral and should not be materialized on disk.
     pub ephemeral: bool,
-    /// Whether the thread has been pinned by the user.
+    /// The independently persisted section selected for this thread, if any.
     #[serde(default)]
-    pub is_pinned: bool,
+    pub section: Option<ThreadSection>,
+    /// Unix timestamp in seconds when the thread entered its current section.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub section_entered_at: Option<i64>,
     /// Persisted thread history contract selected when this thread was created.
     #[experimental("thread.historyMode")]
     #[serde(default)]

@@ -178,7 +178,6 @@ impl TurnRequestProcessor {
         params: TurnStartParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
-        supports_openai_form_elicitation: bool,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         validate_user_input_image_urls(&params.input)?;
         self.turn_start_inner(
@@ -186,7 +185,6 @@ impl TurnRequestProcessor {
             params,
             app_server_client_name,
             app_server_client_version,
-            /*supports_openai_form_elicitation*/ supports_openai_form_elicitation,
         )
         .await
         .map(|response| Some(response.into()))
@@ -227,9 +225,11 @@ impl TurnRequestProcessor {
         request_id: &ConnectionRequestId,
         params: TurnInterruptParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.turn_interrupt_inner(request_id, params)
-            .await
-            .map(|response| response.map(Into::into))
+        let result = self.turn_interrupt_inner(request_id, params).await;
+        if let Err(error) = &result {
+            self.track_error_response(request_id, error, /*error_type*/ None);
+        }
+        result.map(|response| response.map(Into::into))
     }
 
     pub(crate) async fn thread_realtime_start(
@@ -477,7 +477,6 @@ impl TurnRequestProcessor {
         params: TurnStartParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
-        supports_openai_form_elicitation: bool,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let (thread_id, thread) =
             self.load_thread(&params.thread_id)
@@ -504,15 +503,6 @@ impl TurnRequestProcessor {
         .inspect_err(|error| {
             self.track_error_response(&request_id, error, /*error_type*/ None);
         })?;
-        thread
-            .set_openai_form_elicitation_support(supports_openai_form_elicitation)
-            .await
-            .map_err(|err| {
-                internal_error(format!(
-                    "failed to update OpenAI form elicitation support: {err}"
-                ))
-            })?;
-
         let runtime_workspace_roots = params
             .runtime_workspace_roots
             .map(resolve_runtime_workspace_roots);
@@ -1073,6 +1063,7 @@ impl TurnRequestProcessor {
             thread.as_ref(),
             Op::RealtimeConversationStart(ConversationStartParams {
                 client_managed_handoffs: params.client_managed_handoffs.unwrap_or(false),
+                delegation_ack_filler: params.delegation_ack_filler,
                 flush_transcript_tail_on_session_end: params
                     .flush_transcript_tail_on_session_end
                     .unwrap_or(false),
@@ -1093,6 +1084,8 @@ impl TurnRequestProcessor {
                         role: item.role,
                     })
                     .collect(),
+                realtime_start_instructions: params.realtime_start_instructions,
+                realtime_end_instructions: params.realtime_end_instructions,
                 prompt: params.prompt,
                 realtime_session_id: params.realtime_session_id,
                 transport: params.transport.map(|transport| match transport {

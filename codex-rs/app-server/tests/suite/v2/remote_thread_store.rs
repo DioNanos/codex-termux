@@ -37,6 +37,10 @@ use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadSectionCreateParams;
+use codex_app_server_protocol::ThreadSectionDeleteParams;
+use codex_app_server_protocol::ThreadSectionListParams;
+use codex_app_server_protocol::ThreadSectionUpdateParams;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
@@ -54,6 +58,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_state::PINNED_THREAD_SECTION_ID;
 use codex_thread_store::CreateThreadParams as StoreCreateThreadParams;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::ThreadPersistenceMetadata;
@@ -65,6 +70,97 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[tokio::test]
+async fn thread_section_operations_without_sqlite_return_method_not_found() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let store_id = Uuid::new_v4().to_string();
+    create_config_toml_with_thread_store(codex_home.path(), "http://127.0.0.1:1", &store_id)?;
+    let _in_memory_store = InMemoryThreadStoreId { store_id };
+    let client = start_in_process_server(codex_home.path()).await?;
+
+    let section_id = Uuid::now_v7().to_string();
+
+    for request in [
+        ClientRequest::ThreadSectionList {
+            request_id: RequestId::Integer(1),
+            params: ThreadSectionListParams::default(),
+        },
+        ClientRequest::ThreadSectionCreate {
+            request_id: RequestId::Integer(2),
+            params: ThreadSectionCreateParams {
+                name: "Work".to_string(),
+            },
+        },
+        ClientRequest::ThreadSectionUpdate {
+            request_id: RequestId::Integer(3),
+            params: ThreadSectionUpdateParams {
+                section_id: section_id.clone(),
+                name: "Projects".to_string(),
+            },
+        },
+        ClientRequest::ThreadSectionDelete {
+            request_id: RequestId::Integer(4),
+            params: ThreadSectionDeleteParams { section_id },
+        },
+        ClientRequest::ThreadSectionCreate {
+            request_id: RequestId::Integer(5),
+            params: ThreadSectionCreateParams {
+                name: " ".to_string(),
+            },
+        },
+        ClientRequest::ThreadSectionUpdate {
+            request_id: RequestId::Integer(6),
+            params: ThreadSectionUpdateParams {
+                section_id: " ".to_string(),
+                name: "Work".to_string(),
+            },
+        },
+        ClientRequest::ThreadSectionUpdate {
+            request_id: RequestId::Integer(7),
+            params: ThreadSectionUpdateParams {
+                section_id: PINNED_THREAD_SECTION_ID.to_string(),
+                name: "Pinned again".to_string(),
+            },
+        },
+        ClientRequest::ThreadSectionDelete {
+            request_id: RequestId::Integer(8),
+            params: ThreadSectionDeleteParams {
+                section_id: " ".to_string(),
+            },
+        },
+        ClientRequest::ThreadSectionDelete {
+            request_id: RequestId::Integer(9),
+            params: ThreadSectionDeleteParams {
+                section_id: PINNED_THREAD_SECTION_ID.to_string(),
+            },
+        },
+        ClientRequest::ThreadSectionUpdate {
+            request_id: RequestId::Integer(10),
+            params: ThreadSectionUpdateParams {
+                section_id: PINNED_THREAD_SECTION_ID.to_string(),
+                name: " ".to_string(),
+            },
+        },
+    ] {
+        let method = request.method_name();
+        let error = client
+            .request(request)
+            .await?
+            .expect_err("section management requires sqlite state");
+
+        assert_eq!(error.code, -32601);
+        assert_eq!(
+            error.message,
+            format!("{method} is unavailable without sqlite state")
+        );
+    }
+
+    client.shutdown().await?;
+    assert_no_local_persistence_artifacts(codex_home.path())?;
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn thread_start_rejects_paginated_history_without_list_support() -> Result<()> {
@@ -155,9 +251,8 @@ async fn thread_delete_with_non_local_thread_store_does_not_create_local_persist
             let Some(event) = client.next_event().await else {
                 anyhow::bail!("in-process app-server stopped before turn/completed");
             };
-            if let InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
-                completed,
-            )) = event
+            if let InProcessServerEvent::ServerNotification(notification) = event
+                && let ServerNotification::TurnCompleted(completed) = notification.as_ref()
                 && completed.thread_id == thread.id
             {
                 return Ok::<(), anyhow::Error>(());
@@ -177,7 +272,7 @@ async fn thread_delete_with_non_local_thread_store_does_not_create_local_persist
                 model_providers: Some(Vec::new()),
                 source_kinds: None,
                 archived: None,
-                is_pinned: None,
+                section_id: None,
                 cwd: None,
                 use_state_db_only: false,
                 search_term: None,
@@ -296,9 +391,8 @@ async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
             let Some(event) = client.next_event().await else {
                 anyhow::bail!("in-process app-server stopped before turn/completed");
             };
-            if let InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
-                completed,
-            )) = event
+            if let InProcessServerEvent::ServerNotification(notification) = event
+                && let ServerNotification::TurnCompleted(completed) = notification.as_ref()
                 && completed.thread_id == thread.id
             {
                 return Ok::<(), anyhow::Error>(());
@@ -432,14 +526,13 @@ fn assert_no_local_persistence_artifacts(codex_home: &Path) -> Result<()> {
         "non-local thread persistence should not create sqlite artifacts: {sqlite_artifacts:?}"
     );
     let mut entries = codex_home_entries(codex_home)?;
-    // Bazel test runs may initialize shell snapshot storage under codex_home.
-    // That is not thread persistence; keep the assertion focused on rollout,
-    // session, sqlite, and other unexpected thread-store artifacts.
+    // Host startup may leave sandbox migration markers, and Bazel test runs may
+    // initialize shell snapshot storage. Neither is thread persistence.
+    entries.remove(".sandbox_migration");
     entries.remove("shell_snapshots");
     assert_eq!(
         entries,
         BTreeSet::from([
-            ".sandbox_migration".to_string(),
             "config.toml".to_string(),
             "installation_id".to_string(),
             "skills".to_string(),

@@ -34,12 +34,14 @@ async fn catalog_permission_message_loaded_from_remote_models_is_sent() -> Resul
         instructions_template: None,
         instructions_variables: None,
         approvals: None,
+        collaboration_modes: None,
         auto_review: None,
         permissions: Some(PermissionMessages {
             danger_full_access: None,
             workspace_write: None,
             read_only: Some("remote catalog permissions: {{ network_access }}".to_string()),
         }),
+        token_budget: None,
     });
     let models_mock = mount_models_once(
         &server,

@@ -13,6 +13,7 @@ use crate::facts::CompactionStrategy;
 use crate::facts::CompactionTrigger;
 use crate::facts::GoalEventKind;
 use crate::facts::HookRunFact;
+use crate::facts::ImagePreparationMetadata;
 use crate::facts::InvocationType;
 use crate::facts::PluginInstallRequested;
 use crate::facts::PluginState;
@@ -538,6 +539,10 @@ pub(crate) struct CodexToolItemEventBase {
     /// App-server ThreadItem.id. For tool-originated items this generally
     /// corresponds to the originating core call_id.
     pub(crate) item_id: String,
+    pub(crate) cell_id: Option<String>,
+    pub(crate) parent_call_id: Option<String>,
+    pub(crate) originating_response_id: Option<String>,
+    pub(crate) subsequent_response_id: Option<String>,
     pub(crate) app_server_client: CodexAppServerClientMetadata,
     pub(crate) runtime: CodexRuntimeMetadata,
     pub(crate) thread_source: Option<ThreadSource>,
@@ -895,8 +900,12 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) personality: Option<String>,
     pub(crate) workspace_kind: Option<String>,
     pub(crate) num_input_images: usize,
+    pub(crate) image_preparations: Vec<ImagePreparationMetadata>,
     pub(crate) is_first_turn: bool,
     pub(crate) status: Option<TurnStatus>,
+    /// Client wall-clock time for the first non-startup turn/interrupt request
+    /// that later received a successful response.
+    pub(crate) explicit_client_interrupt_requested_at_ms: Option<u64>,
     pub(crate) turn_error: Option<CodexErrorInfo>,
     pub(crate) codex_error_kind: Option<CodexErrKind>,
     pub(crate) codex_error_http_status_code: Option<u16>,

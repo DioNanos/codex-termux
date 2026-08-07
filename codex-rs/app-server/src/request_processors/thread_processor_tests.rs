@@ -39,7 +39,7 @@ mod thread_list_cwd_filter_tests {
 mod background_terminal_pagination_tests {
     use super::super::paginate_background_terminals;
     use codex_app_server_protocol::ThreadBackgroundTerminal;
-    use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_path_uri::LegacyAppPathString;
     use pretty_assertions::assert_eq;
 
     fn terminal(process_id: &str) -> ThreadBackgroundTerminal {
@@ -49,7 +49,7 @@ mod background_terminal_pagination_tests {
             item_id: format!("item-{process_id}"),
             process_id: process_id.to_string(),
             command: format!("command-{process_id}"),
-            cwd: AbsolutePathBuf::from_absolute_path(cwd).expect("absolute cwd"),
+            cwd: LegacyAppPathString::from_string(cwd),
             os_pid: None,
             cpu_percent: None,
             rss_kb: None,
@@ -480,7 +480,9 @@ mod thread_processor_behavior_tests {
             updated_at: updated_at.with_timezone(&Utc),
             recency_at: updated_at.with_timezone(&Utc),
             archived_at: None,
-            is_pinned: false,
+            section: None,
+            section_position: None,
+            section_entered_at: None,
             cwd: PathBuf::from("/tmp"),
             cli_version: "0.0.0".to_string(),
             source: SessionSource::Cli,
@@ -1168,6 +1170,7 @@ mod thread_processor_behavior_tests {
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),
                     questions: vec![],
+                    is_blocking: true,
                     auto_resolution_ms: None,
                 },
             ))

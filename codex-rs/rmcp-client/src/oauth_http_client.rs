@@ -7,9 +7,10 @@ use codex_exec_server::HttpClient;
 use codex_exec_server::HttpHeader;
 use codex_exec_server::HttpRedirectPolicy;
 use codex_exec_server::HttpRequestParams;
+use http::HeaderMap;
+use http::header::AUTHORIZATION;
 use oauth2::HttpRequest;
 use oauth2::HttpResponse;
-use reqwest::header::HeaderMap;
 use rmcp::transport::auth::OAuthHttpClient;
 use rmcp::transport::auth::OAuthHttpClientError;
 use rmcp::transport::auth::OAuthHttpClientFuture;
@@ -17,35 +18,74 @@ use rmcp::transport::auth::OAuthHttpRedirectPolicy;
 use rmcp::transport::auth::OAuthHttpRequest;
 
 use crate::auth_status::OAuthDiscoveryTimeout;
+use crate::http_client_adapter::StreamableHttpRedirectMode;
 
 const MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 static NEXT_OAUTH_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, thiserror::Error)]
+enum OAuthHttpClientAdapterError {
+    #[error("unsupported OAuth HTTP redirect policy")]
+    UnsupportedRedirectPolicy,
+    #[error("OAuth HTTP response body exceeds {maximum_bytes} bytes")]
+    ResponseBodyTooLarge { maximum_bytes: usize },
+}
+
+fn oauth_http_client_error(
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> OAuthHttpClientError {
+    Box::new(error)
+}
 
 #[derive(Clone)]
 pub(crate) struct OAuthHttpClientAdapter {
     http_client: Arc<dyn HttpClient>,
     default_headers: HeaderMap,
     timeout: OAuthDiscoveryTimeout,
+    has_configured_headers: bool,
+    redirect_mode: StreamableHttpRedirectMode,
 }
 
 impl OAuthHttpClientAdapter {
+    #[cfg(test)]
     pub(crate) fn new(http_client: Arc<dyn HttpClient>, default_headers: HeaderMap) -> Self {
         Self {
             http_client,
             default_headers,
             timeout: OAuthDiscoveryTimeout::Requested,
+            has_configured_headers: false,
+            redirect_mode: StreamableHttpRedirectMode::Legacy,
         }
     }
 
-    pub(crate) fn new_with_max_timeout(
+    pub(crate) fn new_with_redirect_mode(
+        http_client: Arc<dyn HttpClient>,
+        default_headers: HeaderMap,
+        has_configured_headers: bool,
+        redirect_mode: StreamableHttpRedirectMode,
+    ) -> Self {
+        Self {
+            http_client,
+            default_headers,
+            timeout: OAuthDiscoveryTimeout::Requested,
+            has_configured_headers,
+            redirect_mode,
+        }
+    }
+
+    pub(crate) fn new_with_max_timeout_and_redirect_mode(
         http_client: Arc<dyn HttpClient>,
         default_headers: HeaderMap,
         max_timeout: Duration,
+        has_configured_headers: bool,
+        redirect_mode: StreamableHttpRedirectMode,
     ) -> Self {
         Self {
             http_client,
             default_headers,
             timeout: OAuthDiscoveryTimeout::Capped(max_timeout),
+            has_configured_headers,
+            redirect_mode,
         }
     }
 
@@ -59,8 +99,8 @@ impl OAuthHttpClientAdapter {
             OAuthHttpRedirectPolicy::Follow => HttpRedirectPolicy::Follow,
             OAuthHttpRedirectPolicy::Stop => HttpRedirectPolicy::Stop,
             _ => {
-                return Err(OAuthHttpClientError::new(
-                    "unsupported OAuth HTTP redirect policy",
+                return Err(oauth_http_client_error(
+                    OAuthHttpClientAdapterError::UnsupportedRedirectPolicy,
                 ));
             }
         };
@@ -70,15 +110,19 @@ impl OAuthHttpClientAdapter {
             headers.remove(name);
         }
         headers.extend(parts.headers);
+        let redirect_policy = oauth_redirect_policy(
+            self.redirect_mode,
+            &headers,
+            self.has_configured_headers,
+            redirect_policy,
+        );
+
         let headers = headers
             .iter()
             .map(|(name, value)| {
                 Ok(HttpHeader {
                     name: name.as_str().to_string(),
-                    value: value
-                        .to_str()
-                        .map_err(|error| OAuthHttpClientError::new(error.to_string()))?
-                        .to_string(),
+                    value: value.to_str().map_err(oauth_http_client_error)?.to_string(),
                 })
             })
             .collect::<Result<Vec<_>, OAuthHttpClientError>>()?;
@@ -107,17 +151,15 @@ impl OAuthHttpClientAdapter {
                 stream_response: true,
             })
             .await
-            .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+            .map_err(oauth_http_client_error)?;
         let mut body = Vec::new();
-        while let Some(chunk) = body_stream
-            .recv()
-            .await
-            .map_err(|error| OAuthHttpClientError::new(error.to_string()))?
-        {
+        while let Some(chunk) = body_stream.recv().await.map_err(oauth_http_client_error)? {
             if chunk.len() > MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES - body.len() {
-                return Err(OAuthHttpClientError::new(format!(
-                    "OAuth HTTP response body exceeds {MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES} bytes"
-                )));
+                return Err(oauth_http_client_error(
+                    OAuthHttpClientAdapterError::ResponseBodyTooLarge {
+                        maximum_bytes: MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES,
+                    },
+                ));
             }
             body.extend_from_slice(&chunk);
         }
@@ -125,14 +167,88 @@ impl OAuthHttpClientAdapter {
         for header in response.headers {
             builder = builder.header(header.name, header.value);
         }
-        builder
-            .body(body)
-            .map_err(|error| OAuthHttpClientError::new(error.to_string()))
+        builder.body(body).map_err(oauth_http_client_error)
+    }
+}
+
+fn oauth_redirect_policy(
+    mode: StreamableHttpRedirectMode,
+    headers: &HeaderMap,
+    has_configured_headers: bool,
+    requested_policy: HttpRedirectPolicy,
+) -> HttpRedirectPolicy {
+    if mode == StreamableHttpRedirectMode::AgentPluginV1
+        && (has_configured_headers || headers.contains_key(AUTHORIZATION))
+    {
+        HttpRedirectPolicy::Stop
+    } else {
+        requested_policy
     }
 }
 
 impl OAuthHttpClient for OAuthHttpClientAdapter {
     fn execute(&self, request: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
         Box::pin(self.execute_request(request.request, request.redirect_policy, request.timeout))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http::HeaderValue;
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn agent_plugin_oauth_stops_only_for_sensitive_headers() {
+        assert_eq!(
+            policy(
+                StreamableHttpRedirectMode::AgentPluginV1,
+                /*has_configured_headers*/ true,
+                /*has_authorization*/ false,
+            ),
+            HttpRedirectPolicy::Stop
+        );
+        assert_eq!(
+            policy(
+                StreamableHttpRedirectMode::AgentPluginV1,
+                /*has_configured_headers*/ false,
+                /*has_authorization*/ true,
+            ),
+            HttpRedirectPolicy::Stop
+        );
+        assert_eq!(
+            policy(
+                StreamableHttpRedirectMode::AgentPluginV1,
+                /*has_configured_headers*/ false,
+                /*has_authorization*/ false,
+            ),
+            HttpRedirectPolicy::Follow
+        );
+        assert_eq!(
+            policy(
+                StreamableHttpRedirectMode::Legacy,
+                /*has_configured_headers*/ true,
+                /*has_authorization*/ true,
+            ),
+            HttpRedirectPolicy::Follow
+        );
+    }
+
+    fn policy(
+        mode: StreamableHttpRedirectMode,
+        has_configured_headers: bool,
+        has_authorization: bool,
+    ) -> HttpRedirectPolicy {
+        let mut headers = HeaderMap::new();
+        if has_authorization {
+            headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+        }
+        oauth_redirect_policy(
+            mode,
+            &headers,
+            has_configured_headers,
+            HttpRedirectPolicy::Follow,
+        )
     }
 }

@@ -23,7 +23,9 @@ pub(super) fn chatgpt_auth_provider_for_server(
     server: &EffectiveMcpServer,
     chatgpt_auth_provider: Option<SharedAuthProvider>,
 ) -> Option<SharedAuthProvider> {
-    if !matches!(&server.config().auth, McpServerAuth::ChatGpt) {
+    if !matches!(&server.config().auth, McpServerAuth::ChatGpt)
+        || !server.config().is_local_environment()
+    {
         return None;
     }
     chatgpt_auth_provider
@@ -62,6 +64,7 @@ pub(super) fn mcp_startup_failure_reason(
         }
         Some(
             McpAuthState::Unsupported
+            | McpAuthState::Unknown
             | McpAuthState::LoggedOut(McpLoginRequirement::Login)
             | McpAuthState::BearerToken
             | McpAuthState::OAuth,

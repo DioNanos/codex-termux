@@ -56,9 +56,8 @@ What this fork does not do:
 ## Releases and Updates
 
 - Latest GitHub release: [releases/latest](https://github.com/DioNanos/codex-termux/releases/latest)
-- Upstream base: OpenAI Codex `rust-v0.146.1`. The `0.146.1` Android package
-  follows the exact-artifact release flow; npm dist-tags and GitHub Releases
-  are authoritative for current publication status.
+- Upstream base: OpenAI Codex `rust-v0.147.0`, published as `0.147.0` on the npm
+  `latest` channel with a matching GitHub tag and release.
 - npm package: [`@mmmbuto/codex-cli-termux`](https://www.npmjs.com/package/@mmmbuto/codex-cli-termux)
 - Legacy `@mmmbuto/codex-cli-lts` (OpenAI Codex 0.80.x) is archived; current builds live in this package or in [`@mmmbuto/codex-vl`](https://www.npmjs.com/package/@mmmbuto/codex-vl) (multi-platform).
 
@@ -78,8 +77,9 @@ Maintainer publish flow:
 - [Changelog](./CHANGELOG.md)
 - [Patch inventory](./patches/README.md)
 - [Building from source](./BUILDING.md)
-- The 0.146.1 on-device validation summary is pending the release artifact and
-  post-build device testing.
+- On-device validation of `0.147.0` on a physical Termux install is still
+  outstanding; in particular the TLS trust store, since the Termux-specific root
+  handling was retired when upstream removed the client it wrapped.
 - [Install docs](./docs/install.md)
 - [Authentication](./docs/authentication.md)
 - [Configuration](./docs/config.md)

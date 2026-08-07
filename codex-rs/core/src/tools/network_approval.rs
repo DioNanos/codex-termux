@@ -7,6 +7,7 @@ use crate::guardian::routes_approval_to_guardian;
 use crate::hook_runtime::run_permission_request_hooks;
 use crate::network_policy_decision::denied_network_policy_message;
 use crate::session::session::Session;
+use crate::session::turn_context::TurnEnvironment;
 use crate::tools::events::truncate_rejection_message;
 use crate::tools::sandboxing::PermissionRequestPayload;
 use crate::tools::sandboxing::ToolError;
@@ -28,6 +29,7 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::WarningEvent;
+use codex_sandboxing::record_network_sandbox_violation;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -59,6 +61,7 @@ pub(crate) struct NetworkApprovalSpec {
     pub trigger: GuardianNetworkAccessTrigger,
     pub command: String,
     pub environment_id: String,
+    pub permission_profile: PermissionProfile,
 }
 
 #[derive(Clone, Debug)]
@@ -264,6 +267,7 @@ struct ActiveNetworkApprovalCall {
     trigger: GuardianNetworkAccessTrigger,
     command: String,
     environment_id: String,
+    permission_profile: PermissionProfile,
     cancellation_token: CancellationToken,
 }
 
@@ -397,28 +401,11 @@ impl NetworkApprovalService {
         other_approved_hosts.extend(approved_hosts.iter().cloned());
     }
 
-    async fn register_call(
-        &self,
-        registration_id: String,
-        turn_id: String,
-        trigger: GuardianNetworkAccessTrigger,
-        command: String,
-        environment_id: String,
-        cancellation_token: CancellationToken,
-    ) {
+    async fn register_call(&self, call: ActiveNetworkApprovalCall) {
         let mut calls = self.calls.lock().await;
-        let key = registration_id.clone();
-        calls.active_calls.insert(
-            key,
-            Arc::new(ActiveNetworkApprovalCall {
-                registration_id,
-                turn_id,
-                trigger,
-                command,
-                environment_id,
-                cancellation_token,
-            }),
-        );
+        calls
+            .active_calls
+            .insert(call.registration_id.clone(), Arc::new(call));
     }
 
     pub(crate) async fn unregister_call(&self, registration_id: &str) {
@@ -710,7 +697,17 @@ impl NetworkApprovalService {
                 .map(|call| call.cancellation_token.clone()),
         );
 
-        if !permission_profile_allows_network_approval_flow(&turn_context.permission_profile()) {
+        let permission_profile = owner_call
+            .as_ref()
+            .map(|call| &call.permission_profile)
+            .or_else(|| {
+                turn_context
+                    .environments
+                    .turn_environments()
+                    .find(|environment| environment.environment_id == environment_id)
+                    .map(TurnEnvironment::permission_profile)
+            });
+        if !permission_profile.is_some_and(permission_profile_allows_network_approval_flow) {
             if let Some(owner_call) = owner_call.as_ref() {
                 self.record_call_outcome(
                     &owner_call.registration_id,
@@ -721,7 +718,7 @@ impl NetworkApprovalService {
             pending_owner.complete(PendingApprovalDecision::Deny);
             return NetworkDecision::deny(REASON_NOT_ALLOWED);
         }
-        if !allows_network_approval_flow(turn_context.approval_policy.value()) {
+        if !allows_network_approval_flow(turn_context.approval_policy()) {
             if let Some(owner_call) = owner_call.as_ref() {
                 self.record_call_outcome(
                     &owner_call.registration_id,
@@ -920,12 +917,25 @@ impl NetworkApprovalService {
                                 .await;
                         }
                     }
-                    {
-                        let mut denied_hosts = self.session_denied_hosts.lock().await;
-                        denied_hosts.remove(&key);
+                    if pending_owner.decision_on_drop == PendingApprovalDecision::AllowForSession {
+                        {
+                            let mut denied_hosts = self.session_denied_hosts.lock().await;
+                            denied_hosts.remove(&key);
+                        }
+                        self.session_approved_hosts.lock().await.insert(key.clone());
+                        PendingApprovalDecision::AllowForSession
+                    } else {
+                        if let Some(owner_call) = owner_call.as_ref() {
+                            self.record_call_outcome(
+                                &owner_call.registration_id,
+                                NetworkApprovalOutcome::DeniedByPolicy(
+                                    policy_denial_message.clone(),
+                                ),
+                            )
+                            .await;
+                        }
+                        PendingApprovalDecision::Deny
                     }
-                    self.session_approved_hosts.lock().await.insert(key.clone());
-                    PendingApprovalDecision::AllowForSession
                 }
                 NetworkPolicyRuleAction::Deny => {
                     match session
@@ -1034,6 +1044,7 @@ pub(crate) fn build_blocked_request_observer(
     Arc::new(move |blocked: BlockedRequest| {
         let network_approval = Arc::clone(&network_approval);
         async move {
+            record_network_sandbox_violation(&blocked);
             network_approval.record_blocked_request(blocked).await;
         }
     })
@@ -1069,6 +1080,7 @@ pub(crate) async fn begin_network_approval(
         trigger,
         command,
         environment_id,
+        permission_profile,
     } = match spec {
         Some(spec) => spec,
         None => return Ok(None),
@@ -1093,14 +1105,15 @@ pub(crate) async fn begin_network_approval(
     session
         .services
         .network_approval
-        .register_call(
-            registration_id.clone(),
-            turn_id.to_string(),
+        .register_call(ActiveNetworkApprovalCall {
+            registration_id: registration_id.clone(),
+            turn_id: turn_id.to_string(),
             trigger,
             command,
             environment_id,
-            cancellation_token.clone(),
-        )
+            permission_profile,
+            cancellation_token: cancellation_token.clone(),
+        })
         .await;
 
     Ok(Some(ActiveNetworkApproval {

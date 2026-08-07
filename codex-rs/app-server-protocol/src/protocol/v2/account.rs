@@ -1,3 +1,5 @@
+use crate::JsonSchema;
+use crate::TS;
 use crate::protocol::common::AuthMode;
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::account::PlanType;
@@ -7,11 +9,9 @@ use codex_protocol::protocol::RateLimitReachedType as CoreRateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow as CoreRateLimitWindow;
 use codex_protocol::protocol::SpendControlLimitSnapshot as CoreSpendControlLimitSnapshot;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -25,7 +25,10 @@ pub enum Account {
     #[serde(rename = "chatgpt", rename_all = "camelCase")]
     #[ts(rename = "chatgpt", rename_all = "camelCase")]
     Chatgpt {
-        #[schemars(required, schema_with = "nullable_string_schema")]
+        #[schemars(
+            required,
+            schema_with = "crate::protocol::serde_helpers::nullable_string_schema"
+        )]
         email: Option<String>,
         plan_type: PlanType,
     },
@@ -36,12 +39,6 @@ pub enum Account {
         #[serde(default)]
         uses_codex_managed_credentials: bool,
     },
-}
-
-fn nullable_string_schema(
-    generator: &mut schemars::r#gen::SchemaGenerator,
-) -> schemars::schema::Schema {
-    generator.subschema_for::<Option<String>>()
 }
 
 impl From<ProviderAccount> for Account {
@@ -675,4 +672,13 @@ pub struct AccountLoginCompletedNotification {
     pub login_id: Option<String>,
     pub success: bool,
     pub error: Option<String>,
+    pub onboarding_entrypoint: Option<DesktopOnboardingEntrypoint>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub enum DesktopOnboardingEntrypoint {
+    LifeSciences,
 }

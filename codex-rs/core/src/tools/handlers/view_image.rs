@@ -244,6 +244,7 @@ impl ToolOutput for ViewImageOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PermissionProfileSnapshot;
     use crate::environment_selection::TurnEnvironmentState;
     use crate::session::step_context::StepContext;
     use crate::session::tests::make_session_and_context;
@@ -273,6 +274,7 @@ mod tests {
             PathUri::from_abs_path(&cwd),
             Vec::new(),
             current.shell,
+            current.config,
         ));
     }
 
@@ -315,7 +317,16 @@ mod tests {
         replace_primary_environment_cwd(&mut turn, image_cwd.clone());
         let image_path = image_cwd.join("image.png");
         std::fs::write(image_path.as_path(), b"not a real image").expect("write test image");
-        turn.permission_profile = PermissionProfile::read_only();
+        Arc::make_mut(&mut turn.config)
+            .permissions
+            .set_permission_profile(PermissionProfile::Disabled)
+            .expect("set thread permission profile");
+        let TurnEnvironmentState::Ready(environment) = &mut turn.environments.environments[0]
+        else {
+            panic!("primary environment should be ready");
+        };
+        environment.config.permission_profile =
+            PermissionProfileSnapshot::legacy(PermissionProfile::read_only());
         let turn = Arc::new(turn);
 
         let result = ViewImageHandler::default()
@@ -382,10 +393,12 @@ mod tests {
         replace_primary_environment_cwd(&mut turn, image_cwd.clone());
         let image_path = image_cwd.join("image.png");
         std::fs::write(image_path.as_path(), b"not a real image").expect("write test image");
-        Arc::make_mut(&mut turn.config)
-            .permissions
-            .set_permission_profile(PermissionProfile::Disabled)
-            .expect("set permission profile");
+        let TurnEnvironmentState::Ready(environment) = &mut turn.environments.environments[0]
+        else {
+            panic!("primary environment should be ready");
+        };
+        environment.config.permission_profile =
+            PermissionProfileSnapshot::legacy(PermissionProfile::Disabled);
         let turn = Arc::new(turn);
 
         let result = ViewImageHandler::default()

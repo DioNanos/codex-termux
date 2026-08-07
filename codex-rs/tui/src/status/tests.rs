@@ -365,7 +365,7 @@ async fn status_snapshot_shows_chatgpt_plan_without_email() {
 
     write_chatgpt_auth(
         temp_home.path(),
-        ChatGptAuthFixture::new("access-chatgpt").plan_type("enterprise"),
+        ChatGptAuthFixture::new("access-chatgpt").plan_type("enterprise_cbp_automation"),
         AuthCredentialsStoreMode::File,
     )
     .expect("write email-less ChatGPT auth");
@@ -384,7 +384,7 @@ async fn status_snapshot_shows_chatgpt_plan_without_email() {
         account_display,
         StatusAccountDisplay::ChatGpt {
             email: None,
-            plan: Some("Enterprise".to_string()),
+            plan: Some("Enterprise (Automation)".to_string()),
         }
     );
     let usage = TokenUsage::default();
@@ -1520,6 +1520,42 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
             *line = line.replace('\\', "/");
         }
     }
+    let sanitized = sanitize_directory(rendered_lines).join("\n");
+
+    assert_snapshot!(sanitized);
+}
+
+#[tokio::test]
+async fn status_snapshot_truncates_halfwidth_kana_in_narrow_terminal() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
+
+    let account = StatusAccountDisplay::ChatGpt {
+        email: Some("ｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟ@example.com".to_string()),
+        plan: Some("ｶﾞﾊﾟ plan".to_string()),
+    };
+    let usage = TokenUsage::default();
+    let now = chrono::Local
+        .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
+        .single()
+        .expect("timestamp");
+    let composite = new_status_output(
+        &config,
+        Some(&account),
+        /*token_info*/ None,
+        &usage,
+        &None,
+        Some("ｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟ thread".to_string()),
+        /*forked_from*/ None,
+        /*rate_limits*/ None,
+        /*plan_type*/ None,
+        now,
+        "ｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟ-model",
+        Some("ｶﾞﾊﾟ collaboration mode"),
+        /*reasoning_effort_override*/ None,
+    );
+    let rendered_lines = render_lines(&composite.display_lines(/*width*/ 42));
     let sanitized = sanitize_directory(rendered_lines).join("\n");
 
     assert_snapshot!(sanitized);

@@ -13,6 +13,7 @@ use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::parse_arguments_with_base_path;
+use crate::tools::handlers::resolve_sandbox_permissions;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::rewrite_function_string_argument;
 use crate::tools::handlers::updated_hook_command;
@@ -155,8 +156,7 @@ impl ExecCommandHandler {
         // permissions config below. Consult the configured platform-sandbox requirement before
         // deciding whether parsing may continue without that base path.
         let sandbox = SandboxManager::new().select_initial(
-            &turn.file_system_sandbox_policy(),
-            turn.network_sandbox_policy(),
+            turn_environment.permission_profile(),
             SandboxablePreference::Auto,
             turn.windows_sandbox_level,
             turn.network.is_some(),
@@ -189,6 +189,8 @@ impl ExecCommandHandler {
                 parse_arguments(&arguments)?
             }
         };
+        let sandbox_permissions =
+            resolve_sandbox_permissions(args.sandbox_permissions, args.justification.as_deref())?;
         let hook_command = args.cmd.clone();
         // TODO(anp) wire PathUri through implicit skills instead of skipping on foreign paths
         if let Some(native_cwd) = native_cwd.as_ref() {
@@ -233,7 +235,7 @@ impl ExecCommandHandler {
             &args,
             shell,
             &shell_mode,
-            turn.config.permissions.allow_login_shell,
+            turn_environment.config.allow_login_shell,
         )
         .map_err(FunctionCallError::RespondToModel)?;
         let command = resolved_command.command;
@@ -244,7 +246,7 @@ impl ExecCommandHandler {
             tty,
             yield_time_ms,
             max_output_tokens,
-            sandbox_permissions,
+            sandbox_permissions: _,
             additional_permissions,
             justification,
             prefix_rule,
@@ -275,11 +277,11 @@ impl ExecCommandHandler {
             .requests_sandbox_override()
             && !effective_additional_permissions.permissions_preapproved
             && !matches!(
-                context.turn.approval_policy.value(),
+                context.turn.approval_policy(),
                 codex_protocol::protocol::AskForApproval::OnRequest
             )
         {
-            let approval_policy = context.turn.approval_policy.value();
+            let approval_policy = context.turn.approval_policy();
             manager.release_process_id(process_id).await;
             return Err(FunctionCallError::RespondToModel(format!(
                 "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
@@ -295,7 +297,7 @@ impl ExecCommandHandler {
             || {
                 normalize_and_validate_additional_permissions(
                     additional_permissions_allowed,
-                    context.turn.approval_policy.value(),
+                    context.turn.approval_policy(),
                     effective_additional_permissions.sandbox_permissions,
                     effective_additional_permissions.additional_permissions,
                     effective_additional_permissions.permissions_preapproved,
