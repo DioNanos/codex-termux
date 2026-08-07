@@ -406,6 +406,18 @@ else
   fail
 fi
 
+printf "Patch #28 (musl ripgrep in the musl aarch64 payload): "
+# Version-agnostic on purpose: anchoring this to a ripgrep version would go stale at the
+# next bump and quietly stop guarding. What must never come back is the gnu artifact in a
+# manifest whose consumers are musl targets — a merge that takes upstream's file restores
+# it with no compilation signal, and rg then fails at runtime on the device.
+if ! grep -q 'aarch64-unknown-linux-gnu' scripts/codex_package/rg \
+  && [ "$(grep -c 'aarch64-unknown-linux-musl' scripts/codex_package/rg)" -ge 2 ]; then
+  pass
+else
+  fail
+fi
+
 printf "release version contract (Cargo/npm/notes/changelog): "
 cargo_workspace_version="$(awk '
   /^\[workspace.package\]$/ { workspace_package = 1; next }

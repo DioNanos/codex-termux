@@ -4,8 +4,8 @@ This fork tracks upstream OpenAI Codex and keeps only the compatibility delta
 required to publish a working Android Termux package.
 
 - Fork repo: `DioNanos/codex-termux`
-- Upstream base for this release: `rust-v0.146.0`
-- Current fork release target: `v0.146.0`
+- Upstream base for this release: `rust-v0.147.0`
+- Current fork release target: `v0.147.0`
 
 ## Runtime patches
 
@@ -303,3 +303,21 @@ bash verify-patches.sh
   Termux user's first contact with remote control, so it belongs in the fork.
 - Covered by `pairing_without_a_running_daemon_says_how_to_start_one`, which
   exercises the behaviour rather than reading the source.
+
+### Patch #28 - musl ripgrep in the musl aarch64 payload
+
+- File: `scripts/codex_package/rg`
+- The DotSlash manifest's `linux-aarch64` entry pointed at
+  `ripgrep-…-aarch64-unknown-linux-gnu`, so the Linux arm64 package — whose target is
+  `aarch64-unknown-linux-musl`, and whose `codex` and `bwrap` are statically linked —
+  bundled a `rg` that requires `libc.so.6` and `ld-linux-aarch64.so.1`. On a musl-only
+  system it does not start and file search silently degrades. The `linux-x86_64` entry
+  already used the musl artifact; only aarch64 was inconsistent, and upstream does not
+  publish an aarch64-musl package of its own, so the mismatch never surfaced there.
+- The entry now points at the musl artifact, whose size and digest were taken from the
+  downloaded file rather than copied.
+- **Why this is guarded**: a future merge that accepts upstream's manifest — by
+  auto-merge or by resolving the file wholesale — restores the glibc artifact with **no
+  compilation signal at all**. The package builds; `rg` breaks at runtime on the device.
+  The check is deliberately version-agnostic: pinning it to a ripgrep version would make
+  it go stale at the next bump and stop guarding anything.

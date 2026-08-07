@@ -16,14 +16,14 @@
       ]
     },
     "linux-aarch64": {
-      "size": 1854661,
+      "size": 1982561,
       "hash": "sha256",
-      "digest": "a740b91c82eaf9914cfedd353572f2791cbe0162c84101ee0951058f4dcbc90d",
+      "digest": "800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915",
       "format": "tar.gz",
-      "path": "ripgrep-15.2.0-aarch64-unknown-linux-gnu/rg",
+      "path": "ripgrep-15.2.0-aarch64-unknown-linux-musl/rg",
       "providers": [
         {
-          "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-gnu.tar.gz"
+          "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz"
         }
       ]
     },
