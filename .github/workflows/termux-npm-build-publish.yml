@@ -120,8 +120,13 @@ jobs:
           package_tgz="$(ls -1 *.tgz)"
           # npm pack omits a listed-but-absent file and still exits 0, so the
           # only proof is reading the archive that will be published.
+          # List once into a file and grep that. `tar -tzf | grep -q` looks right
+          # and is not: grep exits at the first match, tar takes SIGPIPE, and
+          # under `pipefail` the pipeline reports failure — so a tarball that
+          # DOES contain the file is reported as missing.
+          tar -tzf "${package_tgz}" > /tmp/tarball-entries.txt
           for required in package/bin/codex.bin package/bin/codex-code-mode-host package/bin/libc++_shared.so; do
-            if ! tar -tzf "${package_tgz}" | grep -qx "${required}"; then
+            if ! grep -qxF "${required}" /tmp/tarball-entries.txt; then
               echo "packaged tarball is missing ${required}" >&2
               exit 1
             fi
