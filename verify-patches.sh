@@ -438,6 +438,28 @@ else
   fail
 fi
 
+printf "Patch #30 (code-mode host travels in the package): "
+# Since rust-v0.147.0 upstream runs code mode out-of-process: the CLI spawns
+# codex-code-mode-host next to itself and FAILS CLOSED when it is absent —
+# "Code Mode is unavailable ... host executable was not found". Nothing about
+# that is visible to the compiler or the test suite: the crate builds, every
+# test passes, and code mode is simply dead on the device. The 0.147.x release
+# shipped without it on both forks for exactly that reason. Anchored to the
+# three places that must agree, not to a version.
+# The three declarations are necessary but NOT sufficient: `npm pack` omits a
+# listed-but-absent file and still exits 0, so the build must also read the
+# finished archive back. Without that last check the guard goes green on a
+# tarball that has no host in it — verified by an independent negative test.
+if grep -q 'p codex-code-mode-host' .github/workflows/termux-npm-build-publish.yml \
+  && grep -q 'release/codex-code-mode-host npm-package/bin/codex-code-mode-host' .github/workflows/termux-npm-build-publish.yml \
+  && node -p "require('./npm-package/package.json').files.includes('bin/codex-code-mode-host')" | grep -q true \
+  && grep -q 'package/bin/codex-code-mode-host' .github/workflows/termux-npm-build-publish.yml \
+  && grep -q 'packaged tarball is missing' .github/workflows/termux-npm-build-publish.yml; then
+  pass
+else
+  fail
+fi
+
 printf "release version contract (Cargo/npm/notes/changelog): "
 cargo_workspace_version="$(awk '
   /^\[workspace.package\]$/ { workspace_package = 1; next }

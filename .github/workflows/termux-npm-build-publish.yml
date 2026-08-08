@@ -93,26 +93,42 @@ jobs:
           echo "linking compiler-rt builtins: ${builtins}"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-Clink-arg=-lc++_shared -Clink-arg=-Wl,-rpath,\$ORIGIN -Clink-arg=${builtins}"
           cd codex-rs
-          rustup run 1.95.0 cargo build --target aarch64-linux-android --release -p codex-cli
+          rustup run 1.95.0 cargo build --target aarch64-linux-android --release -p codex-cli -p codex-code-mode-host
+          host_path="target/aarch64-linux-android/release/codex-code-mode-host"
+          if [ ! -f "${host_path}" ]; then echo "code-mode host ${host_path} not found" >&2; exit 1; fi
 
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
           cp codex-rs/target/aarch64-linux-android/release/codex npm-package/bin/codex.bin
+          # Code mode runs out-of-process since rust-v0.147.0 and fails closed
+          # when this binary is missing, so it must travel in the package.
+          cp codex-rs/target/aarch64-linux-android/release/codex-code-mode-host npm-package/bin/codex-code-mode-host
           cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" npm-package/bin/libc++_shared.so
           # Strip native binaries and libc++ to stay
           # under npm's unpacked-size limit (~512 MiB). Without this the tarball is
           # rejected with HTTP 413 Payload Too Large.
           export PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}"
-          llvm-strip --strip-all npm-package/bin/codex.bin npm-package/bin/libc++_shared.so
-          chmod 0755 npm-package/bin/codex npm-package/bin/codex-exec npm-package/bin/codex.bin
+          llvm-strip --strip-all npm-package/bin/codex.bin npm-package/bin/codex-code-mode-host npm-package/bin/libc++_shared.so
+          chmod 0755 npm-package/bin/codex npm-package/bin/codex-exec npm-package/bin/codex.bin npm-package/bin/codex-code-mode-host
           chmod 0644 npm-package/bin/libc++_shared.so
           CODEX_PUBLIC_SANITIZED_TREE=1 bash verify-patches.sh
           cd npm-package
           rm -f ./*.tgz
           npm pack
           package_tgz="$(ls -1 *.tgz)"
+          # npm pack omits a listed-but-absent file and still exits 0, so the
+          # only proof is reading the archive that will be published.
+          for required in package/bin/codex.bin package/bin/codex-code-mode-host package/bin/libc++_shared.so; do
+            if ! tar -tzf "${package_tgz}" | grep -qx "${required}"; then
+              echo "packaged tarball is missing ${required}" >&2
+              exit 1
+            fi
+          done
+          echo "tarball payload verified: codex.bin, codex-code-mode-host, libc++_shared.so"
+          unpacked="$(node -p "require('child_process').execSync('npm pack --dry-run --json',{stdio:['ignore','pipe','ignore']}).toString().trim()" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8'))[0].unpackedSize")"
+          echo "unpacked size: ${unpacked} bytes"
           package_version="$(node -p "require('./package.json').version")"
           sha256sum "${package_tgz}" | tee "${package_tgz}.sha256"
           echo "PACKAGE_TGZ=npm-package/${package_tgz}" >> "${GITHUB_ENV}"
