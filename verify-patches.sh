@@ -446,6 +446,10 @@ printf "Patch #30 (code-mode host travels in the package): "
 # test passes, and code mode is simply dead on the device. The 0.147.x release
 # shipped without it on both forks for exactly that reason. Anchored to the
 # three places that must agree, not to a version.
+# The post-pack anchor targets the `for required in ...` list itself, not the
+# bare path: `npm-package/bin/codex-code-mode-host` on the copy/strip/chmod
+# lines CONTAINS `package/bin/codex-code-mode-host`, so a generic grep stayed
+# green with the host removed from the list the assertion actually iterates.
 # The three declarations are necessary but NOT sufficient: `npm pack` omits a
 # listed-but-absent file and still exits 0, so the build must also read the
 # finished archive back. Without that last check the guard goes green on a
@@ -453,7 +457,7 @@ printf "Patch #30 (code-mode host travels in the package): "
 if grep -q 'p codex-code-mode-host' .github/workflows/termux-npm-build-publish.yml \
   && grep -q 'release/codex-code-mode-host npm-package/bin/codex-code-mode-host' .github/workflows/termux-npm-build-publish.yml \
   && node -p "require('./npm-package/package.json').files.includes('bin/codex-code-mode-host')" | grep -q true \
-  && grep -q 'package/bin/codex-code-mode-host' .github/workflows/termux-npm-build-publish.yml \
+  && grep -qE '^ *for required in .*(^| )package/bin/codex-code-mode-host( |;)' .github/workflows/termux-npm-build-publish.yml \
   && grep -q 'packaged tarball is missing' .github/workflows/termux-npm-build-publish.yml; then
   pass
 else
