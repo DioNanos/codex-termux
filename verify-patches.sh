@@ -455,12 +455,26 @@ npm_package_version="$(node -p "require('./npm-package/package.json').version")"
 # exist. What must hold is that the upstream base named in the description is a tag
 # this repository actually has.
 upstream_base_tag="$(node -p "(require('./npm-package/package.json').description.match(/rust-v[0-9]+\\.[0-9]+\\.[0-9]+/)||[''])[0]")"
+# Cross-checked against the release notes so the base is stated deliberately in
+# two places rather than typed once into a description nobody re-reads.
+notes_base_tag="$(grep -oE 'rust-v[0-9]+\.[0-9]+\.[0-9]+' ".release/v${npm_package_version}.md" 2>/dev/null | head -1)"
+# The tag itself is only checkable where the clone actually has tags. CI checks
+# out at depth 1 without them, and a guard that silently fails there is worse
+# than one that says which mode it ran in.
+if [ -n "$(git tag --list 'rust-v*' 2>/dev/null | head -1)" ]; then
+  upstream_tags_available=yes
+else
+  upstream_tags_available=no
+  printf "(no upstream tags in this checkout: base tag existence not verified) "
+fi
 if [ -n "$cargo_workspace_version" ] \
   && [ "$cargo_workspace_version" = "$npm_package_version" ] \
   && [ -f ".release/v${npm_package_version}.md" ] \
   && grep -q "^# \[${npm_package_version}\]" CHANGELOG.md \
   && [ -n "$upstream_base_tag" ] \
-  && git rev-parse -q --verify "refs/tags/${upstream_base_tag}^{commit}" >/dev/null \
+  && [ "$upstream_base_tag" = "$notes_base_tag" ] \
+  && { [ "$upstream_tags_available" = "no" ] \
+       || git rev-parse -q --verify "refs/tags/${upstream_base_tag}^{commit}" >/dev/null; } \
   && grep -q '@mmmbuto/codex-cli-termux@latest' README.md \
   && grep -q '@mmmbuto/codex-cli-termux@latest' docs/install.md \
   && grep -q '@mmmbuto/codex-cli-termux@latest' npm-package/README.md; then
