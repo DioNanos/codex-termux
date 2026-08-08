@@ -418,6 +418,26 @@ else
   fail
 fi
 
+printf "Patch #29 (advisory locks degrade where the filesystem lacks them): "
+# Termux storage under /data/data/com.termux/files does not implement advisory
+# file locks: File::lock and File::try_lock return ErrorKind::Unsupported there.
+# The fork's rule is that a missing lock degrades to running unlocked, never to
+# a fatal error — upstream added the thread writer lock in 0.147.0 and it was the
+# one lock site the rule had never been extended to, which took the whole CLI
+# down at startup on the device. Version-agnostic on purpose: this checks the
+# behaviour is wired, not which upstream release introduced the call.
+writer_lock=codex-rs/thread-store/src/local/writer_lock.rs
+if [ -f "$writer_lock" ] \
+  && grep -q 'fn is_unsupported_file_lock_error' "$writer_lock" \
+  && grep -q 'ErrorKind::Unsupported' "$writer_lock" \
+  && grep -q 'is_unsupported_file_lock_error(&err)' "$writer_lock" \
+  && [ "$(grep -c 'is_unsupported_file_lock_error(&err)' "$writer_lock")" -ge 2 ] \
+  && grep -q 'unsupported_kind_is_classified_as_unsupported_lock_error' "$writer_lock"; then
+  pass
+else
+  fail
+fi
+
 printf "release version contract (Cargo/npm/notes/changelog): "
 cargo_workspace_version="$(awk '
   /^\[workspace.package\]$/ { workspace_package = 1; next }
@@ -429,11 +449,18 @@ cargo_workspace_version="$(awk '
   }
 ' codex-rs/Cargo.toml)"
 npm_package_version="$(node -p "require('./npm-package/package.json').version")"
+# The fork version is NOT always an upstream version: 0.147.1 is a fork-only patch
+# release and upstream has no rust-v0.147.1. Requiring "rust-v<fork version>" here
+# would force the package description to name an upstream release that does not
+# exist. What must hold is that the upstream base named in the description is a tag
+# this repository actually has.
+upstream_base_tag="$(node -p "(require('./npm-package/package.json').description.match(/rust-v[0-9]+\\.[0-9]+\\.[0-9]+/)||[''])[0]")"
 if [ -n "$cargo_workspace_version" ] \
   && [ "$cargo_workspace_version" = "$npm_package_version" ] \
   && [ -f ".release/v${npm_package_version}.md" ] \
   && grep -q "^# \[${npm_package_version}\]" CHANGELOG.md \
-  && grep -q "rust-v${npm_package_version}" npm-package/package.json \
+  && [ -n "$upstream_base_tag" ] \
+  && git rev-parse -q --verify "refs/tags/${upstream_base_tag}^{commit}" >/dev/null \
   && grep -q '@mmmbuto/codex-cli-termux@latest' README.md \
   && grep -q '@mmmbuto/codex-cli-termux@latest' docs/install.md \
   && grep -q '@mmmbuto/codex-cli-termux@latest' npm-package/README.md; then
