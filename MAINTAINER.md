@@ -32,12 +32,12 @@ If a feature is generic and not Termux-specific, the right place is upstream.
 
 ## Reporting
 
-| Channel | Where |
-|---|---|
-| Termux/Android bug reports, PRs | [DioNanos/codex-termux](https://github.com/DioNanos/codex-termux) |
-| Generic Codex bugs (not Termux-specific) | [openai/codex](https://github.com/openai/codex) |
-| Security disclosures (Termux fork) | [`SECURITY.md`](./SECURITY.md) — `security@mmmbuto.com` |
-| General contact | `dev@mmmbuto.com` |
+| Channel                                  | Where                                                             |
+| ---------------------------------------- | ----------------------------------------------------------------- |
+| Termux/Android bug reports, PRs          | [DioNanos/codex-termux](https://github.com/DioNanos/codex-termux) |
+| Generic Codex bugs (not Termux-specific) | [openai/codex](https://github.com/openai/codex)                   |
+| Security disclosures (Termux fork)       | [`SECURITY.md`](./SECURITY.md) — `security@mmmbuto.com`           |
+| General contact                          | `dev@mmmbuto.com`                                                 |
 
 When reporting a Termux bug, please include: device, Android version, Termux
 build (Classic or F-Droid), Node.js version, and `codex --version`.
@@ -58,4 +58,4 @@ See [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE).
 
 ---
 
-*Per aspera ad astra.*
+_Per aspera ad astra._
