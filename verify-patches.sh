@@ -292,18 +292,46 @@ else
 fi
 
 printf "Patch #22 (V8 Android Prebuilt Infrastructure): "
+# Read the version the workflow actually defaults to instead of naming one. A
+# literal here goes stale at every v8 bump and turns this into a check on the
+# calendar rather than on the infrastructure.
+#
+# The read is confined to the `v8_version` stanza and stops at the next input at
+# the same indentation. Scanning forward from the stanza would otherwise accept
+# a neighbouring input's default -- a workflow whose v8_version carries no
+# default at all would then be judged by an unrelated one, and a non-empty
+# result is not evidence that it came from the right place. Exactly one default
+# inside the stanza, or nothing.
+v8_workflow_version="$(awk '
+  /^      v8_version:[[:space:]]*$/ { in_stanza = 1; next }
+  in_stanza && /^      [^[:space:]]/ { in_stanza = 0 }
+  in_stanza && /^        default:/ { value = $2; gsub(/[^0-9.]/, "", value); found++ }
+  END { if (found == 1) print value }
+' .github/workflows/rusty-v8-android-release.yml 2>/dev/null)"
+# Ask the manifest for the sandbox profile *of that version*, by full header. A
+# substring search for the profile name passes on any leftover entry, so a bump
+# to a version published plain-only would keep an old sandbox record vouching
+# for it -- which is the exact substitution this release exists to prevent.
+v8_sandbox_pin="[versions.\"${v8_workflow_version}\".targets.\"aarch64-linux-android\".profiles.ptrcomp_sandbox_release]"
 if [ -f scripts/fetch_rusty_v8_android.py ] \
   && [ -f scripts/prepare_rusty_v8_android_source.py ] \
   && [ -f .github/workflows/rusty-v8-android-release.yml ] \
   && [ -f third_party/v8/android-artifacts.toml ] \
   && grep -q 'aarch64-linux-android' third_party/v8/android-artifacts.toml \
-  && grep -Fq '[versions."149.2.0"]' third_party/v8/android-artifacts.toml \
-  && grep -Fq 'default: "149.2.0"' .github/workflows/rusty-v8-android-release.yml \
+  && [ -n "${v8_workflow_version}" ] \
+  && grep -Fq "[versions.\"${v8_workflow_version}\"]" third_party/v8/android-artifacts.toml \
+  && grep -Fq "${v8_sandbox_pin}" third_party/v8/android-artifacts.toml \
   && grep -q 'RUSTY_V8_ARCHIVE' scripts/fetch_rusty_v8_android.py \
   && grep -q 'missing pinned rusty_v8 Android manifest entry' scripts/fetch_rusty_v8_android.py \
   && grep -q 'invalid lowercase SHA-256' scripts/fetch_rusty_v8_android.py \
   && grep -q 'urlopen(url, timeout=120)' scripts/fetch_rusty_v8_android.py \
-  && grep -q 'shlex.quote' scripts/fetch_rusty_v8_android.py; then
+  && grep -q 'shlex.quote' scripts/fetch_rusty_v8_android.py \
+  && grep -Fq 'DEFAULT_PROFILE = "ptrcomp_sandbox_release"' scripts/fetch_rusty_v8_android.py \
+  && [ -f scripts/check_v8_sandbox.py ] \
+  && grep -Fq 'v8__V8__IsSandboxEnabled' scripts/check_v8_sandbox.py \
+  && grep -Fq 'scripts/check_v8_sandbox.py' .github/workflows/termux-npm-build-publish.yml \
+  && grep -Fq 'scripts/check_v8_sandbox.py' .github/workflows/rusty-v8-android-release.yml \
+  && grep -Fq 'CODEX_ALLOW_SUPERSEDED_V8_BUILDER' scripts/build_rusty_v8_android.sh; then
   pass
 else
   fail

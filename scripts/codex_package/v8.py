@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -36,6 +38,13 @@ def resolve_codex_v8_cargo_env(
     archive_override = environ.get("RUSTY_V8_ARCHIVE")
     binding_override = environ.get("RUSTY_V8_SRC_BINDING_PATH")
     if archive_override and binding_override:
+        # Returning {} leaves cargo inheriting os.environ, so these two paths are
+        # what the build links -- this function chooses nothing but still decides
+        # everything. Judging the override here is the only thing between a
+        # release build and the plain archive: the profile is not in the path, the
+        # v8 build script accepts whatever RUSTY_V8_ARCHIVE names, and the result
+        # links and runs with the sandbox absent.
+        assert_sandbox_archive(Path(archive_override))
         return {}
     if archive_override or binding_override:
         raise RuntimeError(
@@ -43,10 +52,41 @@ def resolve_codex_v8_cargo_env(
         )
 
     artifacts = fetch_codex_v8_artifacts(spec, cache_root=cache_root)
+    # Downloaded from the pinned URL for the sandbox profile, and still checked:
+    # the pin says which bytes, not what they do.
+    assert_sandbox_archive(artifacts.archive)
     return {
         "RUSTY_V8_ARCHIVE": str(artifacts.archive),
         "RUSTY_V8_SRC_BINDING_PATH": str(artifacts.binding),
     }
+
+
+def assert_sandbox_archive(archive: Path) -> None:
+    """Stop the build unless this archive's V8 really carries the sandbox.
+
+    Delegates to scripts/check_v8_sandbox.py, which decodes what
+    `v8__V8__IsSandboxEnabled` returns. Exit 1 means the sandbox is absent and
+    exit 2 means the archive could not be judged; neither is a build worth
+    finishing, so both stop here rather than being told apart.
+    """
+    checker = REPO_ROOT / "scripts" / "check_v8_sandbox.py"
+    if not checker.is_file():
+        raise RuntimeError(
+            f"{checker} is missing, so nothing would verify the V8 this build "
+            "links. Restore it rather than building without it."
+        )
+    completed = subprocess.run(
+        [sys.executable, str(checker), str(archive)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"refusing to build against {archive}:\n"
+            f"{completed.stdout}{completed.stderr}".rstrip()
+        )
+    print(f"[v8] sandbox verified in {archive}")
 
 
 def fetch_codex_v8_artifacts(

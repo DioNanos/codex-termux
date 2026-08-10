@@ -26,6 +26,34 @@
 #
 set -euo pipefail
 
+# SUPERSEDED (2026-08-09) by .github/workflows/rusty-v8-android-release.yml.
+#
+# This script builds the PLAIN profile. Since rust-v0.147.0, code mode enables
+# the v8 crate's `v8_enable_sandbox` feature, and a plain archive links and runs
+# with the sandbox absent while saying nothing about it -- which is exactly the
+# defect the 0.147.x corrective exists to fix. Publishing what this produces
+# under the current release layout would put that archive back in front of the
+# consumers.
+#
+# The workflow supersedes it in full: it builds either profile, verifies the
+# result by decoding what `v8__V8__IsSandboxEnabled` returns, and publishes with
+# the profile in the artifact name. The obstacles documented above are solved
+# there too, which is why this file is kept readable rather than deleted.
+#
+# Refuse by default rather than sit here as a working path to the wrong artifact.
+if [ "${CODEX_ALLOW_SUPERSEDED_V8_BUILDER:-0}" != "1" ]; then
+  cat >&2 <<'SUPERSEDED'
+scripts/build_rusty_v8_android.sh is superseded and builds the PLAIN V8 profile.
+Code mode requires the sandbox profile; a plain archive links, runs, and reports
+nothing while the sandbox is absent.
+
+Use .github/workflows/rusty-v8-android-release.yml (input `sandbox: true`).
+Set CODEX_ALLOW_SUPERSEDED_V8_BUILDER=1 only to study this path, never to
+produce an artifact meant for release.
+SUPERSEDED
+  exit 1
+fi
+
 TAG=""
 NDK_REV="r28c"                 # NDK package revision (r28c == 28.2.13676358)
 JOBS="$(nproc)"

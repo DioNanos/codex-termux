@@ -77,6 +77,14 @@ jobs:
           export PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}"
           eval "$(python3 scripts/fetch_rusty_v8_android.py | grep '^export ' | sed 's/^export //')"
           export RUSTY_V8_ARCHIVE RUSTY_V8_SRC_BINDING_PATH
+          # This target is cross-compiled, so nothing can be executed here and the
+          # archive itself has to answer for the sandbox. Read what
+          # `v8__V8__IsSandboxEnabled` returns: it is the function the Rust side
+          # calls, compiled from the same condition the feature controls. Counting
+          # `v8::internal::Sandbox` symbol names -- which this replaced -- is passed
+          # by a plain archive carrying one extra object that merely mentions the
+          # name, so it never separated the two builds in the first place.
+          python3 scripts/check_v8_sandbox.py "${RUSTY_V8_ARCHIVE}"
           export CC_aarch64_linux_android="aarch64-linux-android29-clang"
           export CXX_aarch64_linux_android="aarch64-linux-android29-clang++"
           export AR_aarch64_linux_android="llvm-ar"
