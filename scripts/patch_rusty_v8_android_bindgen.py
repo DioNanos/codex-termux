@@ -52,7 +52,7 @@ DECLARE = (
 )
 
 BRANCH_ANCHOR = '  } else if target_os == "ios" {'
-BRANCH = '''  } else if target_os == "android" {
+BRANCH = """  } else if target_os == "android" {
     // One definition, composed by the caller and already exercised by the
     // toolchain check, instead of rebuilding the list here where it could
     // drift from what was verified.
@@ -60,7 +60,7 @@ BRANCH = '''  } else if target_os == "android" {
       android_last_args
         .extend(extra.split_whitespace().map(|arg| arg.to_string()));
     }
-'''
+"""
 
 BUILDER_ANCHOR = """    .clang_args(clang_args)
     .clang_args(filtered_args)
