@@ -36,6 +36,14 @@ jobs:
       - name: Test macOS notarization
         run: python3 -m unittest discover -s .github/scripts/macos-signing -p 'test_notarize_with_akv.py'
 
+      - name: Test GitHub workflow helpers
+        run: just test-github-scripts
+
+      - name: Verify the sanitized Termux fork contract
+        env:
+          CODEX_PUBLIC_SANITIZED_TREE: "1"
+        run: ./verify-patches.sh
+
       - name: Setup pnpm
         uses: pnpm/action-setup@a8198c4bff370c8506180b035930dea56dbd5288 # v5
         with:

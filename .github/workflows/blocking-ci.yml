@@ -8,13 +8,9 @@ on:
     branches: [main]
 
 jobs:
-  # Keep reusable workflow calls alphabetized. The `required` job below is the
-  # version-controlled list that the main-branch ruleset should require.
-  bazel:
-    name: Bazel
-    uses: ./.github/workflows/bazel.yml
-    secrets: inherit
-
+  # This public fork ships one Android arm64 package. The broader upstream
+  # Bazel, SDK, Windows, Linux, and macOS runner matrices are outside its
+  # release contract; directly invokable parity workflows remain manual.
   blob-size-policy:
     name: Blob size policy
     uses: ./.github/workflows/blob-size-policy.yml
@@ -35,29 +31,16 @@ jobs:
     uses: ./.github/workflows/repo-checks.yml
     secrets: inherit
 
-  rust-ci:
-    name: rust-ci
-    uses: ./.github/workflows/rust-ci.yml
-    secrets: inherit
-
-  sdk:
-    name: sdk
-    uses: ./.github/workflows/sdk.yml
-    secrets: inherit
-
   required:
     name: CI required
     # Without `always()`, GitHub skips this job after a failed dependency and a
     # required check can appear successful instead of reporting the failure.
     if: ${{ always() }}
     needs:
-      - bazel
       - blob-size-policy
       - cargo-deny
       - codespell
       - repo-checks
-      - rust-ci
-      - sdk
     runs-on: ubuntu-24.04
     steps:
       # Keep the helper on the same revision as the caller and child workflows.

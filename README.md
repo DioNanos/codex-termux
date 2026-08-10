@@ -49,7 +49,7 @@ What this fork does not do:
 - self-update points to `DioNanos/codex-termux` and `@mmmbuto/codex-cli-termux`
 - packaged wrappers set `CODEX_SELF_EXE` to the native ELF, sanitize `LD_LIBRARY_PATH`, and bundle `libc++_shared.so`
 - Android binaries are linked with `RUNPATH=$ORIGIN`
-- `exec`/code-mode now runs for real on Android via the in-process V8 runtime (no longer a stub) — the meaningful capability gain on Termux
+- `exec`/code-mode now runs for real on Android via the in-process V8 runtime (no longer a stub) - the meaningful capability gain on Termux
 - realtime voice/audio is no longer part of this build: upstream removed the TUI realtime voice feature (openai/codex#27801), so the fork's Android cpal/oboe enablement toggle (never usable from the Termux CLI anyway, as the backend needs an Android JavaVM/Activity) was dropped with it. Termux-native audio remains tracked on the Codex VL roadmap.
 - Android PTY and lock-handling compatibility patches remain enabled where upstream behavior still breaks on Bionic/Termux
 
@@ -103,8 +103,8 @@ To report a vulnerability, see [SECURITY.md](./SECURITY.md).
 
 ## Community guides
 
-- [OpenAI Codex CLI on Android via Termux](https://timharbakon.com/openai-codex-cli-android-termux/)
-  — independent third-party walkthrough covering Termux setup, the Bionic-libc incompatibility
+- [OpenAI Codex CLI on Android via Termux](https://timharbakon.com/openai-codex-cli-android-termux/),
+  an independent third-party walkthrough covering Termux setup, the Bionic-libc incompatibility
   this package solves, and a small Hono test project.
 
 ## License
