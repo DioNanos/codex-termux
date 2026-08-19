@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use chrono::SecondsFormat;
+use codex_protocol::RolloutId;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -51,7 +52,11 @@ use super::list::parse_timestamp_uuid_from_filename;
 use super::metadata;
 use super::ordinal::RolloutOrdinalState;
 use super::ordinal::ordinal_state_for_rollout;
+use super::rollout_file_name::RolloutFileName;
 use super::session_index::find_thread_names_by_ids;
+use crate::InitialHistory;
+use crate::ResumedHistory;
+use crate::RolloutItem;
 use crate::config::RolloutConfigView;
 use crate::state_db;
 use crate::state_db::StateDbHandle;
@@ -59,11 +64,7 @@ use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::protocol::GitInfo as ProtocolGitInfo;
 use codex_protocol::protocol::HistoryPosition;
-use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::ResumedHistory;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
@@ -94,6 +95,13 @@ pub enum RolloutRecorderParams {
     Create {
         session_id: SessionId,
         conversation_id: ThreadId,
+        /// Overrides the rollout ID encoded in the filename.
+        ///
+        /// Normally this is `None`, so the filename is
+        /// `rollout-<timestamp>-<conversation_id>.jsonl`. `thread/revert` sets it, producing
+        /// `rollout-<timestamp>-<conversation_id>_<rollout_id>.jsonl`, because revert keeps the
+        /// thread ID stable while creating a new immutable rollout file.
+        rollout_id_override: Option<RolloutId>,
         forked_from_id: Option<ThreadId>,
         parent_thread_id: Option<ThreadId>,
         source: Box<SessionSource>,
@@ -189,6 +197,7 @@ impl RolloutRecorderParams {
         Self::Create {
             session_id: conversation_id.into(),
             conversation_id,
+            rollout_id_override: None,
             forked_from_id,
             parent_thread_id,
             source: Box::new(source),
@@ -208,6 +217,20 @@ impl RolloutRecorderParams {
     pub fn with_session_id(mut self, session_id: SessionId) -> Self {
         if let Self::Create { session_id: id, .. } = &mut self {
             *id = session_id;
+        }
+        self
+    }
+
+    /// Override the rollout ID while preserving the thread ID.
+    ///
+    /// This is for creating a new immutable rollout file for an existing thread.
+    pub fn with_rollout_id(mut self, rollout_id: RolloutId) -> Self {
+        if let Self::Create {
+            rollout_id_override,
+            ..
+        } = &mut self
+        {
+            *rollout_id_override = Some(rollout_id);
         }
         self
     }
@@ -800,6 +823,7 @@ impl RolloutRecorder {
             RolloutRecorderParams::Create {
                 session_id,
                 conversation_id,
+                rollout_id_override,
                 forked_from_id,
                 parent_thread_id,
                 source,
@@ -816,10 +840,8 @@ impl RolloutRecorder {
             } => {
                 let ordinal_state =
                     RolloutOrdinalState::for_new_rollout(history_mode, history_base);
-                let log_file_info = precompute_log_file_info(config, conversation_id)?;
-                let path = log_file_info.path.clone();
-                let thread_id = log_file_info.conversation_id;
-                let started_at = log_file_info.timestamp;
+                let (path, started_at) =
+                    precompute_new_rollout_path(config, conversation_id, rollout_id_override)?;
 
                 let timestamp_format: &[FormatItem] = format_description!(
                     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
@@ -831,7 +853,7 @@ impl RolloutRecorder {
 
                 let session_meta = SessionMeta {
                     session_id,
-                    id: thread_id,
+                    id: conversation_id,
                     forked_from_id,
                     parent_thread_id,
                     timestamp,
@@ -861,7 +883,7 @@ impl RolloutRecorder {
 
                 RolloutWriterState {
                     writer: None,
-                    deferred_log_file_info: Some(log_file_info),
+                    deferred_creation: true,
                     pending_items: Vec::new(),
                     meta: Some(session_meta),
                     cwd: cwd.clone(),
@@ -874,7 +896,7 @@ impl RolloutRecorder {
                 let (path, file, ordinal_state) = open_rollout_for_append(path.as_path()).await?;
                 RolloutWriterState {
                     writer: Some(JsonlWriter { file }),
-                    deferred_log_file_info: None,
+                    deferred_creation: false,
                     pending_items: Vec::new(),
                     meta: None,
                     cwd: cwd.clone(),
@@ -1012,7 +1034,7 @@ impl RolloutRecorder {
                 reject_unknown_thread_history_mode(&value)?;
             }
 
-            let rollout_line = match serde_json::from_value::<RolloutLine>(value) {
+            let rollout_line = match crate::decode_rollout_line(value) {
                 Ok(rollout_line) => rollout_line,
                 Err(e) => {
                     trace!("failed to parse rollout line: {e}");
@@ -1110,17 +1132,57 @@ fn strip_legacy_ghost_snapshot_rollout_line(value: &mut Value) -> bool {
             .get("payload")
             .is_some_and(is_legacy_ghost_snapshot_response_item),
         Some("compacted") => {
-            if let Some(replacement_history) = value
-                .get_mut("payload")
-                .and_then(|payload| payload.get_mut("replacement_history"))
+            let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) else {
+                return false;
+            };
+            let Some(replacement_history) =
+                payload.get("replacement_history").and_then(Value::as_array)
+            else {
+                return false;
+            };
+            let remove = replacement_history
+                .iter()
+                .map(is_legacy_ghost_snapshot_response_item)
+                .collect::<Vec<_>>();
+            if !remove.contains(&true) {
+                return false;
+            }
+
+            // Legacy checkpoints have no sidecar. If a sidecar is present, only filter a
+            // full-length array; malformed shapes should remain intact for typed deserialization
+            // to reject instead of silently shifting metadata onto a different history item.
+            match payload.get("replacement_history_metadata") {
+                None => {}
+                Some(Value::Array(metadata)) if metadata.len() == remove.len() => {}
+                Some(_) => return false,
+            }
+
+            let Some(replacement_history) = payload
+                .get_mut("replacement_history")
+                .and_then(Value::as_array_mut)
+            else {
+                return false;
+            };
+            retain_entries_not_marked(replacement_history, &remove);
+            if let Some(metadata) = payload
+                .get_mut("replacement_history_metadata")
                 .and_then(Value::as_array_mut)
             {
-                replacement_history.retain(|item| !is_legacy_ghost_snapshot_response_item(item));
+                retain_entries_not_marked(metadata, &remove);
             }
             false
         }
         _ => false,
     }
+}
+
+fn retain_entries_not_marked(entries: &mut Vec<Value>, remove: &[bool]) {
+    let mut index = 0;
+    entries.retain(|_| {
+        let retain = !remove[index];
+        index += 1;
+        retain
+    });
 }
 
 fn is_legacy_ghost_snapshot_response_item(value: &Value) -> bool {
@@ -1535,21 +1597,11 @@ fn cursor_from_thread_item(item: &ThreadItem, sort_key: ThreadSortKey) -> Option
     }
 }
 
-struct LogFileInfo {
-    /// Full path to the rollout file.
-    path: PathBuf,
-
-    /// Session ID (also embedded in filename).
-    conversation_id: ThreadId,
-
-    /// Timestamp for the start of the session.
-    timestamp: OffsetDateTime,
-}
-
-fn precompute_log_file_info(
+fn precompute_new_rollout_path(
     config: &impl RolloutConfigView,
-    conversation_id: ThreadId,
-) -> std::io::Result<LogFileInfo> {
+    thread_id: ThreadId,
+    rollout_id_override: Option<RolloutId>,
+) -> std::io::Result<(PathBuf, OffsetDateTime)> {
     // Resolve ~/.codex/sessions/YYYY/MM/DD path.
     let timestamp = OffsetDateTime::now_local()
         .map_err(|e| IoError::other(format!("failed to get local time: {e}")))?;
@@ -1559,23 +1611,14 @@ fn precompute_log_file_info(
     dir.push(format!("{:02}", u8::from(timestamp.month())));
     dir.push(format!("{:02}", timestamp.day()));
 
-    // Custom format for YYYY-MM-DDThh-mm-ss. Use `-` instead of `:` for
-    // compatibility with filesystems that do not allow colons in filenames.
-    let format: &[FormatItem] =
-        format_description!("[year]-[month]-[day]T[hour]-[minute]-[second]");
-    let date_str = timestamp
-        .format(format)
+    let rollout_id = rollout_id_override.unwrap_or(thread_id);
+    let filename = RolloutFileName::new(timestamp, thread_id, rollout_id)
+        .render()
         .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
-
-    let filename = format!("rollout-{date_str}-{conversation_id}.jsonl");
 
     let path = dir.join(filename);
 
-    Ok(LogFileInfo {
-        path,
-        conversation_id,
-        timestamp,
-    })
+    Ok((path, timestamp))
 }
 
 fn open_log_file(path: &Path) -> std::io::Result<File> {
@@ -1607,7 +1650,8 @@ fn open_log_file(path: &Path) -> std::io::Result<File> {
 /// unwritten suffix so the next barrier can reopen the file and retry.
 struct RolloutWriterState {
     writer: Option<JsonlWriter>,
-    deferred_log_file_info: Option<LogFileInfo>,
+    /// True until a newly created rollout is first materialized.
+    deferred_creation: bool,
     pending_items: Vec<RolloutItem>,
     meta: Option<SessionMeta>,
     cwd: PathBuf,
@@ -1676,7 +1720,7 @@ impl RolloutWriterState {
     }
 
     fn is_deferred(&self) -> bool {
-        self.writer.is_none() && self.deferred_log_file_info.is_some()
+        self.writer.is_none() && self.deferred_creation
     }
 
     fn enter_recovery_mode(&mut self, err: &IoError) {
@@ -1699,16 +1743,11 @@ impl RolloutWriterState {
             return Ok(());
         }
 
-        let path = self
-            .deferred_log_file_info
-            .as_ref()
-            .map(|info| info.path.as_path())
-            .unwrap_or(self.rollout_path.as_path());
-        let file = open_log_file(path)?;
+        let file = open_log_file(self.rollout_path.as_path())?;
         self.writer = Some(JsonlWriter {
             file: tokio::fs::File::from_std(file),
         });
-        self.deferred_log_file_info = None;
+        self.deferred_creation = false;
         Ok(())
     }
 
@@ -2027,6 +2066,7 @@ async fn resume_candidate_matches_cwd(
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::EventMsg(_) => None,
         })
     {

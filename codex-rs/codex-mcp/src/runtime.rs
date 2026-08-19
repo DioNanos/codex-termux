@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_channel::Sender;
+use codex_config::types::McpServerDisabledReason;
 use codex_connectors::ConnectorRuntimeContextKey;
 use codex_connectors::ConnectorRuntimeManager;
 use codex_exec_server::Environment;
@@ -29,6 +30,7 @@ use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::Event;
 use codex_rmcp_client::ElicitationResponse;
+use codex_rmcp_client::with_http_headers_helper;
 use codex_utils_path_uri::PathUri;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
@@ -48,8 +50,18 @@ use crate::server::EffectiveMcpServer;
 use crate::tool_catalog_cache::McpToolCatalogCache;
 use crate::tools::ToolInfo;
 
+/// Controls when one task starts its eligible MCP servers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpStartupPolicy {
+    /// Start configured servers when their task's MCP runtime is published.
+    Eager,
+    /// Start servers with cached tool definitions on first use.
+    LazyWhenCached,
+}
+
 /// Everything needed to materialize one exact MCP configuration.
 pub struct McpRuntimeInput {
+    pub startup_policy: McpStartupPolicy,
     pub config: Arc<McpConfig>,
     pub plugins_available: bool,
     pub ready_selected_capability_roots: Vec<SelectedCapabilityRoot>,
@@ -295,6 +307,29 @@ impl McpRuntime {
         }
     }
 
+    /// Detects newly saved credentials for servers whose startup failed authentication.
+    pub async fn updated_oauth_credentials_after_auth_failure(&self) -> Vec<String> {
+        let current = self.current.load_full();
+        let Some(config) = current.config.as_ref() else {
+            return Vec::new();
+        };
+        current
+            .connections
+            .updated_oauth_credentials_after_auth_failure(config)
+            .await
+    }
+
+    /// Checks the current generation before retrying servers detected outside the refresh gate.
+    pub async fn has_authentication_failed_servers(&self, server_names: &[String]) -> bool {
+        self.current
+            .load_full()
+            .connections
+            .authentication_failed_servers()
+            .await
+            .into_iter()
+            .any(|server_name| server_names.contains(&server_name))
+    }
+
     /// Waits for the selected server without capturing an execution binding.
     pub async fn wait_for_server_startup(&self, server: &str) {
         self.current
@@ -329,6 +364,10 @@ impl McpRuntime {
 
     pub fn set_elicitations_auto_deny(&self, auto_deny: bool) {
         self.elicitation_router.set_auto_deny(auto_deny);
+    }
+
+    pub fn enable_full_access_form_input(&self) {
+        self.elicitation_router.enable_full_access_form_input();
     }
 
     pub async fn resolve_elicitation(
@@ -416,33 +455,64 @@ pub struct SandboxState {
 /// Runtime context used when resolving per-server MCP environments.
 ///
 /// `McpConfig` describes what servers exist. This value carries the canonical
-/// environment registry plus the local stdio fallback cwd used when a local
-/// stdio server omits its own working directory.
+/// environment registry plus the host-local cwd used by local MCP processes.
 #[derive(Clone)]
 pub struct McpRuntimeContext {
     environment_manager: Arc<EnvironmentManager>,
-    local_stdio_fallback_cwd: PathBuf,
+    local_process_cwd: PathBuf,
+    local_http_client: Arc<dyn HttpClient>,
+}
+
+/// Applies the local HTTP headers helper configured for an MCP server.
+///
+/// Callers retain ownership of selecting the underlying HTTP transport. This
+/// function centralizes the helper-specific policy checks and decoration used
+/// by both MCP runtime startup and standalone OAuth login.
+pub fn apply_http_headers_helper(
+    client: Arc<dyn HttpClient>,
+    config: &codex_config::McpServerConfig,
+    local_process_cwd: PathBuf,
+) -> Result<Arc<dyn HttpClient>, String> {
+    let codex_config::McpServerTransportConfig::StreamableHttp {
+        url,
+        http_headers_helper: Some(command),
+        ..
+    } = &config.transport
+    else {
+        return Ok(client);
+    };
+    if matches!(
+        config.disabled_reason,
+        Some(McpServerDisabledReason::Requirements { .. })
+    ) {
+        return Err("the MCP server is disabled by managed requirements".to_string());
+    }
+    if !config.is_local_environment() {
+        return Err("HTTP headers helpers can only run in the local environment".to_string());
+    }
+    with_http_headers_helper(client, url, command, local_process_cwd)
+        .map_err(|error| error.to_string())
 }
 
 impl McpRuntimeContext {
-    pub fn new(
-        environment_manager: Arc<EnvironmentManager>,
-        local_stdio_fallback_cwd: PathBuf,
-    ) -> Self {
+    pub fn new(environment_manager: Arc<EnvironmentManager>, local_process_cwd: PathBuf) -> Self {
+        let local_http_client = Arc::new(
+            RouteAwareHttpClient::new(environment_manager.http_client_factory().clone())
+                .with_tls_backend_fallback(),
+        );
         Self {
             environment_manager,
-            local_stdio_fallback_cwd,
+            local_process_cwd,
+            local_http_client,
         }
     }
 
-    pub(crate) fn local_stdio_fallback_cwd(&self) -> PathBuf {
-        self.local_stdio_fallback_cwd.clone()
+    pub(crate) fn local_process_cwd(&self) -> PathBuf {
+        self.local_process_cwd.clone()
     }
 
-    pub(crate) fn local_http_client(&self) -> Arc<dyn HttpClient> {
-        Arc::new(RouteAwareHttpClient::new(
-            self.environment_manager.http_client_factory().clone(),
-        ))
+    fn local_http_client(&self) -> Arc<dyn HttpClient> {
+        Arc::clone(&self.local_http_client)
     }
 
     pub(crate) fn resolve_server_environment(
@@ -475,18 +545,26 @@ impl McpRuntimeContext {
         ))
     }
 
-    /// Resolves the HTTP capability owned by the server's configured environment.
+    /// Resolves local MCP's specialized HTTP capability or the selected remote capability.
     pub fn resolve_http_client(
         &self,
         server_name: &str,
         config: &codex_config::McpServerConfig,
     ) -> Result<Arc<dyn HttpClient>, String> {
-        Ok(self
-            .resolve_server_environment(server_name, config)?
-            .map_or_else(
-                || self.local_http_client(),
-                |environment| environment.get_http_client(),
-            ))
+        let environment = self.resolve_server_environment(server_name, config)?;
+        self.http_client_for_server(config, environment.as_ref())
+    }
+
+    pub(crate) fn http_client_for_server(
+        &self,
+        config: &codex_config::McpServerConfig,
+        environment: Option<&Arc<Environment>>,
+    ) -> Result<Arc<dyn HttpClient>, String> {
+        let client = match environment {
+            Some(environment) if environment.is_remote() => environment.get_http_client(),
+            Some(_) | None => self.local_http_client(),
+        };
+        apply_http_headers_helper(client, config, self.local_process_cwd())
     }
 }
 
@@ -601,6 +679,7 @@ mod tests {
                 bearer_token_env_var: None,
                 http_headers: None,
                 env_http_headers: None,
+                http_headers_helper: None,
             },
             environment_id: environment_id.to_string(),
             ..stdio_server(environment_id)
@@ -698,6 +777,38 @@ mod tests {
         assert!(resolved_runtime.is_none());
     }
 
+    #[tokio::test]
+    async fn local_http_client_is_shared_across_resolution_and_context_clones() {
+        for environment_manager in [
+            EnvironmentManager::default_for_tests(),
+            environment_manager_without_environments(),
+        ] {
+            let runtime_context =
+                McpRuntimeContext::new(Arc::new(environment_manager), PathBuf::from("/tmp"));
+            let config = http_server(DEFAULT_MCP_SERVER_ENVIRONMENT_ID);
+            let first_client = runtime_context
+                .resolve_http_client("http", &config)
+                .expect("first local HTTP capability should resolve");
+            let repeated_client = runtime_context
+                .resolve_http_client("http", &config)
+                .expect("repeated local HTTP capability should resolve");
+            let resolved_environment = runtime_context
+                .resolve_server_environment("http", &config)
+                .expect("local HTTP environment should resolve");
+            let startup_client = runtime_context
+                .http_client_for_server(&config, resolved_environment.as_ref())
+                .expect("startup local HTTP capability should resolve");
+            let cloned_client = runtime_context
+                .clone()
+                .resolve_http_client("http", &config)
+                .expect("cloned local HTTP capability should resolve");
+
+            assert!(Arc::ptr_eq(&first_client, &repeated_client));
+            assert!(Arc::ptr_eq(&first_client, &startup_client));
+            assert!(Arc::ptr_eq(&first_client, &cloned_client));
+        }
+    }
+
     #[test]
     fn unknown_explicit_environment_is_rejected() {
         let runtime_context = McpRuntimeContext::new(
@@ -744,6 +855,37 @@ mod tests {
             };
             assert!(resolved_runtime.is_some());
         }
+
+        let mut remote_http_with_helper = http_server("remote");
+        let McpServerTransportConfig::StreamableHttp {
+            http_headers_helper,
+            ..
+        } = &mut remote_http_with_helper.transport
+        else {
+            unreachable!("HTTP helper should build streamable HTTP transport");
+        };
+        *http_headers_helper = Some("helper-that-must-not-run".to_string());
+        let error = match runtime_context.resolve_http_client("http", &remote_http_with_helper) {
+            Ok(_) => panic!("remote HTTP helper should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "HTTP headers helpers can only run in the local environment"
+        );
+
+        let remote_http = http_server("remote");
+        let remote_environment = runtime_context
+            .resolve_server_environment("http", &remote_http)
+            .expect("remote HTTP MCP should resolve")
+            .expect("remote HTTP MCP should have an environment");
+        let remote_client = runtime_context
+            .resolve_http_client("http", &remote_http)
+            .expect("remote HTTP capability should resolve");
+        assert!(Arc::ptr_eq(
+            &remote_client,
+            &remote_environment.get_http_client()
+        ));
     }
 
     #[tokio::test]

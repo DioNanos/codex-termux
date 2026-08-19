@@ -1,5 +1,6 @@
 use super::*;
 use anyhow::Result;
+use axum::http::HeaderValue;
 use codex_app_server_protocol::AppConfig;
 use codex_app_server_protocol::AppToolApproval;
 use codex_app_server_protocol::AppsConfig;
@@ -8,6 +9,8 @@ use codex_app_server_protocol::ConfigLayerSource as ApiConfigLayerSource;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
 use codex_config::test_support::CloudConfigBundleFixture;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
@@ -107,36 +110,42 @@ personality = true
 }
 
 #[tokio::test]
-async fn process_routing_does_not_enter_config_layers() -> Result<()> {
+async fn psp_feature_configures_first_party_routing() -> Result<()> {
     let tmp = tempdir()?;
-    let mut service = ConfigManager::new_for_tests(
+    let service = ConfigManager::new_for_tests(
         tmp.path().to_path_buf(),
         Vec::new(),
         LoaderOverrides::without_managed_config_for_tests(),
         CloudConfigBundleLoader::default(),
     );
-    service.psp = true;
 
     let config = service
         .load_with_overrides(
             Some(
-                [("features".to_string(), serde_json::json!({ "apps": true }))]
-                    .into_iter()
-                    .collect(),
+                [(
+                    "features".to_string(),
+                    serde_json::json!({ "apps": true, "psp": true }),
+                )]
+                .into_iter()
+                .collect(),
             ),
             Default::default(),
         )
         .await?;
 
-    assert!(config.psp);
-    assert!(config.http_client_factory().has_chatgpt_cookies());
-    assert!(
+    assert!(config.features.enabled(codex_features::Feature::Psp));
+    assert_eq!(
+        config.http_client_factory(),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+            .with_chatgpt_cookies([HeaderValue::from_static("oai-chat-psp=true")])
+    );
+    assert_eq!(
         config
             .config_layer_stack
             .effective_config()
             .get("features")
-            .and_then(|features| features.get("psp"))
-            .is_none()
+            .and_then(|features| features.get("psp")),
+        Some(&toml::Value::Boolean(true))
     );
     Ok(())
 }
@@ -158,6 +167,29 @@ async fn clear_missing_nested_config_is_noop() -> Result<()> {
         })
         .await
         .expect("clear missing config succeeds");
+
+    assert_eq!(response.status, WriteStatus::Ok);
+    assert_eq!(response.overridden_metadata, None);
+    assert_eq!(std::fs::read_to_string(&path)?, "");
+    Ok(())
+}
+
+#[tokio::test]
+async fn clearing_user_setting_falls_back_to_packaged_default_without_override() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&path, "hide_agent_reasoning = true\n")?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let response = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "hide_agent_reasoning".to_string(),
+            value: serde_json::Value::Null,
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await?;
 
     assert_eq!(response.status, WriteStatus::Ok);
     assert_eq!(response.overridden_metadata, None);
@@ -739,7 +771,7 @@ async fn managed_auth_policy_survives_unusable_requirements_file_changes() -> Re
     let auth_manager = codex_login::AuthManager::shared_from_config(
         &startup, /*enable_codex_api_key_env*/ false,
     )
-    .await;
+    .await?;
     std::fs::write(
         &requirements_path,
         "allowed_login_methods = [\"chatgpt\"]\nallowed_chatgpt_workspaces = []\n",
@@ -826,6 +858,33 @@ async fn reserved_builtin_provider_override_rejected() {
 
     let contents = std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE)).expect("read config");
     assert_eq!(contents, "model = \"user\"\n");
+}
+
+#[tokio::test]
+async fn write_value_rejects_invalid_guardian_review_threshold() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    let initial = "[features.guardianv2]\nenabled = true\nreview_threshold = 0.8\n";
+    std::fs::write(&path, initial)?;
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+
+    let error = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "features.guardianv2.review_threshold".to_string(),
+            value: serde_json::json!(2.0),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await
+        .expect_err("Guardian review thresholds above 1.0 must be rejected");
+
+    assert_eq!(
+        error.write_error_code(),
+        Some(ConfigWriteErrorCode::ConfigValidationError)
+    );
+    assert_eq!(std::fs::read_to_string(&path)?, initial);
+    Ok(())
 }
 
 #[tokio::test]

@@ -2,15 +2,17 @@ use anyhow::Result;
 use anyhow::anyhow;
 use codex_core::ForkSnapshot;
 use codex_core::StartThreadOptions;
+use codex_core::TurnInputRequest;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::REMOTE_ENVIRONMENT_ID;
 use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_home::CodexHomeUserInstructionsProvider;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -90,9 +92,9 @@ fn remove_agents_md_world_state_section(rollout_path: &Path) -> Result<()> {
         .into_iter()
         .map(|mut line| {
             if let RolloutItem::WorldState(world_state) = &mut line.item
-                && let Some(state) = world_state.state.as_object_mut()
+                && world_state.state.remove("agents_md").is_some()
             {
-                removed_section |= state.remove("agents_md").is_some();
+                removed_section = true;
             }
             serde_json::to_string(&line)
         })
@@ -149,16 +151,10 @@ fn assert_single_instruction_fragment(request: &responses::ResponsesRequest, exp
 
 async fn submit_thread_turn(thread: &Arc<codex_core::CodexThread>, prompt: &str) -> Result<()> {
     thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: prompt.to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: prompt.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     Ok(())
@@ -496,16 +492,10 @@ async fn loads_user_instructions_without_a_primary_environment() -> Result<()> {
 
     no_environment_thread
         .thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "inspect global instructions without an environment".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "inspect global instructions without an environment".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&no_environment_thread.thread, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -634,6 +624,69 @@ async fn fresh_thread_composes_global_before_project_and_reports_sources() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_environment_project_instructions_share_one_byte_budget() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_no_remote_env!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("multi-env-budget-response"),
+            responses::ev_completed("multi-env-budget-response"),
+        ]),
+    )
+    .await;
+    let local_root = TempDir::new()?;
+    std::fs::write(local_root.path().join(GLOBAL_AGENTS_FILENAME), "VWXYZ")?;
+    let mut builder = test_codex()
+        .with_config(|config| config.project_doc_max_bytes = 7)
+        .with_workspace_setup(|cwd, fs| async move {
+            fs.write_file(
+                &PathUri::from_host_native_path(cwd.join(GLOBAL_AGENTS_FILENAME))?,
+                b"ABCDE".to_vec(),
+                /*sandbox*/ None,
+            )
+            .await?;
+            Ok(())
+        });
+    let test = builder.build_with_remote_and_local_env(&server).await?;
+    let thread = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            environments: Some(vec![
+                TurnEnvironmentSelection {
+                    environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
+                    cwd: PathUri::from_abs_path(&test.config.cwd),
+                    workspace_roots: vec![PathUri::from_abs_path(&test.config.cwd)],
+                    config: EnvironmentConfigState::FromThread,
+                },
+                TurnEnvironmentSelection {
+                    environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+                    cwd: PathUri::from_host_native_path(local_root.path())?,
+                    workspace_roots: vec![PathUri::from_host_native_path(local_root.path())?],
+                    config: EnvironmentConfigState::FromThread,
+                },
+            ]),
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?;
+
+    submit_thread_turn(&thread.thread, "inspect the shared AGENTS.md budget").await?;
+
+    let contents = format!(
+        "for `{REMOTE_ENVIRONMENT_ID}` with root {}\n\nABCDE\n\nfor `{LOCAL_ENVIRONMENT_ID}` with root {}\n\nVW",
+        PathUri::from_abs_path(&test.config.cwd).inferred_native_path_string(),
+        local_root.path().display(),
+    );
+    let expected =
+        format!("# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>");
+    assert_single_instruction_fragment(&response_mock.single_request(), &expected);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_environment_thread_loads_every_project_and_keeps_creation_snapshot() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_no_remote_env!(Ok(()));
@@ -686,11 +739,13 @@ async fn multi_environment_thread_loads_every_project_and_keeps_creation_snapsho
                     environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
                     cwd: PathUri::from_abs_path(&test.config.cwd),
                     workspace_roots: vec![PathUri::from_abs_path(&test.config.cwd)],
+                    config: EnvironmentConfigState::FromThread,
                 },
                 TurnEnvironmentSelection {
                     environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                     cwd: PathUri::from_host_native_path(local_root.path())?,
                     workspace_roots: vec![PathUri::from_host_native_path(local_root.path())?],
+                    config: EnvironmentConfigState::FromThread,
                 },
             ]),
             ..StartThreadOptions::new(test.config.clone())

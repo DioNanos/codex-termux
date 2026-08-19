@@ -245,9 +245,17 @@ impl ChatWidget {
             refreshing_rate_limits,
         );
         if let Some(request_id) = request_id {
-            self.refreshing_status_outputs.push((request_id, handle));
+            self.refreshing_status_outputs
+                .push((request_id, handle.clone()));
         }
-        self.add_to_history(cell);
+        if self.thread_usage_is_available() {
+            handle.reserve_thread_usage_label_width();
+            handle.set_thread_usage(self.estimated_thread_usage().cloned());
+            self.add_to_history(cell);
+            self.request_thread_usage_for_status(handle);
+        } else {
+            self.add_to_history(cell);
+        }
     }
 
     pub(crate) fn finish_status_rate_limit_refresh(
@@ -330,6 +338,13 @@ impl ChatWidget {
                     preview_data.suppress_placeholder(item);
                 }
             }
+        }
+
+        if self
+            .estimated_thread_usage()
+            .is_some_and(|usage| usage.estimated_usage_usd_micros.is_none())
+        {
+            preview_data.suppress_placeholder(StatusSurfacePreviewItem::EstimatedThreadCost);
         }
 
         preview_data

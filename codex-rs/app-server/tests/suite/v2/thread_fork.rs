@@ -54,11 +54,11 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_rollout::RolloutItem;
+use codex_rollout::RolloutLine;
 use codex_rollout::append_rollout_item_to_path;
 use codex_rollout::append_thread_name;
 use codex_rollout::read_session_meta_line;
@@ -1389,15 +1389,18 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
     let source_path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &source_thread_id);
     let source_id = ThreadId::from_string(source_thread_id.as_str())?;
     let user_response_item = |id: &str| {
-        RolloutItem::ResponseItem(ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: format!("{id} model input"),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        })
+        RolloutItem::ResponseItem(
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: format!("{id} model input"),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }
+            .into(),
+        )
     };
     let completed_user_item = |id: &str, completed_at_ms| {
         RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
@@ -1499,17 +1502,18 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
                 ..
             },
             RolloutLine {
-                item: RolloutItem::ResponseItem(codex_protocol::models::ResponseItem::Message {
-                    role,
-                    ..
-                }),
+                item: RolloutItem::ResponseItem(response_item),
                 ..
             },
             RolloutLine {
                 item: RolloutItem::EventMsg(EventMsg::TurnAborted(aborted)),
                 ..
             },
-        ] if role == expected_marker_role && aborted.turn_id.as_deref() == Some("active-turn")
+        ] if matches!(
+            &response_item.item,
+            codex_protocol::models::ResponseItem::Message { role, .. }
+                if role == expected_marker_role
+        ) && aborted.turn_id.as_deref() == Some("active-turn")
     ));
 
     append_rollout_item_to_path(source_path.as_path(), &user_response_item("after-fork")).await?;

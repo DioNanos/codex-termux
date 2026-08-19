@@ -8,6 +8,7 @@ use super::extract_shell_script;
 use super::join_program_and_argv;
 use super::map_exec_result;
 use crate::config::Constrained;
+use crate::guardian::GuardianReviewContext;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::tests::make_session_and_context;
 use anyhow::Context;
@@ -15,7 +16,6 @@ use codex_execpolicy::Decision;
 use codex_execpolicy::Evaluation;
 use codex_execpolicy::PolicyParser;
 use codex_execpolicy::RuleMatch;
-use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
 use codex_network_proxy::PROXY_ACTIVE_ENV_KEY;
 use codex_network_proxy::PROXY_ENV_KEYS;
@@ -38,6 +38,7 @@ use codex_shell_escalation::EscalationExecution;
 use codex_shell_escalation::EscalationPermissions;
 use codex_shell_escalation::ExecResult;
 use codex_shell_escalation::ResolvedPermissionProfile;
+use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -426,10 +427,11 @@ async fn preapproved_additional_permissions_escalate_intercepted_exec() -> anyho
     let provider = CoreShellActionProvider {
         policy: Arc::new(RwLock::new(codex_execpolicy::Policy::empty())),
         session: Arc::new(session),
-        turn: Arc::new(turn_context),
+        review_context: GuardianReviewContext::from(Arc::new(turn_context)),
         call_id: "preapproved-additional-permissions".to_string(),
         environment_id: "local".to_string(),
-        tool_name: GuardianCommandSource::Shell,
+        source: GuardianCommandSource::Shell,
+        tool_name: ToolName::plain("shell_command"),
         approval_policy: AskForApproval::OnRequest,
         permission_profile: permission_profile.clone(),
         sandbox_permissions: SandboxPermissions::WithAdditionalPermissions,
@@ -536,16 +538,14 @@ async fn execve_permission_request_hook_short_circuits_prompt() -> anyhow::Resul
         .derive_exec_args("", /*use_login_shell*/ false);
     let hook_shell_program = hook_shell_argv.remove(0);
     let _ = hook_shell_argv.pop();
-    session
-        .services
-        .hooks
-        .store(Arc::new(Hooks::new(HooksConfig {
-            feature_enabled: true,
-            config_layer_stack: Some(trusted_config_layer_stack),
-            shell_program: Some(hook_shell_program),
-            shell_args: hook_shell_argv,
-            ..HooksConfig::default()
-        })));
+    let hooks = session.hooks().reconfigured(HooksConfig {
+        feature_enabled: true,
+        config_layer_stack: Some(trusted_config_layer_stack),
+        shell_program: Some(hook_shell_program),
+        shell_args: hook_shell_argv,
+        ..HooksConfig::default()
+    });
+    session.services.hooks.store(Arc::new(hooks));
 
     Arc::make_mut(&mut turn_context.config)
         .permissions
@@ -563,13 +563,43 @@ async fn execve_permission_request_hook_short_circuits_prompt() -> anyhow::Resul
     let command = vec!["touch".to_string(), target_str.clone()];
     let expected_hook_command =
         codex_shell_command::parse_command::shlex_join(&["/usr/bin/touch".to_string(), target_str]);
+
+    struct PendingApprovalTask;
+
+    impl crate::tasks::SessionTask for PendingApprovalTask {
+        fn kind(&self) -> crate::state::TaskKind {
+            crate::state::TaskKind::Regular
+        }
+
+        fn span_name(&self) -> &'static str {
+            "session_task.pending_execve_approval"
+        }
+
+        async fn run(
+            self: Arc<Self>,
+            _session: Arc<crate::session::session::Session>,
+            _turn_context: Arc<crate::session::turn_context::TurnContext>,
+            _input: Vec<crate::session::TurnInput>,
+            cancellation_token: tokio_util::sync::CancellationToken,
+        ) -> crate::tasks::SessionTaskResult {
+            cancellation_token.cancelled().await;
+            Ok(None)
+        }
+    }
+
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    session
+        .spawn_task(Arc::clone(&turn_context), Vec::new(), PendingApprovalTask)
+        .await;
     let provider = CoreShellActionProvider {
         policy: std::sync::Arc::new(RwLock::new(codex_execpolicy::Policy::empty())),
-        session: std::sync::Arc::new(session),
-        turn: std::sync::Arc::new(turn_context),
+        session: Arc::clone(&session),
+        review_context: GuardianReviewContext::from(turn_context),
         call_id: "execve-hook-call".to_string(),
         environment_id: "local".to_string(),
-        tool_name: GuardianCommandSource::Shell,
+        source: GuardianCommandSource::Shell,
+        tool_name: ToolName::plain("shell_command"),
         approval_policy: AskForApproval::OnRequest,
         permission_profile: PermissionProfile::read_only(),
         sandbox_permissions: SandboxPermissions::RequireEscalated,
@@ -776,10 +806,11 @@ prefix_rule(pattern = ["{cat_path_literal}"], decision = "allow")
     let provider = CoreShellActionProvider {
         policy: Arc::new(RwLock::new(policy)),
         session: Arc::new(session),
-        turn: Arc::new(turn_context),
+        review_context: GuardianReviewContext::from(Arc::new(turn_context)),
         call_id: "deny-read-prefix-allow".to_string(),
         environment_id: "local".to_string(),
-        tool_name: GuardianCommandSource::Shell,
+        source: GuardianCommandSource::Shell,
+        tool_name: ToolName::plain("shell_command"),
         approval_policy: AskForApproval::OnRequest,
         permission_profile,
         sandbox_permissions: SandboxPermissions::UseDefault,
@@ -812,10 +843,11 @@ async fn denied_reads_keep_granular_sandbox_rejection_for_escalation() -> anyhow
     let provider = CoreShellActionProvider {
         policy: Arc::new(RwLock::new(PolicyParser::new().build())),
         session: Arc::new(session),
-        turn: Arc::new(turn_context),
+        review_context: GuardianReviewContext::from(Arc::new(turn_context)),
         call_id: "deny-read-granular-sandbox-reject".to_string(),
         environment_id: "local".to_string(),
-        tool_name: GuardianCommandSource::Shell,
+        source: GuardianCommandSource::Shell,
+        tool_name: ToolName::plain("shell_command"),
         approval_policy: AskForApproval::Granular(GranularApprovalConfig {
             sandbox_approval: false,
             rules: true,

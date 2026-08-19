@@ -32,6 +32,7 @@ use codex_mcp::should_retry_without_scopes;
 use codex_plugin::PluginId;
 use codex_plugin::PluginTelemetryMetadata;
 use codex_protocol::auth::AuthMode as DomainAuthMode;
+use codex_rmcp_client::McpOAuthClientRegistration;
 use codex_rmcp_client::OAuthDiscoveryTimeout;
 use codex_rmcp_client::StreamableHttpRedirectMode;
 use codex_rmcp_client::perform_oauth_login_silent;
@@ -59,7 +60,7 @@ pub(crate) struct PluginRequestProcessor {
 }
 
 fn plugin_skills_to_info(
-    skills: &[codex_core::skills::SkillMetadata],
+    skills: &[codex_skills::SkillMetadata],
     disabled_skill_paths: &HashSet<AbsolutePathBuf>,
 ) -> Vec<SkillSummary> {
     skills
@@ -520,8 +521,10 @@ impl PluginRequestProcessor {
         Arc::clone(&self.on_effective_plugins_changed)
     }
 
-    fn on_effective_plugins_changed(&self) {
-        (self.on_effective_plugins_changed)(Default::default());
+    async fn on_effective_plugins_changed(&self) {
+        self.clear_plugin_related_caches();
+        self.thread_manager.invalidate_mcp_runtimes().await;
+        self.thread_manager.refresh_hook_runtimes().await;
     }
 
     fn clear_plugin_related_caches(&self) {
@@ -603,7 +606,7 @@ impl PluginRequestProcessor {
                 .refresh_non_curated_plugin_cache_for_config(&plugins_input, &roots)
                 .await
         {
-            self.on_effective_plugins_changed();
+            self.on_effective_plugins_changed().await;
         }
         let include_shared_with_me =
             marketplace_kinds.contains(&PluginListMarketplaceKind::SharedWithMe);
@@ -1479,13 +1482,18 @@ impl PluginRequestProcessor {
         let PluginInstallParams {
             marketplace_path,
             remote_marketplace_name,
+            install_attempt_id,
             plugin_name,
         } = params;
         let marketplace_path = match (marketplace_path, remote_marketplace_name) {
             (Some(marketplace_path), None) => marketplace_path,
             (None, Some(remote_marketplace_name)) => {
                 return self
-                    .remote_plugin_install_response(remote_marketplace_name, plugin_name)
+                    .remote_plugin_install_response(
+                        remote_marketplace_name,
+                        plugin_name,
+                        install_attempt_id,
+                    )
                     .await;
             }
             (Some(_), Some(_)) | (None, None) => {
@@ -1539,7 +1547,7 @@ impl PluginRequestProcessor {
             }
         };
 
-        self.on_effective_plugins_changed();
+        self.on_effective_plugins_changed().await;
 
         let plugin_mcp_servers = load_configured_plugin_mcp_servers(
             result.installed_path.as_path(),
@@ -1580,6 +1588,7 @@ impl PluginRequestProcessor {
         &self,
         remote_marketplace_name: String,
         remote_plugin_id: String,
+        install_attempt_id: Option<String>,
     ) -> Result<PluginInstallResponse, JSONRPCErrorError> {
         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
         if !config.features.enabled(Feature::Plugins) {
@@ -1601,12 +1610,13 @@ impl PluginRequestProcessor {
             .await
             .map_err(|err| {
                 let error_type = remote_plugin_catalog_error_type(&err);
+                let sub_error_type = err.sub_error_type();
                 self.track_plugin_install_failed_for_remote_plugin(
                     &remote_plugin_id,
                     &remote_marketplace_name,
                     /*plugin_id*/ None,
                     error_type,
-                    /*sub_error_type*/ None,
+                    sub_error_type,
                     err.to_string(),
                 );
                 remote_plugin_catalog_error_to_jsonrpc(
@@ -1623,14 +1633,29 @@ impl PluginRequestProcessor {
             ))
         })?;
         if remote_detail.summary.availability == PluginAvailability::DisabledByAdmin {
-            return Err(invalid_request(format!(
-                "remote plugin {remote_plugin_id} is disabled by admin"
-            )));
+            let error_message = format!("remote plugin {remote_plugin_id} is disabled by admin");
+            self.track_plugin_install_failed_for_remote_plugin(
+                &remote_plugin_id,
+                &actual_remote_marketplace_name,
+                Some(&resolved_plugin_id),
+                "remote_plugin_not_available",
+                Some("disabled_by_admin".to_string()),
+                error_message.clone(),
+            );
+            return Err(invalid_request(error_message));
         }
         if remote_detail.summary.install_policy == PluginInstallPolicy::NotAvailable {
-            return Err(invalid_request(format!(
-                "remote plugin {remote_plugin_id} is not available for install"
-            )));
+            let error_message =
+                format!("remote plugin {remote_plugin_id} is not available for install");
+            self.track_plugin_install_failed_for_remote_plugin(
+                &remote_plugin_id,
+                &actual_remote_marketplace_name,
+                Some(&resolved_plugin_id),
+                "remote_plugin_not_available",
+                Some("install_policy_not_available".to_string()),
+                error_message.clone(),
+            );
+            return Err(invalid_request(error_message));
         }
         // Direct install writes the same cache tree that installed-plugin sync
         // prunes before the backend installed snapshot can include this plugin.
@@ -1685,21 +1710,33 @@ impl PluginRequestProcessor {
         // Cache first so a backend install cannot succeed when local materialization fails.
         // If this backend call fails, the cache entry is harmless because remote installed state
         // is still backend-gated.
-        let install_result = codex_core_plugins::remote::install_remote_plugin(
-            &remote_plugin_service_config,
-            auth.as_ref(),
-            &actual_remote_marketplace_name,
-            &remote_plugin_id,
-        )
-        .await
+        let install_result = if let Some(install_attempt_id) = install_attempt_id.as_deref() {
+            codex_core_plugins::remote::install_remote_plugin_with_install_attempt_id(
+                &remote_plugin_service_config,
+                auth.as_ref(),
+                &actual_remote_marketplace_name,
+                &remote_plugin_id,
+                install_attempt_id,
+            )
+            .await
+        } else {
+            codex_core_plugins::remote::install_remote_plugin(
+                &remote_plugin_service_config,
+                auth.as_ref(),
+                &actual_remote_marketplace_name,
+                &remote_plugin_id,
+            )
+            .await
+        }
         .map_err(|err| {
             let error_type = remote_plugin_catalog_error_type(&err);
+            let sub_error_type = err.sub_error_type();
             self.track_plugin_install_failed_for_remote_plugin(
                 &remote_plugin_id,
                 &actual_remote_marketplace_name,
                 Some(&result.plugin_id),
                 error_type,
-                /*sub_error_type*/ None,
+                sub_error_type,
                 err.to_string(),
             );
             remote_plugin_catalog_error_to_jsonrpc(err, "install remote plugin")
@@ -1945,7 +1982,7 @@ impl PluginRequestProcessor {
 
             let store_mode = config.mcp_oauth_credentials_store_mode;
             let keyring_backend_kind = config.auth_keyring_backend_kind();
-            let callback_port = config.mcp_oauth_callback_port;
+            let callback_port = server.oauth_callback_port(config.mcp_oauth_callback_port);
             let callback_url = config.mcp_oauth_callback_url.clone();
             let outgoing = Arc::clone(&self.outgoing);
             let notification_name = name.clone();
@@ -1964,6 +2001,7 @@ impl PluginRequestProcessor {
                     oauth_config.env_http_headers.clone(),
                     &resolved_scopes.scopes,
                     oauth_client_id,
+                    McpOAuthClientRegistration::Auto,
                     server.oauth_resource.as_deref(),
                     callback_port,
                     callback_url.as_deref(),
@@ -1983,6 +2021,7 @@ impl PluginRequestProcessor {
                             oauth_config.env_http_headers,
                             &[],
                             oauth_client_id,
+                            McpOAuthClientRegistration::Auto,
                             server.oauth_resource.as_deref(),
                             callback_port,
                             callback_url.as_deref(),
@@ -2035,7 +2074,7 @@ impl PluginRequestProcessor {
             .await
             .map_err(Self::plugin_uninstall_error)?;
         match self.load_latest_config(/*fallback_cwd*/ None).await {
-            Ok(_) => self.on_effective_plugins_changed(),
+            Ok(_) => self.on_effective_plugins_changed().await,
             Err(err) => {
                 warn!(
                     "failed to reload config after plugin uninstall, clearing plugin-related caches only: {err:?}"
@@ -2153,7 +2192,7 @@ impl PluginRequestProcessor {
             self.analytics_events_client
                 .track_plugin_uninstalled(plugin_telemetry);
             if plugins_manager.clear_remote_installed_plugins_cache() {
-                self.on_effective_plugins_changed();
+                self.on_effective_plugins_changed().await;
             }
             plugins_manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
                 &config.plugins_config_input(),

@@ -47,6 +47,8 @@ use crate::app_server_session::AppServerStartedThread;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::TerminalTitleItem;
+use crate::chatwidget::ConnectorScopeGeneration;
+use crate::chatwidget::ThreadUsageOutcome;
 use crate::chatwidget::UserMessage;
 use crate::goal_files::GoalDraft;
 use codex_app_server_protocol::AskForApproval;
@@ -184,6 +186,12 @@ pub(crate) enum KeymapCaptureMode {
     Chord,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TranscriptExportDestination {
+    Clipboard,
+    File(PathBuf),
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AppEvent {
@@ -235,6 +243,14 @@ pub(crate) enum AppEvent {
         thread_id: ThreadId,
         cursor: String,
         result: Result<ThreadItemsListResponse, String>,
+    },
+
+    /// Open the filename prompt for an on-demand Markdown transcript export.
+    OpenTranscriptExportFilePrompt,
+
+    /// Export all current-thread history to the selected destination.
+    ExportTranscript {
+        destination: TranscriptExportDestination,
     },
 
     /// Persist a submitted prompt in the cross-session message history.
@@ -326,6 +342,12 @@ pub(crate) enum AppEvent {
     /// escape hatch that skips shutdown and may drop in-flight work (e.g.,
     /// background tasks, rollout flush, or child process cleanup).
     Exit(ExitMode),
+
+    /// Apply a choice from the running-task exit menu to its originating thread.
+    RunningTaskExit {
+        action: RunningTaskExitAction,
+        thread_id: ThreadId,
+    },
 
     /// Request app-server account logout, then exit after it succeeds.
     Logout,
@@ -438,6 +460,19 @@ pub(crate) enum AppEvent {
         result: Result<GetAccountTokenUsageResponse, String>,
     },
 
+    /// Fetch backend-estimated usage for the currently visible enterprise thread.
+    RefreshThreadUsage {
+        thread_id: ThreadId,
+        request_id: u64,
+    },
+
+    /// Result of fetching backend-estimated usage for a specific thread.
+    ThreadUsageLoaded {
+        thread_id: ThreadId,
+        request_id: u64,
+        result: Result<ThreadUsageOutcome, String>,
+    },
+
     /// Fetch workspace messages for the status-line headline item.
     RefreshStatusLineWorkspaceHeadline {
         request_id: u64,
@@ -461,6 +496,9 @@ pub(crate) enum AppEvent {
 
     /// Result of prefetching connectors.
     ConnectorsLoaded {
+        thread_id: Option<ThreadId>,
+        cwd: PathBuf,
+        generation: ConnectorScopeGeneration,
         result: Result<ConnectorsSnapshot, String>,
         is_final: bool,
     },
@@ -526,9 +564,10 @@ pub(crate) enum AppEvent {
         force_refetch: bool,
     },
 
-    /// Fetch app connector state from the app server after the widget accepts a refresh request.
+    /// Fetch apps only while the originating account, workspace, and thread remain current.
     FetchConnectorsList {
         force_refetch: bool,
+        generation: ConnectorScopeGeneration,
     },
 
     /// Fetch plugin marketplace state for the provided working directory.
@@ -1183,6 +1222,14 @@ pub(crate) enum ExitMode {
     /// This skips `Op::Shutdown`, so any in-flight work may be dropped and
     /// cleanup that normally runs before `ShutdownComplete` can be missed.
     Immediate,
+}
+
+/// Choice made when leaving a daemon-backed task that is still running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunningTaskExitAction {
+    CancelTask,
+    RunInBackground,
+    Exit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

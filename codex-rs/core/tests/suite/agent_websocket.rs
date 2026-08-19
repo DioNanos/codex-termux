@@ -1,9 +1,9 @@
 use anyhow::Result;
+use codex_core::TurnInputRequest;
 use codex_features::Feature;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::WebSocketConnectionConfig;
@@ -36,29 +36,28 @@ async fn websocket_model_switch_to_responses_lite_omits_top_level_tools() -> Res
     let mut builder = test_codex()
         .with_model_info_override("gpt-5.2", |model_info| {
             model_info.tool_mode = Some(ToolMode::CodeMode);
+            model_info.node_repl_auto_review_required = true;
         })
         .with_model_info_override("gpt-5.4", |model_info| {
             model_info.use_responses_lite = true;
             model_info.tool_mode = Some(ToolMode::CodeMode);
+            model_info.node_repl_disabled = true;
         })
         .with_model("gpt-5.2");
     let test = builder.build_with_websocket_server(&server).await?;
 
     test.submit_turn("non-lite turn").await?;
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "lite turn".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 model: Some("gpt-5.4".to_string()),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -79,29 +78,20 @@ async fn websocket_model_switch_to_responses_lite_omits_top_level_tools() -> Res
 
     assert_eq!(non_lite_turn["model"].as_str(), Some("gpt-5.2"));
     assert_eq!(lite_turn["model"].as_str(), Some("gpt-5.4"));
-    let non_lite_turn_metadata: Value = serde_json::from_str(
-        non_lite_turn["client_metadata"]["x-codex-turn-metadata"]
-            .as_str()
-            .expect("non-lite turn metadata"),
-    )?;
-    assert!(non_lite_turn_metadata.get("code_mode_tool_names").is_none());
-    let lite_turn_metadata: Value = serde_json::from_str(
-        lite_turn["client_metadata"]["x-codex-turn-metadata"]
-            .as_str()
-            .expect("Responses Lite turn metadata"),
-    )?;
-    assert_eq!(
-        lite_turn_metadata["code_mode_tool_names"]["view_image"],
-        serde_json::json!({
-            "name": "view_image",
-            "namespace": null,
-        })
-    );
-    assert!(
-        lite_turn["client_metadata"]
-            .get("x-codex-code-mode-tool-names")
-            .is_none()
-    );
+    for (request, auto_review_required, disabled) in
+        [(&non_lite_turn, true, false), (&lite_turn, false, true)]
+    {
+        let metadata: Value = serde_json::from_str(
+            request["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .expect("websocket request should include turn metadata"),
+        )?;
+        assert_eq!(
+            metadata["node_repl_auto_review_required"],
+            auto_review_required
+        );
+        assert_eq!(metadata["node_repl_disabled"], disabled);
+    }
     assert!(
         non_lite_turn
             .get("tools")

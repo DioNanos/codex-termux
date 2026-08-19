@@ -14,6 +14,8 @@ use crate::exec::ExecCapturePolicy;
 use crate::exec::StdoutStream;
 use crate::exec::execute_exec_request;
 use crate::exec_env::create_env;
+use crate::exec_env::inject_apply_patch_env;
+use crate::exec_env::inject_session_id_env;
 use crate::sandboxing::ExecRequest;
 use crate::session::TurnInput;
 use crate::session::turn_context::TurnContext;
@@ -37,6 +39,7 @@ use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_sandboxing::SandboxType;
 use codex_shell_command::parse_command::parse_command;
+use codex_thread_store::PersistContext;
 
 use super::SessionTask;
 use super::SessionTaskResult;
@@ -159,6 +162,8 @@ pub(crate) async fn execute_user_shell_command(
         &turn_context.config.permissions.shell_environment_policy,
         Some(session.thread_id),
     );
+    inject_session_id_env(&mut exec_env_map, session.session_id());
+    inject_apply_patch_env(&mut exec_env_map, &turn_context.config.features);
     if exec_env_map.contains_key(PROXY_ACTIVE_ENV_KEY) {
         strip_managed_proxy_env(&mut exec_env_map);
     }
@@ -459,7 +464,9 @@ async fn persist_user_shell_output(
             .await;
         // Standalone shell turns can run before any regular user turn, so
         // explicitly materialize rollout persistence after recording output.
-        session.ensure_rollout_materialized().await;
+        session
+            .ensure_rollout_materialized(PersistContext::Standard)
+            .await;
         return;
     }
 

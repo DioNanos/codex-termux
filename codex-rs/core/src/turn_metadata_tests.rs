@@ -1,17 +1,28 @@
 use super::*;
 
-use crate::responses_metadata::CODE_MODE_TOOL_NAMES_KEY;
+use crate::responses_metadata::AUTO_REVIEW_ENABLED_KEY;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::responses_metadata::INSTALLATION_ID_KEY;
+use crate::responses_metadata::LEGACY_CODE_MODE_TOOL_NAMES_KEY;
+use crate::responses_metadata::NODE_REPL_AUTO_REVIEW_REQUIRED_KEY;
+use crate::responses_metadata::NODE_REPL_DISABLED_KEY;
 use crate::responses_metadata::PARENT_TURN_ID_KEY;
+use crate::responses_metadata::ROOT_TURN_ID_KEY;
+use crate::responses_metadata::SANDBOX_MODE_KEY;
+use crate::responses_metadata::TOOL_NAMESPACES_INFO_KEY;
+use crate::responses_metadata::TurnToolFunctionInfo;
+use crate::responses_metadata::TurnToolNamespaceInfo;
+use crate::responses_metadata::TurnToolSource;
 use crate::responses_metadata::WINDOW_ID_KEY;
+use crate::responses_metadata::validate_extra_metadata;
 use crate::sandbox_tags::permission_profile_sandbox_tag;
 use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
-use codex_protocol::ToolName;
+use codex_models_manager::model_info::model_info_from_slug;
+use codex_protocol::AgentPath;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
@@ -143,6 +154,7 @@ async fn detached_memory_responses_metadata_omits_turn_identity() {
         String::new(),
         &SessionSource::Unknown,
         &repo_path,
+        &PermissionProfile::read_only(),
         Some("none"),
     )
     .await
@@ -152,10 +164,12 @@ async fn detached_memory_responses_metadata_omits_turn_identity() {
     assert!(!header.contains("東京"));
     let parsed: Value = serde_json::from_str(&header).expect("valid json");
     assert_eq!(parsed["request_kind"].as_str(), Some("memory"));
+    assert_eq!(parsed[SANDBOX_MODE_KEY].as_str(), Some("read-only"));
     assert!(parsed.get("session_id").is_none());
     assert!(parsed.get("thread_id").is_none());
     assert!(parsed.get("forked_from_thread_id").is_none());
     assert!(parsed.get("turn_id").is_none());
+    assert!(parsed.get(ROOT_TURN_ID_KEY).is_none());
     assert!(parsed.get(WINDOW_ID_KEY).is_none());
 
     let expected_repo_path = repo_path.to_string_lossy().into_owned();
@@ -189,6 +203,7 @@ async fn detached_memory_responses_metadata_omits_empty_workspace_metadata() {
         String::new(),
         &SessionSource::Unknown,
         &cwd,
+        &PermissionProfile::read_only(),
         /*sandbox*/ None,
     )
     .await
@@ -196,11 +211,17 @@ async fn detached_memory_responses_metadata_omits_empty_workspace_metadata() {
     .expect("detached memory should emit its request kind");
     let parsed: Value = serde_json::from_str(&header).expect("valid json");
 
-    assert_eq!(parsed, serde_json::json!({"request_kind": "memory"}));
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "request_kind": "memory",
+            "sandbox_mode": "read-only",
+        })
+    );
 }
 
 #[test]
-fn turn_metadata_state_uses_platform_sandbox_tag() {
+fn turn_metadata_state_includes_sandbox_metadata() {
     let temp_dir = TempDir::new().expect("temp dir");
     let cwd = temp_dir.path().abs();
     let permission_profile = PermissionProfile::read_only();
@@ -217,11 +238,15 @@ fn turn_metadata_state_uses_platform_sandbox_tag() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ true,
+        &model_info_from_slug("gpt-5.4"),
     );
 
     let header = test_turn_metadata_header(&state);
     let json: Value = serde_json::from_str(&header).expect("json");
     let sandbox_name = json.get("sandbox").and_then(Value::as_str);
+    let sandbox_mode = json.get(SANDBOX_MODE_KEY).and_then(Value::as_str);
+    let auto_review_enabled = json.get(AUTO_REVIEW_ENABLED_KEY).and_then(Value::as_bool);
     let session_id = json.get("session_id").and_then(Value::as_str);
     let thread_id = json.get("thread_id").and_then(Value::as_str);
 
@@ -232,8 +257,11 @@ fn turn_metadata_state_uses_platform_sandbox_tag() {
         /*enforce_managed_network*/ false,
     );
     assert_eq!(sandbox_name, Some(expected_sandbox));
+    assert_eq!(sandbox_mode, Some("read-only"));
+    assert_eq!(auto_review_enabled, Some(true));
     assert_eq!(session_id, Some("session-a"));
     assert_eq!(thread_id, Some("thread-a"));
+    assert_eq!(json["agent_name"].as_str(), Some("/root"));
     assert!(json.get("forked_from_thread_id").is_none());
     assert!(json.get("parent_thread_id").is_none());
     assert!(json.get("subagent_kind").is_none());
@@ -260,6 +288,8 @@ fn turn_metadata_state_includes_root_fork_lineage() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
 
     let header = test_turn_metadata_header(&state);
@@ -289,7 +319,7 @@ fn turn_metadata_state_includes_thread_spawn_subagent_parent_without_fork() {
         &SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id,
             depth: 1,
-            agent_path: None,
+            agent_path: Some(AgentPath::root().join("worker").expect("agent path")),
             agent_nickname: None,
             agent_role: None,
         }),
@@ -299,6 +329,8 @@ fn turn_metadata_state_includes_thread_spawn_subagent_parent_without_fork() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
 
     let header = test_turn_metadata_header(&state);
@@ -310,6 +342,7 @@ fn turn_metadata_state_includes_thread_spawn_subagent_parent_without_fork() {
         Some("22222222-2222-4222-8222-222222222222")
     );
     assert_eq!(json["subagent_kind"].as_str(), Some("thread_spawn"));
+    assert_eq!(json["agent_name"].as_str(), Some("/root/worker"));
 }
 
 #[test]
@@ -338,6 +371,8 @@ fn turn_metadata_state_includes_forked_thread_spawn_subagent_lineage() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
 
     let header = test_turn_metadata_header(&state);
@@ -352,6 +387,9 @@ fn turn_metadata_state_includes_forked_thread_spawn_subagent_lineage() {
         Some("33333333-3333-4333-8333-333333333333")
     );
     assert_eq!(json["subagent_kind"].as_str(), Some("thread_spawn"));
+    // V1 subagents have no canonical agent path and are intentionally unsupported by
+    // agent-name-addressed history and notes; their metadata falls back to the root agent.
+    assert_eq!(json["agent_name"].as_str(), Some("/root"));
 }
 
 #[test]
@@ -379,6 +417,8 @@ fn turn_metadata_state_includes_known_parent_for_non_thread_spawn_subagents_with
             &permission_profile,
             WindowsSandboxLevel::Disabled,
             /*enforce_managed_network*/ false,
+            /*auto_review_enabled*/ false,
+            &model_info_from_slug("gpt-5.4"),
         );
 
         let header = test_turn_metadata_header(&state);
@@ -390,6 +430,7 @@ fn turn_metadata_state_includes_known_parent_for_non_thread_spawn_subagents_with
             Some("44444444-4444-4444-8444-444444444444")
         );
         assert_eq!(json["subagent_kind"].as_str(), Some(subagent_kind));
+        assert_eq!(json["agent_name"].as_str(), Some("/root"));
     }
 }
 
@@ -411,6 +452,8 @@ fn turn_metadata_state_includes_turn_started_at_unix_ms_after_start() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
     state.set_turn_started_at_unix_ms(/*turn_started_at_unix_ms*/ 1_700_000_000_123);
 
@@ -441,16 +484,20 @@ fn turn_metadata_state_includes_model_and_reasoning_effort_only_in_request_meta(
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
 
     let header = test_turn_metadata_header(&state);
     let header_json: Value = serde_json::from_str(&header).expect("json");
+    assert_eq!(header_json["agent_name"].as_str(), Some("/root"));
     assert!(header_json.get("model").is_none());
     assert!(header_json.get("reasoning_effort").is_none());
 
     let meta = state
         .current_meta_value_for_mcp_request(test_mcp_turn_metadata_context())
         .expect("turn metadata should be present");
+    assert!(meta.get("agent_name").is_none());
     assert!(meta.get("request_kind").is_none());
     assert_eq!(meta["model"].as_str(), Some("gpt-5.4"));
     assert_eq!(meta["reasoning_effort"].as_str(), Some("high"));
@@ -490,6 +537,8 @@ fn turn_metadata_state_marks_user_input_requested_during_turn_only_for_mcp_reque
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
 
     let header = test_turn_metadata_header(&state);
@@ -543,10 +592,16 @@ fn turn_metadata_state_ignores_client_reserved_metadata_before_start() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
     state.set_responsesapi_client_metadata(HashMap::from([
         (
-            CODE_MODE_TOOL_NAMES_KEY.to_string(),
+            LEGACY_CODE_MODE_TOOL_NAMES_KEY.to_string(),
+            "client-supplied".to_string(),
+        ),
+        (
+            TOOL_NAMESPACES_INFO_KEY.to_string(),
             "client-supplied".to_string(),
         ),
         (
@@ -562,18 +617,38 @@ fn turn_metadata_state_ignores_client_reserved_metadata_before_start() {
             "client-supplied".to_string(),
         ),
         ("parent_turn_id".to_string(), "client-supplied".to_string()),
+        (ROOT_TURN_ID_KEY.to_string(), "client-supplied".to_string()),
         ("subagent_kind".to_string(), "client-supplied".to_string()),
+        (
+            SANDBOX_MODE_KEY.to_string(),
+            "danger-full-access".to_string(),
+        ),
+        (AUTO_REVIEW_ENABLED_KEY.to_string(), "true".to_string()),
+        (
+            NODE_REPL_AUTO_REVIEW_REQUIRED_KEY.to_string(),
+            "true".to_string(),
+        ),
+        (NODE_REPL_DISABLED_KEY.to_string(), "true".to_string()),
     ]));
 
     let header = test_turn_metadata_header(&state);
     let json: Value = serde_json::from_str(&header).expect("json");
 
-    assert!(json.get(CODE_MODE_TOOL_NAMES_KEY).is_none());
+    assert!(json.get(LEGACY_CODE_MODE_TOOL_NAMES_KEY).is_none());
+    assert!(json.get(TOOL_NAMESPACES_INFO_KEY).is_none());
     assert!(json.get("turn_started_at_unix_ms").is_none());
     assert!(json.get("forked_from_thread_id").is_none());
     assert!(json.get("parent_thread_id").is_none());
     assert!(json.get("parent_turn_id").is_none());
+    assert!(json.get(ROOT_TURN_ID_KEY).is_none());
     assert!(json.get("subagent_kind").is_none());
+    assert_eq!(json[SANDBOX_MODE_KEY].as_str(), Some("read-only"));
+    assert_eq!(json[AUTO_REVIEW_ENABLED_KEY].as_bool(), Some(false));
+    assert_eq!(
+        json[NODE_REPL_AUTO_REVIEW_REQUIRED_KEY].as_bool(),
+        Some(false)
+    );
+    assert_eq!(json[NODE_REPL_DISABLED_KEY].as_bool(), Some(false));
 }
 
 #[test]
@@ -604,9 +679,20 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
+    state.set_responses_api_metadata(BTreeMap::from([(
+        "codex_security_surface".to_string(),
+        "sdk".to_string(),
+    )]));
     state.set_parent_turn_id("parent-turn-a".to_string());
+    state.set_root_turn_id("root-turn-a".to_string());
     state.set_responsesapi_client_metadata(HashMap::from([
+        (
+            "codex_security_surface".to_string(),
+            "client-supplied".to_string(),
+        ),
         ("fiber_run_id".to_string(), "fiber-123".to_string()),
         ("origin".to_string(), "東京".to_string()),
         ("workspace_kind".to_string(), "projectless".to_string()),
@@ -617,6 +703,7 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
         ),
         ("session_id".to_string(), "client-supplied".to_string()),
         ("thread_id".to_string(), "client-supplied".to_string()),
+        ("agent_name".to_string(), "client-supplied".to_string()),
         ("installation_id".to_string(), "client-supplied".to_string()),
         (
             "x-codex-installation-id".to_string(),
@@ -639,9 +726,14 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
             "client-supplied".to_string(),
         ),
         ("parent_turn_id".to_string(), "client-supplied".to_string()),
+        (ROOT_TURN_ID_KEY.to_string(), "client-supplied".to_string()),
         ("subagent_kind".to_string(), "client-supplied".to_string()),
         (
-            CODE_MODE_TOOL_NAMES_KEY.to_string(),
+            LEGACY_CODE_MODE_TOOL_NAMES_KEY.to_string(),
+            "client-supplied".to_string(),
+        ),
+        (
+            TOOL_NAMESPACES_INFO_KEY.to_string(),
             "client-supplied".to_string(),
         ),
         ("turn_id".to_string(), "client-supplied".to_string()),
@@ -654,13 +746,24 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
         ),
     ]));
     state.set_turn_started_at_unix_ms(/*turn_started_at_unix_ms*/ 1_700_000_000_123);
-    state.set_code_mode_tool_names(BTreeMap::from([
-        ("exec_command".to_string(), ToolName::plain("exec_command")),
-        (
-            "mcp__calendar__lookup".to_string(),
-            ToolName::namespaced("mcp__calendar", "lookup"),
-        ),
-    ]));
+    state.set_tool_namespaces_info(BTreeMap::from([(
+        "mcp__calendar".to_string(),
+        TurnToolNamespaceInfo {
+            name: "mcp__calendar".to_string(),
+            functions: BTreeMap::from([(
+                "lookup".to_string(),
+                TurnToolFunctionInfo {
+                    name: "lookup".to_string(),
+                    direct: true,
+                    code_mode_name: Some("mcp__calendar__lookup".to_string()),
+                    deferred: false,
+                    source: TurnToolSource::Mcp {
+                        server_name: "calendar".to_string(),
+                    },
+                },
+            )]),
+        },
+    )]));
 
     let header = test_turn_metadata_header(&state);
     assert!(header.is_ascii());
@@ -670,20 +773,30 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
     assert_eq!(json["fiber_run_id"].as_str(), Some("fiber-123"));
     assert_eq!(json["origin"].as_str(), Some("東京"));
     assert_eq!(json["workspace_kind"].as_str(), Some("projectless"));
+    assert_eq!(json["codex_security_surface"].as_str(), Some("sdk"));
     assert_eq!(json["model"].as_str(), Some("client-supplied"));
     assert_eq!(json["reasoning_effort"].as_str(), Some("client-supplied"));
     assert_eq!(json["session_id"].as_str(), Some("session-a"));
     assert_eq!(json["thread_id"].as_str(), Some("thread-a"));
+    assert!(json.get(LEGACY_CODE_MODE_TOOL_NAMES_KEY).is_none());
+    assert_eq!(json["agent_name"].as_str(), Some("/root"));
     assert_eq!(
-        json[CODE_MODE_TOOL_NAMES_KEY],
+        json[TOOL_NAMESPACES_INFO_KEY],
         serde_json::json!({
-            "exec_command": {
-                "name": "exec_command",
-                "namespace": null,
-            },
-            "mcp__calendar__lookup": {
-                "name": "lookup",
-                "namespace": "mcp__calendar",
+            "mcp__calendar": {
+                "name": "mcp__calendar",
+                "functions": {
+                    "lookup": {
+                        "name": "lookup",
+                        "direct": true,
+                        "code_mode_name": "mcp__calendar__lookup",
+                        "deferred": false,
+                        "source": {
+                            "kind": "mcp",
+                            "server_name": "calendar",
+                        },
+                    },
+                },
             },
         })
     );
@@ -700,6 +813,7 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
         Some("55555555-5555-4555-8555-555555555555")
     );
     assert_eq!(json["parent_turn_id"].as_str(), Some("parent-turn-a"));
+    assert_eq!(json[ROOT_TURN_ID_KEY].as_str(), Some("root-turn-a"));
     assert_eq!(json["subagent_kind"].as_str(), Some("thread_spawn"));
     assert_eq!(json["thread_source"].as_str(), Some("automation"));
     assert_eq!(json["turn_id"].as_str(), Some("turn-a"));
@@ -715,8 +829,16 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
         serde_json::from_str(&model_request_header).expect("model request json");
     assert_eq!(model_request_json["request_kind"].as_str(), Some("turn"));
     assert_eq!(
+        model_request_json[ROOT_TURN_ID_KEY].as_str(),
+        Some("root-turn-a")
+    );
+    assert_eq!(
         model_request_json["thread_source"].as_str(),
         Some("automation")
+    );
+    assert_eq!(
+        model_request_json["codex_security_surface"].as_str(),
+        Some("sdk")
     );
     assert_eq!(
         model_request_json[INSTALLATION_ID_KEY].as_str(),
@@ -727,14 +849,43 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
         Some("thread-a:1")
     );
 
+    let compatibility_headers = state
+        .to_responses_metadata(
+            "installation-a".to_string(),
+            "thread-a:1".to_string(),
+            CodexResponsesRequestKind::Turn,
+        )
+        .compatibility_headers();
+    let compatibility_metadata: Value = serde_json::from_str(
+        compatibility_headers
+            .get("x-codex-turn-metadata")
+            .expect("compatibility turn metadata header")
+            .to_str()
+            .expect("valid compatibility header"),
+    )
+    .expect("compatibility metadata json");
+    assert!(
+        compatibility_metadata
+            .get(LEGACY_CODE_MODE_TOOL_NAMES_KEY)
+            .is_none()
+    );
+    assert!(
+        compatibility_metadata
+            .get(TOOL_NAMESPACES_INFO_KEY)
+            .is_none()
+    );
+
     let meta = state
         .current_meta_value_for_mcp_request(test_mcp_turn_metadata_context())
         .expect("turn metadata should be present");
     assert_eq!(meta["model"].as_str(), Some("gpt-5.4"));
     assert_eq!(meta["reasoning_effort"].as_str(), Some("high"));
-    assert!(meta.get(CODE_MODE_TOOL_NAMES_KEY).is_none());
+    assert!(meta.get(LEGACY_CODE_MODE_TOOL_NAMES_KEY).is_none());
+    assert!(meta.get(TOOL_NAMESPACES_INFO_KEY).is_none());
     assert!(meta.get(PARENT_TURN_ID_KEY).is_none());
+    assert!(meta.get(ROOT_TURN_ID_KEY).is_none());
     assert!(meta.get(WINDOW_ID_KEY).is_none());
+    assert!(meta.get("codex_security_surface").is_none());
     assert_eq!(state.workspace_kind().as_deref(), Some("projectless"));
 }
 
@@ -755,7 +906,13 @@ fn turn_metadata_state_overlays_compaction_only_on_compaction_requests() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
+    state.set_responses_api_metadata(BTreeMap::from([(
+        "codex_security_surface".to_string(),
+        "sdk".to_string(),
+    )]));
     state.set_responsesapi_client_metadata(HashMap::from([(
         "compaction".to_string(),
         "client-supplied".to_string(),
@@ -775,6 +932,7 @@ fn turn_metadata_state_overlays_compaction_only_on_compaction_requests() {
     assert_eq!(compact_json["request_kind"].as_str(), Some("compaction"));
     assert_eq!(compact_json["turn_id"].as_str(), Some("turn-a"));
     assert_eq!(compact_json[WINDOW_ID_KEY].as_str(), Some("thread-a:2"));
+    assert_eq!(compact_json["codex_security_surface"].as_str(), Some("sdk"));
     assert_eq!(
         compact_json["compaction"],
         serde_json::json!({
@@ -790,7 +948,18 @@ fn turn_metadata_state_overlays_compaction_only_on_compaction_requests() {
     let regular_json: Value = serde_json::from_str(&regular_header).expect("json");
     assert_eq!(regular_json["request_kind"].as_str(), Some("turn"));
     assert_eq!(regular_json[WINDOW_ID_KEY].as_str(), Some("thread-a:3"));
+    assert_eq!(regular_json["codex_security_surface"].as_str(), Some("sdk"));
     assert!(regular_json.get("compaction").is_none());
+}
+
+#[test]
+fn responses_api_metadata_rejects_reserved_keys() {
+    assert_eq!(
+        validate_extra_metadata(
+            BTreeMap::from([("thread_source".to_string(), "sdk".to_string())]).iter()
+        ),
+        Err("responses_api_metadata contains a reserved key")
+    );
 }
 
 #[tokio::test]
@@ -818,6 +987,8 @@ async fn turn_metadata_state_preserves_lineage_after_git_enrichment() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     ));
 
     state.spawn_git_enrichment_task();
@@ -860,6 +1031,8 @@ async fn turn_metadata_state_coalesces_concurrent_git_enrichment() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     ));
     let barrier = Arc::new(tokio::sync::Barrier::new(8));
     let tasks = (0..8)
@@ -913,6 +1086,8 @@ async fn turn_metadata_state_git_enrichment_cancellation_is_retryable_and_errors
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     ));
     state.spawn_git_enrichment_task();
     state.cancel_git_enrichment_task();
@@ -946,6 +1121,8 @@ async fn turn_metadata_state_git_enrichment_cancellation_is_retryable_and_errors
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     ));
     invalid_state.spawn_git_enrichment_task();
     tokio::time::timeout(Duration::from_secs(2), async {

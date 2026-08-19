@@ -36,7 +36,6 @@ pub(crate) struct ConfigManager {
     cloud_config_bundle: Arc<RwLock<CloudConfigBundleLoader>>,
     arg0_paths: Arg0DispatchPaths,
     thread_config_loader: Arc<RwLock<Arc<dyn ThreadConfigLoader>>>,
-    pub(crate) psp: bool,
 }
 
 impl ConfigManager {
@@ -58,7 +57,6 @@ impl ConfigManager {
             cloud_config_bundle: Arc::new(RwLock::new(cloud_config_bundle)),
             arg0_paths,
             thread_config_loader: Arc::new(RwLock::new(thread_config_loader)),
-            psp: false,
         }
     }
 
@@ -110,6 +108,14 @@ impl ConfigManager {
             *guard = loader;
         } else {
             warn!("failed to update cloud config bundle loader");
+        }
+    }
+
+    pub(crate) fn clear_cloud_config_bundle_loader(&self) {
+        if let Ok(mut guard) = self.cloud_config_bundle.write() {
+            *guard = CloudConfigBundleLoader::default();
+        } else {
+            warn!("failed to clear cloud config bundle loader");
         }
     }
 
@@ -182,7 +188,6 @@ impl ConfigManager {
             .cloud_config_bundle(CloudConfigBundleLoader::default())
             .build()
             .await?;
-        config.psp = self.psp;
         self.apply_runtime_feature_enablement(&mut config);
         self.apply_arg0_paths(&mut config);
         Ok(config)
@@ -243,8 +248,6 @@ impl ConfigManager {
                     .map(|(key, value)| (key, json_to_toml(value))),
             )
             .collect::<Vec<_>>();
-        typesafe_overrides.psp = Some(self.psp);
-
         let mut config = codex_core::config::ConfigBuilder::default()
             .codex_home(self.codex_home.clone())
             .cli_overrides(merged_cli_overrides)

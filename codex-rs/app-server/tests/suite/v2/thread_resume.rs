@@ -79,13 +79,11 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentMessageEvent;
-use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ImageGenerationEndEvent;
 use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::McpToolCallEndEvent;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource as RolloutSessionSource;
@@ -97,6 +95,8 @@ use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
+use codex_rollout::CompactedItem;
+use codex_rollout::RolloutItem;
 use codex_rollout::append_rollout_item_to_path;
 use codex_rollout::read_session_meta_line;
 use codex_state::StateRuntime;
@@ -717,6 +717,134 @@ async fn thread_resume_preserves_persisted_approvals_reviewer() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_resume_restores_persisted_approval_policy() -> Result<()> {
+    assert_thread_resume_approval_policy(
+        ThreadHistoryMode::Legacy,
+        /*approval_policy*/ None,
+        AskForApproval::Never,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn paginated_thread_resume_restores_persisted_approval_policy() -> Result<()> {
+    assert_thread_resume_approval_policy(
+        ThreadHistoryMode::Paginated,
+        /*approval_policy*/ None,
+        AskForApproval::Never,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn thread_resume_approval_policy_override_wins_over_persisted_policy() -> Result<()> {
+    assert_thread_resume_approval_policy(
+        ThreadHistoryMode::Legacy,
+        Some(AskForApproval::OnRequest),
+        AskForApproval::OnRequest,
+    )
+    .await
+}
+
+async fn assert_thread_resume_approval_policy(
+    history_mode: ThreadHistoryMode,
+    approval_policy: Option<AskForApproval>,
+    expected_approval_policy: AskForApproval,
+) -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let config_path = codex_home.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+model = "gpt-5.4"
+approval_policy = "never"
+model_provider = "mock_provider"
+
+[model_providers.mock_provider]
+name = "Mock provider for test"
+base_url = "{}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#,
+            server.uri()
+        ),
+    )?;
+
+    let thread_id = {
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .without_auto_env()
+            .build_initialized()
+            .await?;
+
+        let start_id = mcp
+            .send_thread_start_request(ThreadStartParams {
+                model: Some("gpt-5.4".to_string()),
+                history_mode: Some(history_mode),
+                ..Default::default()
+            })
+            .await?;
+        let ThreadStartResponse { thread, .. } =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
+
+        let turn_id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: None,
+                input: vec![UserInput::Text {
+                    text: "materialize this thread".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
+        )
+        .await??;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+
+        thread.id
+    };
+
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        config_path,
+        config.replace(
+            "approval_policy = \"never\"",
+            "approval_policy = \"on-request\"",
+        ),
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            approval_policy,
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        approval_policy, ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+
+    assert_eq!(approval_policy, expected_approval_policy);
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_resume_preserves_goal_first_and_fork_approvals_reviewer() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
@@ -833,6 +961,9 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
 -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
+    let updated_workspace = TempDir::new()?;
+    let persisted_cwd = normalized_existing_path(updated_workspace.path())?;
+    let live_cwd = normalized_existing_path(codex_home.path())?;
     mock_responses_config(&server.uri()).write(codex_home.path())?;
     let config_path = codex_home.path().join("config.toml");
     let config_toml = std::fs::read_to_string(&config_path)?;
@@ -887,6 +1018,7 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
                 model: Some("gpt-5.2-codex".to_string()),
                 effort: Some(ReasoningEffort::Ultra),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+                cwd: Some(persisted_cwd.clone()),
                 ..Default::default()
             })
             .await?;
@@ -898,6 +1030,31 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
         )
         .await??;
 
+        let read_id = mcp
+            .send_thread_read_request(ThreadReadParams {
+                thread_id: thread.id.clone(),
+                include_turns: false,
+            })
+            .await?;
+        let ThreadReadResponse { thread: read } =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
+        assert_eq!(read.cwd.as_path(), persisted_cwd);
+
+        let list_id = mcp
+            .send_raw_request(
+                "thread/list",
+                Some(json!({ "cwd": persisted_cwd, "useStateDbOnly": true })),
+            )
+            .await?;
+        let ThreadListResponse { data, .. } =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(list_id)).await??;
+        assert_eq!(
+            data.iter()
+                .find(|listed| listed.id == thread.id)
+                .map(|listed| &listed.cwd),
+            Some(&read.cwd)
+        );
+
         thread.id
     };
 
@@ -908,10 +1065,13 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread_id.clone(),
+            cwd: Some(live_cwd.to_string_lossy().into_owned()),
             ..Default::default()
         })
         .await?;
     let ThreadResumeResponse {
+        thread,
+        cwd,
         model,
         reasoning_effort,
         approvals_reviewer,
@@ -921,6 +1081,8 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
     assert_eq!(model, "gpt-5.2-codex");
     assert_eq!(reasoning_effort, Some(ReasoningEffort::Ultra));
     assert_eq!(approvals_reviewer, ApprovalsReviewer::AutoReview);
+    assert_eq!(thread.cwd.as_path(), persisted_cwd);
+    assert_eq!(cwd.as_path(), live_cwd);
 
     let update_id = mcp
         .send_thread_settings_update_request(ThreadSettingsUpdateParams {
@@ -1682,6 +1844,7 @@ fn append_resume_redaction_history(
             revised_prompt: Some("secret revised prompt".to_string()),
             result: "base64-image-result".to_string(),
             transparent_background: None,
+            failure: None,
             saved_path: Some(test_absolute_path("/tmp/ig-1.png")),
         }),
     ]
@@ -1884,6 +2047,103 @@ async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
             .iter()
             .any(|method| method == "turn/started"),
         "paused goal should not continue after thread resume"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_goal_set_enforces_configured_maximum_token_budget() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    let config = config.replace("personality = true\n", "personality = true\ngoals = true\n");
+    std::fs::write(
+        config_path,
+        format!("{config}\n[goals]\nmax_goal_token_budget = 200\n"),
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build_initialized()
+        .await?;
+    let start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("gpt-5.2-codex".to_string()),
+            config: Some(
+                [("goals.max_goal_token_budget".to_string(), json!(100))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
+
+    let oversized_creation_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({
+                "threadId": thread.id,
+                "objective": "oversized goal",
+                "tokenBudget": 101,
+            })),
+        )
+        .await?;
+    let creation_error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(oversized_creation_id)),
+    )
+    .await??;
+    assert_eq!(
+        creation_error.error.message,
+        "goal token budget 101 exceeds the maximum allowed goal token budget of 100"
+    );
+
+    let creation_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({
+                "threadId": thread.id,
+                "objective": "bounded goal",
+            })),
+        )
+        .await?;
+    let creation: ThreadGoalSetResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(creation_id)).await??;
+    assert_eq!(creation.goal.token_budget, Some(100));
+
+    let clear_budget_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({ "threadId": thread.id, "tokenBudget": null })),
+        )
+        .await?;
+    let clear_budget: ThreadGoalSetResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(clear_budget_id)).await??;
+    assert_eq!(clear_budget.goal.token_budget, Some(100));
+
+    let oversized_update_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({
+                "threadId": thread.id,
+                "tokenBudget": 101,
+            })),
+        )
+        .await?;
+    let update_error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(oversized_update_id)),
+    )
+    .await??;
+    assert_eq!(
+        update_error.error.message,
+        "goal token budget 101 exceeds the maximum allowed goal token budget of 100"
     );
 
     Ok(())

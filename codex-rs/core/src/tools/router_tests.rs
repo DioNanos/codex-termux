@@ -471,15 +471,22 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
         Vec::new(),
         &dynamic_tools,
     );
+    let visible_specs = router.model_visible_specs();
 
+    assert!(Arc::ptr_eq(&visible_specs, &router.model_visible_specs()));
     assert_eq!(
-        namespace_function_names(&router.model_visible_specs(), "codex_app"),
+        namespace_function_names(&visible_specs, "codex_app"),
         vec![visible_tool.to_string()]
     );
     assert_eq!(
         router.deferred_tool_namespaces(),
         BTreeMap::from([("codex_app".to_string(), "Codex app tools.".to_string())])
     );
+
+    let updated_router = test_tool_router(step_context.as_ref(), Vec::new(), Vec::new(), &[]);
+    let updated_specs = updated_router.model_visible_specs();
+    assert!(!Arc::ptr_eq(&visible_specs, &updated_specs));
+    assert!(namespace_function_names(&updated_specs, "codex_app").is_empty());
 
     Ok(())
 }
@@ -538,8 +545,13 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
     session
         .record_conversation_items(&turn, std::slice::from_ref(&history_item))
         .await;
-    let mut expected_history_item = history_item.clone();
-    expected_history_item.set_turn_id_if_missing(&turn.sub_id);
+    let expected_history_item = session
+        .clone_history()
+        .await
+        .raw_items()
+        .next()
+        .expect("history item")
+        .clone();
 
     let router = test_tool_router(
         step_context.as_ref(),

@@ -67,6 +67,7 @@ use serde::Serialize;
 use supports_color::Stream;
 
 mod background;
+mod disk;
 mod git;
 mod output;
 mod progress;
@@ -75,6 +76,8 @@ mod system;
 mod thread_inventory;
 mod title;
 mod updates;
+#[cfg(target_os = "windows")]
+mod windows_dev_drive;
 
 use background::background_server_check;
 use git::git_check;
@@ -348,10 +351,28 @@ async fn build_report(
 
     progress.begin("config");
     let config_result = load_config(root_config_overrides, interactive, arg0_paths).await;
+    let cwd = config_result
+        .as_ref()
+        .map(|config| config.cwd.as_path().to_path_buf())
+        .unwrap_or_else(|_| {
+            let mut cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            if let Some(requested_cwd) = &interactive.cwd {
+                cwd.push(requested_cwd);
+            }
+            cwd
+        });
+    checks.push(run_sync_check("disk", progress.clone(), || {
+        disk::check(config_result.as_ref().ok(), &cwd)
+    }));
+    #[cfg(target_os = "windows")]
+    checks.push(run_sync_check("dev drive", progress.clone(), || {
+        windows_dev_drive::check(&cwd)
+    }));
     match &config_result {
         Ok(config) => {
-            let auth_manager =
+            let auth_manager_result =
                 AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await;
+            let auth_manager = auth_manager_result.as_ref().ok().cloned();
             let reachability_plan = provider_reachability_plan(config);
             let (
                 config_check,
@@ -370,13 +391,27 @@ async fn build_report(
                 reachability_check,
             ) = tokio::join!(
                 async { run_sync_check("config", progress.clone(), || config_check(config)) },
-                async { run_sync_check("auth", progress.clone(), || auth_check(config)) },
+                async {
+                    run_sync_check("auth", progress.clone(), || match &auth_manager_result {
+                        Ok(_) => auth_check(config),
+                        Err(error) => DoctorCheck::new(
+                            "auth.load",
+                            "auth",
+                            CheckStatus::Fail,
+                            "authentication could not be initialized",
+                        )
+                        .detail(error.to_string())
+                        .remediation(
+                            "Fix the reported authentication error, then rerun codex doctor.",
+                        ),
+                    })
+                },
                 async { run_sync_check("updates", progress.clone(), || updates_check(config)) },
                 async { run_sync_check("network", progress.clone(), network_check) },
                 run_async_check(
                     "websocket",
                     progress.clone(),
-                    websocket_reachability_check(config, Some(auth_manager)),
+                    websocket_reachability_check(config, auth_manager),
                 ),
                 run_async_check("MCP", progress.clone(), mcp_check(config)),
                 async {
@@ -431,10 +466,6 @@ async fn build_report(
         }
         Err(err) => {
             let reachability_plan = default_reachability_plan();
-            let fallback_cwd = interactive
-                .cwd
-                .clone()
-                .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
             let (
                 config_check,
                 network_check,
@@ -461,7 +492,7 @@ async fn build_report(
                         terminal_check(command.no_color)
                     })
                 },
-                run_async_check("git", progress.clone(), git_check(fallback_cwd.as_path())),
+                run_async_check("git", progress.clone(), git_check(&cwd)),
                 async { run_sync_check("state", progress.clone(), fallback_state_check) },
                 run_async_check(
                     "provider reachability",
@@ -2411,10 +2442,6 @@ async fn websocket_reachability_check(
             details.push(format!("handshake result: HTTP {}", probe.status));
             details.push(format!("reasoning header: {}", probe.reasoning_included));
             details.push(format!(
-                "models etag present: {}",
-                probe.models_etag_present
-            ));
-            details.push(format!(
                 "server model present: {}",
                 probe.server_model_present
             ));
@@ -2483,6 +2510,7 @@ fn websocket_error_detail(err: &ApiError) -> String {
         | ApiError::RateLimit(_)
         | ApiError::InvalidRequest { .. }
         | ApiError::CyberPolicy { .. }
+        | ApiError::MisalignmentPolicyViolation { .. }
         | ApiError::ServerOverloaded => format!("handshake error: {err}"),
     }
 }

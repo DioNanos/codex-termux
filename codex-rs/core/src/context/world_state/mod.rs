@@ -23,6 +23,7 @@ use codex_extension_api::WorldStateSectionContribution;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use indexmap::IndexMap;
+use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Map;
@@ -109,7 +110,8 @@ impl<S: WorldStateSection> ErasedWorldStateSection for S {
         let typed_snapshot;
         let previous = match previous {
             PreviousSectionState::Known(previous) => {
-                match serde_json::from_value::<S::Snapshot>(previous.clone()) {
+                // Deserialize the borrowed snapshot without copying its JSON tree.
+                match S::Snapshot::deserialize(previous) {
                     Ok(previous) => {
                         typed_snapshot = previous;
                         PreviousSectionState::Known(&typed_snapshot)
@@ -276,23 +278,56 @@ pub(crate) struct WorldStateSnapshot {
     sections: BTreeMap<String, Value>,
 }
 
+impl From<&Map<String, Value>> for WorldStateSnapshot {
+    fn from(state: &Map<String, Value>) -> Self {
+        Self {
+            sections: state
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        }
+    }
+}
+
 impl WorldStateSnapshot {
-    pub(crate) fn into_value(self) -> Value {
-        Value::Object(self.sections.into_iter().collect())
+    pub(crate) fn into_object(self) -> Map<String, Value> {
+        self.sections.into_iter().collect()
     }
 
     /// Returns the RFC 7386 merge patch that advances `previous` to `self`.
-    pub(crate) fn merge_patch_from(&self, previous: &Self) -> Option<Value> {
-        let previous = Value::Object(previous.sections.clone().into_iter().collect());
-        let current = Value::Object(self.sections.clone().into_iter().collect());
-        create_merge_patch(&previous, &current)
+    pub(crate) fn merge_patch_from(&self, previous: &Self) -> Option<Map<String, Value>> {
+        let mut patch = Map::new();
+        // Emit removals first to preserve insertion-ordered JSON patch output.
+        for key in previous.sections.keys() {
+            if !self.sections.contains_key(key) {
+                patch.insert(key.clone(), Value::Null);
+            }
+        }
+        for (key, current) in &self.sections {
+            if let Some(previous) = previous.sections.get(key) {
+                if let Some(value) = create_merge_patch(previous, current) {
+                    patch.insert(key.clone(), value);
+                }
+            } else {
+                patch.insert(key.clone(), current.clone());
+            }
+        }
+        (!patch.is_empty()).then_some(patch)
     }
 
-    pub(crate) fn apply_merge_patch(&mut self, patch: &Value) -> serde_json::Result<()> {
-        let mut current = self.clone().into_value();
-        apply_merge_patch_value(&mut current, patch);
-        *self = serde_json::from_value(current)?;
-        Ok(())
+    pub(crate) fn apply_merge_patch(&mut self, patch: &Map<String, Value>) {
+        // Borrow existing keys; only newly inserted sections need owned keys.
+        for (key, value) in patch {
+            if value.is_null() {
+                self.sections.remove(key);
+            } else if let Some(current) = self.sections.get_mut(key) {
+                apply_merge_patch_value(current, value);
+            } else {
+                let mut current = Value::Null;
+                apply_merge_patch_value(&mut current, value);
+                self.sections.insert(key.clone(), current);
+            }
+        }
     }
 }
 
@@ -361,20 +396,21 @@ impl WorldState {
     }
 
     /// Falls back to retained model history when no exact persisted snapshot is available.
-    pub(crate) fn render_history_diff(
+    pub(crate) fn render_history_diff<'a>(
         &self,
         previous: Option<&WorldStateSnapshot>,
-        items: &[ResponseItem],
+        items: impl IntoIterator<Item = &'a ResponseItem> + Clone,
     ) -> Vec<Box<dyn ContextualUserFragment>> {
         self.render_with(|id, section| {
             if let Some(previous) = previous.and_then(|previous| previous.sections.get(id)) {
-                if section.has_retained_fragment_matcher() && !has_retained_fragment(items, section)
+                if section.has_retained_fragment_matcher()
+                    && !has_retained_fragment(items.clone(), section)
                 {
                     PreviousSectionState::Absent
                 } else {
                     PreviousSectionState::Known(previous)
                 }
-            } else if has_legacy_fragment(items, section) {
+            } else if has_legacy_fragment(items.clone(), section) {
                 PreviousSectionState::Unknown
             } else {
                 PreviousSectionState::Absent
@@ -393,8 +429,11 @@ impl WorldState {
     }
 }
 
-fn has_retained_fragment(items: &[ResponseItem], section: &dyn ErasedWorldStateSection) -> bool {
-    items.iter().any(|item| {
+fn has_retained_fragment<'a>(
+    items: impl IntoIterator<Item = &'a ResponseItem>,
+    section: &dyn ErasedWorldStateSection,
+) -> bool {
+    items.into_iter().any(|item| {
         matches!(
             item,
             ResponseItem::Message { role, content, .. }
@@ -409,8 +448,11 @@ fn has_retained_fragment(items: &[ResponseItem], section: &dyn ErasedWorldStateS
     })
 }
 
-fn has_legacy_fragment(items: &[ResponseItem], section: &dyn ErasedWorldStateSection) -> bool {
-    items.iter().any(|item| {
+fn has_legacy_fragment<'a>(
+    items: impl IntoIterator<Item = &'a ResponseItem>,
+    section: &dyn ErasedWorldStateSection,
+) -> bool {
+    items.into_iter().any(|item| {
         matches!(
             item,
             ResponseItem::Message { role, content, .. }
@@ -470,10 +512,12 @@ fn create_merge_patch(previous: &Value, current: &Value) -> Option<Value> {
 }
 
 fn apply_merge_patch_value(target: &mut Value, patch: &Value) {
+    // Nested patches can replace objects with scalars or arrays.
     let Value::Object(patch) = patch else {
         target.clone_from(patch);
         return;
     };
+    // RFC 7386 replaces non-object values with an object before merging.
     if !target.is_object() {
         *target = Value::Object(Map::new());
     }
@@ -481,8 +525,12 @@ fn apply_merge_patch_value(target: &mut Value, patch: &Value) {
         for (key, value) in patch {
             if value.is_null() {
                 target.remove(key);
+            } else if let Some(current) = target.get_mut(key) {
+                apply_merge_patch_value(current, value);
             } else {
-                apply_merge_patch_value(target.entry(key.clone()).or_insert(Value::Null), value);
+                let mut current = Value::Null;
+                apply_merge_patch_value(&mut current, value);
+                target.insert(key.clone(), current);
             }
         }
     }

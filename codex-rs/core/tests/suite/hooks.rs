@@ -3,11 +3,15 @@ use std::path::Path;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::StartThreadOptions;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::ThreadStoreConfig;
 use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_plugin::PluginHookSource;
@@ -21,10 +25,9 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
@@ -32,6 +35,7 @@ use codex_protocol::user_input::UserInput;
 use codex_thread_store::InMemoryThreadStore;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::TestTargetOs;
+use core_test_support::fs_wait;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::hooks::trust_hooks;
 use core_test_support::managed_network_requirements_loader;
@@ -71,6 +75,37 @@ const SECOND_CONTINUATION_PROMPT: &str = "Now tighten it to just: meow.";
 const BLOCKED_PROMPT_CONTEXT: &str = "Remember the blocked lighthouse note.";
 const PERMISSION_REQUEST_HOOK_MATCHER: &str = "^Bash$";
 const PERMISSION_REQUEST_ALLOW_REASON: &str = "should not be used for allow";
+
+#[tokio::test]
+async fn managed_hook_discovery_failure_rejects_session_startup_when_hooks_enabled() -> Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_cloud_config_bundle(
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            r#"
+[hooks]
+
+[[hooks.PreToolUse]]
+matcher = "["
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "echo managed"
+"#,
+        ),
+    );
+
+    let result = builder.build_with_auto_env(&server).await;
+    let Err(error) = result else {
+        panic!("session startup should reject an invalid managed hook matcher");
+    };
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("managed") && error.contains("invalid matcher"),
+        "unexpected managed hook startup error: {error}"
+    );
+
+    Ok(())
+}
 
 fn restrictive_workspace_write_profile() -> PermissionProfile {
     PermissionProfile::workspace_write_with(
@@ -304,6 +339,55 @@ if payload.get("prompt") == {blocked_prompt_json}:
 
     fs::write(&script_path, script).context("write user prompt submit hook script")?;
     fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
+    Ok(())
+}
+
+fn write_async_user_prompt_submit_hook(home: &Path, gated: bool) -> Result<()> {
+    let script_path = home.join("async_user_prompt_submit_hook.py");
+    let started_path = home.join("async_user_prompt_submit_started");
+    let finished_path = home.join("async_user_prompt_submit_finished");
+    let release_path = home.join("async_user_prompt_submit_release");
+    let script = format!(
+        r#"import json
+from pathlib import Path
+import sys
+import time
+
+prompt = json.load(sys.stdin).get("prompt")
+Path(r"{started_path}").write_text(prompt, encoding="utf-8")
+while {gated} and not Path(r"{release_path}").exists():
+    time.sleep(0.01)
+print(json.dumps({{
+    "continue": False,
+    "decision": "block",
+    "reason": "an async hook cannot block its launching operation",
+    "systemMessage": f"async warning for {{prompt}}",
+    "hookSpecificOutput": {{
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": f"async context for {{prompt}}"
+    }}
+}}), flush=True)
+Path(r"{finished_path}").write_text(prompt, encoding="utf-8")
+"#,
+        started_path = started_path.display(),
+        finished_path = finished_path.display(),
+        release_path = release_path.display(),
+        gated = if gated { "True" } else { "False" },
+    );
+    let hooks = serde_json::json!({
+        "hooks": {
+            "UserPromptSubmit": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("python3 {}", script_path.display()),
+                    "async": true,
+                }]
+            }]
+        }
+    });
+
+    fs::write(&script_path, script).context("write async user prompt submit hook script")?;
+    fs::write(home.join("hooks.json"), hooks.to_string()).context("write async hooks.json")?;
     Ok(())
 }
 
@@ -1054,7 +1138,8 @@ fn rollout_hook_prompt_texts(text: &str) -> Result<Vec<String>> {
             continue;
         }
         let rollout: RolloutLine = serde_json::from_str(trimmed).context("parse rollout line")?;
-        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = rollout.item
+        if let RolloutItem::ResponseItem(envelope) = rollout.item
+            && let ResponseItem::Message { role, content, .. } = envelope.item
             && role == "user"
         {
             for item in content {
@@ -1514,6 +1599,248 @@ async fn session_start_runs_before_user_prompt_submit_on_first_turn() -> Result<
     assert_eq!(
         hook_inputs[1].get("prompt").and_then(Value::as_str),
         Some("hello")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn async_hook_context_is_injected_into_the_active_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let gate = TempDir::new()?;
+    let release_path = gate.path().join("release");
+    let call_id = "async-hook-context-gated-shell-command";
+    let args = serde_json::json!({
+        "command": format!(
+            r#"python3 -c 'import time; from pathlib import Path; gate = Path(r"{}"); exec("while not gate.exists(): time.sleep(0.01)")'"#,
+            release_path.display()
+        )
+    });
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "async context observed in this turn"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let test = test_codex()
+        .with_pre_build_hook(|home| {
+            write_async_user_prompt_submit_hook(home, /*gated*/ false)
+                .expect("write immediate async user prompt submit hook");
+        })
+        .with_config(trust_discovered_hooks)
+        .build(&server)
+        .await?;
+
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "observe async context immediately".to_string(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(
+                codex_protocol::protocol::ThreadSettingsOverrides {
+                    approval_policy: Some(AskForApproval::Never),
+                    sandbox_policy: Some(sandbox_policy),
+                    permission_profile,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await?;
+
+    let finished_path = test
+        .codex_home_path()
+        .join("async_user_prompt_submit_finished");
+    fs_wait::wait_for_path_exists(finished_path, Duration::from_secs(5))
+        .await
+        .context("timed out waiting for the async hook to finish")?;
+    assert!(
+        timeout(
+            Duration::from_millis(150),
+            wait_for_event(&test.codex, |event| {
+                matches!(
+                    event,
+                    EventMsg::Warning(warning)
+                        if warning.message == "async warning for observe async context immediately"
+                )
+            }),
+        )
+        .await
+        .is_err(),
+        "async hook output must not interrupt the active sampling request"
+    );
+    fs::write(release_path, "ready").context("release gated shell command")?;
+    timeout(
+        Duration::from_secs(5),
+        wait_for_event(&test.codex, |event| {
+            matches!(
+                event,
+                EventMsg::Warning(warning)
+                    if warning.message == "async warning for observe async context immediately"
+            )
+        }),
+    )
+    .await
+    .context("timed out waiting for the async hook warning after sampling")?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]
+            .message_input_texts("developer")
+            .contains(&"async context for observe async context immediately".to_string()),
+        "an async hook should steer its context into the same active turn"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn async_hook_finishing_while_idle_waits_for_the_next_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "first turn completed"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "idle async context observed"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let test = test_codex()
+        .with_pre_build_hook(|home| {
+            write_async_user_prompt_submit_hook(home, /*gated*/ true)
+                .expect("write gated async user prompt submit hook");
+        })
+        .with_config(trust_discovered_hooks)
+        .build(&server)
+        .await?;
+
+    test.submit_turn("finish before the async hook").await?;
+    let first_turn_id = responses.requests()[0].body_json()["client_metadata"]["turn_id"]
+        .as_str()
+        .context("first model request should include its turn ID")?
+        .to_string();
+    let started_path = test
+        .codex_home_path()
+        .join("async_user_prompt_submit_started");
+    fs_wait::wait_for_path_exists(started_path, Duration::from_secs(5))
+        .await
+        .context("timed out waiting for the async hook to start")?;
+
+    fs::write(
+        test.codex_home_path()
+            .join("async_user_prompt_submit_release"),
+        "ready",
+    )
+    .context("release gated async hook")?;
+
+    let finished_path = test
+        .codex_home_path()
+        .join("async_user_prompt_submit_finished");
+    fs_wait::wait_for_path_exists(finished_path, Duration::from_secs(5))
+        .await
+        .context("timed out waiting for the async hook to finish")?;
+
+    assert!(
+        timeout(Duration::from_millis(150), test.codex.next_event())
+            .await
+            .is_err(),
+        "an async hook result from the previous turn must not emit warnings or raw response items"
+    );
+
+    assert_eq!(
+        responses.requests().len(),
+        1,
+        "an async hook result from the previous turn must not start a model turn"
+    );
+
+    let next_prompt = "observe the buffered async context";
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: next_prompt.to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let mut warning_event = None;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let event = test.codex.next_event().await?;
+            if matches!(
+                &event.msg,
+                EventMsg::Warning(warning)
+                    if warning.message == "async warning for finish before the async hook"
+            ) {
+                warning_event = Some(event);
+                continue;
+            }
+            if matches!(event.msg, EventMsg::TurnComplete(_)) {
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for the next turn to complete")??;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    let second_turn_id = requests[1].body_json()["client_metadata"]["turn_id"]
+        .as_str()
+        .context("second model request should include its turn ID")?
+        .to_string();
+    assert_ne!(first_turn_id, second_turn_id);
+    assert_eq!(
+        warning_event
+            .context("buffered async hook warning should be delivered during the next turn")?
+            .id,
+        second_turn_id
+    );
+
+    let input = requests[1].input();
+    let context_index = input
+        .iter()
+        .position(|item| {
+            item.to_string()
+                .contains("async context for finish before the async hook")
+        })
+        .context("buffered async hook context should be present in the next model request")?;
+    let prompt_index = input
+        .iter()
+        .position(|item| item.to_string().contains(next_prompt))
+        .context("next user prompt should be present in the next model request")?;
+    assert!(
+        context_index < prompt_index,
+        "buffered async hook context should precede the next user prompt"
     );
 
     Ok(())
@@ -2336,16 +2663,10 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
     let test = builder.build_with_streaming_server(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "initial prompt".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "initial prompt".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     wait_for_event(&test.codex, |event| {
@@ -2355,16 +2676,10 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
 
     for text in ["accepted queued prompt", "blocked queued prompt"] {
         test.codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: text.to_string(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }]))
             .await?;
     }
 
@@ -2591,7 +2906,8 @@ async fn permission_request_hook_allow_bypasses_strict_auto_review() -> Result<(
                 .enable(Feature::RequestPermissionsTool)
                 .expect("test config should allow feature update");
         });
-    let test = builder.build_with_auto_env(&server).await?;
+    // Command hooks currently need a local executor even when the tool executor is remote.
+    let test = builder.build_with_remote_and_local_env(&server).await?;
 
     let marker = test
         .executor_environment()
@@ -2605,21 +2921,18 @@ async fn permission_request_hook_allow_bypasses_strict_auto_review() -> Result<(
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "request strict review, then run the shell command".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 approval_policy: Some(AskForApproval::OnRequest),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     let request = wait_for_event(&test.codex, |event| {
@@ -3201,6 +3514,168 @@ async fn blocked_pre_tool_use_records_additional_context_for_shell_command() -> 
         !marker.exists(),
         "blocked command should not create marker file"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn async_pre_tool_use_cannot_block_or_rewrite_and_still_records_additional_context()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let gate = TempDir::new()?;
+    let release_path = gate.path().join("release");
+    let hook_finished_path = gate.path().join("hook-finished");
+    let hook_finished_path_for_fixture = hook_finished_path.clone();
+    let original_marker = gate.path().join("original");
+    let rewritten_marker = gate.path().join("rewritten");
+    let call_id = "async-pretooluse-shell-command";
+    let original_command = format!(
+        r#"python3 -c 'import time; from pathlib import Path; gate = Path(r"{}"); exec("while not gate.exists(): time.sleep(0.01)"); Path(r"{}").write_text("original"); print("original-output")'"#,
+        release_path.display(),
+        original_marker.display()
+    );
+    let args = serde_json::json!({ "command": original_command });
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "async pre-tool hook context observed"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let pre_context = "async pre-tool hook cannot block its launching command";
+    let updated_input = serde_json::json!({
+        "command": format!("printf rewritten > {}", rewritten_marker.display())
+    });
+    let test = test_codex()
+        .with_pre_build_hook(move |home| {
+            let denying_script = home.join("async_deny_pre_tool_use_hook.py");
+            fs::write(
+                &denying_script,
+                format!(
+                    r#"import json, sys
+from pathlib import Path
+json.load(sys.stdin)
+print(json.dumps({{
+    "systemMessage": "{pre_context}",
+    "hookSpecificOutput": {{
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "{pre_context}",
+        "additionalContext": "{pre_context}"
+    }}
+}}), flush=True)
+Path(r"{hook_finished_path}").write_text("finished", encoding="utf-8")
+"#,
+                    hook_finished_path = hook_finished_path_for_fixture.display(),
+                ),
+            )
+            .expect("write async denying pre-tool hook fixture");
+            write_updating_pre_tool_use_hook(home, "^Bash$", &updated_input)
+                .expect("write async rewriting pre-tool hook fixture");
+
+            let hooks_path = home.join("hooks.json");
+            let mut hooks: Value = serde_json::from_slice(
+                &fs::read(&hooks_path).expect("read async pre-tool hook config"),
+            )
+            .expect("parse async pre-tool hook config");
+            let handlers = hooks["hooks"]["PreToolUse"][0]["hooks"]
+                .as_array_mut()
+                .expect("pre-tool hook handlers");
+            handlers[0]["async"] = Value::Bool(true);
+            handlers.push(serde_json::json!({
+                "type": "command",
+                "command": format!("python3 {}", denying_script.display()),
+                "async": true,
+            }));
+            fs::write(hooks_path, hooks.to_string()).expect("write async pre-tool hook config");
+        })
+        .with_config(trust_discovered_hooks)
+        .build(&server)
+        .await?;
+
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "run the original command with async pre-tool hooks".to_string(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(
+                codex_protocol::protocol::ThreadSettingsOverrides {
+                    approval_policy: Some(AskForApproval::Never),
+                    sandbox_policy: Some(sandbox_policy),
+                    permission_profile,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await?;
+
+    fs_wait::wait_for_path_exists(hook_finished_path, Duration::from_secs(5))
+        .await
+        .context("timed out waiting for the async pre-tool hook to finish")?;
+    assert!(
+        timeout(
+            Duration::from_millis(150),
+            wait_for_event(
+                &test.codex,
+                |event| matches!(event, EventMsg::Warning(warning) if warning.message == pre_context),
+            ),
+        )
+        .await
+        .is_err(),
+        "async pre-tool output must not interrupt the launching command"
+    );
+    fs::write(release_path, "ready").context("release original shell command")?;
+    timeout(
+        Duration::from_secs(5),
+        wait_for_event(
+            &test.codex,
+            |event| matches!(event, EventMsg::Warning(warning) if warning.message == pre_context),
+        ),
+    )
+    .await
+    .context("timed out waiting for the async pre-tool warning after sampling")?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]
+            .message_input_texts("developer")
+            .contains(&pre_context.to_string()),
+        "async pre-tool hook context should reach the follow-up model request",
+    );
+    let output_item = requests[1].function_call_output(call_id);
+    let output = output_item
+        .get("output")
+        .and_then(Value::as_str)
+        .expect("shell command output string");
+    assert!(
+        output.contains("original-output"),
+        "async pre-tool hooks should not block the original command",
+    );
+    assert!(original_marker.exists(), "original command should execute");
+    assert!(
+        !rewritten_marker.exists(),
+        "async pre-tool hooks should not rewrite the original command",
+    );
+
     Ok(())
 }
 

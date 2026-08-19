@@ -10,6 +10,7 @@ use crate::apply_patch;
 use crate::apply_patch::convert_apply_patch_to_protocol;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
+use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::tools::context::ApplyPatchToolOutput;
@@ -36,6 +37,7 @@ use crate::tools::runtimes::apply_patch::ApplyPatchRuntime;
 use crate::tools::sandboxing::ToolCtx;
 use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
+use codex_apply_patch::ApplyPatchFileUpdateMode;
 use codex_apply_patch::Hunk;
 use codex_apply_patch::StreamingPatchParser;
 use codex_exec_server::ExecutorFileSystem;
@@ -54,6 +56,19 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 
 const APPLY_PATCH_ARGUMENT_DIFF_BUFFER_INTERVAL: Duration = Duration::from_millis(500);
+
+fn apply_patch_file_update_mode(turn: &TurnContext) -> ApplyPatchFileUpdateMode {
+    if turn
+        .config
+        .features
+        .enabled(Feature::ApplyPatchPreserveLineEndings)
+    {
+        ApplyPatchFileUpdateMode::PreserveLineEndings
+    } else {
+        ApplyPatchFileUpdateMode::NormalizeToLf
+    }
+}
+
 /// Handles freeform `apply_patch` requests and routes verified patches to the
 /// selected environment filesystem.
 #[derive(Default)]
@@ -267,7 +282,7 @@ async fn effective_patch_permissions(
     crate::tools::handlers::EffectiveAdditionalPermissions,
     codex_protocol::permissions::FileSystemSandboxPolicy,
 )> {
-    let environment_id = environment.environment_id.as_str();
+    let environment_id = environment.selection.environment_id.as_str();
     let file_paths = file_paths_for_action(action);
     let native_cwd = cwd.to_abs_path()?;
     let granted_permissions = merge_permission_profiles(
@@ -386,9 +401,10 @@ impl ApplyPatchHandler {
         let fs = turn_environment.environment.get_filesystem();
         let sandbox = turn
             .file_system_sandbox_context(/*additional_permissions*/ None, turn_environment);
-        match codex_apply_patch::verify_apply_patch_args(
+        match codex_apply_patch::verify_apply_patch_args_with_mode(
             args,
             turn_environment.cwd(),
+            apply_patch_file_update_mode(&turn),
             fs.as_ref(),
             Some(&sandbox),
         )
@@ -397,7 +413,7 @@ impl ApplyPatchHandler {
             codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
                 let tool_ctx = ToolCtx {
                     session,
-                    turn,
+                    step_context: Arc::clone(&step_context),
                     call_id,
                     tool_name,
                 };
@@ -487,20 +503,27 @@ pub(crate) async fn intercept_apply_patch(
     fs: &dyn ExecutorFileSystem,
     turn_environment: TurnEnvironment,
     session: Arc<Session>,
-    turn: Arc<TurnContext>,
+    step_context: Arc<StepContext>,
     tracker: Option<&SharedTurnDiffTracker>,
     call_id: &str,
     tool_name: &str,
 ) -> Result<Option<FunctionToolOutput>, FunctionCallError> {
+    let turn = &step_context.turn;
     let sandbox =
         turn.file_system_sandbox_context(/*additional_permissions*/ None, &turn_environment);
-    match codex_apply_patch::maybe_parse_apply_patch_verified(command, cwd, fs, Some(&sandbox))
-        .await
+    match codex_apply_patch::maybe_parse_apply_patch_verified_with_mode(
+        command,
+        cwd,
+        apply_patch_file_update_mode(turn),
+        fs,
+        Some(&sandbox),
+    )
+    .await
     {
         codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
             let tool_ctx = ToolCtx {
                 session,
-                turn,
+                step_context,
                 call_id: call_id.to_string(),
                 tool_name: ToolName::plain(tool_name),
             };
@@ -533,7 +556,7 @@ async fn execute_verified_patch(
             .await
             .unwrap_or_else(|_| patch_permissions_without_path_matching(&action));
     let apply = apply_patch::prepare_apply_patch(
-        tool_ctx.turn.as_ref(),
+        tool_ctx.step_context.turn.as_ref(),
         turn_environment.permission_profile(),
         &file_system_sandbox_policy,
         action,
@@ -542,11 +565,11 @@ async fn execute_verified_patch(
     let emitter = ToolEmitter::apply_patch_for_environment(
         changes.clone(),
         apply.auto_approved,
-        turn_environment.environment_id.clone(),
+        turn_environment.selection.environment_id.clone(),
     );
     let event_ctx = ToolEventCtx::new(
         tool_ctx.session.as_ref(),
-        tool_ctx.turn.as_ref(),
+        tool_ctx.step_context.turn.as_ref(),
         &tool_ctx.call_id,
         tracker,
     );
@@ -568,8 +591,8 @@ async fn execute_verified_patch(
             &mut runtime,
             &request,
             &tool_ctx,
-            tool_ctx.turn.as_ref(),
-            tool_ctx.turn.approval_policy(),
+            tool_ctx.step_context.turn.as_ref(),
+            tool_ctx.step_context.turn.approval_policy(),
         )
         .await
         .map(|result| result.output);
@@ -579,7 +602,7 @@ async fn execute_verified_patch(
     };
     let event_ctx = ToolEventCtx::new(
         tool_ctx.session.as_ref(),
-        tool_ctx.turn.as_ref(),
+        tool_ctx.step_context.turn.as_ref(),
         &tool_ctx.call_id,
         tracker,
     );

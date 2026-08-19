@@ -4,6 +4,7 @@ use std::time::Duration;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceContent;
+use codex_protocol::protocol::SkillScope;
 use url::Url;
 
 use crate::catalog::SkillAuthority;
@@ -246,13 +247,15 @@ impl SkillProvider for OrchestratorSkillProvider {
 
 fn catalog_entry_from_resource(resource: &Resource) -> Option<SkillCatalogEntry> {
     let uri = validated_skill_uri(resource.uri.as_str(), MAX_SKILL_PACKAGE_URI_CHARS)?;
+    let namespace = uri.strip_prefix("skill://")?.split_once('/')?.0;
     let meta = resource.meta.as_ref()?.as_object()?;
     let allow_implicit_invocation = meta
         .get("allow_implicit_invocation")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
     let skill_name = normalized_label(meta.get("skill_name")?.as_str()?, MAX_SKILL_NAME_CHARS)?;
-    let name = if meta.get("source").and_then(|value| value.as_str()) == Some("user") {
+    let user_owned = meta.get("source").and_then(|value| value.as_str()) == Some("user");
+    let name = if user_owned {
         skill_name
     } else {
         let plugin_name =
@@ -264,14 +267,20 @@ fn catalog_entry_from_resource(resource: &Resource) -> Option<SkillCatalogEntry>
     let description = normalized_description(resource.description.as_deref().unwrap_or_default())?;
     let main_prompt = main_prompt_uri(uri);
 
-    let entry = SkillCatalogEntry::new(
+    let mut entry = SkillCatalogEntry::new(
         SkillPackageId(uri.to_string()),
         SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME),
         name,
         description,
         SkillResourceId::new(main_prompt),
     )
-    .with_display_path(uri);
+    .with_display_path(uri)
+    .with_alias_root(format!("skill://{namespace}"));
+    entry.canonical_skill_id = meta
+        .get("skill_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    entry.analytics_scope = user_owned.then_some(SkillScope::User);
 
     Some(if allow_implicit_invocation {
         entry

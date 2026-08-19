@@ -81,12 +81,15 @@ use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_remote;
 use core_test_support::skip_if_wine_exec;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
 use tempfile::TempDir;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 use wiremock::ResponseTemplate;
 
@@ -285,6 +288,89 @@ async fn turn_start_with_empty_input_runs_model_request() -> Result<()> {
         "empty turn/start should not synthesize an empty user message: {input:?}"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_start_steers_active_turn_and_returns_active_turn_id() -> Result<()> {
+    let (release_response, response_gate) = oneshot::channel();
+    let (server, _completions) = start_streaming_sse_server(vec![
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: responses::sse(vec![responses::ev_response_created("resp-1")]),
+            },
+            StreamingSseChunk {
+                gate: Some(response_gate),
+                body: responses::sse(vec![responses::ev_completed("resp-1")]),
+            },
+        ],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![
+                responses::ev_response_created("resp-2"),
+                responses::ev_completed("resp-2"),
+            ]),
+        }],
+    ])
+    .await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(server.uri()).write(codex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let TurnStartResponse { turn: active_turn } = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: None,
+                input: vec![V2UserInput::Text {
+                    text: "start".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/started"),
+    )
+    .await??;
+
+    let TurnStartResponse { turn: steered_turn } = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: None,
+                input: vec![V2UserInput::Text {
+                    text: "steer".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        })
+        .await?;
+    assert_eq!(steered_turn.id, active_turn.id);
+
+    release_response
+        .send(())
+        .expect("active response gate should remain open");
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
     Ok(())
 }
 
@@ -4328,7 +4414,7 @@ async fn command_execution_notifications_include_trusted_plugin_id() -> Result<(
     let curated_sha = "0123456789abcdef0123456789abcdef01234567";
     let plugin_root = codex_home
         .path()
-        .join("plugins/cache/openai-curated/google-calendar/01234567");
+        .join("plugins/cache/openai-api-curated/google-calendar/01234567");
     let script_path = plugin_root.join("scripts/run.sh");
     let synced_root = codex_home.path().join(".tmp/plugins");
     for path in [
@@ -4351,9 +4437,9 @@ async fn command_execution_notifications_include_trusted_plugin_id() -> Result<(
         format!("{curated_sha}\n"),
     )?;
     std::fs::write(
-        synced_root.join(".agents/plugins/marketplace.json"),
+        synced_root.join(".agents/plugins/api_marketplace.json"),
         r#"{
-  "name": "openai-curated",
+  "name": "openai-api-curated",
   "plugins": [{
     "name": "google-calendar",
     "source": {"source": "local", "path": "./plugins/google-calendar"}
@@ -4378,7 +4464,7 @@ async fn command_execution_notifications_include_trusted_plugin_id() -> Result<(
         .with_sandbox_mode("danger-full-access")
         .enable_feature(Feature::Plugins)
         .disable_feature(Feature::RemotePlugin)
-        .with_extra_config("[plugins.\"google-calendar@openai-curated\"]\nenabled = true")
+        .with_extra_config("[plugins.\"google-calendar@openai-api-curated\"]\nenabled = true")
         .write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
@@ -4420,7 +4506,7 @@ async fn command_execution_notifications_include_trusted_plugin_id() -> Result<(
                         .expect("command execution item should include scriptPath");
                     assert_eq!(
                         (item_json["pluginId"].as_str(), emitted_script_path),
-                        (Some("google-calendar@openai-curated"), "scripts/run.sh")
+                        (Some("google-calendar@openai-api-curated"), "scripts/run.sh")
                     );
                     assert!(
                         !emitted_script_path.contains(script_path.to_string_lossy().as_ref()),

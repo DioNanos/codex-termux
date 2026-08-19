@@ -8,6 +8,7 @@ use std::time::Instant;
 use anyhow::Context;
 use anyhow::Result;
 use codex_core::StartThreadOptions;
+use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_features::Feature;
@@ -23,7 +24,6 @@ use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::assert_regex_match;
@@ -133,16 +133,10 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
         .thread;
 
     thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "use the planning tool".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "use the planning tool".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     let EventMsg::Error(error) =
@@ -196,16 +190,10 @@ async fn strict_tool_collisions_do_not_duplicate_unrelated_compaction_errors() -
     let test = builder.build_with_auto_env(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "trigger compaction".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "trigger compaction".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     let mut errors = Vec::new();
@@ -409,10 +397,15 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
         .and_then(Value::as_str)
         .map(str::to_string)
         .expect("custom tool call should include turn metadata");
+    let custom_tool_output = request.custom_tool_call_output(call_id);
+    let output_create_time = custom_tool_output
+        .pointer("/internal_chat_message_metadata_passthrough/create_time")
+        .and_then(Value::as_f64)
+        .expect("custom tool output should include a creation timestamp");
     assert_eq!(
         (
             strip_response_item_ids_from_json(Value::Array(custom_tool_calls)),
-            strip_response_item_ids_from_json(request.custom_tool_call_output(call_id)),
+            strip_response_item_ids_from_json(custom_tool_output),
         ),
         (
             Value::Array(vec![json!({
@@ -431,6 +424,7 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
                 "output": format!("unsupported custom tool call: {namespace}{tool_name}"),
                 "internal_chat_message_metadata_passthrough": {
                     "turn_id": turn_id,
+                    "create_time": output_create_time,
                     "executed_tool_calls": [{
                         "name": format!("{namespace}__{tool_name}"),
                         "arguments": input,

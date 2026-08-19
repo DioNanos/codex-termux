@@ -646,10 +646,10 @@ impl ExecServerClient {
                             .flatten();
                         let controller = session
                             .as_ref()
-                            .and_then(|session| session.network_policy_controller.load_full());
+                            .and_then(|session| session.network_policy.controller.load_full());
                         let process_cancelled = session
                             .as_ref()
-                            .map(|session| session.network_policy_cancelled.clone());
+                            .map(|session| session.network_policy.cancelled.clone());
                         let expected_session = session.as_ref().map(Arc::downgrade);
                         let policy_request =
                             (process_id_valid && host_valid).then_some(NetworkPolicyRequest {
@@ -770,7 +770,10 @@ impl ExecServerClient {
     }
 }
 
-fn is_retryable_recovery_error(error: &ExecServerError) -> bool {
+pub(crate) fn is_retryable_recovery_error(error: &ExecServerError) -> bool {
+    if let ExecServerError::ConnectionAttempt(error) = error {
+        return is_retryable_recovery_error(error.as_ref());
+    }
     is_transport_closed_error(error)
         || matches!(
             error,

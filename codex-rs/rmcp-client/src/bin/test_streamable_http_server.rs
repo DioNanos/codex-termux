@@ -112,6 +112,17 @@ struct EchoArgs {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args_os().skip(1);
+    match args.next().as_deref() {
+        Some(value) if value == std::ffi::OsStr::new("--http-headers-helper") => {
+            if std::env::var_os("MCP_TEST_AMBIENT_SECRET").is_some() {
+                return Err("helper inherited ambient secret".into());
+            }
+            println!(r#"{{"Proxy-Authorization":"Bearer gateway-token"}}"#);
+            return Ok(());
+        }
+        _ => {}
+    }
     let bind_addr = parse_bind_addr()?;
     let post_failure_state = PostFailureState::default();
     const MAX_BIND_RETRIES: u32 = 20;
@@ -177,6 +188,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }),
         )
+        .route(
+            "/oauth/token",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "invalid_grant",
+                        "error_description": "refresh token expired or revoked",
+                    })),
+                )
+            }),
+        )
         .nest_service(
             "/mcp",
             StreamableHttpService::new(
@@ -194,6 +217,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let router = if let Ok(token) = std::env::var("MCP_EXPECT_BEARER") {
         let expected = Arc::new(format!("Bearer {token}"));
         router.layer(middleware::from_fn_with_state(expected, require_bearer))
+    } else {
+        router
+    };
+    let router = if let Ok(token) = std::env::var("MCP_EXPECT_GATEWAY_BEARER") {
+        let expected = Arc::new(format!("Bearer {token}"));
+        router.layer(middleware::from_fn_with_state(
+            expected,
+            require_gateway_bearer,
+        ))
     } else {
         router
     };
@@ -386,12 +418,31 @@ async fn require_bearer(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if request.uri().path().contains("/.well-known/") {
+    if request.uri().path().contains("/.well-known/") || request.uri().path() == "/oauth/token" {
         return Ok(next.run(request).await);
     }
     if request
         .headers()
         .get(AUTHORIZATION)
+        .is_some_and(|value| value.as_bytes() == expected.as_bytes())
+    {
+        Ok(next.run(request).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+async fn require_gateway_bearer(
+    State(expected): State<Arc<String>>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if !request.uri().path().starts_with("/mcp") {
+        return Ok(next.run(request).await);
+    }
+    if request
+        .headers()
+        .get("proxy-authorization")
         .is_some_and(|value| value.as_bytes() == expected.as_bytes())
     {
         Ok(next.run(request).await)

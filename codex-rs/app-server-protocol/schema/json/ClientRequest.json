@@ -150,6 +150,13 @@
         "includeTools": {
           "description": "When true, include display-only public tool summaries in the returned metadata.",
           "type": "boolean"
+        },
+        "threadId": {
+          "description": "Optional loaded thread id used to evaluate effective app configuration.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -1496,6 +1503,18 @@
       },
       "type": "object"
     },
+    "GetAccountTokenUsageParams": {
+      "properties": {
+        "threadId": {
+          "description": "When present, read estimated usage for this thread instead of account-wide token activity.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "HookMigration": {
       "properties": {
         "name": {
@@ -1923,8 +1942,27 @@
       ],
       "type": "object"
     },
+    "McpServerOauthClientRegistration": {
+      "enum": [
+        "auto",
+        "cimd",
+        "dcr"
+      ],
+      "type": "string"
+    },
     "McpServerOauthLoginParams": {
       "properties": {
+        "clientRegistration": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/McpServerOauthClientRegistration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Registration strategy for this login only; omission selects automatic discovery."
+        },
         "name": {
           "type": "string"
         },
@@ -2179,6 +2217,13 @@
     },
     "PluginInstallParams": {
       "properties": {
+        "installAttemptId": {
+          "description": "Client-generated identifier used to correlate one installation attempt.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "marketplacePath": {
           "anyOf": [
             {
@@ -4606,9 +4651,38 @@
       ],
       "type": "string"
     },
+    "ThreadSectionAppearance": {
+      "description": "Extensible visual presentation for a custom thread section.",
+      "properties": {
+        "color": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "icon": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "ThreadSectionCreateParams": {
       "description": "Parameters for creating an independently persisted thread section.",
       "properties": {
+        "appearance": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadSectionAppearance"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "name": {
           "description": "The user-visible name of the section.",
           "type": "string"
@@ -4685,6 +4759,17 @@
     "ThreadSectionUpdateParams": {
       "description": "Parameters for updating an independently persisted thread section.",
       "properties": {
+        "appearance": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadSectionAppearance"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Omit to preserve appearance, use `null` to clear it, or provide a replacement."
+        },
         "name": {
           "description": "The updated user-visible name of the section.",
           "type": "string"
@@ -7189,7 +7274,14 @@
           "type": "string"
         },
         "params": {
-          "type": "null"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GetAccountTokenUsageParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [

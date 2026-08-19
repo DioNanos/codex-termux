@@ -10,13 +10,12 @@ use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use super::common;
-use crate::engine::CommandShell;
+use crate::engine::ClaudeHooksEngine;
 use crate::engine::ConfiguredHandler;
-use crate::engine::command_runner::CommandRunResult;
+use crate::engine::HandlerRunResult;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
 use crate::output_spill::AdditionalContext;
-use crate::output_spill::HookOutputSpiller;
 use crate::schema::NullableString;
 use crate::schema::SessionStartCommandInput;
 use crate::schema::SubagentStartCommandInput;
@@ -108,15 +107,12 @@ pub(crate) fn preview(
 }
 
 pub(crate) async fn run(
-    handlers: &[ConfiguredHandler],
-    shell: &CommandShell,
-    output_spiller: &HookOutputSpiller,
+    engine: &ClaudeHooksEngine,
     request: SessionStartRequest,
     turn_id: Option<String>,
 ) -> SessionStartOutcome {
-    let session_id = request.session_id;
     let matched = dispatcher::select_handlers(
-        handlers,
+        &engine.handlers,
         request.target.event_name(),
         Some(request.target.matcher_input()),
     );
@@ -185,7 +181,7 @@ pub(crate) async fn run(
     };
 
     let results = dispatcher::execute_handlers(
-        shell,
+        engine,
         matched,
         input_json,
         request.cwd.as_path(),
@@ -203,8 +199,10 @@ pub(crate) async fn run(
             .iter()
             .map(|result| result.data.additional_contexts_for_model.as_slice()),
     );
-    let additional_contexts = output_spiller
-        .maybe_spill_additional_contexts(session_id, additional_contexts)
+    let additional_contexts = engine
+        .command_runtime
+        .output_spiller()
+        .maybe_spill_additional_contexts(additional_contexts)
         .await;
 
     SessionStartOutcome {
@@ -223,7 +221,7 @@ pub(crate) async fn run(
 /// `continue:false`; `SubagentStart` stays context-injection-only.
 fn parse_completed(
     handler: &ConfiguredHandler,
-    run_result: CommandRunResult,
+    run_result: HandlerRunResult,
     turn_id: Option<String>,
 ) -> dispatcher::ParsedHandler<SessionStartHandlerData> {
     let mut entries = Vec::new();
@@ -270,7 +268,8 @@ fn parse_completed(
                         );
                     }
                     let _ = parsed.universal.suppress_output;
-                    if handler.event_name == HookEventName::SessionStart
+                    if handler.can_apply_control_effects()
+                        && handler.event_name == HookEventName::SessionStart
                         && !parsed.universal.continue_processing
                     {
                         status = HookRunStatus::Stopped;
@@ -365,7 +364,7 @@ mod tests {
     use super::SessionStartHandlerData;
     use super::parse_completed;
     use crate::engine::ConfiguredHandler;
-    use crate::engine::command_runner::CommandRunResult;
+    use crate::engine::HandlerRunResult;
     use crate::output_spill::AdditionalContext;
     use crate::output_spill::AdditionalContextLimit;
 
@@ -543,19 +542,22 @@ mod tests {
         ConfiguredHandler {
             event_name,
             matcher: None,
-            command: "echo hook".to_string(),
             timeout_sec: 600,
             status_message: None,
             additional_context_limit: Default::default(),
             source_path: test_path_buf("/tmp/hooks.json").abs(),
             source: codex_protocol::protocol::HookSource::User,
             display_order: 0,
-            env: std::collections::HashMap::new(),
+            kind: crate::engine::ConfiguredHandlerKind::Command {
+                command: "echo hook".to_string(),
+                r#async: false,
+                env: std::collections::HashMap::new(),
+            },
         }
     }
 
-    fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> CommandRunResult {
-        CommandRunResult {
+    fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> HandlerRunResult {
+        HandlerRunResult {
             started_at: 1,
             completed_at: 2,
             duration_ms: 1,

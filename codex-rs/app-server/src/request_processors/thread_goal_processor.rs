@@ -65,18 +65,11 @@ impl ThreadGoalRequestProcessor {
             .map(|()| None)
     }
 
-    pub(crate) async fn emit_resume_goal_snapshot_and_continue(
-        &self,
-        thread_id: ThreadId,
-        thread: &CodexThread,
-    ) {
+    pub(crate) async fn emit_resume_goal_snapshot(&self, thread_id: ThreadId) {
         if !self.config.features.enabled(Feature::Goals) {
             return;
         }
         self.emit_thread_goal_snapshot(thread_id).await;
-        // App-server owns resume response and snapshot ordering, so wait until
-        // those are sent before letting extensions react to the idle thread.
-        thread.emit_thread_idle_lifecycle_if_idle().await;
     }
 
     pub(crate) async fn pending_resume_goal_state(
@@ -129,6 +122,10 @@ impl ThreadGoalRequestProcessor {
         let state_db = self.state_db_for_materialized_thread(thread_id).await?;
         self.reconcile_thread_goal_rollout(thread_id, &state_db)
             .await?;
+        let max_goal_token_budget = match self.thread_manager.get_thread(thread_id).await {
+            Ok(thread) => thread.config().await.max_goal_token_budget,
+            Err(_) => self.config.max_goal_token_budget,
+        };
 
         let listener_command_tx = {
             let thread_state = self.thread_state_manager.thread_state(thread_id).await;
@@ -152,6 +149,7 @@ impl ThreadGoalRequestProcessor {
                         Some(token_budget) => GoalTokenBudgetUpdate::Set(token_budget),
                         None => GoalTokenBudgetUpdate::Keep,
                     },
+                    max_goal_token_budget,
                 },
             )
             .await

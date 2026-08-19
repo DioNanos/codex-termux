@@ -1,3 +1,25 @@
+# [0.148.0] - 2026-08-20
+
+Candidate Termux release synchronized to final upstream OpenAI Codex
+`rust-v0.148.0`. Publication remains gated on the sanitized artifact audit and
+device validation.
+
+## Changed
+
+- Integrated the final upstream `rust-v0.148.0` release: Markdown conversation
+  export with `/export`, session forking via `codex exec fork` with archive and
+  restore from the resume picker, prompt drafting during TUI startup, estimated
+  thread credits or cost for eligible workspaces, Amazon Bedrock Runtime as a
+  built-in provider, and asynchronous hook commands with MCP tool invocation.
+  Upstream fixes include resumed sessions restoring their persisted working
+  directory and approval policy, turn reconnection through provider outages,
+  MCP recovery after OAuth reauthentication, fail-closed sandbox paths, and
+  composer handling of CRLF pastes and long URLs.
+- Preserved the verified Android/Termux compatibility and release-profile
+  contracts, including the fork-owned updater and installer channels and the
+  sandboxed Android V8 code-mode payload.
+- Bumped the Cargo workspace and npm package versions to `0.148.0`.
+
 # [0.147.3] - 2026-08-10
 
 Fork-only patch release on top of the upstream OpenAI Codex `rust-v0.147.0`
@@ -35,12 +57,10 @@ stable release. Upstream has no `rust-v0.147.2`.
 
 - **Code mode did not work.** Since `rust-v0.147.0` upstream runs code mode out
   of process: the CLI spawns `codex-code-mode-host` next to its own binary and
-  fails closed when it is absent, reporting
-  `Code Mode is unavailable ... host executable was not found`. That binary was
-  never built or packaged, so code mode was dead on every install of 0.147.0
-  and 0.147.1. It now ships with the package, and the build reads the finished
-  tarball back to prove it is there.
-
+  fails closed when it is absent, reporting `Code Mode is unavailable ... host
+  executable was not found`. That binary was never built or packaged, so code
+  mode was dead on every install of 0.147.0 and 0.147.1. It now ships with the
+  package, and the build reads the finished tarball back to prove it is there.
 # [0.147.1] - 2026-08-08
 
 Fork-only patch release on top of the upstream OpenAI Codex `rust-v0.147.0`
@@ -52,16 +72,16 @@ stable release. No upstream changes are included: upstream has no `rust-v0.147.1
   `/data/data/com.termux/files` does not implement advisory file locks, and the
   thread writer lock added upstream in `rust-v0.147.0` treated a missing lock as
   a fatal error. Starting a session failed with
-  `thread-store internal error: failed to acquire thread writer coordination lock ...: lock() not supported`.
-  A lock the filesystem cannot provide now degrades to running without it,
-  matching how the rest of this fork already handles advisory locks.
+  `thread-store internal error: failed to acquire thread writer coordination
+  lock ...: lock() not supported`. A lock the filesystem cannot provide now
+  degrades to running without it, matching how the rest of this fork already
+  handles advisory locks.
 
   Where the lock is unavailable, single-writer ownership of a thread is no
   longer enforced and a second writer on the same thread is not detected. Every
   other lock failure stays fatal.
 
 `0.147.0` remains available on the `next` channel; it does not start on Termux.
-
 # [0.147.0] - 2026-08-07
 
 Termux release synchronized to the upstream OpenAI Codex `rust-v0.147.0` stable
@@ -141,7 +161,6 @@ Synced the complete Termux fork directly to the final upstream OpenAI Codex
 installer surfaces. The Android/Termux compatibility delta remains applied.
 
 ## Changed
-
 - Integrated the complete upstream `rust-v0.145.0` stable release.
 - Preserved every verified Termux patch, including Android TLS roots, PTY and
   lock compatibility, real in-process V8 code-mode, bundled libc++, and
@@ -168,7 +187,6 @@ Synced the complete Termux fork to the final upstream OpenAI Codex
 Android/Termux compatibility delta remains applied.
 
 ## Changed
-
 - Integrated the complete upstream `rust-v0.144.5` delta, including expanded
   dangerous-command detection for additional forced recursive deletion forms.
 - Preserved all Termux patches, including Android TLS roots, PTY and lock
@@ -184,7 +202,6 @@ user-facing changes in this patch; the complete Android/Termux compatibility
 delta remains applied.
 
 ## Changed
-
 - Integrated the complete upstream `rust-v0.144.4` delta.
 - Preserved all Termux patches, including Android TLS roots, PTY and lock
   compatibility, real in-process V8 code-mode, bundled libc++, and
@@ -201,7 +218,6 @@ the npm `next` lane. The complete Android/Termux compatibility delta remains
 applied; npm `latest` remains on `0.144.1` and `stable` on `0.143.0`.
 
 ## Changed
-
 - Integrated the complete upstream `rust-v0.144.3` delta, including the
   advanced reasoning picker and persisted thread reasoning effort.
 - Preserved all Termux patches, including Android TLS roots, PTY and lock
@@ -216,7 +232,6 @@ on device (AI-guided surface report, PASS) and promoted to npm `latest`;
 the `stable` dist-tag stays on `0.135.0`.
 
 ## Changed
-
 - Synced the Termux fork to upstream OpenAI Codex `rust-v0.140.0`.
 - Preserved the full Android/Termux runtime delta, including Patch #24
   (Termux TLS roots, no rustls-platform-verifier panic) and real code-mode
@@ -230,7 +245,6 @@ on device (AI-guided surface report, PASS) and promoted to npm `latest`;
 the `stable` dist-tag stays on `0.135.0`.
 
 ## Changed
-
 - Synced the Termux fork to upstream OpenAI Codex `rust-v0.139.0`.
 - Preserved the full Android/Termux runtime delta, including Patch #24
   (Termux TLS roots, no rustls-platform-verifier panic) and real code-mode
@@ -244,7 +258,6 @@ on device (AI-guided surface report, PASS) and promoted to npm `latest`;
 the `stable` dist-tag stays on `0.135.0`.
 
 ## Changed
-
 - Synced the Termux fork to upstream OpenAI Codex `rust-v0.138.0`.
 - Preserved the full Android/Termux runtime delta, including Patch #24
   (Termux TLS roots, no rustls-platform-verifier panic) and real code-mode
@@ -258,7 +271,6 @@ on device (AI-guided surface report, PASS) and promoted to npm `latest`;
 the `stable` dist-tag stays on `0.135.0`.
 
 ## Changed
-
 - Synced the Termux fork to upstream OpenAI Codex `rust-v0.137.0`
   (119 upstream commits assimilated across `rust-v0.136.0..rust-v0.137.0`).
 - Preserved the full Android/Termux runtime delta, including Patch #24
@@ -271,10 +283,8 @@ Hotfix for the 0.136.0 startup crash on Termux ([#11]). Promoted to npm
 `latest` — the `stable` dist-tag stays on the 0.135.0 line.
 
 ## Fixed
-
-- **Startup TLS panic on Termux**
-  (`Expect rustls-platform-verifier to be initialized`): reqwest 0.13 (rmcp
-  1.7.0 upgrade) verifies TLS through
+- **Startup TLS panic on Termux** (`Expect rustls-platform-verifier to be
+  initialized`): reqwest 0.13 (rmcp 1.7.0 upgrade) verifies TLS through
   `rustls-platform-verifier`, which on Android requires an initialized JVM
   Context that a Termux CLI process does not have, so the TUI crashed at the
   first TLS handshake right after startup. The Termux build now supplies the
@@ -292,19 +302,16 @@ npm `next` for on-device validation; npm `latest` keeps tracking `0.135.0`
 until `0.136.0` is promoted.
 
 ## Changed
-
 - Synced the Termux fork to upstream OpenAI Codex `rust-v0.136.0`.
 - Bumped npm package and Cargo workspace versions to `0.136.0`.
 
 ## Restored (Android)
-
 - **code-mode (`exec`/`wait`)**: reverted the Android code-mode stub. The real
   in-process V8 runtime is now enabled on Android via the fork-owned
   `aarch64-linux-android` `rusty_v8` prebuild, so code-mode is no longer a
   no-op on the published Termux package. This is the meaningful capability gain.
 
 ## Known limitation (Android / Termux)
-
 - **Realtime voice/audio is not usable in Termux CLI.** The `voice`/`audio_device`
   modules now build for Android (cpal links `c++_shared` via `oboe-shared-stdcxx`,
   see openai/codex#24507), but the audio backend (cpal → oboe → `ndk-context`)
@@ -324,7 +331,6 @@ binaries already built in CI and smoke-tested on the alpha `next` lane, now
 published on npm `latest`.
 
 ## Changed
-
 - Synced the Termux fork to upstream OpenAI Codex `rust-v0.135.0`
   (86 upstream commits assimilated across `rust-v0.134.0..rust-v0.135.0`).
 - Preserved the Android/Termux runtime delta: browser login via
@@ -344,7 +350,6 @@ published on npm `latest`.
 - Aligned Cargo workspace and lockfile package versions to `0.135.0`.
 
 ## Verify
-
 - Patch inventory: `bash verify-patches.sh` passes the runtime patches
   (#1, #2, #4/#5, #6, #6b, #10, #10b, #11, #12, #13, #14, #15, #16, #17,
   #18, #19, #20, #21, #22, #23) and the Bazel patch inventory check.
@@ -354,7 +359,6 @@ published on npm `latest`.
 # [0.134.0-termux] - 2026-05-26
 
 ## Changed
-
 - Synced the Termux fork to upstream OpenAI Codex `rust-v0.134.0` (stable).
 - Preserved the Android/Termux runtime delta: browser login via
   `termux-open-url`, fork-owned update channels, npm wrapper hardening,
@@ -370,14 +374,12 @@ published on npm `latest`.
 - `rusty_v8` Android prebuilt manifest is unchanged: V8 stays at 147.4.0.
 
 ## Documented
-
 - Surfaced 8 previously-undocumented Android/Termux compatibility patches
   in `patches/README.md` and added matching checks to `verify-patches.sh`
   (Patches #6b, #17, #18, #19, #20, #21, #22, #23). No new code; the
   inventory now reflects the existing fork delta accurately.
 
 ## Upstream
-
 - Search across local conversation history (case-insensitive content matches
   with result previews).
 - `--profile` becomes the primary profile selector across CLI, TUI
@@ -396,7 +398,6 @@ published on npm `latest`.
 # [0.133.1-termux] - 2026-05-23
 
 ## Fixed
-
 - `codex remote-control` no longer aborts daemon startup with
   `lock() not supported` on Android Termux storage backends that
   reject `flock(2)` with `ENOTSUP` / `EOPNOTSUPP`. The two
@@ -410,13 +411,11 @@ published on npm `latest`.
   blocker.
 
 ## Upstream
-
 - OpenAI Codex `rust-v0.133.0` (unchanged from `0.133.0`'s parent release).
 
 # [0.133.0-termux] - 2026-05-22
 
 ## Changed
-
 - Synced the Termux fork to upstream OpenAI Codex `rust-v0.133.0`.
 - Preserved the Android/Termux runtime delta: browser login via
   `termux-open-url`, fork-owned update channels, npm wrapper hardening,
@@ -429,7 +428,6 @@ published on npm `latest`.
   `0.133.0` release.
 
 ## Upstream
-
 - Goals are now enabled by default, backed by dedicated storage, and track
   progress across active turns.
 - `codex remote-control` now runs like a foreground command, waits for
@@ -446,7 +444,6 @@ published on npm `latest`.
 # [0.132.0-termux] - 2026-05-20
 
 ## Changed
-
 - Synced the Termux fork to upstream OpenAI Codex `rust-v0.132.0`.
 - Preserved the Android/Termux runtime delta: browser login via
   `termux-open-url`, fork-owned update channels, npm wrapper hardening,
@@ -458,7 +455,6 @@ published on npm `latest`.
   `0.132.0` release.
 
 ## Upstream
-
 - Python SDK authentication now includes API key login, ChatGPT browser and
   device-code flows, account inspection, and logout APIs.
 - Python turn APIs accept plain string input for text-only workflows and return
@@ -473,7 +469,6 @@ published on npm `latest`.
 # [0.131.1-termux] - 2026-05-19
 
 ## Changed
-
 - Completed fork-safety coverage for diagnostic update guidance: `codex doctor`
   now points npm and bun users to `@mmmbuto/codex-cli-termux`, and release
   checks read `DioNanos/codex-termux` tags.
@@ -486,14 +481,12 @@ published on npm `latest`.
   checked together before release.
 
 ## Upstream
-
 - Upstream base remains OpenAI Codex `rust-v0.131.0`; this is a Termux fork
   patch release with no upstream base change.
 
 # [0.131.0-termux] - 2026-05-19
 
 ## Changed
-
 - Synced the Termux fork to upstream OpenAI Codex `rust-v0.131.0`.
 - Preserved the Android/Termux runtime delta: browser login via `termux-open-url`, fork-owned update channels, npm wrapper hardening, ELF `RUNPATH=$ORIGIN`, Android no-voice policy, code-mode Android stubs, and Termux-compatible release profile.
 - Hardened fork update paths so standalone update actions and app-server daemon guidance stay on `@mmmbuto/codex-cli-termux@latest`.
@@ -501,7 +494,6 @@ published on npm `latest`.
 - Aligned Cargo.lock with the upstream `rust-v0.131.0` dependency resolution while preserving workspace version `0.131.0`.
 
 ## Upstream
-
 - OpenAI Codex `rust-v0.131.0` is the upstream base for this Termux package.
   The fork includes the upstream CLI/TUI improvements that are compatible with
   Android Termux, while preserving the Termux packaging and no-voice policy.
@@ -520,7 +512,6 @@ published on npm `latest`.
 # [0.130.0-termux] - 2026-05-09
 
 ## Changed
-
 - Synced the Termux fork to upstream OpenAI Codex `rust-v0.130.0`.
 - Preserved all 9 Termux patches: browser login, release profile, update channel, npm scope, launcher, ELF runpath, no-voice, dynamic subcommand routing, Bazel inventory.
 - Upstream highlights: plugin details/show bundled hooks, plugin share discoverability, `codex remote-control` headless entrypoint, thread pagination APIs, Bedrock AWS console-login auth, `view_image` multi-environment support, built-in MCPs as first-class runtime servers.
@@ -528,7 +519,6 @@ published on npm `latest`.
 # [0.128.0-termux] - 2026-04-30
 
 ## Changed
-
 - Synced the Termux fork to upstream OpenAI Codex `rust-v0.128.0`.
 - Preserved Termux packaging, update URLs, Android runtime patches, and fork npm scope `@mmmbuto/codex-cli-termux`.
 
@@ -541,12 +531,10 @@ published on npm `latest`.
 # [0.125.0-termux] - 2026-04-26
 
 ### Upstream
-
 - OpenAI Codex `rust-v0.125.0` release: https://github.com/openai/codex/releases/tag/rust-v0.125.0
 - Fork line rebuilt cleanly from upstream `rust-v0.125.0`.
 
 ### Termux Patches
-
 - Kept Android browser login via `termux-open-url`.
 - Kept the fork update channel and `-termux` version parsing for self-update UX.
 - Kept Termux npm package/update commands targeting `@mmmbuto/codex-cli-termux`.

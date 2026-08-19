@@ -5,6 +5,7 @@
 
 mod fs;
 mod history;
+mod rollout_history;
 
 pub(crate) use history::HISTORY_ITEM_PAGE_LIMIT;
 pub(crate) use history::HISTORY_ITEM_SCAN_LIMIT;
@@ -120,6 +121,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::approvals::GuardianAssessmentEvent;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelAvailabilityNux;
@@ -169,7 +171,7 @@ fn bootstrap_request_error(context: &'static str, err: TypedRequestError) -> col
     color_eyre::eyre::eyre!("{context}: {err}")
 }
 
-fn is_history_pagination_unsupported(source: &JSONRPCErrorError) -> bool {
+pub(crate) fn is_history_pagination_unsupported(source: &JSONRPCErrorError) -> bool {
     if source.code == JSONRPC_METHOD_NOT_FOUND {
         return true;
     }
@@ -264,6 +266,7 @@ pub(crate) struct AppServerSession {
     history_pagination: HashMap<ThreadId, history::ThreadHistoryPagination>,
     remote_cwd_override: Option<PathBuf>,
     thread_params_mode: ThreadParamsMode,
+    background_rollout_migration_enabled: bool,
     history_support: ThreadHistorySupport,
     thread_settings_update_supported: bool,
     default_model: Option<String>,
@@ -338,6 +341,7 @@ impl AppServerSession {
             history_pagination: HashMap::new(),
             remote_cwd_override: None,
             thread_params_mode,
+            background_rollout_migration_enabled: true,
             history_support: ThreadHistorySupport::Paginated,
             thread_settings_update_supported: true,
             default_model: None,
@@ -381,6 +385,20 @@ impl AppServerSession {
     pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
         let started_at = Instant::now();
         let account = self.read_account().await?;
+        let mut bootstrap = self.bootstrap_with_account(config, account).await?;
+        bootstrap.duration = started_at.elapsed();
+        Ok(bootstrap)
+    }
+
+    /// Bootstraps using a previously read account.
+    ///
+    /// Callers must discard a prefetched account after authentication, server, or provider changes.
+    pub(crate) async fn bootstrap_with_account(
+        &mut self,
+        config: &Config,
+        account: GetAccountResponse,
+    ) -> Result<AppServerBootstrap> {
+        let started_at = Instant::now();
         // `hooks/list` holds the global config queue during startup. Submit models and config
         // requirements together so an uncached model fetch can overlap both config requests.
         let model_request_id = self.next_request_id();
@@ -613,77 +631,6 @@ impl AppServerSession {
             self.history_support = ThreadHistorySupport::LegacyOnly;
         }
         started_thread_from_start_response(response, config, self.thread_params_mode()).await
-    }
-
-    pub(crate) async fn resume_thread(
-        &mut self,
-        config: Config,
-        thread_id: ThreadId,
-        model_settings: ResumeModelSettings,
-    ) -> Result<AppServerStartedThread> {
-        let request_id = self.next_request_id();
-        let session_config = if model_settings == ResumeModelSettings::RestoreFromThread {
-            config.clone()
-        } else {
-            self.session_config_with_effective_service_tier(&config)
-        };
-        let mut params = thread_resume_params_from_config(
-            session_config,
-            thread_id,
-            self.thread_params_mode(),
-            self.remote_cwd_override.as_deref(),
-            model_settings,
-        );
-        params.exclude_turns = self.history_support == ThreadHistorySupport::Paginated
-            && self
-                .history_pagination
-                .get(&thread_id)
-                .is_none_or(|state| state.history_mode == ThreadHistoryMode::Paginated);
-        let mut response: ThreadResumeResponse = match self
-            .client
-            .request_typed(ClientRequest::ThreadResume {
-                request_id,
-                params: params.clone(),
-            })
-            .await
-        {
-            Ok(response) => response,
-            Err(TypedRequestError::Server { source, .. })
-                if params.exclude_turns && is_history_pagination_unsupported(&source) =>
-            {
-                self.history_support = ThreadHistorySupport::LegacyOnly;
-                params.exclude_turns = false;
-                let request_id = self.next_request_id();
-                self.client
-                    .request_typed(ClientRequest::ThreadResume { request_id, params })
-                    .await
-                    .map_err(|err| {
-                        bootstrap_request_error("thread/resume failed during TUI bootstrap", err)
-                    })?
-            }
-            Err(err) => {
-                return Err(bootstrap_request_error(
-                    "thread/resume failed during TUI bootstrap",
-                    err,
-                ));
-            }
-        };
-        self.hydrate_initial_thread_history(
-            &mut response.thread,
-            response.turns_backwards_cursor.clone(),
-            response.items_backwards_cursor.clone(),
-            Some(&config),
-            HistoryHydrationScope::Initial,
-        )
-        .await?;
-        let fork_parent_title = self
-            .fork_parent_title_from_app_server(response.thread.forked_from_id.as_deref())
-            .await;
-        let mut started =
-            started_thread_from_resume_response(response, &config, self.thread_params_mode())
-                .await?;
-        started.session.fork_parent_title = fork_parent_title;
-        Ok(started)
     }
 
     pub(crate) async fn fork_thread(
@@ -1518,6 +1465,13 @@ fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
                 .as_ref()
                 .and_then(|info| info.upgrade_copy.clone()),
             migration_markdown: upgrade_info.and_then(|info| info.migration_markdown),
+            retirement_at: model
+                .upgrade_info
+                .as_ref()
+                .and_then(|info| info.retirement_at)
+                .and_then(|retirement_at| {
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(retirement_at, 0)
+                }),
         }
     });
 
@@ -1808,7 +1762,12 @@ fn thread_fork_params_from_config(
         sandbox,
         permissions,
         config: config_request_overrides_from_config(&config),
-        base_instructions: config.base_instructions.clone(),
+        base_instructions: config.base_instructions.clone().filter(|_| {
+            !matches!(
+                config.base_instructions_provenance,
+                Some(BaseInstructionsProvenance::Model { .. })
+            )
+        }),
         developer_instructions: with_terminal_visualization_instructions(
             &config,
             config.developer_instructions.clone(),
@@ -1995,6 +1954,17 @@ fn display_permission_profile_from_thread_response(
     thread_params_mode: ThreadParamsMode,
 ) -> PermissionProfile {
     match thread_params_mode {
+        ThreadParamsMode::Embedded
+            if matches!(
+                config.permissions.effective_permission_profile(),
+                PermissionProfile::Disabled
+            ) && !matches!(
+                sandbox,
+                codex_app_server_protocol::SandboxPolicy::DangerFullAccess
+            ) =>
+        {
+            PermissionProfile::from_legacy_sandbox_policy_for_cwd(&sandbox.to_core(), cwd)
+        }
         ThreadParamsMode::Embedded => config.permissions.effective_permission_profile(),
         ThreadParamsMode::Remote => {
             PermissionProfile::from_legacy_sandbox_policy_for_cwd(&sandbox.to_core(), cwd)
@@ -2121,6 +2091,58 @@ mod tests {
             .expect("config should build")
     }
 
+    #[tokio::test]
+    async fn bootstrap_reuses_prefetched_account_without_another_account_read() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        let config = build_config(&codex_home).await;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let next_request_id = app_server.next_request_id;
+        let account = GetAccountResponse {
+            account: Some(Account::Chatgpt {
+                email: Some("teammate@openai.com".to_string()),
+                plan_type: codex_protocol::account::PlanType::Plus,
+            }),
+            requires_openai_auth: true,
+        };
+
+        let bootstrap = app_server.bootstrap_with_account(&config, account).await?;
+
+        assert_eq!(app_server.next_request_id, next_request_id + 2);
+        assert_eq!(
+            (
+                bootstrap.account_email.as_deref(),
+                bootstrap.auth_mode,
+                bootstrap.plan_type,
+                bootstrap.feedback_audience,
+                bootstrap.has_chatgpt_account,
+            ),
+            (
+                Some("teammate@openai.com"),
+                Some(TelemetryAuthMode::Chatgpt),
+                Some(codex_protocol::account::PlanType::Plus),
+                FeedbackAudience::OpenAiEmployee,
+                true,
+            )
+        );
+
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_reads_account_when_no_prefetched_account_is_available() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        let config = build_config(&codex_home).await;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let next_request_id = app_server.next_request_id;
+
+        app_server.bootstrap(&config).await?;
+
+        assert_eq!(app_server.next_request_id, next_request_id + 3);
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
     fn rate_limit_snapshot(limit_id: &str) -> RateLimitSnapshot {
         RateLimitSnapshot {
             limit_id: Some(limit_id.to_string()),
@@ -2137,6 +2159,72 @@ mod tests {
             plan_type: None,
             rate_limit_reached_type: None,
         }
+    }
+
+    fn api_model_with_upgrade_retirement_at(retirement_at: Option<i64>) -> ApiModel {
+        ApiModel {
+            id: "model-id".to_string(),
+            model: "current-model".to_string(),
+            upgrade: Some("replacement-model".to_string()),
+            upgrade_info: Some(codex_app_server_protocol::ModelUpgradeInfo {
+                model: "replacement-model".to_string(),
+                upgrade_copy: None,
+                model_link: None,
+                migration_markdown: None,
+                retirement_at,
+            }),
+            availability_nux: None,
+            display_name: "Current model".to_string(),
+            description: "A test model".to_string(),
+            model_specialty: None,
+            hidden: false,
+            supported_reasoning_efforts: Vec::new(),
+            default_reasoning_effort: ReasoningEffort::Medium,
+            input_modalities: Vec::new(),
+            supports_personality: false,
+            multi_agent_version: None,
+            additional_speed_tiers: Vec::new(),
+            service_tiers: Vec::new(),
+            default_service_tier: None,
+            is_default: false,
+        }
+    }
+
+    #[test]
+    fn model_preset_from_api_model_preserves_upgrade_retirement_at() {
+        let retirement_at = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .expect("valid RFC 3339 timestamp")
+            .with_timezone(&chrono::Utc);
+        let expected_upgrade = |retirement_at| {
+            Some(ModelUpgrade {
+                id: "replacement-model".to_string(),
+                migration_config_key: "current-model".to_string(),
+                model_link: None,
+                upgrade_copy: None,
+                migration_markdown: None,
+                retirement_at,
+            })
+        };
+
+        assert_eq!(
+            vec![
+                model_preset_from_api_model(api_model_with_upgrade_retirement_at(Some(
+                    retirement_at.timestamp(),
+                )))
+                .upgrade,
+                model_preset_from_api_model(api_model_with_upgrade_retirement_at(
+                    /*retirement_at*/ None,
+                ))
+                .upgrade,
+                model_preset_from_api_model(api_model_with_upgrade_retirement_at(Some(i64::MAX)))
+                    .upgrade,
+            ],
+            vec![
+                expected_upgrade(Some(retirement_at)),
+                expected_upgrade(None),
+                expected_upgrade(None),
+            ]
+        );
     }
 
     #[test]
@@ -2918,11 +3006,12 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let mut config = build_config(&temp_dir).await;
         config.base_instructions = Some("Base override.".to_string());
+        config.base_instructions_provenance = Some(BaseInstructionsProvenance::Custom);
         config.developer_instructions = Some("Developer override.".to_string());
         let thread_id = ThreadId::new();
 
         let params = thread_fork_params_from_config(
-            config,
+            config.clone(),
             thread_id,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
@@ -2933,6 +3022,18 @@ mod tests {
             params.developer_instructions.as_deref(),
             Some("Developer override.")
         );
+
+        config.base_instructions_provenance = Some(BaseInstructionsProvenance::Model {
+            model: "gpt-5.2".to_string(),
+        });
+        let params = thread_fork_params_from_config(
+            config,
+            thread_id,
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+        );
+
+        assert_eq!(params.base_instructions, None);
     }
 
     #[tokio::test]

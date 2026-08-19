@@ -1,32 +1,32 @@
 #!/usr/bin/env node
 
-import { spawn, spawnSync } from "child_process";
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
+import { spawn, spawnSync } from 'child_process';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const binaryPath = join(__dirname, "codex");
-const nativeBinaryPath = join(__dirname, "codex.bin");
-const TERMUX_PREFIX = process.env.PREFIX || "/data/data/com.termux/files/usr";
+const binaryPath = join(__dirname, 'codex');
+const nativeBinaryPath = join(__dirname, 'codex.bin');
+const TERMUX_PREFIX = process.env.PREFIX || '/data/data/com.termux/files/usr';
 
 function sanitizeLdLibraryPath(binDir) {
   const blocked = new Set([
     `${TERMUX_PREFIX}/lib`,
     `${TERMUX_PREFIX}/libexec`,
-    "/data/data/com.termux/files/usr/lib",
-    "/data/data/com.termux/files/usr/libexec",
+    '/data/data/com.termux/files/usr/lib',
+    '/data/data/com.termux/files/usr/libexec'
   ]);
 
-  const extraPaths = (process.env.LD_LIBRARY_PATH || "")
-    .split(":")
+  const extraPaths = (process.env.LD_LIBRARY_PATH || '')
+    .split(':')
     .filter((entry) => entry && !blocked.has(entry));
 
-  return [binDir, ...extraPaths].join(":");
+  return [binDir, ...extraPaths].join(':');
 }
 
-const env = { ...process.env, CODEX_MANAGED_BY_NPM: "1" };
+const env = { ...process.env, CODEX_MANAGED_BY_NPM: '1' };
 const binDir = __dirname;
 // Hidden arg0 aliases must target the native ELF directly. Pointing them at
 // the shell wrapper would lose the special argv[0] when it execs codex.bin.
@@ -40,9 +40,9 @@ function detectSubcommands() {
     return cachedSubcommands;
   }
 
-  const helpResult = spawnSync(binaryPath, ["--help"], {
-    encoding: "utf8",
-    env,
+  const helpResult = spawnSync(binaryPath, ['--help'], {
+    encoding: 'utf8',
+    env
   });
 
   if (helpResult.error || helpResult.status !== 0) {
@@ -50,7 +50,7 @@ function detectSubcommands() {
     return cachedSubcommands;
   }
 
-  const output = `${helpResult.stdout || ""}\n${helpResult.stderr || ""}`;
+  const output = `${helpResult.stdout || ''}\n${helpResult.stderr || ''}`;
   const commands = new Set();
   let inCommandsSection = false;
 
@@ -75,7 +75,7 @@ function detectSubcommands() {
 
     const aliasesMatch = line.match(/\[aliases?: ([^\]]+)\]/);
     if (aliasesMatch?.[1]) {
-      for (const alias of aliasesMatch[1].split(",")) {
+      for (const alias of aliasesMatch[1].split(',')) {
         const cleanAlias = alias.trim();
         if (cleanAlias) {
           commands.add(cleanAlias);
@@ -90,7 +90,7 @@ function detectSubcommands() {
 
 const args = process.argv.slice(2);
 const first = args[0];
-const isOption = first?.startsWith("-");
+const isOption = first?.startsWith('-');
 const knownSubcommands = first && !isOption ? detectSubcommands() : null;
 const isKnownSubcommand = Boolean(first && knownSubcommands?.has(first));
 
@@ -99,19 +99,19 @@ const finalArgs =
     ? []
     : isOption || isKnownSubcommand || knownSubcommands === null
       ? args
-      : ["exec", ...args];
+      : ['exec', ...args];
 
 const child = spawn(binaryPath, finalArgs, {
-  stdio: "inherit",
-  env,
+  stdio: 'inherit',
+  env
 });
 
-child.on("error", (error) => {
+child.on('error', (error) => {
   console.error(`Failed to launch bundled Codex binary: ${error.message}`);
   process.exit(1);
 });
 
-child.on("exit", (code, signal) => {
+child.on('exit', (code, signal) => {
   if (signal) {
     process.kill(process.pid, signal);
     return;

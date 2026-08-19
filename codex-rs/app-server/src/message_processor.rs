@@ -37,9 +37,11 @@ use crate::request_processors::ProcessExecRequestProcessor;
 use crate::request_processors::RemoteControlRequestProcessor;
 use crate::request_processors::SearchRequestProcessor;
 use crate::request_processors::ThreadGoalRequestProcessor;
+use crate::request_processors::ThreadQueueRequestProcessor;
 use crate::request_processors::ThreadRequestProcessor;
 use crate::request_processors::TurnRequestProcessor;
 use crate::request_processors::WindowsSandboxRequestProcessor;
+use crate::request_processors::read_server_diagnostics;
 use crate::request_serialization::QueuedInitializedRequest;
 use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
@@ -66,6 +68,7 @@ use codex_chatgpt::workspace_settings;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
+use codex_core::config::ThreadStoreConfig;
 use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
 use codex_goal_extension::GoalService;
@@ -75,8 +78,11 @@ use codex_protocol::ThreadId;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
+use codex_queue_extension::QueuedItemService;
 use codex_rollout::StateDbHandle;
 use codex_state::log_db::LogDbLayer;
+use codex_thread_store::LocalQueueStore;
+use codex_thread_store::QueueStore;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
@@ -117,6 +123,7 @@ pub(crate) struct MessageProcessor {
     remote_control_processor: RemoteControlRequestProcessor,
     search_processor: SearchRequestProcessor,
     thread_goal_processor: ThreadGoalRequestProcessor,
+    thread_queue_processor: ThreadQueueRequestProcessor,
     thread_processor: ThreadRequestProcessor,
     turn_processor: TurnRequestProcessor,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
@@ -247,6 +254,14 @@ impl MessageProcessor {
         // affect per-thread behavior, but they must not move newly started,
         // resumed, or forked threads to a different persistence backend/root.
         let thread_store = codex_core::thread_store_from_config(config.as_ref(), state_db.clone());
+        // Queue persistence requires SQLite, so in-memory thread stores and
+        // app servers without a state database do not have a queue backend.
+        let queue_store: Option<Arc<dyn QueueStore>> = match &config.experimental_thread_store {
+            ThreadStoreConfig::Local => state_db.as_ref().map(|state_db| {
+                Arc::new(LocalQueueStore::new(Arc::clone(state_db))) as Arc<dyn QueueStore>
+            }),
+            ThreadStoreConfig::InMemory { .. } => None,
+        };
         let environment_manager_for_requests = Arc::clone(&environment_manager);
         let environment_manager_for_extensions = Arc::clone(&environment_manager);
         let restriction_product = session_source.restriction_product();
@@ -257,7 +272,17 @@ impl MessageProcessor {
             ),
         );
         let goal_service = Arc::new(GoalService::new());
+        let extension_event_sink =
+            app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
+        let mut queue_service = None;
         let thread_manager = Arc::new_cyclic(|thread_manager| {
+            queue_service = queue_store.map(|queue| {
+                Arc::new(QueuedItemService::new(
+                    queue,
+                    thread_manager.clone(),
+                    Arc::clone(&extension_event_sink),
+                ))
+            });
             let manager = ThreadManager::new(
                 config.as_ref(),
                 auth_manager.clone(),
@@ -268,10 +293,7 @@ impl MessageProcessor {
                 thread_extensions(
                     guardian_agent_spawner(thread_manager.clone()),
                     ThreadExtensionDependencies {
-                        event_sink: app_server_extension_event_sink(
-                            outgoing.clone(),
-                            thread_state_manager.clone(),
-                        ),
+                        event_sink: Arc::clone(&extension_event_sink),
                         auth_manager: auth_manager.clone(),
                         state_db: state_db.clone(),
                         analytics_events_client: analytics_events_client.clone(),
@@ -281,7 +303,7 @@ impl MessageProcessor {
                         executor_skill_provider: Arc::clone(&executor_skill_provider),
                         git_attribution_base_url: config.chatgpt_base_url.clone(),
                         http_client_factory: config.http_client_factory(),
-                        thread_store: Arc::clone(&thread_store),
+                        queue_service: queue_service.clone(),
                     },
                 ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(
@@ -420,6 +442,12 @@ impl MessageProcessor {
             state_db.clone(),
             Arc::clone(&goal_service),
         );
+        let thread_queue_processor = ThreadQueueRequestProcessor::new(
+            Arc::clone(&thread_manager),
+            Arc::clone(&thread_store),
+            outgoing.clone(),
+            queue_service,
+        );
         let thread_processor = ThreadRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
@@ -510,6 +538,7 @@ impl MessageProcessor {
             remote_control_processor,
             search_processor,
             thread_goal_processor,
+            thread_queue_processor,
             thread_processor,
             turn_processor,
             windows_sandbox_processor,
@@ -889,6 +918,7 @@ impl MessageProcessor {
             ClientRequest::Initialize { .. } => {
                 panic!("Initialize should be handled before initialized request dispatch");
             }
+            ClientRequest::ServerDiagnostics { .. } => Ok(Some(read_server_diagnostics().into())),
             ClientRequest::ConfigRead { params, .. } => self
                 .config_processor
                 .read(params)
@@ -1111,6 +1141,36 @@ impl MessageProcessor {
                     .thread_goal_clear(request_id.clone(), params)
                     .await
             }
+            ClientRequest::ThreadQueueAdd { params, .. } => self
+                .thread_queue_processor
+                .add(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadQueueList { params, .. } => self
+                .thread_queue_processor
+                .list(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadQueueUpdate { params, .. } => self
+                .thread_queue_processor
+                .update(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadQueueDelete { params, .. } => self
+                .thread_queue_processor
+                .delete(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadQueueReorder { params, .. } => self
+                .thread_queue_processor
+                .reorder(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadQueueStart { params, .. } => self
+                .thread_queue_processor
+                .start(&request_id, params)
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ThreadMetadataUpdate { params, .. } => {
                 self.thread_processor.thread_metadata_update(params).await
             }
@@ -1166,6 +1226,16 @@ impl MessageProcessor {
             ClientRequest::ThreadRollback { params, .. } => {
                 self.thread_processor
                     .thread_rollback(&request_id, params, app_server_client_name.as_deref())
+                    .await
+            }
+            ClientRequest::ThreadRevert { params, .. } => {
+                self.thread_processor
+                    .thread_revert(
+                        request_id.clone(),
+                        params,
+                        app_server_client_name.clone(),
+                        client_version.clone(),
+                    )
                     .await
             }
             ClientRequest::ThreadList { params, .. } => {
@@ -1396,8 +1466,8 @@ impl MessageProcessor {
                     .consume_account_rate_limit_reset_credit(params)
                     .await
             }
-            ClientRequest::GetAccountTokenUsage { .. } => {
-                self.account_processor.get_account_token_usage().await
+            ClientRequest::GetAccountTokenUsage { params, .. } => {
+                self.account_processor.get_account_token_usage(params).await
             }
             ClientRequest::GetWorkspaceMessages { .. } => {
                 self.account_processor.get_workspace_messages().await

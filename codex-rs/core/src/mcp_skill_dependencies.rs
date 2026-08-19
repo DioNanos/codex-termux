@@ -3,25 +3,26 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use codex_config::McpServerConfig;
+use codex_config::McpServerOAuthConfig;
 use codex_config::McpServerTransportConfig;
 use codex_config::load_global_mcp_servers;
 use codex_login::default_client::is_first_party_originator;
 use codex_login::default_client::originator;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::request_user_input::RequestUserInputQuestionOption;
 use codex_protocol::request_user_input::RequestUserInputResponse;
+use codex_rmcp_client::McpOAuthClientRegistration;
 use codex_rmcp_client::OAuthDiscoveryTimeout;
 use codex_rmcp_client::StreamableHttpRedirectMode;
 use codex_rmcp_client::perform_oauth_login;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::SkillMetadata;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::skills::model::SkillToolDependency;
 use codex_mcp::ElicitationReviewerHandle;
 use codex_mcp::McpOAuthLoginSupport;
 use codex_mcp::McpPermissionPromptAutoApproveContext;
@@ -29,6 +30,8 @@ use codex_mcp::mcp_permission_prompt_is_auto_approved;
 use codex_mcp::oauth_login_support;
 use codex_mcp::resolve_oauth_scopes;
 use codex_mcp::should_retry_without_scopes;
+use codex_skills::SkillMetadata;
+use codex_skills::SkillToolDependency;
 
 const SKILL_MCP_DEPENDENCY_PROMPT_ID: &str = "skill_mcp_dependency_install";
 const MCP_DEPENDENCY_OPTION_INSTALL: &str = "Install";
@@ -172,6 +175,7 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         );
         let oauth_client_id = server_config.oauth_client_id();
         let oauth_credential_name = server_config.oauth_credential_name(&name);
+        let callback_port = server_config.oauth_callback_port(config.mcp_oauth_callback_port);
         let first_attempt = perform_oauth_login(
             oauth_credential_name.as_ref(),
             &oauth_config.url,
@@ -181,8 +185,9 @@ pub(crate) async fn maybe_install_mcp_dependencies(
             oauth_config.env_http_headers.clone(),
             &resolved_scopes.scopes,
             oauth_client_id,
+            McpOAuthClientRegistration::Auto,
             server_config.oauth_resource.as_deref(),
-            config.mcp_oauth_callback_port,
+            callback_port,
             config.mcp_oauth_callback_url.as_deref(),
             Arc::clone(&http_client),
         )
@@ -199,8 +204,9 @@ pub(crate) async fn maybe_install_mcp_dependencies(
                     oauth_config.env_http_headers,
                     &[],
                     oauth_client_id,
+                    McpOAuthClientRegistration::Auto,
                     server_config.oauth_resource.as_deref(),
-                    config.mcp_oauth_callback_port,
+                    callback_port,
                     config.mcp_oauth_callback_url.as_deref(),
                     Arc::clone(&http_client),
                 )
@@ -241,6 +247,10 @@ async fn should_install_mcp_dependencies(
         McpPermissionPromptAutoApproveContext::default(),
     ) {
         return true;
+    }
+
+    if turn_context.approval_policy() == AskForApproval::Never {
+        return false;
     }
 
     let server_list = format_missing_mcp_dependencies(missing);
@@ -383,6 +393,7 @@ fn mcp_dependency_to_server_config(
                 bearer_token_env_var: None,
                 http_headers: None,
                 env_http_headers: None,
+                http_headers_helper: None,
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
@@ -396,7 +407,12 @@ fn mcp_dependency_to_server_config(
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
-            oauth: None,
+            oauth: dependency
+                .oauth_callback_port
+                .map(|callback_port| McpServerOAuthConfig {
+                    client_id: None,
+                    callback_port: Some(callback_port),
+                }),
             oauth_resource: None,
             tools: HashMap::new(),
         });

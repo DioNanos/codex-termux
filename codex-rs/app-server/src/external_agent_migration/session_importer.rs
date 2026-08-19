@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,14 +27,16 @@ use codex_external_agent_migration::sessions::record_completed_session_imports;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_rollout::RolloutItem;
 use codex_rollout::is_persisted_rollout_item;
 use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::CreateThreadParams;
+use codex_thread_store::PersistContext;
 use codex_thread_store::ThreadMetadataPatch;
 use codex_thread_store::ThreadPersistenceMetadata;
 use codex_thread_store::ThreadStore;
@@ -169,7 +172,7 @@ impl ExternalAgentSessionImporter {
                     record_import_error(
                         &mut item_result,
                         stage,
-                        Some(sub_error_type),
+                        Some(sub_error_type.as_str()),
                         message,
                         Some(source_path.display().to_string()),
                     );
@@ -407,8 +410,25 @@ impl ExternalAgentSessionImporter {
             )
             .await
             .map_err(|err| {
+                let io_kind = match err.kind() {
+                    ErrorKind::NotFound => "not_found",
+                    ErrorKind::PermissionDenied => "permission_denied",
+                    ErrorKind::AlreadyExists => "already_exists",
+                    ErrorKind::InvalidInput => "invalid_input",
+                    ErrorKind::InvalidData => "invalid_data",
+                    ErrorKind::IsADirectory => "is_a_directory",
+                    ErrorKind::NotADirectory => "not_a_directory",
+                    ErrorKind::TimedOut => "timed_out",
+                    ErrorKind::WriteZero => "write_zero",
+                    ErrorKind::UnexpectedEof => "unexpected_eof",
+                    ErrorKind::StorageFull => "storage_full",
+                    ErrorKind::QuotaExceeded => "quota_exceeded",
+                    ErrorKind::FileTooLarge => "file_too_large",
+                    ErrorKind::ReadOnlyFilesystem => "read_only_filesystem",
+                    _ => "other",
+                };
                 SessionImportStepFailure::new(
-                    "failed_to_load_session_config",
+                    format!("failed_to_load_session_config_{io_kind}"),
                     format!("failed to load imported session config: {err}"),
                 )
             })?;
@@ -448,6 +468,17 @@ impl ExternalAgentSessionImporter {
                     .base_instructions
                     .clone()
                     .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+                provenance: Some(config.base_instructions_provenance.clone().unwrap_or_else(
+                    || {
+                        if config.base_instructions.is_some() {
+                            BaseInstructionsProvenance::Custom
+                        } else {
+                            BaseInstructionsProvenance::Model {
+                                model: model_info.slug.clone(),
+                            }
+                        }
+                    },
+                )),
             },
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
@@ -546,7 +577,7 @@ impl ExternalAgentSessionImporter {
                 )
             })?;
         self.thread_store
-            .persist_thread(thread_id)
+            .persist_thread(thread_id, PersistContext::Standard)
             .await
             .map_err(|err| {
                 SessionImportStepFailure::new(
@@ -571,18 +602,18 @@ struct SessionImportFailure {
     source_path: PathBuf,
     message: String,
     stage: &'static str,
-    sub_error_type: &'static str,
+    sub_error_type: String,
 }
 
 struct SessionImportStepFailure {
-    sub_error_type: &'static str,
+    sub_error_type: String,
     message: String,
 }
 
 impl SessionImportStepFailure {
-    fn new(sub_error_type: &'static str, message: String) -> Self {
+    fn new(sub_error_type: impl Into<String>, message: String) -> Self {
         Self {
-            sub_error_type,
+            sub_error_type: sub_error_type.into(),
             message,
         }
     }

@@ -6,13 +6,14 @@ use codex_protocol::models::ShellCommandToolCallParams;
 use pretty_assertions::assert_eq;
 
 use crate::config::PermissionProfileSnapshot;
+use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
 use crate::exec_env::create_env;
 use crate::exec_env::inject_permission_profile_env;
+use crate::exec_env::inject_session_id_env;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
-use crate::session::turn_context::EnvironmentConfig;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
 use crate::shell::ShellType;
@@ -24,6 +25,9 @@ use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use codex_protocol::protocol::EnvironmentConfig;
+use codex_protocol::protocol::EnvironmentConfigState;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 use codex_shell_command::powershell::try_find_powershell_executable_blocking;
 use codex_shell_command::powershell::try_find_pwsh_executable_blocking;
@@ -102,7 +106,20 @@ async fn shell_command_handler_to_exec_params_uses_selected_environment() {
     let expected_cwd = selected_cwd.join("subdir");
     let active_permission_profile = ActivePermissionProfile::new("selected-profile");
     let selected_environment = TurnEnvironment::new(
-        "selected-environment".to_string(),
+        TurnEnvironmentSelection {
+            environment_id: "selected-environment".to_string(),
+            cwd: PathUri::from_abs_path(&selected_cwd),
+            workspace_roots: Vec::new(),
+            config: EnvironmentConfigState::Ready(EnvironmentConfig {
+                allow_login_shell: true,
+                permission_profile: PermissionProfileSnapshot::active(
+                    permission_profile,
+                    active_permission_profile.clone(),
+                ),
+                selected_capability_roots: Vec::new(),
+            }),
+        },
+        EnvironmentConfigOrigin::Thread,
         Arc::clone(
             &turn_context
                 .environments
@@ -110,21 +127,13 @@ async fn shell_command_handler_to_exec_params_uses_selected_environment() {
                 .expect("primary environment")
                 .environment,
         ),
-        PathUri::from_abs_path(&selected_cwd),
-        Vec::new(),
         Some(selected_shell),
-        EnvironmentConfig {
-            allow_login_shell: true,
-            permission_profile: PermissionProfileSnapshot::active(
-                permission_profile,
-                active_permission_profile.clone(),
-            ),
-        },
     );
     let mut expected_env = create_env(
         &turn_context.config.permissions.shell_environment_policy,
         Some(session.thread_id),
     );
+    inject_session_id_env(&mut expected_env, session.session_id());
     inject_permission_profile_env(&mut expected_env, Some(&active_permission_profile));
 
     let params = ShellCommandToolCallParams {
@@ -202,7 +211,7 @@ async fn shell_command_handler_defaults_to_non_login_when_disallowed() {
         .primary()
         .expect("primary environment")
         .clone();
-    turn_environment.config.allow_login_shell = false;
+    turn_environment.config_mut().allow_login_shell = false;
     let cwd = turn_environment
         .cwd()
         .to_abs_path()

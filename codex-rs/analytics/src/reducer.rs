@@ -1,6 +1,6 @@
 use crate::accepted_lines::AcceptedLineFingerprintEventInput;
+use crate::accepted_lines::accepted_line_counts_from_unified_diff;
 use crate::accepted_lines::accepted_line_fingerprint_event_requests;
-use crate::accepted_lines::accepted_line_fingerprints_from_unified_diff;
 use crate::accepted_lines::accepted_line_repo_hash_for_cwd;
 use crate::events::AppServerRpcTransport;
 use crate::events::CodexAppMentionedEventRequest;
@@ -29,6 +29,8 @@ use crate::events::CodexPluginEventRequest;
 use crate::events::CodexPluginInstallFailedEventRequest;
 use crate::events::CodexPluginInstallFailedMetadata;
 use crate::events::CodexPluginInstallRequestedEventRequest;
+use crate::events::CodexPluginMeasurementEventParams;
+use crate::events::CodexPluginMeasurementEventRequest;
 use crate::events::CodexPluginUsedEventRequest;
 use crate::events::CodexReviewEventParams;
 use crate::events::CodexReviewEventRequest;
@@ -51,6 +53,9 @@ use crate::events::ReviewTrigger;
 use crate::events::Reviewer;
 use crate::events::SkillInvocationEventParams;
 use crate::events::SkillInvocationEventRequest;
+use crate::events::ThreadArchiveAction;
+use crate::events::ThreadArchiveEvent;
+use crate::events::ThreadArchiveEventParams;
 use crate::events::ThreadInitializedEvent;
 use crate::events::ThreadInitializedEventParams;
 use crate::events::ToolItemFailureKind;
@@ -58,6 +63,7 @@ use crate::events::ToolItemTerminalStatus;
 use crate::events::TrackEventRequest;
 use crate::events::WebSearchActionKind;
 use crate::events::codex_app_metadata;
+use crate::events::codex_artifact_operation_event_request;
 use crate::events::codex_compaction_event_params;
 use crate::events::codex_goal_event_params;
 use crate::events::codex_hook_run_metadata;
@@ -71,6 +77,7 @@ use crate::facts::AnalyticsFact;
 use crate::facts::AnalyticsJsonRpcError;
 use crate::facts::AppMentionedInput;
 use crate::facts::AppUsedInput;
+use crate::facts::ArtifactOperationInput;
 use crate::facts::CodeModeToolCallFact;
 use crate::facts::CodeModeToolCallStatus;
 use crate::facts::CodexCompactionEvent;
@@ -81,11 +88,15 @@ use crate::facts::ExternalAgentConfigImportFailureInput;
 use crate::facts::HookRunInput;
 use crate::facts::ImagePreparationFact;
 use crate::facts::ImagePreparationMetadata;
+use crate::facts::InvocationType;
 use crate::facts::PluginInstallFailedInput;
 use crate::facts::PluginInstallRequestedInput;
+use crate::facts::PluginMeasurementRow;
+use crate::facts::PluginMeasurementsInput;
 use crate::facts::PluginState;
 use crate::facts::PluginStateChangedInput;
 use crate::facts::PluginUsedInput;
+use crate::facts::SkillInvocationLocation;
 use crate::facts::SkillInvokedInput;
 use crate::facts::SubAgentThreadStartedInput;
 use crate::facts::ThreadInitializationMode;
@@ -98,6 +109,7 @@ use crate::facts::TurnStatus;
 use crate::facts::TurnSteerRejectionReason;
 use crate::facts::TurnSteerResult;
 use crate::facts::TurnTokenUsageFact;
+use crate::now_unix_millis;
 use crate::now_unix_seconds;
 use crate::option_i64_to_u64;
 use crate::serialize_enum_as_string;
@@ -147,10 +159,33 @@ use codex_protocol::request_permissions::PermissionGrantScope as CorePermissionG
 use codex_protocol::request_permissions::RequestPermissionsResponse as CoreRequestPermissionsResponse;
 use sha1::Digest;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 const MAX_TOOL_RESPONSE_ENTRIES: usize = 256;
+
+pub(crate) const MAX_PLUGIN_MEASUREMENTS_PER_BATCH: usize = 100;
+const MAX_PLUGIN_MEASUREMENT_DIMENSIONS: usize = 8;
+const MAX_PLUGIN_MEASUREMENT_IDENTIFIER_BYTES: usize = 64;
+
+pub(crate) fn valid_plugin_measurement_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    matches!(characters.next(), Some('a'..='z'))
+        && value.len() <= MAX_PLUGIN_MEASUREMENT_IDENTIFIER_BYTES
+        && characters.all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+}
+
+pub(crate) fn valid_plugin_measurement_row(row: &PluginMeasurementRow) -> bool {
+    row.number_value.is_finite()
+        && valid_plugin_measurement_identifier(&row.measurement_name)
+        && row.dimensions.len() <= MAX_PLUGIN_MEASUREMENT_DIMENSIONS
+        && row.dimensions.iter().all(|(name, value)| {
+            valid_plugin_measurement_identifier(name) && valid_plugin_measurement_identifier(value)
+        })
+}
 
 #[derive(Default)]
 pub(crate) struct AnalyticsReducer {
@@ -388,6 +423,8 @@ struct TurnState {
     latest_diff: Option<String>,
     steer_count: usize,
     tool_counts: TurnToolCounts,
+    resource_skill_invocations: HashSet<String>,
+    turn_event_emitted: bool,
 }
 
 #[derive(Clone, Hash, Eq, PartialEq)]
@@ -546,6 +583,9 @@ impl AnalyticsReducer {
                 self.ingest_server_request_aborted(completed_at_ms, request_id, out);
             }
             AnalyticsFact::Custom(input) => match input {
+                CustomAnalyticsFact::ArtifactOperation(input) => {
+                    self.ingest_artifact_operation(input, out);
+                }
                 CustomAnalyticsFact::CodeModeToolCall(input) => {
                     self.ingest_code_mode_tool_call(input, out);
                 }
@@ -600,6 +640,9 @@ impl AnalyticsReducer {
                 CustomAnalyticsFact::PluginInstallFailed(input) => {
                     self.ingest_plugin_install_failed(input, out);
                 }
+                CustomAnalyticsFact::PluginMeasurements(input) => {
+                    self.ingest_plugin_measurements(input, out);
+                }
                 CustomAnalyticsFact::ExternalAgentConfigImportCompleted(input) => {
                     self.ingest_external_agent_config_import_completed(input, out);
                 }
@@ -608,6 +651,16 @@ impl AnalyticsReducer {
                 }
             },
         }
+    }
+
+    fn ingest_artifact_operation(
+        &mut self,
+        input: ArtifactOperationInput,
+        out: &mut Vec<TrackEventRequest>,
+    ) {
+        out.push(TrackEventRequest::ArtifactOperation(
+            codex_artifact_operation_event_request(input.tracking, input.operation),
+        ));
     }
 
     fn ingest_code_mode_tool_call(
@@ -624,8 +677,8 @@ impl AnalyticsReducer {
         };
         let has_thread_context = self.threads.get(thread_id).is_some_and(|thread| {
             thread.metadata.is_some()
-                && thread
-                    .connection_id
+                && self
+                    .thread_connection_id(thread_id)
                     .is_some_and(|connection_id| self.connections.contains_key(&connection_id))
         });
         if !has_thread_context {
@@ -917,9 +970,8 @@ impl AnalyticsReducer {
     ) {
         let parent_thread_id = input.parent_thread_id.clone();
         let parent_connection_id = parent_thread_id
-            .as_ref()
-            .and_then(|parent_thread_id| self.threads.get(parent_thread_id))
-            .and_then(|thread| thread.connection_id);
+            .as_deref()
+            .and_then(|parent_thread_id| self.thread_connection_id(parent_thread_id));
         let thread_state = self.threads.entry(input.thread_id.clone()).or_default();
         thread_state
             .originator
@@ -1059,26 +1111,54 @@ impl AnalyticsReducer {
             invocations,
         } = input;
         for invocation in invocations {
-            let skill_scope = match invocation.skill_scope {
-                SkillScope::User => "user",
-                SkillScope::Repo => "repo",
-                SkillScope::System => "system",
-                SkillScope::Admin => "admin",
+            let (skill_id, repo_url, skill_scope) = match invocation.location {
+                SkillInvocationLocation::Host { path, scope } => {
+                    let skill_scope = match scope {
+                        SkillScope::User => "user",
+                        SkillScope::Repo => "repo",
+                        SkillScope::System => "system",
+                        SkillScope::Admin => "admin",
+                    };
+                    let repo_root = get_git_repo_root(path.as_path());
+                    let repo_url = if let Some(root) = repo_root.as_ref() {
+                        collect_git_info(root)
+                            .await
+                            .and_then(|info| info.repository_url)
+                    } else {
+                        None
+                    };
+                    let skill_id = skill_id_for_local_skill(
+                        repo_url.as_deref(),
+                        repo_root.as_deref(),
+                        path.as_path(),
+                        invocation.skill_name.as_str(),
+                    );
+                    (skill_id, repo_url, Some(skill_scope.to_string()))
+                }
+                SkillInvocationLocation::Resource {
+                    id,
+                    skill_id,
+                    scope,
+                } => {
+                    if matches!(invocation.invocation_type, InvocationType::Implicit) {
+                        let turn_state = self.turns.entry(tracking.turn_id.clone()).or_default();
+                        if !turn_state.resource_skill_invocations.insert(id.clone()) {
+                            continue;
+                        }
+                    }
+                    let skill_id = skill_id
+                        .unwrap_or_else(|| format!("{:x}", sha1::Sha1::digest(id.as_bytes())));
+                    let skill_scope = scope
+                        .map(|scope| match scope {
+                            SkillScope::User => "user",
+                            SkillScope::Repo => "repo",
+                            SkillScope::System => "system",
+                            SkillScope::Admin => "admin",
+                        })
+                        .map(str::to_owned);
+                    (skill_id, None, skill_scope)
+                }
             };
-            let repo_root = get_git_repo_root(invocation.skill_path.as_path());
-            let repo_url = if let Some(root) = repo_root.as_ref() {
-                collect_git_info(root)
-                    .await
-                    .and_then(|info| info.repository_url)
-            } else {
-                None
-            };
-            let skill_id = skill_id_for_local_skill(
-                repo_url.as_deref(),
-                repo_root.as_deref(),
-                invocation.skill_path.as_path(),
-                invocation.skill_name.as_str(),
-            );
             out.push(TrackEventRequest::SkillInvocation(
                 SkillInvocationEventRequest {
                     event_type: "skill_invocation",
@@ -1091,7 +1171,7 @@ impl AnalyticsReducer {
                         model_slug: Some(tracking.model_slug.clone()),
                         product_client_id: Some(tracking.product_client_id.clone()),
                         repo_url,
-                        skill_scope: Some(skill_scope.to_string()),
+                        skill_scope,
                         plugin_id: invocation.plugin_id,
                         remote_plugin_id: invocation.remote_plugin_id,
                     },
@@ -1572,6 +1652,26 @@ impl AnalyticsReducer {
         out: &mut Vec<TrackEventRequest>,
     ) {
         match notification {
+            ServerNotification::ThreadArchived(notification) => {
+                out.push(TrackEventRequest::ThreadArchive(ThreadArchiveEvent {
+                    event_type: "codex_thread_archive_event",
+                    event_params: ThreadArchiveEventParams {
+                        thread_id: notification.thread_id,
+                        action: ThreadArchiveAction::Archived,
+                        occurred_at_ms: now_unix_millis(),
+                    },
+                }));
+            }
+            ServerNotification::ThreadUnarchived(notification) => {
+                out.push(TrackEventRequest::ThreadArchive(ThreadArchiveEvent {
+                    event_type: "codex_thread_archive_event",
+                    event_params: ThreadArchiveEventParams {
+                        thread_id: notification.thread_id,
+                        action: ThreadArchiveAction::Unarchived,
+                        occurred_at_ms: now_unix_millis(),
+                    },
+                }));
+            }
             ServerNotification::ItemStarted(notification) => {
                 let Some(item_id) = tracked_tool_item_id(&notification.item) else {
                     return;
@@ -1658,6 +1758,14 @@ impl AnalyticsReducer {
                     );
                 }
                 self.item_review_summaries.remove(&key);
+                if self
+                    .turns
+                    .get(&notification.turn_id)
+                    .is_some_and(|turn_state| turn_state.turn_event_emitted)
+                    && !self.has_pending_tool_items_for_turn(&notification.turn_id)
+                {
+                    self.turns.remove(&notification.turn_id);
+                }
             }
             ServerNotification::ItemGuardianApprovalReviewStarted(notification) => {
                 let _ = notification;
@@ -1712,6 +1820,48 @@ impl AnalyticsReducer {
             }
             _ => {}
         }
+    }
+
+    fn ingest_plugin_measurements(
+        &mut self,
+        input: PluginMeasurementsInput,
+        out: &mut Vec<TrackEventRequest>,
+    ) {
+        if input.rows.is_empty()
+            || input.rows.len() > MAX_PLUGIN_MEASUREMENTS_PER_BATCH
+            || !valid_plugin_measurement_identifier(&input.operation)
+        {
+            return;
+        }
+        let PluginMeasurementsInput {
+            thread_id,
+            turn_id,
+            item_id,
+            plugin_id,
+            execution_id,
+            operation,
+            rows,
+        } = input;
+        out.extend(
+            rows.into_iter()
+                .filter(valid_plugin_measurement_row)
+                .map(|row| {
+                    TrackEventRequest::PluginMeasurement(CodexPluginMeasurementEventRequest {
+                        event_type: "codex_plugin_measurement_event",
+                        event_params: CodexPluginMeasurementEventParams {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            item_id: item_id.clone(),
+                            plugin_id: plugin_id.clone(),
+                            execution_id: execution_id.clone(),
+                            operation: operation.clone(),
+                            measurement_name: row.measurement_name,
+                            number_value: row.number_value,
+                            dimensions: (!row.dimensions.is_empty()).then_some(row.dimensions),
+                        },
+                    })
+                }),
+        );
     }
 
     fn emit_thread_initialized(
@@ -1987,6 +2137,9 @@ impl AnalyticsReducer {
         let Some(turn_state) = self.turns.get(turn_id) else {
             return;
         };
+        if turn_state.turn_event_emitted {
+            return;
+        }
         if turn_state.thread_id.is_none()
             || turn_state.num_input_images.is_none()
             || turn_state.resolved_config.is_none()
@@ -1999,11 +2152,9 @@ impl AnalyticsReducer {
             return;
         };
         let drop_site = AnalyticsDropSite::turn(thread_id, turn_id);
-        let connection_id = turn_state.connection_id.or_else(|| {
-            self.threads
-                .get(drop_site.thread_id)
-                .and_then(|thread| thread.connection_id)
-        });
+        let connection_id = turn_state
+            .connection_id
+            .or_else(|| self.thread_connection_id(drop_site.thread_id));
         let Some(connection_id) = connection_id else {
             warn_missing_analytics_context(&drop_site, MissingAnalyticsContext::ThreadConnection);
             return;
@@ -2040,18 +2191,39 @@ impl AnalyticsReducer {
             input.repo_hash = accepted_line_repo_hash_for_cwd(cwd.as_path()).await;
             out.extend(accepted_line_fingerprint_event_requests(input));
         }
-        self.turns.remove(turn_id);
+        if self.has_pending_tool_items_for_turn(turn_id) {
+            if let Some(turn_state) = self.turns.get_mut(turn_id) {
+                turn_state.turn_event_emitted = true;
+            }
+        } else {
+            self.turns.remove(turn_id);
+        }
+    }
+
+    fn has_pending_tool_items_for_turn(&self, turn_id: &str) -> bool {
+        self.tool_items_started_at_ms
+            .keys()
+            .any(|key| key.turn_id == turn_id)
+    }
+
+    /// Resolve the parent connection lazily when a subagent fact arrives first.
+    ///
+    /// Parents are spawned before their children, so ancestor links cannot cycle.
+    fn thread_connection_id(&self, thread_id: &str) -> Option<u64> {
+        let mut thread = self.threads.get(thread_id)?;
+        while thread.connection_id.is_none() {
+            let thread_metadata = thread.metadata.as_ref()?;
+            let parent_thread_id = thread_metadata.parent_thread_id.as_deref()?;
+            thread = self.threads.get(parent_thread_id)?;
+        }
+        thread.connection_id
     }
 
     fn thread_connection_or_warn(
         &self,
         drop_site: AnalyticsDropSite<'_>,
     ) -> Option<&ConnectionState> {
-        let Some(thread_state) = self.threads.get(drop_site.thread_id) else {
-            warn_missing_analytics_context(&drop_site, MissingAnalyticsContext::ThreadConnection);
-            return None;
-        };
-        let Some(connection_id) = thread_state.connection_id else {
+        let Some(connection_id) = self.thread_connection_id(drop_site.thread_id) else {
             warn_missing_analytics_context(&drop_site, MissingAnalyticsContext::ThreadConnection);
             return None;
         };
@@ -2994,7 +3166,7 @@ fn accepted_line_event_input(
     turn_state: &TurnState,
 ) -> Option<(AcceptedLineFingerprintEventInput, PathBuf)> {
     let latest_diff = turn_state.latest_diff.as_deref()?;
-    let summary = accepted_line_fingerprints_from_unified_diff(latest_diff);
+    let summary = accepted_line_counts_from_unified_diff(latest_diff);
     if summary.accepted_added_lines == 0 && summary.accepted_deleted_lines == 0 {
         return None;
     }
@@ -3013,7 +3185,6 @@ fn accepted_line_event_input(
             repo_hash: None,
             accepted_added_lines: summary.accepted_added_lines,
             accepted_deleted_lines: summary.accepted_deleted_lines,
-            line_fingerprints: summary.line_fingerprints,
         },
         resolved_config.permission_profile_cwd,
     ))

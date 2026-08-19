@@ -24,9 +24,14 @@ use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_core::config::set_project_trust_level;
 use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
+use codex_exec_server::CreateDirectoryOptions;
+use codex_protocol::config_types::TrustLevel;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use core_test_support::skip_if_remote;
+use core_test_support::skip_if_wine_exec;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -37,6 +42,7 @@ use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::matchers::query_param;
+use wiremock::matchers::query_param_is_missing;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const WATCHER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -136,8 +142,13 @@ fn write_cached_remote_plugin_with_skill(
     Ok(skill_path)
 }
 
-fn write_cached_local_curated_plugin_with_skill(codex_home: &std::path::Path) -> Result<()> {
-    let plugin_root = codex_home.join("plugins/cache/openai-curated/google-calendar/local");
+fn write_cached_local_curated_plugin_with_skill(
+    codex_home: &std::path::Path,
+    marketplace_name: &str,
+) -> Result<()> {
+    let plugin_root = codex_home.join(format!(
+        "plugins/cache/{marketplace_name}/google-calendar/local"
+    ));
     std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
     std::fs::write(
         plugin_root.join(".codex-plugin/plugin.json"),
@@ -243,6 +254,58 @@ async fn skills_list_disabled_bundled_skills_preserves_shared_system_skill_cache
 }
 
 #[tokio::test]
+async fn skills_list_uses_each_cwds_bundled_skills_configuration() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let disabled_cwd = TempDir::new()?;
+    let enabled_cwd = TempDir::new()?;
+
+    for (cwd, enabled) in [(disabled_cwd.path(), false), (enabled_cwd.path(), true)] {
+        std::fs::create_dir_all(cwd.join(".git"))?;
+        std::fs::create_dir_all(cwd.join(".codex"))?;
+        std::fs::write(
+            cwd.join(".codex/config.toml"),
+            format!("[skills.bundled]\nenabled = {enabled}\n"),
+        )?;
+        set_project_trust_level(codex_home.path(), cwd, TrustLevel::Trusted)?;
+    }
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let request_id = app_server
+        .send_skills_list_request(SkillsListParams {
+            cwds: vec![
+                disabled_cwd.path().to_path_buf(),
+                enabled_cwd.path().to_path_buf(),
+            ],
+            force_reload: true,
+        })
+        .await?;
+    let SkillsListResponse { data } =
+        timeout(DEFAULT_TIMEOUT, app_server.read_response(request_id)).await??;
+
+    assert_eq!(data.len(), 2);
+    for (entry, (cwd, enabled)) in data
+        .iter()
+        .zip([(disabled_cwd.path(), false), (enabled_cwd.path(), true)])
+    {
+        assert_eq!(entry.cwd, cwd);
+        assert_eq!(entry.errors, Vec::new());
+        assert_eq!(
+            entry
+                .skills
+                .iter()
+                .any(|skill| skill.scope == SkillScope::System),
+            enabled
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn skills_list_runtime_enable_refreshes_shared_system_skill_cache() -> Result<()> {
     let codex_home = TempDir::new()?;
     let cwd = TempDir::new()?;
@@ -339,7 +402,7 @@ async fn runtime_remote_plugin_toggle_updates_local_curated_plugin_skills() -> R
     let codex_home = TempDir::new()?;
     let cwd = TempDir::new()?;
     let server = MockServer::start().await;
-    write_cached_local_curated_plugin_with_skill(codex_home.path())?;
+    write_cached_local_curated_plugin_with_skill(codex_home.path(), "openai-curated")?;
     std::fs::write(
         codex_home.path().join("config.toml"),
         format!(
@@ -579,6 +642,14 @@ async fn skills_list_loads_remote_installed_plugin_skills_from_cache() -> Result
             .mount(&server)
             .await;
     }
+    Mock::given(method("GET"))
+        .and(path("/backend-api/ps/plugins/installed"))
+        .and(query_param_is_missing("scope"))
+        .and(header("authorization", "Bearer chatgpt-token"))
+        .and(header("chatgpt-account-id", "account-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(global_installed_body))
+        .mount(&server)
+        .await;
 
     let plugin_list_request_id = mcp
         .send_plugin_list_request(PluginListParams {
@@ -768,37 +839,196 @@ async fn skills_list_accepts_relative_cwds() -> Result<()> {
 
 #[tokio::test]
 async fn skills_list_preserves_requested_cwd_order() -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "skills/list currently requires host-native cwd paths for workspace config"
+    );
     let codex_home = TempDir::new()?;
     let first_cwd = TempDir::new()?;
     let second_cwd = TempDir::new()?;
+    write_skill(&codex_home, "shared-skill")?;
+    write_cached_local_curated_plugin_with_skill(codex_home.path(), "openai-api-curated")?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"[features]
+plugins = true
+
+[plugins."google-calendar@openai-api-curated"]
+enabled = true
+"#,
+    )?;
+
+    for (cwd, plugin_enabled) in [(first_cwd.path(), true), (second_cwd.path(), false)] {
+        std::fs::create_dir_all(cwd.join(".git"))?;
+        std::fs::create_dir_all(cwd.join(".codex"))?;
+        std::fs::write(
+            cwd.join(".codex/config.toml"),
+            format!(
+                "[plugins.\"google-calendar@openai-api-curated\"]\nenabled = {plugin_enabled}\n"
+            ),
+        )?;
+        set_project_trust_level(codex_home.path(), cwd, TrustLevel::Trusted)?;
+    }
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .without_auto_env()
         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
 
-    let request_id = mcp
-        .send_skills_list_request(SkillsListParams {
-            cwds: vec![
-                first_cwd.path().to_path_buf(),
-                second_cwd.path().to_path_buf(),
-            ],
-            force_reload: true,
-        })
+    let file_system = mcp.auto_env()?.environment().get_filesystem();
+    for (cwd, name) in [
+        (first_cwd.path(), "first-project-skill"),
+        (second_cwd.path(), "second-project-skill"),
+    ] {
+        let cwd = AbsolutePathBuf::try_from(cwd)?;
+        let git_dir = PathUri::from_abs_path(&cwd.join(".git"));
+        let skill_dir = PathUri::from_abs_path(&cwd.join(".agents/skills").join(name));
+        for directory in [&git_dir, &skill_dir] {
+            file_system
+                .create_directory(
+                    directory,
+                    CreateDirectoryOptions { recursive: true },
+                    /*sandbox*/ None,
+                )
+                .await?;
+        }
+        file_system
+            .write_file(
+                &skill_dir.join("SKILL.md")?,
+                format!("---\nname: {name}\ndescription: {name}\n---\n").into_bytes(),
+                /*sandbox*/ None,
+            )
+            .await?;
+    }
+
+    for (request_index, force_reload) in [false, false, true].into_iter().enumerate() {
+        if request_index == 1 {
+            write_skill(&codex_home, "new-skill")?;
+        }
+
+        let request_id = mcp
+            .send_skills_list_request(SkillsListParams {
+                cwds: vec![
+                    first_cwd.path().to_path_buf(),
+                    second_cwd.path().to_path_buf(),
+                ],
+                force_reload,
+            })
+            .await?;
+        let SkillsListResponse { data } =
+            timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0].cwd, first_cwd.path());
+        assert_eq!(data[1].cwd, second_cwd.path());
+        for (entry, project_skill) in data
+            .iter()
+            .zip(["first-project-skill", "second-project-skill"])
+        {
+            assert_eq!(entry.errors, Vec::new());
+            assert!(
+                entry
+                    .skills
+                    .iter()
+                    .any(|skill| skill.name == "shared-skill")
+            );
+            assert_eq!(
+                entry
+                    .skills
+                    .iter()
+                    .filter(|skill| {
+                        skill.name.ends_with("-project-skill")
+                            || skill.name.starts_with("google-calendar:")
+                    })
+                    .map(|skill| skill.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec![project_skill, "google-calendar:meeting-prep"]
+            );
+            assert_eq!(
+                entry.skills.iter().any(|skill| skill.name == "new-skill"),
+                force_reload
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn skills_list_force_reload_refreshes_cached_plugin_roots() -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "skills/list currently requires host-native cwd paths for workspace config"
+    );
+    let codex_home = TempDir::new()?;
+    let first_cwd = TempDir::new()?;
+    let second_cwd = TempDir::new()?;
+    write_cached_local_curated_plugin_with_skill(codex_home.path(), "openai-api-curated")?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"[features]
+plugins = true
+
+[plugins."google-calendar@openai-api-curated"]
+enabled = true
+"#,
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
 
-    let SkillsListResponse { data } =
-        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
-    assert_eq!(
-        data.iter()
-            .map(|entry| entry.cwd.clone())
-            .collect::<Vec<_>>(),
-        vec![
-            first_cwd.path().to_path_buf(),
-            second_cwd.path().to_path_buf(),
-        ]
-    );
+    let file_system = mcp.auto_env()?.environment().get_filesystem();
+    for cwd in [first_cwd.path(), second_cwd.path()] {
+        let cwd = PathUri::from_abs_path(&AbsolutePathBuf::try_from(cwd)?);
+        file_system
+            .create_directory(
+                &cwd.join(".git")?,
+                CreateDirectoryOptions { recursive: true },
+                /*sandbox*/ None,
+            )
+            .await?;
+    }
+
+    for (cwd, force_reload, expected_skill) in [
+        (first_cwd.path(), false, "google-calendar:meeting-prep"),
+        (first_cwd.path(), true, "google-calendar:refreshed-skill"),
+        (second_cwd.path(), false, "google-calendar:refreshed-skill"),
+    ] {
+        if force_reload {
+            let plugin_root = codex_home
+                .path()
+                .join("plugins/cache/openai-api-curated/google-calendar/local");
+            std::fs::write(
+                plugin_root.join(".codex-plugin/plugin.json"),
+                r#"{"name":"google-calendar","skills":"./replacement-skills"}"#,
+            )?;
+            let skill_dir = plugin_root.join("replacement-skills/refreshed-skill");
+            std::fs::create_dir_all(&skill_dir)?;
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: refreshed-skill\ndescription: refreshed skill\n---\n",
+            )?;
+        }
+
+        let request_id = mcp
+            .send_skills_list_request(SkillsListParams {
+                cwds: vec![cwd.to_path_buf()],
+                force_reload,
+            })
+            .await?;
+        let SkillsListResponse { data } =
+            timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+        assert_eq!(
+            data[0]
+                .skills
+                .iter()
+                .filter(|skill| skill.name.starts_with("google-calendar:"))
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![expected_skill]
+        );
+    }
     Ok(())
 }
 

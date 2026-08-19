@@ -50,6 +50,7 @@ use rmcp::model::ServerResult;
 use rmcp::model::Tool;
 use rmcp::service::ClientCacheConfig;
 use rmcp::service::ClientServiceExt;
+use rmcp::service::RequestHandle;
 use rmcp::service::RoleClient;
 use rmcp::service::RunningService;
 use rmcp::transport::AuthorizationManager;
@@ -70,6 +71,8 @@ use tracing::instrument;
 use tracing::warn;
 
 use crate::elicitation_client_service::ElicitationClientService;
+use crate::event_notification_transport::capture_event_notifications;
+use crate::event_notification_transport::event_notification_channel;
 use crate::http_client_adapter::StreamableHttpClientAdapter;
 use crate::http_client_adapter::StreamableHttpClientAdapterError;
 use crate::http_client_adapter::StreamableHttpRedirectMode;
@@ -251,7 +254,7 @@ where
 }
 
 #[derive(Debug, thiserror::Error)]
-enum ClientOperationError {
+pub(crate) enum ClientOperationError {
     #[error(transparent)]
     Service(#[from] rmcp::service::ServiceError),
     #[error("timed out awaiting {label} after {duration:.0?}")]
@@ -342,6 +345,12 @@ pub struct ToolWithConnectorId {
 pub struct ListToolsWithConnectorIdResult {
     pub next_cursor: Option<String>,
     pub tools: Vec<ToolWithConnectorId>,
+}
+
+/// An active Plugin Runtime event request and its request-scoped notifications.
+pub struct CancellableEventStreamRequest {
+    pub handle: RequestHandle<RoleClient>,
+    pub notifications: crate::EventNotificationReceiver,
 }
 
 /// MCP client implemented on top of the official `rmcp` SDK.
@@ -846,9 +855,19 @@ impl RmcpClient {
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<ServerResult> {
+        self.send_custom_request_with_timeout(method, params, /*timeout*/ None)
+            .await
+    }
+
+    pub async fn send_custom_request_with_timeout(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        timeout: Option<Duration>,
+    ) -> Result<ServerResult> {
         self.refresh_oauth_if_needed().await?;
         let response = self
-            .run_service_operation("requests/custom", /*timeout*/ None, move |service| {
+            .run_service_operation("requests/custom", timeout, move |service| {
                 let params = params.clone();
                 async move {
                     service
@@ -862,6 +881,29 @@ impl RmcpClient {
             .await?;
         self.persist_oauth_tokens().await;
         Ok(response)
+    }
+
+    /// Starts a Plugin Runtime event stream without waiting for its final response.
+    pub async fn send_event_stream_request(
+        &self,
+        params: Option<serde_json::Value>,
+    ) -> Result<CancellableEventStreamRequest> {
+        let service = self.service().await?;
+        let (sender, notifications) = event_notification_channel();
+        let mut request = CustomRequest::new("events/stream", params);
+        request.extensions.insert(sender);
+        let handle = service
+            .peer()
+            .send_cancellable_request(
+                ClientRequest::CustomRequest(request),
+                rmcp::service::PeerRequestOptions::no_options(),
+            )
+            .await?;
+
+        Ok(CancellableEventStreamRequest {
+            handle,
+            notifications,
+        })
     }
 
     async fn service(&self) -> Result<Arc<RunningService<RoleClient, ElicitationClientService>>> {
@@ -983,19 +1025,27 @@ impl RmcpClient {
                     && auth_provider.is_none()
                     && !default_headers.contains_key(AUTHORIZATION)
                 {
-                    if let Some(store) = pinned_credential_store.get().copied() {
-                        // Rebuilds reread the source selected during first construction. Only the
-                        // initial construction below evaluates configured store policy.
-                        store
-                            .load(&DefaultKeyringStore, server_name, url)?
-                            .map(|tokens| ResolvedOAuthTokens { tokens, store })
-                    } else {
+                    let oauth_server_name = server_name.clone();
+                    let oauth_url = url.clone();
+                    let oauth_store_mode = *store_mode;
+                    let oauth_keyring_backend_kind = *keyring_backend_kind;
+                    let pinned_credential_store = Arc::clone(pinned_credential_store);
+
+                    tokio::task::spawn_blocking(move || -> Result<Option<ResolvedOAuthTokens>> {
+                        if let Some(store) = pinned_credential_store.get().copied() {
+                            // Rebuilds reread the source selected during first construction. Only
+                            // initial construction below evaluates configured store policy.
+                            return store
+                                .load(&DefaultKeyringStore, &oauth_server_name, &oauth_url)
+                                .map(|tokens| tokens.map(|tokens| ResolvedOAuthTokens { tokens, store }));
+                        }
+
                         match resolve_oauth_tokens_from_store_policy(
                             &DefaultKeyringStore,
-                            server_name,
-                            url,
-                            *store_mode,
-                            *keyring_backend_kind,
+                            &oauth_server_name,
+                            &oauth_url,
+                            oauth_store_mode,
+                            oauth_keyring_backend_kind,
                         ) {
                             Ok(tokens) => {
                                 if let Some(resolved) = tokens.as_ref() {
@@ -1003,18 +1053,22 @@ impl RmcpClient {
                                     // first concrete source so Auto is not reevaluated mid-client.
                                     pinned_credential_store.set(resolved.store).map_err(|_| {
                                         anyhow!(
-                                            "OAuth credential store pinned concurrently for MCP server `{server_name}`"
+                                            "OAuth credential store pinned concurrently for MCP server `{oauth_server_name}`"
                                         )
                                     })?;
                                 }
-                                tokens
+                                Ok(tokens)
                             }
                             Err(err) => {
-                                warn!("failed to read tokens for server `{server_name}`: {err}");
-                                None
+                                warn!(
+                                    "failed to read tokens for server `{oauth_server_name}`: {err}"
+                                );
+                                Ok(None)
                             }
                         }
-                    }
+                    })
+                    .await
+                    .map_err(|error| anyhow!("OAuth credential loading task failed: {error}"))??
                 } else {
                     None
                 };
@@ -1139,7 +1193,7 @@ impl RmcpClient {
             ),
             PendingTransport::StreamableHttp { transport } => (
                 client_service
-                    .serve_with_lifecycle(transport, lifecycle)
+                    .serve_with_lifecycle(capture_event_notifications(transport), lifecycle)
                     .boxed(),
                 None,
             ),

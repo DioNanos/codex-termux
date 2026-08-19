@@ -1,14 +1,15 @@
 use anyhow::Result;
+use codex_core::TurnInputRequest;
 use codex_core::config::AgentRoleConfig;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
-use codex_protocol::protocol::Submission;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::assert_parent_turn;
+use core_test_support::responses::assert_root_turn;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call_with_namespace;
@@ -245,26 +246,18 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     });
     let initial = initial_builder.build_with_auto_env(&server).await?;
     let root_thread_id = initial.session_configured.thread_id;
-    let mut op = vec![UserInput::Text {
-        text: INITIAL_PROMPT.to_string(),
-        text_elements: Vec::new(),
-    }]
-    .into();
-    if let Op::UserInput {
-        thread_settings, ..
-    } = &mut op
-    {
-        thread_settings.permission_profile = Some(PermissionProfile::Disabled);
-    }
     initial
         .codex
-        .submit_with_id(Submission {
-            id: "spoofed-root-turn".to_string(),
-            op,
-            client_user_message_id: None,
-            trace: None,
-            parent_turn_id: Some("spoofed-parent-turn".to_string()),
-        })
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: INITIAL_PROMPT.to_string(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                permission_profile: Some(PermissionProfile::Disabled),
+                ..Default::default()
+            }),
+        )
         .await?;
     wait_for_event(&initial.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -550,6 +543,16 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
             );
         }
         assert_parent_turn(body, parent_turn)?;
+    }
+    for (body, root_turn) in [
+        (&initial_root, initial_parent),
+        (&queue_root, queue_parent),
+        (&followup_root, followup_parent),
+        (&initial_child, initial_parent),
+        (&followup_child, followup_parent),
+        (&grandchild, initial_parent),
+    ] {
+        assert_root_turn(body, Some(root_turn))?;
     }
     let reloaded_worker_config = reloaded_worker.config_snapshot().await;
     let reloaded_worker_role_config = (

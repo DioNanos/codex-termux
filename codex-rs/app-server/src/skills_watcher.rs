@@ -7,17 +7,16 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SkillsChangedNotification;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
-use codex_core::skills::HostSkillsLoadInput;
-use codex_core::skills::HostSkillsService;
 use codex_file_watcher::FileWatcher;
 use codex_file_watcher::FileWatcherSubscriber;
 use codex_file_watcher::Receiver;
 use codex_file_watcher::ThrottledWatchReceiver;
 use codex_file_watcher::WatchPath;
 use codex_file_watcher::WatchRegistration;
-use codex_protocol::protocol::SkillScope;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_skills::system_cache_root_dir;
+use codex_skills_extension::HostSkillsLoadInput;
+use codex_skills_extension::HostSkillsService;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio_util::sync::CancellationToken;
 use tokio_util::sync::DropGuard;
@@ -117,18 +116,14 @@ impl SkillsWatcher {
             config.cwd.clone(),
             plugin_outcome.effective_plugin_skill_roots(),
             config.config_layer_stack.clone(),
-            config.bundled_skills_enabled(),
         );
         let roots = thread_manager
             .skills_service()
-            .skill_roots_for_config(&skills_input, Some(environment.get_filesystem()))
+            .watchable_skill_root_paths(&skills_input, environment.get_filesystem())
             .await
             .into_iter()
-            // Plugin roots have explicit lifecycle invalidation; generated system skills are
-            // installed before this watcher starts.
-            .filter(|root| root.plugin_identity.is_none() && root.scope != SkillScope::System)
-            .map(|root| WatchPath {
-                path: root.path.into_path_buf(),
+            .map(|path| WatchPath {
+                path: path.into_path_buf(),
                 recursive: true,
             })
             .collect();

@@ -165,6 +165,7 @@ async fn compact_uses_bearer_after_agent_identity_session_fallback() -> anyhow::
         }],
         base_instructions: BaseInstructions {
             text: "base instructions".to_string(),
+            provenance: None,
         },
         ..Default::default()
     };
@@ -263,7 +264,6 @@ fn test_model_info() -> ModelInfo {
         "default_verbosity": null,
         "apply_patch_tool_type": null,
         "truncation_policy": {"mode": "bytes", "limit": 10000},
-        "supports_parallel_tool_calls": false,
         "supports_image_detail_original": false,
         "context_window": 272000,
         "auto_compact_token_limit": null,

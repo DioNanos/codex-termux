@@ -1,13 +1,16 @@
 use super::*;
 use crate::config::PermissionProfileSnapshot;
-use crate::session::turn_context::EnvironmentConfig;
+use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::tools::sandboxing::SandboxAttempt;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::EnvironmentConfig;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::GranularApprovalConfig;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
@@ -18,15 +21,21 @@ use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 fn test_turn_environment(environment_id: &str) -> crate::session::turn_context::TurnEnvironment {
     crate::session::turn_context::TurnEnvironment::new(
-        environment_id.to_string(),
-        std::sync::Arc::new(codex_exec_server::Environment::default_for_tests()),
-        PathUri::from_abs_path(&std::env::temp_dir().abs()),
-        Vec::new(),
-        /*shell*/ None,
-        EnvironmentConfig {
-            allow_login_shell: true,
-            permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::read_only()),
+        TurnEnvironmentSelection {
+            environment_id: environment_id.to_string(),
+            cwd: PathUri::from_abs_path(&std::env::temp_dir().abs()),
+            workspace_roots: Vec::new(),
+            config: EnvironmentConfigState::Ready(EnvironmentConfig {
+                allow_login_shell: true,
+                permission_profile: PermissionProfileSnapshot::legacy(
+                    PermissionProfile::read_only(),
+                ),
+                selected_capability_roots: Vec::new(),
+            }),
         },
+        EnvironmentConfigOrigin::Thread,
+        std::sync::Arc::new(codex_exec_server::Environment::default_for_tests()),
+        /*shell*/ None,
     )
 }
 
@@ -267,7 +276,7 @@ async fn file_system_sandbox_context_preserves_executor_workspace_permissions() 
 }
 
 #[tokio::test]
-async fn no_sandbox_attempt_has_no_file_system_context() {
+async fn file_system_sandbox_context_respects_sandbox_request() {
     let path = std::env::temp_dir()
         .join("apply-patch-runtime-none.txt")
         .abs();
@@ -309,5 +318,29 @@ async fn no_sandbox_attempt_has_no_file_system_context() {
     assert_eq!(
         ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt),
         None
+    );
+
+    let cwd = PathUri::parse("file:///C:/workspace").expect("Windows workspace URI");
+    let permissions = PermissionProfile::workspace_write();
+    let attempt = SandboxAttempt {
+        sandbox_requested: true,
+        permissions: &permissions,
+        exec_server_permissions: &permissions,
+        sandbox_cwd: &cwd,
+        workspace_roots: std::slice::from_ref(&cwd),
+        ..attempt
+    };
+
+    assert_eq!(
+        ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt),
+        Some(FileSystemSandboxContext {
+            permissions: permissions.into(),
+            cwd: Some(cwd.clone()),
+            workspace_roots: vec![cwd],
+            windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
+            windows_sandbox_private_desktop: false,
+            windows_sandbox_proxy_settings_mode: None,
+            use_legacy_landlock: false,
+        })
     );
 }

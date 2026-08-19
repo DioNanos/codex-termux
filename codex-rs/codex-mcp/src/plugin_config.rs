@@ -64,6 +64,9 @@ impl PluginMcpFile {
 
 /// Parses the two supported plugin MCP file shapes and normalizes each server.
 ///
+/// Native plugin HTTP servers share the regular MCP transport configuration;
+/// relative helper commands therefore use the session's local process cwd.
+///
 /// Invalid individual servers are returned as errors without discarding valid
 /// siblings. A malformed top-level document fails the whole parse.
 pub fn parse_plugin_mcp_config(
@@ -263,12 +266,10 @@ fn normalize_plugin_mcp_server_value(
     }
 
     if let Some(JsonValue::Object(mut oauth)) = object.remove("oauth") {
-        if oauth.remove("callbackPort").is_some() {
-            let plugin_display = source.display();
-            warn!(
-                plugin = %plugin_display,
-                "plugin MCP server OAuth callbackPort is ignored; Codex uses global MCP OAuth callback settings"
-            );
+        if let Some(callback_port) = oauth.remove("callbackPort") {
+            oauth
+                .entry("callback_port".to_string())
+                .or_insert(callback_port);
         }
 
         if let Some(client_id) = oauth.remove("clientId") {

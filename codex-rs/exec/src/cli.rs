@@ -12,10 +12,6 @@ use std::path::PathBuf;
     override_usage = "codex exec [OPTIONS] [PROMPT]\n       codex exec [OPTIONS] <COMMAND> [ARGS]"
 )]
 pub struct Cli {
-    /// Process-only PSP routing selected by the parent Codex CLI.
-    #[clap(skip)]
-    pub psp: bool,
-
     /// Action to perform. If omitted, runs a new non-interactive session.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -149,8 +145,32 @@ pub enum Command {
     /// Resume a previous session by id or pick the most recent with --last.
     Resume(ResumeArgs),
 
+    /// Fork a previous session by id into a new session.
+    Fork(ForkArgs),
+
     /// Run a code review against the current repository.
     Review(ReviewArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ForkArgs {
+    /// Conversation/session id (UUID) or thread name to fork.
+    #[arg(value_name = "SESSION_ID")]
+    pub session_id: String,
+
+    /// Optional image(s) to attach to the prompt sent after forking.
+    #[arg(
+        long = "image",
+        short = 'i',
+        value_name = "FILE",
+        value_delimiter = ',',
+        num_args = 1
+    )]
+    pub images: Vec<PathBuf>,
+
+    /// Optional prompt to send after forking. If `-` is used, read from stdin.
+    #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
+    pub prompt: Option<String>,
 }
 
 #[derive(Args, Debug)]

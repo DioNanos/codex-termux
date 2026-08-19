@@ -2,6 +2,7 @@ use super::*;
 use crate::compact::InitialContextInjection;
 use crate::exec_policy::ExecPolicyManager;
 use crate::guardian::GUARDIAN_REVIEWER_NAME;
+use crate::plugins::plugins_manager_for_config;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::step_context::StepContext;
 use crate::test_support::models_manager_with_provider;
@@ -38,6 +39,7 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_response_once;
 use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
@@ -68,12 +70,13 @@ where
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
     let server = start_mock_server().await;
-    let guardian_request_log = mount_sse_once(
+    let guardian_request_log = mount_sse_sequence(
         &server,
-        sse(vec![
+        vec![
+            sse(vec![
             ev_response_created("resp-guardian"),
             ev_assistant_message(
                 "msg-guardian",
@@ -86,11 +89,14 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
                 .to_string(),
             ),
             ev_completed("resp-guardian"),
-        ]),
+        ]);
+            2
+        ],
     )
     .await;
 
     let (mut session, mut turn_context_raw) = make_session_and_context().await;
+    Arc::make_mut(&mut turn_context_raw.model_info).node_repl_auto_review_required = true;
     *session.active_turn.lock().await = Some(ActiveTurn::default());
     Arc::make_mut(&mut turn_context_raw.config)
         .permissions
@@ -116,6 +122,16 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
         config.model_provider.clone(),
         turn_context_raw.auth_manager.clone(),
     );
+    let image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    let evidence = session
+        .services
+        .thread_extension_data
+        .get_or_init(crate::context::NodeReplReviewEvidence::default);
+    let image = UserInput::Image {
+        image_url: image_url.to_string(),
+        detail: None,
+    };
+    evidence.record("js", "cell", "image", vec![image]);
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
 
@@ -140,7 +156,7 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
                 reason: Some("need network".to_string()),
                 permissions: requested_permissions.clone(),
             },
-            environment,
+            environment.clone(),
             CancellationToken::new(),
         ),
     )
@@ -155,6 +171,20 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
             strict_auto_review: false,
         })
     );
+    let second_response = session
+        .request_permissions_for_environment(
+            &turn_context,
+            "perm-call-2".to_string(),
+            RequestPermissionsArgs {
+                environment_id: None,
+                reason: Some("need network".to_string()),
+                permissions: requested_permissions.clone(),
+            },
+            environment,
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(second_response, response);
     assert_eq!(
         session
             .granted_turn_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID)
@@ -162,8 +192,13 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
         Some(requested_permissions.into())
     );
 
-    let guardian_request = guardian_request_log.single_request();
+    let guardian_requests = guardian_request_log.requests();
+    assert_eq!(guardian_requests.len(), 2);
+    let guardian_request = &guardian_requests[0];
     assert_eq!(guardian_request.path(), "/v1/responses");
+    for request in &guardian_requests {
+        assert_eq!(request.message_input_image_urls("user"), [image_url]);
+    }
     assert!(guardian_request.body_contains_text("request_permissions"));
     assert!(guardian_request.body_contains_text("need network"));
 }
@@ -314,7 +349,7 @@ async fn guardian_allows_shell_command_additional_permissions_requests_past_poli
     else {
         panic!("primary environment should be ready");
     };
-    environment.config.permission_profile =
+    environment.config_mut().permission_profile =
         config.permissions.permission_profile_state().snapshot();
     config.codex_linux_sandbox_exe = codex_linux_sandbox_exe_or_skip!();
     config
@@ -436,7 +471,7 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
     else {
         panic!("primary environment should be ready");
     };
-    environment.config.permission_profile =
+    environment.config_mut().permission_profile =
         config.permissions.permission_profile_state().snapshot();
     config.approvals_reviewer = ApprovalsReviewer::User;
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
@@ -454,6 +489,17 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
     );
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
+    session
+        .start_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            super::NeverEndingTask {
+                kind: crate::state::TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+            crate::tasks::MailboxParentProvenance::Ignore,
+        )
+        .await;
 
     let handler = crate::tools::handlers::ShellCommandHandler::from(
         codex_tools::ShellCommandBackendConfig::Classic,
@@ -738,7 +784,10 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         auth_manager.clone(),
         config.model_provider.clone(),
     );
-    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
+    let plugins_manager = Arc::new(plugins_manager_for_config(
+        &config,
+        auth_manager.get_api_auth_mode(),
+    ));
     let skills_service = Arc::new(HostSkillsService::new(
         config.codex_home.clone(),
         /*bundled_skills_enabled*/ true,

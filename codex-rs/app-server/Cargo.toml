@@ -42,6 +42,7 @@ codex-config = { workspace = true }
 codex-connectors = { workspace = true }
 codex-core = { workspace = true }
 codex-core-plugins = { workspace = true }
+codex-diagnostics = { workspace = true }
 codex-home = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-extension-api = { workspace = true }
@@ -50,6 +51,7 @@ codex-features = { workspace = true }
 codex-goal-extension = { workspace = true }
 codex-git-attribution = { workspace = true }
 codex-guardian = { workspace = true }
+codex-guardian-v2 = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-file-watcher = { workspace = true }
 codex-hooks = { workspace = true }
@@ -74,6 +76,7 @@ codex-mcp-extension = { workspace = true }
 codex-model-provider = { workspace = true }
 codex-models-manager = { workspace = true }
 codex-protocol = { workspace = true }
+codex-queue-extension = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-app-server-transport = { workspace = true }
 codex-feedback = { workspace = true }

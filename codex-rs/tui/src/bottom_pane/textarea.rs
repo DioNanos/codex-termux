@@ -11,7 +11,8 @@
 //! recent killed span.
 //!
 //! Wrapping also reserves a visible insertion point: full logical lines get continuation rows,
-//! and overflowing spaces wrap instead of moving the cursor outside the textarea.
+//! and overflowing spaces wrap instead of moving the cursor outside the textarea. A partial
+//! whitespace continuation stays attached to the following word rather than becoming a blank row.
 
 use crate::key_hint::KeyBindingListExt;
 use crate::key_hint::is_altgr;
@@ -38,10 +39,10 @@ use std::borrow::Cow;
 use std::cell::Ref;
 use std::cell::RefCell;
 use std::ops::Range;
-use textwrap::Options;
 use unicode_segmentation::UnicodeSegmentation;
 
 mod vim;
+mod wrapping;
 use self::vim::VimMode;
 use self::vim::VimMotion;
 use self::vim::VimOperator;
@@ -1006,7 +1007,22 @@ impl TextArea {
         }
         let mut target = self.cursor_pos;
         for _ in 0..n {
-            target = self.prev_atomic_boundary(target);
+            if let Some((boundary, ch)) = self.text[..target].char_indices().next_back()
+                && matches!(
+                    ch,
+                    // Thai-only special casing is not ideal; refactor if it becomes more complex.
+                    // All Thai nonspacing marks: vowel signs, tone marks, and other diacritics.
+                    '\u{0e31}' | '\u{0e34}'..='\u{0e3a}' | '\u{0e47}'..='\u{0e4e}'
+                )
+                && !self
+                    .elements
+                    .iter()
+                    .any(|element| target > element.range.start && target <= element.range.end)
+            {
+                target = boundary;
+            } else {
+                target = self.prev_atomic_boundary(target);
+            }
             if target == 0 {
                 break;
             }
@@ -1881,8 +1897,9 @@ impl TextArea {
 
     /// Returns cached grapheme-safe visual ranges, including cursor-position sentinel bytes.
     ///
-    /// Overflowing spaces get their own rows, and full logical lines receive a continuation row
-    /// so their insertion point stays visible.
+    /// Overflowing spaces wrap without separating a partial whitespace continuation from the next
+    /// word, existing word breakpoints stay intact, and full logical lines receive a continuation
+    /// row so their insertion point stays visible.
     #[expect(clippy::unwrap_used)]
     fn wrapped_lines(&self, width: u16) -> Ref<'_, Vec<Range<usize>>> {
         // Ensure cache is ready (potentially mutably borrow, then drop)
@@ -1894,39 +1911,7 @@ impl TextArea {
             };
             if needs_recalc {
                 let display_text = text_for_display(&self.text);
-                let mut lines = crate::wrapping::wrap_ranges(
-                    display_text.as_ref(),
-                    Options::new(width as usize).wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
-                );
-                if width > 0 {
-                    let wrapped_lines = lines;
-                    lines = Vec::with_capacity(wrapped_lines.len());
-                    for wrapped_line in wrapped_lines {
-                        let line_end = wrapped_line.end.saturating_sub(1);
-                        let mut line_start = wrapped_line.start;
-                        let mut line_width = 0;
-
-                        for (offset, grapheme) in display_text[wrapped_line.start..line_end]
-                            .grapheme_indices(/*is_extended*/ true)
-                        {
-                            let grapheme_width = display_width(grapheme);
-                            if line_width > 0 && line_width + grapheme_width > usize::from(width) {
-                                let next_line_start = wrapped_line.start + offset;
-                                lines.push(line_start..next_line_start + 1);
-                                line_start = next_line_start;
-                                line_width = 0;
-                            }
-                            line_width += grapheme_width;
-                        }
-
-                        lines.push(line_start..line_end + 1);
-                        if line_width >= usize::from(width)
-                            && matches!(display_text.as_bytes().get(line_end), None | Some(b'\n'))
-                        {
-                            lines.push(line_end..line_end + 1);
-                        }
-                    }
-                }
+                let lines = wrapping::wrapped_lines(display_text.as_ref(), width);
                 *cache = Some(WrapCache { width, lines });
             }
         }
@@ -2273,6 +2258,63 @@ mod tests {
         t.set_cursor(t.text().len());
         t.delete_forward(/*n*/ 1);
         assert_eq!(t.text(), "b");
+    }
+
+    #[test]
+    fn delete_backward_removes_thai_marks_one_at_a_time() {
+        let mut t = ta_with("ที่");
+
+        t.input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        let area = Rect::new(0, 0, /*width*/ 8, /*height*/ 1);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let mut state = TextAreaState::default();
+        terminal
+            .draw(|frame| {
+                StatefulWidgetRef::render_ref(&(&t), frame.area(), frame.buffer_mut(), &mut state);
+            })
+            .unwrap();
+        insta::assert_snapshot!(
+            "textarea_thai_backspace_preserves_remaining_marks",
+            format!("cursor: {:?}\n{}", t.cursor_pos(area), terminal.backend())
+        );
+        assert_eq!(t.text(), "ที");
+
+        t.delete_backward(/*n*/ 1);
+        assert_eq!(t.text(), "ท");
+
+        t.delete_backward(/*n*/ 1);
+        assert_eq!(t.text(), "");
+    }
+
+    #[test]
+    fn delete_backward_preserves_other_grapheme_behavior() {
+        let mut thai_spacing_vowel = ta_with("ซ้ำ");
+        thai_spacing_vowel.delete_backward(/*n*/ 1);
+        assert_eq!(thai_spacing_vowel.text(), "ซ้");
+
+        let mut decomposed_latin = ta_with("e\u{301}");
+        decomposed_latin.delete_backward(/*n*/ 1);
+        assert_eq!(decomposed_latin.text(), "");
+
+        let mut family_emoji = ta_with("👨\u{200d}👩\u{200d}👧\u{200d}👦");
+        family_emoji.delete_backward(/*n*/ 1);
+        assert_eq!(family_emoji.text(), "");
+    }
+
+    #[test]
+    fn delete_backward_keeps_thai_elements_atomic() {
+        let mut t = TextArea::new();
+        t.insert_str("before ");
+        t.insert_element("ที่");
+        t.insert_str(" after");
+
+        t.set_cursor(t.elements[0].range.end);
+        t.delete_backward(/*n*/ 1);
+
+        assert_eq!(t.text(), "before  after");
+        assert_eq!(t.cursor(), "before ".len());
+        assert!(t.elements.is_empty());
     }
 
     #[test]
@@ -3603,13 +3645,160 @@ mod tests {
     }
 
     #[test]
+    fn leading_space_after_full_line_stays_with_following_text() {
+        let mut t = ta_with("abad a");
+        t.set_cursor(t.text().len());
+        let area = Rect::new(0, 0, /*width*/ 4, /*height*/ 2);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let mut state = TextAreaState::default();
+        terminal
+            .draw(|frame| {
+                StatefulWidgetRef::render_ref(&(&t), frame.area(), frame.buffer_mut(), &mut state);
+            })
+            .unwrap();
+
+        assert_eq!(t.desired_height(area.width), 2);
+        assert_eq!(t.cursor_pos(area), Some((2, 1)));
+        insta::assert_snapshot!(
+            "textarea_leading_space_after_full_line_stays_with_following_text",
+            format!("cursor: {:?}\n{}", t.cursor_pos(area), terminal.backend())
+        );
+
+        for text in ["界界 a", "abｶﾞ a", "abad\ta"] {
+            let mut t = ta_with(text);
+            t.set_cursor(t.text().len());
+
+            assert_eq!(t.desired_height(area.width), 2);
+            assert_eq!(t.cursor_pos(area), Some((2, 1)));
+        }
+    }
+
+    #[test]
+    fn breakable_unicode_space_stays_with_following_text() {
+        let mut t = ta_with("abad\u{3000}abcde");
+        t.set_cursor(t.text().len());
+        let area = Rect::new(0, 0, /*width*/ 4, /*height*/ 3);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let mut state = TextAreaState::default();
+        terminal
+            .draw(|frame| {
+                StatefulWidgetRef::render_ref(&(&t), frame.area(), frame.buffer_mut(), &mut state);
+            })
+            .unwrap();
+
+        assert_eq!(t.desired_height(area.width), 3);
+        assert_eq!(t.cursor_pos(area), Some((3, 2)));
+        insta::assert_snapshot!(
+            "textarea_breakable_unicode_space_stays_with_following_text",
+            format!("cursor: {:?}\n{}", t.cursor_pos(area), terminal.backend())
+        );
+    }
+
+    #[test]
+    fn leading_space_reflows_across_following_wrapped_fragments() {
+        let mut t = ta_with("abad abcde wxyz");
+        let area = Rect::new(0, 0, /*width*/ 4, /*height*/ 5);
+        assert_eq!(t.desired_height(area.width), 5);
+        for (cursor, expected) in [(11, (0, 3)), (14, (3, 3)), (15, (0, 4))] {
+            t.set_cursor(cursor);
+            assert_eq!(t.cursor_pos(area), Some(expected));
+        }
+
+        let mut t = ta_with("abad abcde xy zz");
+        assert_eq!(t.desired_height(area.width), 5);
+        for (cursor, expected) in [
+            (4, (0, 1)),
+            (5, (1, 1)),
+            (8, (0, 2)),
+            (9, (1, 2)),
+            (10, (2, 2)),
+            (11, (0, 3)),
+            (12, (1, 3)),
+            (13, (2, 3)),
+            (14, (0, 4)),
+            (16, (2, 4)),
+        ] {
+            t.set_cursor(cursor);
+            assert_eq!(t.cursor_pos(area), Some(expected));
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let mut state = TextAreaState::default();
+        terminal
+            .draw(|frame| {
+                StatefulWidgetRef::render_ref(&(&t), frame.area(), frame.buffer_mut(), &mut state);
+            })
+            .unwrap();
+
+        insta::assert_snapshot!(
+            "textarea_leading_space_reflows_across_following_wrapped_fragments",
+            format!("cursor: {:?}\n{}", t.cursor_pos(area), terminal.backend())
+        );
+    }
+
+    #[test]
+    fn reflow_keeps_fitting_remainder_on_current_row() {
+        for (text, width, expected_height, expected_cursor) in [
+            ("  -", 1, 4, (0, 3)),
+            ("p    a b", 3, 3, (2, 2)),
+            ("p     a b", 5, 2, (4, 1)),
+            (" aaaa a   ", 3, 4, (1, 3)),
+        ] {
+            let mut t = ta_with(text);
+            t.set_cursor(t.text().len());
+            let area = Rect::new(0, 0, width, expected_height);
+
+            assert_eq!(t.desired_height(area.width), expected_height);
+            assert_eq!(t.cursor_pos(area), Some(expected_cursor));
+            for range in t.wrapped_lines(width).iter() {
+                assert!(display_width(&text[range.start..range.end - 1]) <= usize::from(width));
+            }
+        }
+
+        let mut t = ta_with("p     a b");
+        t.set_cursor(t.text().len());
+        let area = Rect::new(0, 0, /*width*/ 5, /*height*/ 2);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let mut state = TextAreaState::default();
+        terminal
+            .draw(|frame| {
+                StatefulWidgetRef::render_ref(&(&t), frame.area(), frame.buffer_mut(), &mut state);
+            })
+            .unwrap();
+
+        insta::assert_snapshot!(
+            "textarea_reflow_keeps_fitting_remainder_on_current_row",
+            format!("cursor: {:?}\n{}", t.cursor_pos(area), terminal.backend())
+        );
+    }
+
+    #[test]
+    fn reflow_preserves_hyphenated_word_breakpoint_when_rendering() {
+        let mut t = ta_with("a foo-barbaz");
+        t.set_cursor(t.text().len());
+        let area = Rect::new(0, 0, /*width*/ 10, /*height*/ 2);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let mut state = TextAreaState::default();
+        terminal
+            .draw(|frame| {
+                StatefulWidgetRef::render_ref(&(&t), frame.area(), frame.buffer_mut(), &mut state);
+            })
+            .unwrap();
+
+        insta::assert_snapshot!(
+            "textarea_reflow_preserves_hyphenated_word_breakpoint",
+            format!("cursor: {:?}\n{}", t.cursor_pos(area), terminal.backend())
+        );
+    }
+
+    #[test]
     fn space_runs_wrap_before_later_text() {
         let mut t = ta_with("abad     next");
-        let area = Rect::new(0, 0, /*width*/ 4, /*height*/ 5);
+        let area = Rect::new(0, 0, /*width*/ 4, /*height*/ 4);
 
-        assert_eq!(t.desired_height(area.width), 5);
+        assert_eq!(t.desired_height(area.width), 4);
 
-        for (cursor, expected) in [(4, (0, 1)), (6, (2, 1)), (8, (0, 2)), (9, (0, 3))] {
+        for (cursor, expected) in [(4, (0, 1)), (6, (2, 1)), (8, (0, 2)), (9, (1, 2))] {
             t.set_cursor(cursor);
             assert_eq!(t.cursor_pos(area), Some(expected));
         }
@@ -4010,28 +4199,26 @@ mod tests {
     fn wrapped_navigation_with_newlines_and_spaces() {
         // Include spaces and an explicit newline to exercise boundaries
         let mut t = ta_with("word1  word2\nword3");
-        // Width 6 wraps "word1 ", its remaining space, and then "word2" before the newline.
+        // Width 6 wraps "word1 " and " word2" before the newline.
         let _ = t.desired_height(/*width*/ 6);
 
         // Put the cursor at column 1 of "word2".
         let start_word2 = t.text().find("word2").unwrap();
         t.set_cursor(start_word2 + 1);
 
-        // Up first lands on the short whitespace continuation instead of skipping it.
+        // Up moves directly to the preceding visual line while preserving the visual column.
         t.move_cursor_up();
-        assert_eq!(t.cursor(), start_word2 - 1);
+        assert_eq!(t.cursor(), 2);
 
-        // A second Up preserves the preferred column on the first wrapped line.
-        t.move_cursor_up();
-        assert_eq!(t.cursor(), 1);
-
-        // Down visits the whitespace continuation before returning to "word2".
-        t.move_cursor_down();
-        assert_eq!(t.cursor(), start_word2 - 1);
+        // Down returns to the same visual column of " word2".
         t.move_cursor_down();
         assert_eq!(t.cursor(), start_word2 + 1);
 
-        // Down again should cross the logical newline to the next visual line ("word3"), clamped to its length if needed
+        // A full line reserves an insertion row immediately before the explicit newline.
+        t.move_cursor_down();
+        assert_eq!(t.cursor(), t.text().find('\n').unwrap());
+
+        // Down again crosses the logical newline to the next visual line ("word3").
         t.move_cursor_down();
         let start_word3 = t.text().find("word3").unwrap();
         assert!(t.cursor() >= start_word3 && t.cursor() <= start_word3 + "word3".len());

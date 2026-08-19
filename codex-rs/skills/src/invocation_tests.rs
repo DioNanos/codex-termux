@@ -28,6 +28,7 @@ fn test_skill_metadata(skill_doc_path: AbsolutePathBuf) -> SkillMetadata {
         name: "test-skill".to_string(),
         description: "test".to_string(),
         short_description: None,
+        model: None,
         interface: None,
         dependencies: None,
         policy: None,
@@ -62,6 +63,66 @@ fn script_run_detection_excludes_python_c() {
     ];
 
     assert!(script_run_token(&tokens).is_none());
+}
+
+#[test]
+fn powershell_skill_doc_read_matches_common_forms() {
+    let skill_doc_path = test_path_buf("/tmp/skill-test/SKILL.md").abs();
+    let spaced_skill_doc_path = test_path_buf("/tmp/skill test/SKILL.md").abs();
+    let skill = test_skill_metadata(skill_doc_path.clone());
+    let spaced_skill = test_skill_metadata(spaced_skill_doc_path.clone());
+    let outcome = TestLookup {
+        by_doc_path: HashMap::from([
+            (canonicalize_if_exists(&skill_doc_path), skill),
+            (canonicalize_if_exists(&spaced_skill_doc_path), spaced_skill),
+        ]),
+        ..Default::default()
+    };
+    let path = skill_doc_path.display();
+    let spaced_path = spaced_skill_doc_path.display();
+
+    for command in [
+        format!("Get-Content {path}"),
+        format!("Get-Content -Raw {path}"),
+        format!("Get-Content \"{spaced_path}\""),
+        format!("Get-Content -Raw \"{spaced_path}\""),
+        format!("get-content   -raw '{spaced_path}'"),
+    ] {
+        let found = detect_implicit_skill_invocation_for_command(
+            &outcome,
+            &command,
+            &test_path_buf("/tmp").abs(),
+        );
+
+        assert_eq!(
+            found.map(|value| value.name),
+            Some("test-skill".to_string()),
+            "command: {command}"
+        );
+    }
+}
+
+#[test]
+fn windows_executor_skill_reads_share_powershell_classification() {
+    let workdir = PathUri::parse("file:///C:/skills").expect("Windows workdir URI");
+    let document = PathUri::parse("file:///C:/skills/demo/SKILL.md").expect("skill URI");
+
+    for command in [
+        r"Get-Content C:\skills\demo\SKILL.md",
+        r"get-content -Raw C:\skills\demo\SKILL.md",
+        r"Get-Content -Path C:\skills\demo\SKILL.md",
+        r"Get-Content -LiteralPath C:\skills\demo\SKILL.md",
+        r"Get-Content C:\skills\demo\SKILL.md -Raw",
+        r"Get-Content -Raw -LiteralPath C:\skills\demo\SKILL.md",
+        r"gc C:\skills\demo\SKILL.md",
+        r"type C:\skills\demo\SKILL.md",
+    ] {
+        assert_eq!(
+            implicit_skill_accesses_for_command(command, &workdir),
+            vec![ImplicitSkillAccess::Document(document.clone())],
+            "command: {command}"
+        );
+    }
 }
 
 #[test]

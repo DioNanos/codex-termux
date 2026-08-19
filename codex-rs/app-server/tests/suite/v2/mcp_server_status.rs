@@ -3,16 +3,26 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
+use axum::Json;
 use axum::Router;
+use axum::body::Bytes;
+use axum::http::HeaderMap;
+use axum::routing::get;
+use axum::routing::post;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::ListMcpServerStatusParams;
 use codex_app_server_protocol::ListMcpServerStatusResponse;
+use codex_app_server_protocol::McpServerOauthLoginCompletedNotification;
+use codex_app_server_protocol::McpServerOauthLoginResponse;
 use codex_app_server_protocol::McpServerStatusDetail;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadStartParams;
@@ -39,11 +49,147 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio::time::timeout;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::header;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[tokio::test]
+async fn oauth_login_uses_http_headers_helper() -> Result<()> {
+    let oauth = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server/mcp"))
+        .and(header("x-gateway", "gateway-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": format!("{}/mcp", oauth.uri()),
+            "authorization_endpoint": format!("{}/oauth/authorize", oauth.uri()),
+            "token_endpoint": format!("{}/oauth/token", oauth.uri()),
+        })))
+        .mount(&oauth)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(header("x-gateway", "gateway-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "oauth-token",
+            "token_type": "Bearer",
+        })))
+        .expect(1)
+        .mount(&oauth)
+        .await;
+
+    let codex_home = TempDir::new()?;
+    let helper_command = if cfg!(windows) {
+        r#"echo {"X-Gateway":"gateway-token"}"#
+    } else {
+        r#"printf '{"X-Gateway":"gateway-token"}'"#
+    };
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            "mcp_oauth_credentials_store = \"file\"\n\
+             [mcp_servers.gateway]\n\
+             url = \"{}/mcp\"\n\
+             http_headers_helper = {}\n\
+             [mcp_servers.gateway.oauth]\n\
+             client_id = \"test-client\"\n",
+            oauth.uri(),
+            toml::Value::String(helper_command.to_string()),
+        ),
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
+        .send_raw_request(
+            "mcpServer/oauth/login",
+            Some(json!({"name": "gateway", "timeoutSecs": 10})),
+        )
+        .await?;
+    let response: McpServerOauthLoginResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    let authorization_url = reqwest::Url::parse(&response.authorization_url)?;
+    let query: BTreeMap<_, _> = authorization_url.query_pairs().into_owned().collect();
+    let mut callback_url = reqwest::Url::parse(&query["redirect_uri"])?;
+    callback_url
+        .query_pairs_mut()
+        .append_pair("code", "test-code")
+        .append_pair("state", &query["state"]);
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()?
+        .get(callback_url)
+        .send()
+        .await?
+        .error_for_status()?;
+    let completed: McpServerOauthLoginCompletedNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("mcpServer/oauthLogin/completed"),
+    )
+    .await??;
+    assert_eq!(
+        completed,
+        McpServerOauthLoginCompletedNotification {
+            name: "gateway".to_string(),
+            thread_id: None,
+            success: true,
+            error: None,
+        }
+    );
+    oauth.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn oauth_login_does_not_run_helper_disabled_by_managed_requirements() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let marker = codex_home.path().join("helper-ran");
+    let helper = toml::Value::String(format!("echo invoked > \"{}\"", marker.display()));
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            "[mcp_servers.blocked]\nurl = \"https://example.com/mcp\"\nhttp_headers_helper = {helper}\n"
+        ),
+    )?;
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        "[mcp_servers.blocked.identity]\nurl = \"https://allowed.example.com/mcp\"\n",
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
+        .send_raw_request(
+            "mcpServer/oauth/login",
+            Some(json!({"name": "blocked", "timeoutSecs": 10})),
+        )
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert!(
+        error
+            .error
+            .message
+            .contains("disabled by managed requirements")
+    );
+    assert!(!marker.exists());
+    Ok(())
+}
 
 async fn wait_for_new_pid(path: &Path, previous_pid: Option<&str>) -> Result<String> {
     Ok(timeout(DEFAULT_READ_TIMEOUT, async {
@@ -81,6 +227,235 @@ fn assert_dynamic_status(response: &ListMcpServerStatusResponse, process_label: 
 }
 
 #[tokio::test]
+async fn oauth_login_automatically_selects_callback_specific_cimd_without_metadata_issuer()
+-> Result<()> {
+    let responses_server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let base_url = format!("http://{}", listener.local_addr()?);
+    let metadata = json!({
+        "authorization_endpoint": format!("{base_url}/authorize"),
+        "token_endpoint": format!("{base_url}/token"),
+        "registration_endpoint": format!("{base_url}/register"),
+        "client_id_metadata_document_supported": true,
+        "token_endpoint_auth_methods_supported": ["none"],
+        "response_types_supported": ["code"],
+        "code_challenge_methods_supported": ["S256"],
+    });
+    let registrations = Arc::new(AtomicUsize::new(0));
+    let registration_count = Arc::clone(&registrations);
+    let token_count = Arc::new(AtomicUsize::new(0));
+    let (token_request_tx, mut token_request_rx) = mpsc::unbounded_channel();
+    let (mcp_authorization_tx, mut mcp_authorization_rx) = mpsc::unbounded_channel();
+    let tool_name = Arc::new("cimd".to_string());
+    let mcp_service = StreamableHttpService::new(
+        move || {
+            Ok(McpStatusServer {
+                tool_name: Arc::clone(&tool_name),
+            })
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let mcp_router =
+        Router::new()
+            .nest_service("/mcp", mcp_service)
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let mcp_authorization_tx = mcp_authorization_tx.clone();
+                    async move {
+                        if let Some(authorization) = request
+                            .headers()
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                        {
+                            let _ = mcp_authorization_tx.send(authorization.to_string());
+                        }
+                        next.run(request).await
+                    }
+                },
+            ));
+    let oauth_server = Router::new()
+        .route(
+            "/.well-known/oauth-authorization-server/mcp",
+            get(move || {
+                let metadata = metadata.clone();
+                async move { Json(metadata) }
+            }),
+        )
+        .route(
+            "/register",
+            post(move || {
+                let registrations = Arc::clone(&registration_count);
+                async move {
+                    registrations.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"client_id": "unexpected-dcr-client"}))
+                }
+            }),
+        )
+        .route(
+            "/token",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let token_request_tx = token_request_tx.clone();
+                let token_count = Arc::clone(&token_count);
+                async move {
+                    let _ = token_request_tx.send((
+                        String::from_utf8_lossy(&body).into_owned(),
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                    ));
+                    if token_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Json(json!({
+                            "access_token": "expired-cimd-access-token",
+                            "token_type": "Bearer",
+                            "expires_in": 0,
+                            "refresh_token": "test-refresh-token",
+                        }))
+                    } else {
+                        Json(json!({
+                            "access_token": "refreshed-cimd-access-token",
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                            "refresh_token": "test-refresh-token",
+                        }))
+                    }
+                }
+            }),
+        )
+        .merge(mcp_router);
+    let oauth_server_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, oauth_server).await;
+    });
+
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&responses_server.uri())
+        .with_extra_config(&format!(
+            "mcp_oauth_credentials_store = \"file\"\n[mcp_servers.cimd]\nurl = \"{base_url}/mcp\""
+        ))
+        .write(codex_home.path())?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    let request_id = app_server
+        .send_raw_request(
+            "mcpServer/oauth/login",
+            Some(json!({"name": "cimd", "timeoutSecs": 10})),
+        )
+        .await?;
+    let response: McpServerOauthLoginResponse =
+        timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(request_id)).await??;
+    let authorization_url = reqwest::Url::parse(&response.authorization_url)?;
+    let parameters = authorization_url
+        .query_pairs()
+        .into_owned()
+        .collect::<BTreeMap<String, String>>();
+    let redirect_uri = parameters["redirect_uri"].clone();
+    let mut callback_url = reqwest::Url::parse(&redirect_uri)?;
+    let callback_id = callback_url
+        .path()
+        .strip_prefix("/callback/")
+        .expect("issuerless CIMD should use a resource-specific callback");
+    let client_id = format!("https://chatgpt.com/oauth/codex/{callback_id}/client.json");
+    assert_eq!(parameters.get("client_id"), Some(&client_id));
+    assert_eq!(
+        parameters.get("code_challenge_method").map(String::as_str),
+        Some("S256")
+    );
+    assert_eq!(registrations.load(Ordering::SeqCst), 0);
+
+    callback_url
+        .query_pairs_mut()
+        .append_pair("code", "cimd-authorization-code")
+        .append_pair("state", &parameters["state"]);
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()?
+        .get(callback_url)
+        .send()
+        .await?
+        .error_for_status()?;
+    let (token_request, token_authorization) =
+        timeout(DEFAULT_READ_TIMEOUT, token_request_rx.recv())
+            .await?
+            .expect("CIMD authorization should exchange its authorization code");
+    let token_parameters = url::form_urlencoded::parse(token_request.as_bytes())
+        .into_owned()
+        .collect::<BTreeMap<String, String>>();
+    assert_eq!(token_parameters.get("client_id"), Some(&client_id));
+    assert!(token_parameters.contains_key("code_verifier"));
+    assert_eq!(token_authorization, None);
+
+    let completed: McpServerOauthLoginCompletedNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_notification("mcpServer/oauthLogin/completed"),
+    )
+    .await??;
+    assert_eq!(
+        completed,
+        McpServerOauthLoginCompletedNotification {
+            name: "cimd".to_string(),
+            thread_id: None,
+            success: true,
+            error: None,
+        }
+    );
+    assert_eq!(registrations.load(Ordering::SeqCst), 0);
+
+    let request_id = app_server
+        .send_raw_request("config/mcpServer/reload", /*params*/ None)
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let _: ListMcpServerStatusResponse = app_server
+        .request(|request_id| ClientRequest::McpServerStatusList {
+            request_id,
+            params: ListMcpServerStatusParams {
+                cursor: None,
+                limit: None,
+                detail: Some(McpServerStatusDetail::Full),
+                thread_id: None,
+            },
+        })
+        .await?;
+    let (refresh_request, refresh_authorization) =
+        timeout(DEFAULT_READ_TIMEOUT, token_request_rx.recv())
+            .await?
+            .expect("expired CIMD token should be refreshed");
+    let refresh_parameters = url::form_urlencoded::parse(refresh_request.as_bytes())
+        .into_owned()
+        .collect::<BTreeMap<String, String>>();
+    assert_eq!(
+        refresh_parameters.get("grant_type").map(String::as_str),
+        Some("refresh_token")
+    );
+    assert_eq!(
+        refresh_parameters.get("refresh_token").map(String::as_str),
+        Some("test-refresh-token")
+    );
+    assert_eq!(refresh_parameters.get("client_id"), Some(&client_id));
+    assert!(!refresh_parameters.contains_key("client_secret"));
+    assert_eq!(refresh_authorization, None);
+    assert_eq!(
+        timeout(DEFAULT_READ_TIMEOUT, mcp_authorization_rx.recv())
+            .await?
+            .expect("MCP startup should use the refreshed token"),
+        "Bearer refreshed-cimd-access-token"
+    );
+    assert_eq!(registrations.load(Ordering::SeqCst), 0);
+
+    oauth_server_handle.abort();
+    let _ = oauth_server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_server_status_list_returns_raw_server_and_tool_names() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let (mcp_server_url, mcp_server_handle) = start_mcp_server("look-up.raw").await?;
@@ -112,6 +487,7 @@ async fn mcp_server_status_list_returns_raw_server_and_tool_names() -> Result<()
     assert_eq!(response.data.len(), 1);
     let status = &response.data[0];
     assert_eq!(status.name, "some-server");
+    assert_eq!(status.plugin_id, None);
     assert_eq!(
         status.tools.keys().cloned().collect::<BTreeSet<_>>(),
         BTreeSet::from(["look-up.raw".to_string()])

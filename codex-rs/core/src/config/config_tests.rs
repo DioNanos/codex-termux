@@ -1,6 +1,9 @@
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::config::edit::apply_blocking;
+use crate::context::ContextualUserFragment;
+use crate::plugins::plugins_manager_for_config;
+use crate::session::multi_agents::resolve_usage_hints;
 use assert_matches::assert_matches;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerEntry;
@@ -67,7 +70,6 @@ use codex_config::types::TuiNotificationSettings;
 use codex_config::types::TuiPetAnchor;
 use codex_config::types::WindowsSandboxModeToml;
 use codex_config::types::WindowsToml;
-use codex_core_plugins::PluginsManager;
 use codex_exec_server::LOCAL_FS;
 use codex_features::Feature;
 use codex_features::FeaturesToml;
@@ -87,6 +89,7 @@ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxEnforcement;
+use codex_protocol::openai_models::MultiAgentRoleMessages;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -159,6 +162,7 @@ fn http_mcp(url: &str) -> McpServerConfig {
             bearer_token_env_var: None,
             http_headers: None,
             env_http_headers: None,
+            http_headers_helper: None,
         },
         environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
         enabled: true,
@@ -324,6 +328,28 @@ consolidation_model = "gpt-5.2"
         )
         .disable_on_external_context
     );
+}
+
+#[tokio::test]
+async fn goal_max_token_budget_requires_positive_integer() {
+    let config_toml = toml::from_str::<ConfigToml>("[goals]\nmax_goal_token_budget = 25000\n")
+        .expect("positive goal token budget should deserialize");
+    let config = Config::load_from_base_config_with_overrides(
+        config_toml,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("positive goal token budget should load");
+    assert_eq!(config.max_goal_token_budget, Some(25_000));
+
+    for invalid in ["0", "-1", "1.5", "\"100\""] {
+        let config = format!("[goals]\nmax_goal_token_budget = {invalid}\n");
+        assert!(
+            toml::from_str::<ConfigToml>(&config).is_err(),
+            "invalid goal token budget should be rejected: {invalid}"
+        );
+    }
 }
 
 #[test]
@@ -499,7 +525,7 @@ async fn load_config_resolves_non_prefixed_mcp_tool_servers() -> std::io::Result
 
         assert_eq!(config.non_prefixed_mcp_tool_servers, expected_servers);
         assert_eq!(config.prefix_mcp_tool_names(), expected_prefix);
-        let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+        let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
         let mcp_config = config.to_mcp_config(&plugins_manager).await;
         assert_eq!(mcp_config.prefix_mcp_tool_names, expected_prefix);
         assert_eq!(
@@ -538,6 +564,7 @@ async fn load_config_resolves_code_mode_config() -> std::io::Result<()> {
         r#"
 [features.code_mode]
 enabled = true
+default_exec_yield_time_ms = 10000
 excluded_tool_namespaces = ["mcp__codex_apps", "multi_agent_v1"]
 direct_only_tool_namespaces = ["mcp__history", "mcp__notes"]
 
@@ -554,6 +581,7 @@ disable_in_process_fallback = true
     )
     .await?;
 
+    assert_eq!(config.code_mode.default_exec_yield_time_ms, 10_000);
     assert_eq!(
         config.code_mode.excluded_tool_namespaces,
         vec!["mcp__codex_apps".to_string(), "multi_agent_v1".to_string()]
@@ -572,10 +600,16 @@ disable_in_process_fallback = true
 async fn load_config_resolves_tool_registry_config() -> std::io::Result<()> {
     let codex_home = tempdir()?;
 
-    for (config_toml, error_on_tool_collisions) in [
-        ("", false),
+    for (config_toml, error_on_tool_collisions, turn_metadata_includes_tool_info) in [
+        ("", false, false),
         (
             "[features.tool_registry]\nerror_on_tool_collisions = true\n",
+            true,
+            false,
+        ),
+        (
+            "[features.tool_registry]\nturn_metadata_includes_tool_info = true\n",
+            false,
             true,
         ),
     ] {
@@ -591,6 +625,10 @@ async fn load_config_resolves_tool_registry_config() -> std::io::Result<()> {
         assert_eq!(
             config.tool_registry.error_on_tool_collisions,
             error_on_tool_collisions
+        );
+        assert_eq!(
+            config.tool_registry.turn_metadata_includes_tool_info,
+            turn_metadata_includes_tool_info
         );
         assert!(!config.features.enabled(Feature::CodeMode));
     }
@@ -609,7 +647,6 @@ async fn load_config_resolves_token_budget_config() -> std::io::Result<()> {
             r#"
 [features.token_budget]
 enabled = true
-mode = "thread"
 reminder_threshold_tokens = 16000
 reminder_message_template = "Custom reminder: {n_remaining} tokens."
 guidance_message = "Preserve important state before compaction."
@@ -617,19 +654,11 @@ auto_compact_fallback_prompt = "  Write notes immediately.  "
 auto_compact_fallback_buffer_tokens = 8000
 "#,
             TokenBudgetConfig {
-                mode: TokenBudgetMode::Thread,
                 reminder_threshold_tokens: Some(16_000),
                 reminder_message_template: "Custom reminder: {n_remaining} tokens.".to_string(),
                 guidance_message: Some("Preserve important state before compaction.".to_string()),
                 auto_compact_fallback_prompt: Some("Write notes immediately.".to_string()),
                 auto_compact_fallback_buffer_tokens: Some(8_000),
-            },
-        ),
-        (
-            "[features.token_budget]\nenabled = true\nmode = \"name\"\n",
-            TokenBudgetConfig {
-                mode: TokenBudgetMode::Name,
-                ..TokenBudgetConfig::default()
             },
         ),
     ] {
@@ -5009,7 +5038,6 @@ async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::
         refreshed_toml,
         ConfigOverrides {
             cwd: Some(codex_home.path().to_path_buf()),
-            psp: Some(true),
             ..Default::default()
         },
         codex_home.abs(),
@@ -5087,8 +5115,6 @@ async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::
         .rebuild_preserving_session_layers(&refreshed_config)
         .await?;
 
-    assert!(config.psp);
-    assert!(config.http_client_factory().has_chatgpt_cookies());
     assert_eq!(
         config.mcp_servers.get(),
         &HashMap::from([
@@ -5211,7 +5237,7 @@ async fn rebuild_preserving_session_layers_refreshes_plugin_derived_mcp_config()
     let config = thread_config
         .rebuild_preserving_session_layers(&refreshed_config)
         .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     let configured_servers = mcp_config.mcp_server_catalog.configured_servers();
 
@@ -5273,7 +5299,7 @@ enabled = true
         .codex_home(codex_home.path().to_path_buf())
         .build()
         .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     let configured_servers = mcp_config.mcp_server_catalog.configured_servers();
 
@@ -5341,7 +5367,7 @@ url = "https://sample.example/mcp"
         )
         .build()
         .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     let configured_servers = mcp_config.mcp_server_catalog.configured_servers();
 
@@ -5443,7 +5469,7 @@ enabled = true
         )
         .build()
         .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     let configured_servers = mcp_config.mcp_server_catalog.configured_servers();
 
@@ -6460,7 +6486,7 @@ async fn to_mcp_config_preserves_apps_feature_from_config() -> std::io::Result<(
         codex_home.abs(),
     )
     .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
 
     config.apps_mcp_product_sku = Some("tpp".to_string());
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
@@ -6487,7 +6513,7 @@ async fn to_mcp_config_flows_mcp_tool_prefix_from_feature() -> std::io::Result<(
         codex_home.abs(),
     )
     .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
 
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     assert!(mcp_config.prefix_mcp_tool_names);
@@ -6523,7 +6549,7 @@ async fn to_mcp_config_flows_mcp_2026_feature_from_config() -> std::io::Result<(
         codex_home.abs(),
     )
     .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
 
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     assert_eq!(mcp_config.protocol_mode, codex_mcp::McpProtocolMode::Legacy);
@@ -6547,7 +6573,7 @@ async fn to_mcp_config_preserves_auth_elicitation_feature_from_config() -> std::
         codex_home.abs(),
     )
     .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
 
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     assert_eq!(
@@ -6860,6 +6886,7 @@ async fn replace_mcp_servers_streamable_http_serializes_bearer_token() -> anyhow
                 bearer_token_env_var: Some("MCP_TOKEN".to_string()),
                 http_headers: None,
                 env_http_headers: None,
+                http_headers_helper: None,
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
@@ -6903,6 +6930,7 @@ startup_timeout_sec = 2.0
             bearer_token_env_var,
             http_headers,
             env_http_headers,
+            ..
         } => {
             assert_eq!(url, "https://example.com/mcp");
             assert_eq!(bearer_token_env_var.as_deref(), Some("MCP_TOKEN"));
@@ -6932,6 +6960,7 @@ async fn replace_mcp_servers_streamable_http_serializes_custom_headers() -> anyh
                     "X-Auth".to_string(),
                     "DOCS_AUTH".to_string(),
                 )])),
+                http_headers_helper: None,
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
@@ -7016,6 +7045,7 @@ async fn replace_mcp_servers_streamable_http_removes_optional_sections() -> anyh
                     "X-Auth".to_string(),
                     "DOCS_AUTH".to_string(),
                 )])),
+                http_headers_helper: None,
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
@@ -7053,6 +7083,7 @@ async fn replace_mcp_servers_streamable_http_removes_optional_sections() -> anyh
                 bearer_token_env_var: None,
                 http_headers: None,
                 env_http_headers: None,
+                http_headers_helper: None,
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
@@ -7092,6 +7123,7 @@ url = "https://example.com/mcp"
             bearer_token_env_var,
             http_headers,
             env_http_headers,
+            ..
         } => {
             assert_eq!(url, "https://example.com/mcp");
             assert!(bearer_token_env_var.is_none());
@@ -7125,6 +7157,7 @@ async fn replace_mcp_servers_streamable_http_isolates_headers_between_servers() 
                         "X-Auth".to_string(),
                         "DOCS_AUTH".to_string(),
                     )])),
+                    http_headers_helper: None,
                 },
                 environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
                 enabled: true,
@@ -7403,6 +7436,7 @@ async fn replace_mcp_servers_streamable_http_serializes_oauth_resource() -> anyh
                 bearer_token_env_var: None,
                 http_headers: None,
                 env_http_headers: None,
+                http_headers_helper: None,
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
@@ -7418,6 +7452,7 @@ async fn replace_mcp_servers_streamable_http_serializes_oauth_resource() -> anyh
             scopes: None,
             oauth: Some(McpServerOAuthConfig {
                 client_id: Some("eci-prd-pub-codex-123".to_string()),
+                callback_port: None,
             }),
             oauth_resource: Some("https://resource.example.com".to_string()),
             tools: HashMap::new(),
@@ -9477,6 +9512,7 @@ async fn test_requirements_web_search_mode_allowlist_does_not_warn_when_unset() 
         enforce_residency: None,
         network: None,
         permissions: None,
+        auto_review: None,
         models: None,
         guardian_policy_config: None,
     };
@@ -10567,77 +10603,6 @@ browser_use_full_cdp_access = false
 }
 
 #[tokio::test]
-async fn debug_config_lockfile_export_settings_load_from_nested_table() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"[debug.config_lockfile]
-export_dir = "locks"
-allow_codex_version_mismatch = true
-save_fields_resolved_from_model_catalog = false
-"#,
-    )?;
-
-    let config = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await?;
-
-    assert_eq!(
-        config.config_lock_export_dir,
-        Some(AbsolutePathBuf::resolve_path_against_base(
-            "locks",
-            codex_home.path()
-        ))
-    );
-    assert!(config.config_lock_allow_codex_version_mismatch);
-    assert!(!config.config_lock_save_fields_resolved_from_model_catalog);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn debug_config_lockfile_load_path_loads_lock_from_nested_table() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let lock_path = codex_home.path().join("session.config.lock.toml");
-    std::fs::write(
-        &lock_path,
-        format!(
-            r#"version = {}
-codex_version = "older-version"
-
-[config]
-"#,
-            crate::config_lock::CONFIG_LOCK_VERSION
-        ),
-    )?;
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        format!(
-            r#"[debug.config_lockfile]
-load_path = '{}'
-allow_codex_version_mismatch = true
-save_fields_resolved_from_model_catalog = false
-"#,
-            lock_path.display()
-        ),
-    )?;
-
-    let config = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await?;
-
-    assert!(config.config_lock_toml.is_some());
-    assert!(config.config_lock_allow_codex_version_mismatch);
-    assert!(!config.config_lock_save_fields_resolved_from_model_catalog);
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn explicit_feature_config_is_normalized_by_requirements() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(
@@ -11029,17 +10994,29 @@ max_concurrent_threads_per_session = 17
 
     let config = resolve_multi_agent_v2_config(&config_toml);
     let concurrency_guidance = "There are 17 available concurrency slots, meaning that up to 17 agents can be active at once, including you.";
-    let expected_suffix = format!(
-        "{DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT}\n{DEFAULT_MULTI_AGENT_V2_WAIT_AGENT_USAGE_HINT_TEXT}\n\n{concurrency_guidance}"
+    assert!(config.wait_agent_enabled);
+    for wait_agent_enabled in [true, false] {
+        let mut config = config.clone();
+        config.wait_agent_enabled = wait_agent_enabled;
+        let usage_hints = resolve_usage_hints(&config, /*catalog*/ None);
+        for hint in [usage_hints.root, usage_hints.subagent] {
+            let hint = hint.expect("default usage hints should be present").body();
+            assert!(hint.contains(concurrency_guidance));
+            assert_eq!(
+                hint.contains("When calling `wait_agent`, prefer longer waits"),
+                wait_agent_enabled
+            );
+        }
+    }
+
+    let usage_hints = resolve_usage_hints(
+        &config,
+        Some(&MultiAgentRoleMessages {
+            root: Some(String::new()),
+            subagent: Some(String::new()),
+        }),
     );
-    assert!(
-        [
-            config.root_agent_usage_hint_text,
-            config.subagent_usage_hint_text,
-        ]
-        .into_iter()
-        .all(|hint| hint.is_some_and(|hint| hint.contains(expected_suffix.as_str())))
-    );
+    assert!(usage_hints.root.is_none() && usage_hints.subagent.is_none());
 }
 
 #[test]
@@ -11064,6 +11041,23 @@ expose_spawn_agent_model_overrides = true
         config.subagent_usage_hint_text.as_deref(),
         Some("Subagent guidance.")
     );
+    let usage_hints = resolve_usage_hints(
+        &config,
+        Some(&MultiAgentRoleMessages {
+            root: Some("Catalog root base.".to_string()),
+            subagent: Some("Catalog subagent base.".to_string()),
+        }),
+    );
+    assert_eq!(
+        (
+            usage_hints.root.map(|hint| hint.body()),
+            usage_hints.subagent.map(|hint| hint.body()),
+        ),
+        (
+            Some("Root guidance.".to_string()),
+            Some("Subagent guidance.".to_string()),
+        )
+    );
 }
 
 #[test]
@@ -11071,18 +11065,39 @@ fn multi_agent_v2_exposes_model_overrides_by_default() {
     let config_toml =
         toml::from_str(r#"[features.multi_agent_v2]"#).expect("multi-agent v2 config should parse");
 
-    let config = resolve_multi_agent_v2_config(&config_toml);
+    let mut config = resolve_multi_agent_v2_config(&config_toml);
     assert!(config.expose_spawn_agent_model_overrides);
-    assert!(
-        [
-            config.root_agent_usage_hint_text,
-            config.subagent_usage_hint_text,
-        ]
-        .into_iter()
-        .all(|hint| hint.is_some_and(|hint| {
-            hint.ends_with(DEFAULT_MULTI_AGENT_V2_MODEL_OVERRIDE_USAGE_HINT_TEXT)
-        }))
-    );
+    let usage_hints = resolve_usage_hints(&config, /*catalog*/ None);
+    config.expose_spawn_agent_model_overrides = false;
+    let usage_hints_without_model_overrides = resolve_usage_hints(&config, /*catalog*/ None);
+
+    for (hint, hint_without_model_overrides) in [
+        (usage_hints.root, usage_hints_without_model_overrides.root),
+        (
+            usage_hints.subagent,
+            usage_hints_without_model_overrides.subagent,
+        ),
+    ] {
+        let hint = hint.expect("default usage hints should be present").body();
+        let hint_without_model_overrides = hint_without_model_overrides
+            .expect("default usage hints should be present without model overrides")
+            .body();
+
+        let model_override_guidance = hint
+            .strip_prefix(hint_without_model_overrides.as_str())
+            .expect("model-override guidance should extend the base usage hint");
+        for required_fragment in [
+            "Full-history forks",
+            "`fork_turns`",
+            "`model`",
+            "`reasoning_effort`",
+        ] {
+            assert!(
+                model_override_guidance.contains(required_fragment),
+                "model-override guidance should contain {required_fragment}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -11146,7 +11161,7 @@ subagent_developer_instructions = "  \t  "
 }
 
 #[tokio::test]
-async fn multi_agent_v2_empty_usage_hint_overrides_clear_default_hints() -> std::io::Result<()> {
+async fn multi_agent_v2_empty_usage_hint_overrides_are_preserved() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(
         codex_home.path().join(CONFIG_TOML_FILE),
@@ -11163,8 +11178,22 @@ subagent_usage_hint_text = ""
         .build()
         .await?;
 
-    assert_eq!(config.multi_agent_v2.root_agent_usage_hint_text, None);
-    assert_eq!(config.multi_agent_v2.subagent_usage_hint_text, None);
+    let usage_hints = resolve_usage_hints(
+        &config.multi_agent_v2,
+        Some(&MultiAgentRoleMessages {
+            root: Some("catalog root".to_string()),
+            subagent: Some("catalog subagent".to_string()),
+        }),
+    );
+    assert_eq!(
+        (
+            config.multi_agent_v2.root_agent_usage_hint_text.as_deref(),
+            config.multi_agent_v2.subagent_usage_hint_text.as_deref(),
+            usage_hints.root,
+            usage_hints.subagent,
+        ),
+        (Some(""), Some(""), None, None)
+    );
 
     Ok(())
 }

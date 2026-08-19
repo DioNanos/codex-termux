@@ -18,6 +18,7 @@ use codex_core::CodexThread;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
 use codex_core::TimeProvider;
+pub use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::resolve_installation_id;
 use codex_core::shell::Shell;
@@ -37,14 +38,17 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
 use codex_models_manager::manager::SharedModelsManager;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeConversationVersion as RealtimeWsVersion;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
@@ -115,6 +119,7 @@ pub fn local(cwd: AbsolutePathBuf) -> TurnEnvironmentSelection {
         environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
         cwd: PathUri::from_abs_path(&cwd),
         workspace_roots: vec![PathUri::from_abs_path(&cwd)],
+        config: EnvironmentConfigState::FromThread,
     }
 }
 
@@ -147,6 +152,7 @@ impl TestEnv {
                 environment_id: codex_exec_server::REMOTE_ENVIRONMENT_ID.to_string(),
                 cwd: PathUri::from_abs_path(&cwd),
                 workspace_roots: vec![PathUri::from_abs_path(&cwd)],
+                config: EnvironmentConfigState::FromThread,
             },
             None => local(cwd.clone()),
         };
@@ -215,6 +221,7 @@ pub async fn test_env() -> Result<TestEnv> {
                 environment_id: codex_exec_server::REMOTE_ENVIRONMENT_ID.to_string(),
                 cwd: cwd_uri.clone(),
                 workspace_roots: vec![cwd_uri.clone()],
+                config: EnvironmentConfigState::FromThread,
             };
             let cwd = if remote_env == TestEnvironment::WineExec {
                 // TODO(anp): Convert `Config::cwd` to `LegacyAppPathString` and remove this
@@ -870,16 +877,10 @@ impl TestCodex {
     /// Submits a text turn without changing the current thread settings.
     pub async fn submit_text_turn(&self, prompt: &str) -> Result<()> {
         self.codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: prompt.into(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: ThreadSettingsOverrides::default(),
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: prompt.into(),
+                text_elements: Vec::new(),
+            }]))
             .await?;
 
         wait_for_event(&self.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1007,31 +1008,28 @@ impl TestCodex {
             TurnEnvironmentSelections::new(self.config.cwd.clone(), environments)
         });
         self.codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
+            .start_or_steer_turn(
+                TurnInputRequest::user_input(vec![UserInput::Text {
                     text: prompt.into(),
                     text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: ThreadSettingsOverrides {
+                }])
+                .with_thread_settings(ThreadSettingsOverrides {
                     environments: turn_environment_selections,
                     approval_policy: Some(approval_policy),
                     sandbox_policy: Some(sandbox_policy),
                     permission_profile,
                     service_tier,
-                    collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                        mode: codex_protocol::config_types::ModeKind::Default,
-                        settings: codex_protocol::config_types::Settings {
+                    collaboration_mode: Some(CollaborationMode {
+                        mode: ModeKind::Default,
+                        settings: Settings {
                             model: session_model,
                             reasoning_effort: None,
                             developer_instructions: None,
                         },
                     }),
                     ..Default::default()
-                },
-            })
+                }),
+            )
             .await?;
 
         let turn_id = wait_for_event_match(&self.codex, |event| match event {

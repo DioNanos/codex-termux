@@ -17,7 +17,7 @@ use codex_protocol::items::AgentMessageContent as CoreAgentMessageContent;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
+use codex_rollout::RolloutItem;
 use codex_rollout::state_db::StateDbHandle;
 use codex_utils_path_uri::LegacyAppPathString;
 use std::collections::HashMap;
@@ -61,6 +61,8 @@ pub(crate) enum ThreadListenerCommand {
         turn_id: Option<String>,
         goal: ThreadGoal,
     },
+    // EmitThreadQueueChanged orders durable queue updates with thread notifications.
+    EmitThreadQueueChanged,
     // EmitWarning is used to order extension warnings with other thread notifications.
     EmitWarning {
         message: String,
@@ -94,6 +96,9 @@ pub(crate) struct ThreadState {
     pub(crate) pending_rollbacks: Option<ConnectionRequestId>,
     pub(crate) turn_summary: TurnSummary,
     pub(crate) last_terminal_turn_id: Option<String>,
+    /// Lets an internal runtime replacement wait until the old listener has processed Core's
+    /// `ShutdownComplete` event before that listener is superseded.
+    shutdown_drain_waiter: Option<oneshot::Sender<()>>,
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
     pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
@@ -135,6 +140,7 @@ impl ThreadState {
         if let Some(cancel_tx) = self.cancel_tx.take() {
             let _ = cancel_tx.send(());
         }
+        self.shutdown_drain_waiter = None;
         self.listener_command_tx = None;
         self.current_turn_history.reset();
         self.listener_thread = None;
@@ -153,6 +159,16 @@ impl ThreadState {
 
     pub(crate) fn active_turn_snapshot(&self) -> Option<Turn> {
         self.current_turn_history.active_turn_snapshot()
+    }
+
+    pub(crate) fn register_shutdown_drain_waiter(&mut self) -> oneshot::Receiver<()> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.shutdown_drain_waiter = Some(completion_tx);
+        completion_rx
+    }
+
+    pub(crate) fn take_shutdown_drain_waiter(&mut self) -> Option<oneshot::Sender<()>> {
+        self.shutdown_drain_waiter.take()
     }
 
     pub(crate) fn track_current_turn_event(&mut self, event_turn_id: &str, event: &EventMsg) {

@@ -11,7 +11,6 @@ use codex_login::AuthManager;
 use codex_login::default_client::USER_AGENT_SUFFIX;
 use codex_login::default_client::get_codex_user_agent;
 use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::Submission;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResult;
 use rmcp::model::ClientNotification;
@@ -55,13 +54,14 @@ impl MessageProcessor {
         environment_manager: Arc<EnvironmentManager>,
         state_db: Option<StateDbHandle>,
         installation_id: String,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let outgoing = Arc::new(outgoing);
         let auth_manager = AuthManager::shared_from_config(
             config.as_ref(),
             /*enable_codex_api_key_env*/ false,
         )
-        .await;
+        .await
+        .map_err(std::io::Error::other)?;
         let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
             config.codex_home.clone(),
         ));
@@ -111,13 +111,13 @@ impl MessageProcessor {
             /*attestation_provider*/ None,
             /*external_time_provider*/ None,
         ));
-        Self {
+        Ok(Self {
             outgoing,
             initialized: false,
             arg0_paths,
             thread_manager,
             active_turns,
-        }
+        })
     }
 
     pub(crate) async fn process_request(&mut self, request: JsonRpcRequest<ClientRequest>) {
@@ -535,7 +535,7 @@ impl MessageProcessor {
             tracing::warn!("ignoring cancellation without a request id");
             return;
         };
-        // Create a stable string form early for logging and submission id.
+        // Create a stable string form early for logging.
         let request_id_string = request_id.to_string();
 
         // Resolve the thread for the active MCP request.
@@ -559,13 +559,7 @@ impl MessageProcessor {
 
         // Submit interrupt to Codex.
         if let Err(e) = codex_arc
-            .submit_with_id(Submission {
-                id: request_id_string,
-                op: codex_protocol::protocol::Op::Interrupt,
-                client_user_message_id: None,
-                trace: None,
-                parent_turn_id: None,
-            })
+            .submit(codex_protocol::protocol::Op::Interrupt)
             .await
         {
             tracing::error!("Failed to submit interrupt to Codex: {e}");

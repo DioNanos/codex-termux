@@ -3,34 +3,21 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use codex_analytics::InvocationType;
 use codex_analytics::SkillInvocation;
+use codex_analytics::SkillInvocationLocation;
+use codex_analytics::TrackEventsContext;
 use codex_analytics::build_track_events_context;
 use codex_extension_api::SkillInvocationInput;
 use codex_extension_api::SkillInvocationKind;
 use codex_otel::sanitize_metric_tag_value;
 use codex_protocol::protocol::SkillScope;
+use codex_skills::SkillMetadata;
+use codex_skills_extension::HostSkillsLoadInput;
+use codex_skills_extension::detect_implicit_skill_invocation;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use codex_utils_plugins::PluginSkillRoot;
 use std::collections::HashSet;
 use tokio::sync::Mutex;
-
-pub use codex_core_skills::SkillError;
-pub use codex_core_skills::SkillLoadOutcome;
-pub use codex_core_skills::build_skill_name_counts;
-pub use codex_core_skills::config_rules;
-pub use codex_core_skills::detect_implicit_skill_invocation_for_command;
-pub use codex_core_skills::filter_skill_load_outcome_for_product;
-pub use codex_core_skills::injection;
-pub use codex_core_skills::injection::SkillInjections;
-pub use codex_core_skills::injection::build_skill_injections;
-pub use codex_core_skills::loader;
-pub use codex_core_skills::model;
-pub use codex_core_skills::remote;
-pub use codex_skills::SkillMetadata;
-pub use codex_skills::SkillPolicy;
-pub use codex_skills::collect_explicit_skill_mentions;
-pub use codex_skills_extension::HostSkillsLoadInput;
-pub use codex_skills_extension::HostSkillsService;
-pub use codex_skills_extension::bundled_skills_enabled_from_stack;
 
 #[derive(Debug, Default)]
 struct ImplicitSkillInvocations(Mutex<HashSet<String>>);
@@ -43,40 +30,88 @@ pub(crate) fn skills_load_input_from_config(
         config.cwd.clone(),
         effective_skill_roots,
         config.config_layer_stack.clone(),
-        config.bundled_skills_enabled(),
     )
+}
+
+pub(crate) fn emit_explicit_skill_invocations(
+    sess: &Session,
+    turn_context: &TurnContext,
+    mentioned_skills: &[SkillMetadata],
+    injected_skills: &[SkillMetadata],
+    tracking: TrackEventsContext,
+) {
+    let injected_skill_paths = injected_skills
+        .iter()
+        .map(|skill| &skill.path_to_skills_md)
+        .collect::<HashSet<_>>();
+    for skill in mentioned_skills {
+        let skill_name_tag = sanitize_metric_tag_value(skill.name.as_str());
+        let status = if injected_skill_paths.contains(&skill.path_to_skills_md) {
+            "ok"
+        } else {
+            "error"
+        };
+        turn_context.session_telemetry.counter(
+            "codex.skill.injected",
+            /*inc*/ 1,
+            &[
+                ("status", status),
+                ("skill", skill_name_tag.as_str()),
+                ("invoke_type", "explicit"),
+            ],
+        );
+    }
+
+    let invocations = injected_skills
+        .iter()
+        .map(|skill| SkillInvocation {
+            skill_name: skill.name.clone(),
+            location: SkillInvocationLocation::Host {
+                path: skill.path_to_skills_md.to_path_buf(),
+                scope: skill.scope,
+            },
+            plugin_id: skill.plugin_id.clone(),
+            remote_plugin_id: skill.remote_plugin_id.clone(),
+            invocation_type: InvocationType::Explicit,
+        })
+        .collect();
+    sess.services
+        .analytics_events_client
+        .track_skill_invocations(tracking, invocations);
 }
 
 pub(crate) async fn maybe_emit_implicit_skill_invocation(
     sess: &Session,
     turn_context: &TurnContext,
     command: &str,
-    workdir: &AbsolutePathBuf,
+    workdir: &PathUri,
+    native_workdir: Option<&AbsolutePathBuf>,
+    environment_id: &str,
 ) {
-    let Some(candidate) = detect_implicit_skill_invocation_for_command(
-        turn_context.skills_snapshot().outcome(),
+    let Some(invocation) = detect_implicit_skill_invocation(
+        turn_context.extension_data.as_ref(),
+        environment_id,
         command,
         workdir,
+        native_workdir,
     ) else {
         return;
     };
-    let invocation = SkillInvocation {
-        skill_name: candidate.name,
-        skill_scope: candidate.scope,
-        skill_path: candidate.path_to_skills_md.to_path_buf(),
-        plugin_id: candidate.plugin_id,
-        remote_plugin_id: candidate.remote_plugin_id,
-        invocation_type: InvocationType::Implicit,
-    };
-    let skill_scope = match invocation.skill_scope {
-        SkillScope::User => "user",
-        SkillScope::Repo => "repo",
-        SkillScope::System => "system",
-        SkillScope::Admin => "admin",
-    };
-    let skill_path = invocation.skill_path.to_string_lossy();
     let skill_name = invocation.skill_name.clone();
-    let seen_key = format!("{skill_scope}:{skill_path}:{skill_name}");
+    let (skill_resource, seen_key) = match &invocation.location {
+        SkillInvocationLocation::Host { path, scope } => {
+            let skill_scope = match scope {
+                SkillScope::User => "user",
+                SkillScope::Repo => "repo",
+                SkillScope::System => "system",
+                SkillScope::Admin => "admin",
+            };
+            let skill_path = path.to_string_lossy().into_owned();
+            let seen_key = format!("{skill_scope}:{skill_path}:{skill_name}");
+            (skill_path, seen_key)
+        }
+        SkillInvocationLocation::Resource { id, .. } => (id.clone(), format!("resource:{id}")),
+    };
     let inserted = {
         let skill_invocations = turn_context
             .extension_data
@@ -96,7 +131,7 @@ pub(crate) async fn maybe_emit_implicit_skill_invocation(
                 thread_store: &sess.services.thread_extension_data,
                 turn_store: turn_context.extension_data.as_ref(),
                 turn_id: turn_context.sub_id.as_str(),
-                skill_resource: skill_path.as_ref(),
+                skill_resource: skill_resource.as_str(),
                 kind: SkillInvocationKind::Implicit,
             })
             .await;

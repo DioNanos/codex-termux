@@ -57,13 +57,13 @@ pub(super) async fn run_remote_compact_attempt(
     }
     let trace_input_history = compaction_trace
         .is_enabled()
-        .then(|| history.raw_items().to_vec());
+        .then(|| history.raw_items().cloned().collect());
     let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
     let tool_router = &step_context.tool_router;
     let prompt = Prompt {
         input: prompt_input,
         tools: tool_router.model_visible_specs(),
-        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
+        parallel_tool_calls: true,
         base_instructions,
         output_schema: None,
         output_schema_strict: true,

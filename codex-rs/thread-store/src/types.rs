@@ -15,12 +15,12 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode as MemoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_rollout::RolloutItem;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -196,6 +196,15 @@ pub struct PrepareForkParams {
     pub thread_id: ThreadId,
     /// Requested inclusive or exclusive fork boundary.
     pub boundary: ForkBoundary,
+}
+
+/// Parameters for reverting a paginated thread's durable history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevertThreadParams {
+    /// Stable logical thread to revert.
+    pub thread_id: ThreadId,
+    /// First turn excluded from the retained history.
+    pub before_turn_id: String,
 }
 
 /// Frozen source history and model context for a reference-backed fork.

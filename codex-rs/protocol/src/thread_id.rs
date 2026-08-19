@@ -17,10 +17,24 @@ pub struct ThreadId {
     pub(crate) uuid: Uuid,
 }
 
+/// Identifier encoded in a rollout filename.
+///
+/// Rollout IDs use the same UUID representation as thread IDs. Ordinary rollout files use the
+/// thread ID as their rollout ID; \`thread/revert\` creates a new rollout file with a distinct
+/// rollout ID while preserving the thread ID.
+pub type RolloutId = ThreadId;
+
 impl ThreadId {
     pub fn new() -> Self {
         Self {
             uuid: Uuid::now_v7(),
+        }
+    }
+
+    /// Construct an identifier from a UUID's 128-bit representation.
+    pub fn from_u128(value: u128) -> Self {
+        Self {
+            uuid: Uuid::from_u128(value),
         }
     }
 
@@ -98,6 +112,7 @@ impl JsonSchema for ThreadId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test_thread_id_default_is_not_zeroes() {
         let id = ThreadId::default();

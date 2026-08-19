@@ -37,6 +37,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::sync::Weak;
 use std::time::Duration;
 use tracing::debug;
@@ -98,7 +99,7 @@ impl MetricReader for SharedManualReader {
 }
 
 #[derive(Debug)]
-struct MetricsClientInner {
+pub(super) struct MetricsClientInner {
     meter_provider: SdkMeterProvider,
     meter: Meter,
     counters: Mutex<HashMap<InstrumentKey, Counter<u64>>>,
@@ -106,7 +107,7 @@ struct MetricsClientInner {
     histograms: Mutex<HashMap<String, Histogram<f64>>>,
     duration_histograms: Mutex<HashMap<InstrumentKey, Histogram<f64>>>,
     runtime_reader: Option<Arc<ManualReader>>,
-    runtime_only_metrics: &'static [&'static str],
+    statsig_disabled_metrics: &'static [&'static str],
     default_tags: BTreeMap<String, String>,
 }
 
@@ -127,7 +128,7 @@ impl MetricsClientInner {
         }
         let attributes = self.attributes(tags)?;
 
-        if self.runtime_only_metrics.contains(&name) {
+        if self.statsig_disabled_metrics.contains(&name) {
             return Ok(());
         }
 
@@ -155,6 +156,10 @@ impl MetricsClientInner {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
 
+        if self.statsig_disabled_metrics.contains(&name) {
+            return Ok(());
+        }
+
         let mut histograms = self
             .histograms
             .lock()
@@ -175,6 +180,10 @@ impl MetricsClientInner {
     ) -> Result<()> {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
+
+        if self.statsig_disabled_metrics.contains(&name) {
+            return Ok(());
+        }
 
         let mut gauges = self
             .gauges
@@ -205,6 +214,11 @@ impl MetricsClientInner {
     ) -> Result<()> {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
+
+        if self.statsig_disabled_metrics.contains(&name) {
+            return Ok(());
+        }
+
         let _gauge = self
             .meter
             .i64_observable_gauge(name.to_string())
@@ -226,7 +240,7 @@ impl MetricsClientInner {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
 
-        if self.runtime_only_metrics.contains(&name) {
+        if self.statsig_disabled_metrics.contains(&name) {
             return Ok(());
         }
 
@@ -287,7 +301,12 @@ impl MetricsClientInner {
 
 /// OpenTelemetry metrics client used by Codex.
 #[derive(Clone, Debug)]
-pub struct MetricsClient(std::sync::Arc<MetricsClientInner>);
+pub struct MetricsClient {
+    // Keep the original provider so its owner only shuts down its own exporter.
+    pub(super) inner: Arc<MetricsClientInner>,
+    // Installed clients share this slot, so existing clones follow account changes.
+    pub(super) active: Option<Arc<RwLock<Arc<MetricsClientInner>>>>,
+}
 
 impl MetricsClient {
     /// Build a metrics client from configuration and validate defaults.
@@ -299,7 +318,7 @@ impl MetricsClient {
             exporter,
             export_interval,
             runtime_reader,
-            runtime_only_metrics,
+            statsig_disabled_metrics,
             default_tags,
         } = config;
 
@@ -336,22 +355,36 @@ impl MetricsClient {
             }
         };
 
-        Ok(Self(std::sync::Arc::new(MetricsClientInner {
-            meter_provider,
-            meter,
-            counters: Mutex::new(HashMap::new()),
-            gauges: Mutex::new(HashMap::new()),
-            histograms: Mutex::new(HashMap::new()),
-            duration_histograms: Mutex::new(HashMap::new()),
-            runtime_reader,
-            runtime_only_metrics,
-            default_tags,
-        })))
+        Ok(Self {
+            inner: Arc::new(MetricsClientInner {
+                meter_provider,
+                meter,
+                counters: Mutex::new(HashMap::new()),
+                gauges: Mutex::new(HashMap::new()),
+                histograms: Mutex::new(HashMap::new()),
+                duration_histograms: Mutex::new(HashMap::new()),
+                runtime_reader,
+                statsig_disabled_metrics,
+                default_tags,
+            }),
+            active: None,
+        })
+    }
+
+    pub(super) fn active_inner(&self) -> Arc<MetricsClientInner> {
+        match &self.active {
+            Some(active) => active
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            None => Arc::clone(&self.inner),
+        }
     }
 
     /// Send a single counter increment.
     pub fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)]) -> Result<()> {
-        self.0.counter(name, /*description*/ None, inc, tags)
+        self.active_inner()
+            .counter(name, /*description*/ None, inc, tags)
     }
 
     /// Send a single counter increment with an instrument description.
@@ -362,17 +395,19 @@ impl MetricsClient {
         inc: i64,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.0.counter(name, Some(description), inc, tags)
+        self.active_inner()
+            .counter(name, Some(description), inc, tags)
     }
 
     /// Send a single histogram sample.
     pub fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()> {
-        self.0.histogram(name, value, tags)
+        self.active_inner().histogram(name, value, tags)
     }
 
     /// Send a single gauge measurement.
     pub fn gauge(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()> {
-        self.0.gauge(name, /*description*/ None, value, tags)
+        self.active_inner()
+            .gauge(name, /*description*/ None, value, tags)
     }
 
     /// Send a single gauge measurement with an instrument description.
@@ -383,7 +418,8 @@ impl MetricsClient {
         value: i64,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.0.gauge(name, Some(description), value, tags)
+        self.active_inner()
+            .gauge(name, Some(description), value, tags)
     }
 
     /// Register a gauge callback that reports the current value on every collection.
@@ -394,7 +430,7 @@ impl MetricsClient {
         observe: impl Fn() -> i64 + Send + Sync + 'static,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.0
+        self.active_inner()
             .register_observable_gauge(name, description, observe, tags)
     }
 
@@ -405,7 +441,7 @@ impl MetricsClient {
         duration: Duration,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.0.duration_histogram(
+        self.active_inner().duration_histogram(
             name,
             duration.as_millis().min(i64::MAX as u128) as f64,
             MILLISECOND_DURATION_UNIT,
@@ -422,7 +458,7 @@ impl MetricsClient {
         duration_ms: f64,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.0.duration_histogram(
+        self.active_inner().duration_histogram(
             name,
             duration_ms,
             MILLISECOND_DURATION_UNIT,
@@ -440,7 +476,7 @@ impl MetricsClient {
         duration: Duration,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.0.duration_histogram(
+        self.active_inner().duration_histogram(
             name,
             duration.as_secs_f64(),
             SECOND_DURATION_UNIT,
@@ -460,7 +496,8 @@ impl MetricsClient {
 
     /// Collect a runtime metrics snapshot without shutting down the provider.
     pub fn snapshot(&self) -> Result<ResourceMetrics> {
-        let Some(reader) = &self.0.runtime_reader else {
+        let inner = self.active_inner();
+        let Some(reader) = &inner.runtime_reader else {
             return Err(MetricsError::RuntimeSnapshotUnavailable);
         };
         let mut snapshot = ResourceMetrics::default();
@@ -472,7 +509,7 @@ impl MetricsClient {
 
     /// Flush metrics and stop the underlying OTEL meter provider.
     pub fn shutdown(&self) -> Result<()> {
-        self.0.shutdown()
+        self.inner.shutdown()
     }
 }
 

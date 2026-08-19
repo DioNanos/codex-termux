@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::RolloutConfig;
+use codex_rollout::RolloutItem;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::RolloutRecorderParams;
-use codex_rollout::persisted_rollout_items;
+use codex_rollout::is_persisted_rollout_item;
 use tracing::warn;
 
 use super::LocalThreadStore;
@@ -33,7 +33,7 @@ pub(super) async fn create_thread(
     let writer_lock = store.writer_lock_coordinator.acquire(thread_id)?;
     let recorder = create_thread::create_thread(store, params).await?;
     store
-        .insert_live_recorder(thread_id, recorder, history_mode, writer_lock)
+        .insert_live_recorder(thread_id, recorder, thread_id, history_mode, writer_lock)
         .await
 }
 
@@ -100,13 +100,24 @@ pub(super) async fn resume_thread(
         model_provider_id: params.metadata.model_provider.clone(),
         generate_memories: matches!(params.metadata.memory_mode, ThreadMemoryMode::Enabled),
     };
+    let rollout_id = super::thread_rollout_resolver::rollout_id_from_path_or_legacy_thread_id(
+        rollout_path.as_path(),
+        params.thread_id,
+        history_mode,
+    )?;
     let recorder = RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path))
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to resume local thread recorder: {err}"),
         })?;
     store
-        .insert_live_recorder(params.thread_id, recorder, history_mode, writer_lock)
+        .insert_live_recorder(
+            params.thread_id,
+            recorder,
+            rollout_id,
+            history_mode,
+            writer_lock,
+        )
         .await
 }
 
@@ -146,7 +157,7 @@ pub(super) async fn shutdown_thread(
     thread_id: ThreadId,
 ) -> ThreadStoreResult<()> {
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
-    let (recorder, history_mode) = live_writer_parts(store, thread_id).await?;
+    let (recorder, rollout_id, history_mode) = live_writer_parts(store, thread_id).await?;
     let rollout_path = recorder.rollout_path().to_path_buf();
     if matches!(history_mode, ThreadHistoryMode::Legacy) {
         recorder.shutdown().await.map_err(thread_store_io_error)?;
@@ -154,7 +165,7 @@ pub(super) async fn shutdown_thread(
         recorder.shutdown().await.map_err(thread_store_io_error)?;
         if let Err(err) = super::thread_history_materialization::materialize_to_sqlite(
             store,
-            thread_id,
+            rollout_id,
             rollout_path.as_path(),
         )
         .await
@@ -269,12 +280,12 @@ enum RolloutWriteOp {
 async fn live_writer_parts(
     store: &LocalThreadStore,
     thread_id: ThreadId,
-) -> ThreadStoreResult<(RolloutRecorder, ThreadHistoryMode)> {
+) -> ThreadStoreResult<(RolloutRecorder, ThreadId, ThreadHistoryMode)> {
     let live_recorders = store.live_recorders.lock().await;
     let entry = live_recorders
         .get(&thread_id)
         .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
-    Ok((entry.recorder.clone(), entry.history_mode))
+    Ok((entry.recorder.clone(), entry.rollout_id, entry.history_mode))
 }
 
 async fn write_and_project(
@@ -286,11 +297,11 @@ async fn write_and_project(
     // shutdown/discard/delete removes it. Keep the lookup defensive so late writes fail after
     // teardown.
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
-    let (recorder, history_mode) = live_writer_parts(store, thread_id).await?;
+    let (recorder, rollout_id, history_mode) = live_writer_parts(store, thread_id).await?;
     let sync_rollout_path = matches!(&write_op, RolloutWriteOp::Persist | RolloutWriteOp::Flush);
     let write_op = match write_op {
-        RolloutWriteOp::AppendItems(items) => {
-            let items = persisted_rollout_items(items.as_slice(), history_mode);
+        RolloutWriteOp::AppendItems(mut items) => {
+            items.retain(|item| is_persisted_rollout_item(item, history_mode));
             if items.is_empty() {
                 return Ok(());
             }
@@ -308,7 +319,7 @@ async fn write_and_project(
         durable_write(&recorder, write_op).await?;
         if let Err(err) = super::thread_history_materialization::materialize_to_sqlite(
             store,
-            thread_id,
+            rollout_id,
             rollout_path,
         )
         .await

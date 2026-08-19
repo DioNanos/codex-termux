@@ -3,12 +3,13 @@
 # write token, so this workflow only BUILDS the Android arm64 payload and
 # uploads the npm tarball as an artifact. Publishing is done with a local
 # ~/.npmrc.
-#
-# Versioned builds are dispatched explicitly after the zero-Action preflight.
-# A public main push must not rebuild an already audited release tarball.
 name: termux-npm-build-publish
 
 on:
+  push:
+    branches:
+      - main
+      - lts
   workflow_dispatch:
 
 jobs:

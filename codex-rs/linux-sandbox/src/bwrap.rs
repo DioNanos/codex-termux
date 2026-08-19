@@ -271,6 +271,13 @@ fn create_bwrap_flags_full_filesystem(command: Vec<String>, options: BwrapOption
         "--bind".to_string(),
         "/".to_string(),
         "/".to_string(),
+        // Preserve nodev on the root bind while exposing only standard devices.
+        "--dev".to_string(),
+        "/dev".to_string(),
+        // Restore shared memory without exposing other host devices.
+        "--bind-try".to_string(),
+        "/dev/shm".to_string(),
+        "/dev/shm".to_string(),
         // Always enter a fresh user namespace so root inside a container does
         // not need ambient CAP_SYS_ADMIN to create the remaining namespaces.
         "--unshare-user".to_string(),
@@ -711,9 +718,12 @@ fn expand_unreadable_globs_with_ripgrep(
     // lets one `rg --files` call handle all patterns under the same root.
     let mut patterns_by_search_root: BTreeMap<AbsolutePathBuf, Vec<String>> = BTreeMap::new();
     for pattern in patterns {
-        if let Some((search_root, glob)) = split_pattern_for_ripgrep(pattern, cwd)
-            && search_root.as_path().is_dir()
-        {
+        let Some((search_root, glob)) = split_pattern_for_ripgrep(pattern, cwd) else {
+            return Err(CodexErr::Fatal(format!(
+                "unreadable glob `{pattern}` cannot be safely expanded; use a pattern with a non-root directory prefix"
+            )));
+        };
+        if search_root.as_path().is_dir() {
             patterns_by_search_root
                 .entry(search_root)
                 .or_default()
@@ -1401,6 +1411,11 @@ mod tests {
                 "--bind".to_string(),
                 "/".to_string(),
                 "/".to_string(),
+                "--dev".to_string(),
+                "/dev".to_string(),
+                "--bind-try".to_string(),
+                "/dev/shm".to_string(),
+                "/dev/shm".to_string(),
                 "--unshare-user".to_string(),
                 "--unshare-pid".to_string(),
                 "--unshare-net".to_string(),
@@ -1546,12 +1561,12 @@ mod tests {
         let real_blocked_str = path_to_string(&blocked);
         let policy = FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: link_root },
+                path: link_root.into(),
                 access: FileSystemAccessMode::Write,
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: link_blocked },
+                path: link_blocked.into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },
@@ -1596,9 +1611,7 @@ mod tests {
         let real_memories_str = path_to_string(&real_memories);
         let logical_memories_str = path_to_string(&logical_memories);
         let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: logical_memories_root,
-            },
+            path: logical_memories_root.into(),
             access: FileSystemAccessMode::Write,
             missing_path_behavior: None,
         }]);
@@ -1638,7 +1651,7 @@ mod tests {
         let root = AbsolutePathBuf::from_absolute_path(&root).expect("absolute root");
         let agents_link_str = path_to_string(&agents_link);
         let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path { path: root },
+            path: root.into(),
             access: FileSystemAccessMode::Write,
             missing_path_behavior: None,
         }]);
@@ -1675,12 +1688,12 @@ mod tests {
         let real_linked_private_str = path_to_string(&linked_private);
         let policy = FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: link_root },
+                path: link_root.into(),
                 access: FileSystemAccessMode::Write,
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: link_private },
+                path: link_private.into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },
@@ -1710,14 +1723,12 @@ mod tests {
         let blocked_root = AbsolutePathBuf::from_absolute_path(&blocked).expect("absolute blocked");
         let policy = FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: workspace_root,
-                },
+                path: workspace_root.into(),
                 access: FileSystemAccessMode::Write,
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: blocked_root },
+                path: blocked_root.into(),
                 access: FileSystemAccessMode::Read,
                 missing_path_behavior: None,
             },
@@ -1758,9 +1769,7 @@ mod tests {
         let workspace_root =
             AbsolutePathBuf::from_absolute_path(&workspace).expect("absolute workspace");
         let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: workspace_root,
-            },
+            path: workspace_root.into(),
             access: FileSystemAccessMode::Write,
             missing_path_behavior: None,
         }]);
@@ -1808,9 +1817,7 @@ mod tests {
         let workspace_root =
             AbsolutePathBuf::from_absolute_path(&workspace).expect("absolute workspace");
         let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: workspace_root,
-            },
+            path: workspace_root.into(),
             access: FileSystemAccessMode::Write,
             missing_path_behavior: None,
         }]);
@@ -1855,9 +1862,7 @@ mod tests {
         let link_workspace_root = AbsolutePathBuf::from_absolute_path(&link_workspace)
             .expect("absolute symlinked workspace");
         let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: link_workspace_root,
-            },
+            path: link_workspace_root.into(),
             access: FileSystemAccessMode::Write,
             missing_path_behavior: None,
         }]);
@@ -2124,10 +2129,9 @@ mod tests {
         std::fs::create_dir(&readable_root).expect("create readable root");
 
         let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: AbsolutePathBuf::try_from(readable_root.as_path())
-                    .expect("absolute readable root"),
-            },
+            path: AbsolutePathBuf::try_from(readable_root.as_path())
+                .expect("absolute readable root")
+                .into(),
             access: FileSystemAccessMode::Read,
             missing_path_behavior: None,
         }]);
@@ -2191,14 +2195,12 @@ mod tests {
         let blocked_str = path_to_string(blocked.as_path());
         let policy = FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: writable_root,
-                },
+                path: writable_root.into(),
                 access: FileSystemAccessMode::Write,
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: blocked },
+                path: blocked.into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },
@@ -2266,21 +2268,17 @@ mod tests {
             AbsolutePathBuf::from_absolute_path(&docs_public).expect("absolute docs/public");
         let policy = FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: writable_root,
-                },
+                path: writable_root.into(),
                 access: FileSystemAccessMode::Write,
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: docs.clone() },
+                path: docs.clone().into(),
                 access: FileSystemAccessMode::Read,
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: docs_public.clone(),
-                },
+                path: docs_public.clone().into(),
                 access: FileSystemAccessMode::Write,
                 missing_path_behavior: None,
             },
@@ -2328,16 +2326,12 @@ mod tests {
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: blocked.clone(),
-                },
+                path: blocked.clone().into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: allowed.clone(),
-                },
+                path: allowed.clone().into(),
                 access: FileSystemAccessMode::Write,
                 missing_path_behavior: None,
             },
@@ -2400,16 +2394,12 @@ mod tests {
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: blocked.clone(),
-                },
+                path: blocked.clone().into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: allowed_file.clone(),
-                },
+                path: allowed_file.clone().into(),
                 access: FileSystemAccessMode::Write,
                 missing_path_behavior: None,
             },
@@ -2477,19 +2467,17 @@ mod tests {
         let allowed_str = path_to_string(allowed.as_path());
         let policy = FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: writable_root,
-                },
+                path: writable_root.into(),
                 access: FileSystemAccessMode::Write,
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: blocked },
+                path: blocked.into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: allowed },
+                path: allowed.into(),
                 access: FileSystemAccessMode::Write,
                 missing_path_behavior: None,
             },
@@ -2536,9 +2524,7 @@ mod tests {
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: blocked.clone(),
-                },
+                path: blocked.clone().into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },
@@ -2582,9 +2568,7 @@ mod tests {
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: blocked_file.clone(),
-                },
+                path: blocked_file.clone().into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },
@@ -2662,10 +2646,20 @@ mod tests {
     }
 
     #[test]
-    fn root_prefix_unreadable_globs_are_too_broad_for_linux_expansion() {
+    fn root_prefix_unreadable_globs_fail_closed_on_linux() {
+        let policy = default_policy_with_unreadable_glob("/**/*.env".to_string());
+        let error = create_bwrap_command_args(
+            vec!["/bin/true".to_string()],
+            &policy,
+            Path::new("/tmp"),
+            Path::new("/tmp"),
+            BwrapOptions::default(),
+        )
+        .expect_err("root-prefix deny-read glob must reject sandbox construction");
+
         assert_eq!(
-            split_pattern_for_ripgrep("/**/*.env", Path::new("/tmp")),
-            None
+            error.to_string(),
+            "Fatal error: unreadable glob `/**/*.env` cannot be safely expanded; use a pattern with a non-root directory prefix"
         );
     }
 

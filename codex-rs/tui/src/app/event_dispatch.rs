@@ -61,6 +61,20 @@ impl App {
                     tracing::warn!(%thread_id, error = %err, "failed to load older transcript history");
                 }
             }
+            AppEvent::OpenTranscriptExportFilePrompt => {
+                self.chat_widget.show_transcript_export_file_prompt();
+            }
+            AppEvent::ExportTranscript { destination } => {
+                if let Err(error) = self.export_transcript(app_server, destination).await {
+                    self.chat_widget
+                        .add_error_message(format!("Export failed: {error}"));
+                }
+                if self.chat_widget.no_modal_or_popup_active() {
+                    self.chat_widget
+                        .set_queue_autosend_suppressed(/*suppressed*/ false);
+                    self.chat_widget.maybe_send_next_queued_input();
+                }
+            }
             AppEvent::ClearUi { name } => {
                 self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
                 self.reset_app_ui_state_after_clear();
@@ -118,6 +132,9 @@ impl App {
                     /*show_all*/ false,
                     /*include_non_interactive*/ false,
                     picker_app_server,
+                    app_server.request_handle(),
+                    self.primary_thread_id
+                        .or(self.current_displayed_thread_id()),
                 )
                 .await?
                 {
@@ -164,6 +181,9 @@ impl App {
                         );
                     }
                     Ok(ExternalAgentConfigMigrationFlowOutcome::Cancelled) => {}
+                    Ok(ExternalAgentConfigMigrationFlowOutcome::TerminalError(err)) => {
+                        return Err(err.into());
+                    }
                     Err(error_message) => {
                         self.chat_widget.add_error_message(error_message);
                     }
@@ -304,7 +324,57 @@ impl App {
                     .await;
                 let config = self.fresh_session_config();
                 let turns = match self.thread_event_channels.get(&thread_id) {
-                    Some(channel) => Some(channel.store.lock().await.turns.clone()),
+                    Some(channel) => {
+                        let store = channel.store.lock().await;
+                        let mut turns = store.turns.clone();
+                        // Snapshot turns contain loaded history; newer live turns remain in
+                        // the replay buffer and must also be visible to prompt-edit lookups.
+                        for event in &store.buffer {
+                            let ThreadBufferedEvent::Notification(notification) = event else {
+                                continue;
+                            };
+                            match notification.as_ref() {
+                                ServerNotification::TurnStarted(notification)
+                                    if !turns
+                                        .iter()
+                                        .any(|turn| turn.id == notification.turn.id) =>
+                                {
+                                    turns.push(notification.turn.clone());
+                                }
+                                ServerNotification::ItemCompleted(notification) => {
+                                    if matches!(
+                                        notification.item,
+                                        ThreadItem::UserMessage { .. }
+                                            | ThreadItem::EnteredReviewMode { .. }
+                                            | ThreadItem::ExitedReviewMode { .. }
+                                    ) && let Some(turn) = turns
+                                        .iter_mut()
+                                        .find(|turn| turn.id == notification.turn_id)
+                                        && !turn
+                                            .items
+                                            .iter()
+                                            .any(|item| item.id() == notification.item.id())
+                                    {
+                                        turn.items.push(notification.item.clone());
+                                    }
+                                }
+                                ServerNotification::TurnCompleted(notification) => {
+                                    if let Some(turn) = turns
+                                        .iter_mut()
+                                        .find(|turn| turn.id == notification.turn.id)
+                                    {
+                                        turn.status = notification.turn.status.clone();
+                                        turn.error = notification.turn.error.clone();
+                                        turn.started_at = notification.turn.started_at;
+                                        turn.completed_at = notification.turn.completed_at;
+                                        turn.duration_ms = notification.turn.duration_ms;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        Some(turns)
+                    }
                     None => None,
                 };
                 let started = match turns {
@@ -464,6 +534,61 @@ impl App {
                 }
                 return Ok(self.handle_exit_mode(app_server, mode).await);
             }
+            AppEvent::RunningTaskExit { action, thread_id } => match action {
+                RunningTaskExitAction::RunInBackground => {
+                    return Ok(self.handle_exit_mode(app_server, ExitMode::Immediate).await);
+                }
+                RunningTaskExitAction::CancelTask => {
+                    if self.chat_widget.thread_id() == Some(thread_id)
+                        && self.chat_widget.is_agent_turn_running()
+                        && self.chat_widget.submit_op(AppCommand::interrupt())
+                    {
+                        self.chat_widget.pause_active_goal_for_interrupt();
+                    } else if self.side_threads.contains_key(&thread_id)
+                        && let Err(error) = self
+                            .try_submit_active_thread_op_via_app_server(
+                                app_server,
+                                thread_id,
+                                &AppCommand::interrupt(),
+                            )
+                            .await
+                    {
+                        self.chat_widget
+                            .add_error_message(format!("Failed to interrupt task: {error}"));
+                    }
+                }
+                RunningTaskExitAction::Exit => {
+                    if self.chat_widget.thread_id() == Some(thread_id)
+                        && self.chat_widget.is_active_goal_turn_running()
+                        && let Err(error) = app_server
+                            .thread_goal_set(
+                                thread_id,
+                                /*objective*/ None,
+                                Some(codex_app_server_protocol::ThreadGoalStatus::Paused),
+                                /*token_budget*/ None,
+                            )
+                            .await
+                    {
+                        self.chat_widget
+                            .add_error_message(format!("Failed to pause task goal: {error}"));
+                        return Ok(AppRunControl::Continue);
+                    }
+                    let turn_id = self
+                        .active_turn_id_for_thread(thread_id)
+                        .await
+                        .unwrap_or_default();
+                    match app_server.turn_interrupt(thread_id, turn_id).await {
+                        Ok(()) => {
+                            self.app_event_tx
+                                .send(AppEvent::Exit(ExitMode::ShutdownFirst));
+                        }
+                        Err(error) => {
+                            self.chat_widget
+                                .add_error_message(format!("Failed to interrupt task: {error}"));
+                        }
+                    }
+                }
+            },
             AppEvent::Logout => match app_server.logout_account().await {
                 Ok(()) => {
                     self.show_shutdown_feedback(tui)?;
@@ -640,8 +765,13 @@ impl App {
             AppEvent::RefreshConnectors { force_refetch } => {
                 self.chat_widget.refresh_connectors(force_refetch);
             }
-            AppEvent::FetchConnectorsList { force_refetch } => {
-                self.fetch_connectors_list(app_server, force_refetch);
+            AppEvent::FetchConnectorsList {
+                force_refetch,
+                generation,
+            } => {
+                if generation == self.chat_widget.connector_scope_generation() {
+                    self.fetch_connectors_list(app_server, force_refetch);
+                }
             }
             AppEvent::PluginInstallAuthAdvance { refresh_connectors } => {
                 if refresh_connectors {
@@ -916,6 +1046,12 @@ impl App {
             AppEvent::RefreshTokenActivity { request_id } => {
                 self.refresh_token_activity(app_server, request_id);
             }
+            AppEvent::RefreshThreadUsage {
+                thread_id,
+                request_id,
+            } => {
+                self.refresh_thread_usage(app_server, thread_id, request_id);
+            }
             AppEvent::RefreshStatusLineWorkspaceHeadline { request_id } => {
                 self.refresh_status_line_workspace_headline(app_server, request_id);
             }
@@ -1141,14 +1277,32 @@ impl App {
                     self.insert_pending_usage_output_if_ready(tui);
                 }
             }
+            AppEvent::ThreadUsageLoaded {
+                thread_id,
+                request_id,
+                result,
+            } => {
+                self.finish_thread_usage_refresh(tui, thread_id, request_id, result)?;
+            }
             AppEvent::CommitPendingUsageOutput => {
                 self.insert_pending_usage_output_if_ready(tui);
             }
             AppEvent::CommitPendingUsageOutputAfterStreamShutdown => {
                 self.insert_pending_usage_output_after_stream_shutdown(tui);
             }
-            AppEvent::ConnectorsLoaded { result, is_final } => {
-                self.chat_widget.on_connectors_loaded(result, is_final);
+            AppEvent::ConnectorsLoaded {
+                thread_id,
+                cwd,
+                generation,
+                result,
+                is_final,
+            } => {
+                if thread_id == self.current_displayed_thread_id()
+                    && cwd.as_path() == self.chat_widget.config_ref().cwd.as_path()
+                    && generation == self.chat_widget.connector_scope_generation()
+                {
+                    self.chat_widget.on_connectors_loaded(result, is_final);
+                }
             }
             AppEvent::UpdateReasoningEffort(effort) => {
                 self.on_update_reasoning_effort(effort.clone());

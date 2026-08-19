@@ -62,6 +62,14 @@ async fn config_requirements_read_includes_remote_control_and_managed_hooks() ->
 type = "command"
 command = "echo managed"
 additionalContextLimit = 4096
+
+[[hooks.SessionStart.hooks]]
+type = "mcp_tool"
+server = "security"
+tool = "scan"
+input = { path = "${tool_input.file_path}", metadata = { enabled = true, retries = 2 } }
+timeout = 30
+statusMessage = "Scanning file"
 "#,
     )?;
     let mut mcp = TestAppServer::builder()
@@ -83,14 +91,26 @@ additionalContextLimit = 4096
             .expect("managed hooks should be returned")
             .session_start[0]
             .hooks,
-        vec![ConfiguredHookHandler::Command {
-            command: "echo managed".to_string(),
-            command_windows: None,
-            timeout_sec: None,
-            r#async: false,
-            status_message: None,
-            additional_context_limit: Some(4_096),
-        }]
+        vec![
+            ConfiguredHookHandler::Command {
+                command: "echo managed".to_string(),
+                command_windows: None,
+                timeout_sec: None,
+                r#async: false,
+                status_message: None,
+                additional_context_limit: Some(4_096),
+            },
+            ConfiguredHookHandler::McpTool {
+                server: "security".to_string(),
+                tool: "scan".to_string(),
+                input: serde_json::from_value(json!({
+                    "path": "${tool_input.file_path}",
+                    "metadata": { "enabled": true, "retries": 2 },
+                }))?,
+                timeout_sec: Some(30),
+                status_message: Some("Scanning file".to_string()),
+            },
+        ]
     );
     Ok(())
 }
@@ -159,11 +179,16 @@ in_app_updates = false
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn config_requirements_read_includes_new_thread_model_defaults() -> Result<()> {
+async fn config_requirements_read_includes_model_auto_review_and_new_thread_defaults() -> Result<()>
+{
     let codex_home = TempDir::new()?;
     std::fs::write(
         codex_home.path().join("requirements.toml"),
         r#"
+[auto_review]
+required_on_models = ["gpt-protected", "gpt-sensitive"]
+ignore_rules = ["gpt-protected"]
+
 [models.new_thread]
 model = "gpt-managed"
 model_reasoning_effort = "medium"
@@ -180,11 +205,23 @@ service_tier = "fast"
     let response: ConfigRequirementsReadResponse =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
-    let defaults = response
-        .requirements
-        .and_then(|requirements| requirements.models)
-        .and_then(|models| models.new_thread)
-        .expect("managed new-thread defaults");
+    let requirements = response.requirements.expect("managed requirements");
+    let auto_review = requirements
+        .auto_review
+        .expect("managed automatic-review requirements");
+    assert_eq!(
+        auto_review.required_on_models,
+        Some(vec![
+            "gpt-protected".to_string(),
+            "gpt-sensitive".to_string()
+        ])
+    );
+    assert_eq!(
+        auto_review.ignore_rules,
+        Some(vec!["gpt-protected".to_string()])
+    );
+    let models = requirements.models.expect("managed model requirements");
+    let defaults = models.new_thread.expect("managed new-thread defaults");
     assert_eq!(defaults.model.as_deref(), Some("gpt-managed"));
     assert_eq!(
         defaults.model_reasoning_effort,
@@ -232,6 +269,11 @@ sandbox_mode = "workspace-write"
             file: user_file.clone(),
             profile: None,
         }
+    );
+    assert!(
+        origins
+            .values()
+            .all(|origin| !matches!(&origin.name, ConfigLayerSource::PackagedDefaults { .. }))
     );
     let layers = layers.expect("layers present");
     assert_layers_user_then_optional_system(&layers, user_file)?;

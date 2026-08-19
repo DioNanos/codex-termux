@@ -1,6 +1,9 @@
 pub const TOOL_CALL_COUNT_METRIC: &str = "codex.tool.call";
 pub const TOOL_CALL_DURATION_METRIC: &str = "codex.tool.call.duration_ms";
 pub const TOOL_CALL_UNIFIED_EXEC_METRIC: &str = "codex.tool.unified_exec";
+pub const ARTIFACT_OPERATION_STARTED_METRIC: &str = "codex.artifact.operation.started";
+pub const ARTIFACT_OPERATION_EXPECTED_OUTPUT_COUNT_METRIC: &str =
+    "codex.artifact.operation.expected_output_count";
 pub const PROCESS_START_METRIC: &str = "codex.process.start";
 pub const API_CALL_COUNT_METRIC: &str = "codex.api_request";
 pub const API_CALL_DURATION_METRIC: &str = "codex.api_request.duration_ms";
@@ -28,6 +31,8 @@ pub const TURN_NETWORK_PROXY_METRIC: &str = "codex.turn.network_proxy";
 pub const TURN_MEMORY_METRIC: &str = "codex.turn.memory";
 pub const TURN_TOOL_CALL_METRIC: &str = "codex.turn.tool.call";
 pub const TURN_TOKEN_USAGE_METRIC: &str = "codex.turn.token_usage";
+pub const TURN_UNIFIED_EXEC_RUNNING_PROCESSES_METRIC: &str =
+    "codex.turn.unified_exec.running_processes";
 pub const GUARDIAN_REVIEW_COUNT_METRIC: &str = "codex.guardian.review";
 pub const GUARDIAN_REVIEW_DURATION_METRIC: &str = "codex.guardian.review.duration_ms";
 pub const GUARDIAN_REVIEW_TTFT_DURATION_METRIC: &str = "codex.guardian.review.ttft.duration_ms";

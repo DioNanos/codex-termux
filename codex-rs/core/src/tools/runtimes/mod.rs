@@ -5,11 +5,14 @@ Concrete ToolRuntime implementations for specific tools. Each runtime stays
 small and focused and reuses the orchestrator for approvals + sandbox + retry.
 */
 use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
+use crate::exec_env::CODEX_SESSION_ID_ENV_VAR;
 use crate::exec_env::CODEX_THREAD_ID_ENV_VAR;
 use crate::sandboxing::SandboxPermissions;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::tools::sandboxing::ToolError;
+use codex_apply_patch::CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR;
+use codex_core_plugins::PLUGIN_METRICS_OUTPUT_ENV_VAR;
 #[cfg(unix)]
 use codex_install_context::InstallContext;
 #[cfg(target_os = "macos")]
@@ -23,8 +26,8 @@ pub(crate) use codex_network_proxy::is_managed_proxy_env_var;
 pub(crate) use codex_network_proxy::strip_managed_proxy_env;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::shell_environment::is_non_inheritable_env_var;
 use codex_sandboxing::SandboxCommand;
-use codex_sandboxing::SandboxType;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
@@ -179,11 +182,11 @@ pub(crate) fn apply_zsh_fork_path_prepend(
 pub(crate) fn disable_powershell_profile_for_elevated_windows_sandbox(
     command: &[String],
     shell_type: Option<&ShellType>,
-    sandbox: SandboxType,
+    sandbox_requested: bool,
     windows_sandbox_level: WindowsSandboxLevel,
 ) -> Vec<String> {
     if shell_type != Some(&ShellType::PowerShell)
-        || sandbox != SandboxType::WindowsRestrictedToken
+        || !sandbox_requested
         || windows_sandbox_level != WindowsSandboxLevel::Elevated
         || command.is_empty()
     {
@@ -267,14 +270,26 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
         .map(|arg| format!(" '{}'", shell_single_quote(arg)))
         .collect::<String>();
     let mut override_env = explicit_env_overrides.clone();
-    for key in [CODEX_THREAD_ID_ENV_VAR, CODEX_PERMISSION_PROFILE_ENV_VAR] {
+    for key in [
+        CODEX_SESSION_ID_ENV_VAR,
+        CODEX_THREAD_ID_ENV_VAR,
+        CODEX_PERMISSION_PROFILE_ENV_VAR,
+        CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR,
+        PLUGIN_METRICS_OUTPUT_ENV_VAR,
+    ] {
         if let Some(value) = env.get(key) {
             override_env.insert(key.to_string(), value.clone());
         }
     }
-    // Do not let a snapshot resurrect a stale profile when no named profile is active.
-    let (override_captures, override_exports) =
-        build_override_exports(&override_env, &[CODEX_PERMISSION_PROFILE_ENV_VAR]);
+    // Do not let a snapshot resurrect stale runtime state when it is inactive.
+    let (override_captures, override_exports) = build_override_exports(
+        &override_env,
+        &[
+            CODEX_PERMISSION_PROFILE_ENV_VAR,
+            CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR,
+            PLUGIN_METRICS_OUTPUT_ENV_VAR,
+        ],
+    );
     let (proxy_captures, proxy_exports) = build_proxy_env_exports();
     let runtime_path_prepend_exports =
         runtime_path_prepends.shell_exports_after_snapshot(explicit_env_overrides);
@@ -305,6 +320,7 @@ fn build_override_exports(
         .keys()
         .map(String::as_str)
         .chain(restore_even_when_absent.iter().copied())
+        .filter(|key| !is_non_inheritable_env_var(key))
         .filter(|key| is_valid_shell_variable_name(key))
         .collect::<Vec<_>>();
     keys.sort_unstable();
@@ -428,7 +444,7 @@ mod disable_powershell_profile_tests {
         let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
             Some(&ShellType::PowerShell),
-            SandboxType::WindowsRestrictedToken,
+            /*sandbox_requested*/ true,
             WindowsSandboxLevel::Elevated,
         );
 
@@ -454,7 +470,7 @@ mod disable_powershell_profile_tests {
         let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
             Some(&ShellType::PowerShell),
-            SandboxType::WindowsRestrictedToken,
+            /*sandbox_requested*/ true,
             WindowsSandboxLevel::Elevated,
         );
 
@@ -481,7 +497,7 @@ mod disable_powershell_profile_tests {
         let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
             Some(&ShellType::PowerShell),
-            SandboxType::WindowsRestrictedToken,
+            /*sandbox_requested*/ true,
             WindowsSandboxLevel::Elevated,
         );
 
@@ -499,7 +515,7 @@ mod disable_powershell_profile_tests {
         let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
             Some(&ShellType::PowerShell),
-            SandboxType::WindowsRestrictedToken,
+            /*sandbox_requested*/ true,
             WindowsSandboxLevel::RestrictedToken,
         );
 
@@ -517,7 +533,7 @@ mod disable_powershell_profile_tests {
         let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
             Some(&ShellType::PowerShell),
-            SandboxType::None,
+            /*sandbox_requested*/ false,
             WindowsSandboxLevel::Elevated,
         );
 
@@ -535,7 +551,7 @@ mod disable_powershell_profile_tests {
         let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
             Some(&ShellType::Bash),
-            SandboxType::WindowsRestrictedToken,
+            /*sandbox_requested*/ true,
             WindowsSandboxLevel::Elevated,
         );
 

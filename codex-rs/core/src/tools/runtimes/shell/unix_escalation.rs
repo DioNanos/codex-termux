@@ -3,32 +3,29 @@ use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
 use crate::exec::cancel_when_either;
 use crate::exec::is_likely_sandbox_denied;
-use crate::guardian::GuardianApprovalRequest;
-use crate::guardian::new_guardian_review_id;
-use crate::guardian::review_approval_request;
-use crate::guardian::routes_approval_to_guardian;
-use crate::hook_runtime::run_permission_request_hooks;
+use crate::guardian::GuardianReviewContext;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecRequest;
 use crate::sandboxing::SandboxPermissions;
 use crate::shell::ShellType;
+use crate::tools::approvals::ApprovalAction;
+use crate::tools::approvals::ApprovalContext;
 use crate::tools::runtimes::build_sandbox_command;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::prepend_zsh_fork_bin_to_path;
-use crate::tools::sandboxing::PermissionRequestPayload;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::unsandboxed_execution_allowed;
+use codex_core_plugins::PluginMetricsSidecar;
 use codex_execpolicy::Decision;
 use codex_execpolicy::Evaluation;
 use codex_execpolicy::MatchOptions;
 use codex_execpolicy::Policy;
 use codex_execpolicy::RuleMatch;
 use codex_features::Feature;
-use codex_hooks::PermissionRequestDecision;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
@@ -45,6 +42,7 @@ use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
+use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use codex_sandboxing::record_filesystem_sandbox_violation;
 use codex_shell_command::bash::parse_shell_lc_plain_commands;
 use codex_shell_command::bash::parse_shell_lc_single_command_prefix;
@@ -62,6 +60,7 @@ use codex_shell_escalation::ResolvedPermissionProfile;
 use codex_shell_escalation::ShellCommandExecutor;
 use codex_shell_escalation::ShellCommandExecutorFuture;
 use codex_shell_escalation::Stopwatch;
+use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
@@ -71,6 +70,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use tracing::error;
 use uuid::Uuid;
 
 pub(crate) struct PreparedUnifiedExecZshFork {
@@ -105,6 +105,7 @@ pub(super) async fn try_run_zsh_fork(
     attempt: &SandboxAttempt<'_>,
     ctx: &ToolCtx,
     command: &[String],
+    metrics_sidecar: Option<&PluginMetricsSidecar>,
 ) -> Result<Option<ExecToolCallOutput>, ToolError> {
     let Some(shell_zsh_path) = ctx.session.services.shell_zsh_path.as_ref() else {
         tracing::warn!("ZshFork backend specified, but shell_zsh_path is not configured.");
@@ -129,9 +130,16 @@ pub(super) async fn try_run_zsh_fork(
         ..req.clone()
     };
     let mut env = exec_env_for_sandbox_permissions(&req.env, req.sandbox_permissions);
+    if let Some(sidecar) = metrics_sidecar {
+        sidecar.install_output_env(&mut env);
+    }
     prepend_zsh_fork_bin_to_path(&mut env, shell_zsh_path);
-    let command =
-        build_sandbox_command(command, &req.cwd, &env, req.additional_permissions.clone())?;
+    let sidecar_permissions = metrics_sidecar.map(PluginMetricsSidecar::additional_permissions);
+    let additional_permissions = merge_permission_profiles(
+        req.additional_permissions.as_ref(),
+        sidecar_permissions.as_ref(),
+    );
+    let command = build_sandbox_command(command, &req.cwd, &env, additional_permissions)?;
     let options = ExecOptions {
         expiration: req.timeout_ms.into(),
         capture_policy: ExecCapturePolicy::ShellTool,
@@ -141,7 +149,7 @@ pub(super) async fn try_run_zsh_fork(
             command,
             options,
             managed_network_for_sandbox_permissions(req.network.as_ref(), req.sandbox_permissions),
-            Some(&req.turn_environment.environment_id),
+            Some(&req.turn_environment.selection.environment_id),
         )
         .map_err(ToolError::Codex)?;
     let crate::sandboxing::ExecRequest {
@@ -172,7 +180,12 @@ pub(super) async fn try_run_zsh_fork(
             .unwrap_or(crate::exec::DEFAULT_EXEC_COMMAND_TIMEOUT_MS),
     );
     let exec_policy = Arc::new(RwLock::new(
-        ctx.session.services.exec_policy.current().as_ref().clone(),
+        ctx.session
+            .services
+            .exec_policy
+            .current_for_prefix_rules(ctx.step_context.turn.allow_prefix_rules())
+            .as_ref()
+            .clone(),
     ));
     // TODO(anp): Keep PathUri through the shell escalation boundary.
     let sandbox_cwd = sandbox_cwd
@@ -194,8 +207,8 @@ pub(super) async fn try_run_zsh_fork(
         arg0,
         sandbox_policy_cwd,
         windows_sandbox_workspace_roots,
-        codex_linux_sandbox_exe: ctx.turn.config.codex_linux_sandbox_exe.clone(),
-        use_legacy_landlock: ctx.turn.config.features.use_legacy_landlock(),
+        codex_linux_sandbox_exe: ctx.step_context.turn.config.codex_linux_sandbox_exe.clone(),
+        use_legacy_landlock: ctx.step_context.turn.config.features.use_legacy_landlock(),
     };
     let main_execve_wrapper_exe = ctx
         .session
@@ -229,11 +242,12 @@ pub(super) async fn try_run_zsh_fork(
     let escalation_policy = CoreShellActionProvider {
         policy: Arc::clone(&exec_policy),
         session: Arc::clone(&ctx.session),
-        turn: Arc::clone(&ctx.turn),
+        review_context: GuardianReviewContext::from(&ctx.step_context),
         call_id: ctx.call_id.clone(),
-        environment_id: req.turn_environment.environment_id.clone(),
-        tool_name: GuardianCommandSource::Shell,
-        approval_policy: ctx.turn.approval_policy(),
+        environment_id: req.turn_environment.selection.environment_id.clone(),
+        source: GuardianCommandSource::Shell,
+        tool_name: ctx.tool_name.clone(),
+        approval_policy: ctx.step_context.turn.approval_policy(),
         permission_profile: command_executor.permission_profile.clone(),
         sandbox_permissions: req.sandbox_permissions,
         approval_sandbox_permissions,
@@ -280,7 +294,12 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
     }
 
     let exec_policy = Arc::new(RwLock::new(
-        ctx.session.services.exec_policy.current().as_ref().clone(),
+        ctx.session
+            .services
+            .exec_policy
+            .current_for_prefix_rules(ctx.step_context.turn.allow_prefix_rules())
+            .as_ref()
+            .clone(),
     ));
     // TODO(anp): Keep PathUri through the zsh-fork executor boundary.
     let cwd = exec_request
@@ -304,17 +323,18 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         arg0: exec_request.arg0.clone(),
         sandbox_policy_cwd,
         windows_sandbox_workspace_roots: exec_request.windows_sandbox_workspace_roots.clone(),
-        codex_linux_sandbox_exe: ctx.turn.config.codex_linux_sandbox_exe.clone(),
-        use_legacy_landlock: ctx.turn.config.features.use_legacy_landlock(),
+        codex_linux_sandbox_exe: ctx.step_context.turn.config.codex_linux_sandbox_exe.clone(),
+        use_legacy_landlock: ctx.step_context.turn.config.features.use_legacy_landlock(),
     };
     let escalation_policy = CoreShellActionProvider {
         policy: Arc::clone(&exec_policy),
         session: Arc::clone(&ctx.session),
-        turn: Arc::clone(&ctx.turn),
+        review_context: GuardianReviewContext::from(&ctx.step_context),
         call_id: ctx.call_id.clone(),
-        environment_id: req.turn_environment.environment_id.clone(),
-        tool_name: GuardianCommandSource::UnifiedExec,
-        approval_policy: ctx.turn.approval_policy(),
+        environment_id: req.turn_environment.selection.environment_id.clone(),
+        source: GuardianCommandSource::UnifiedExec,
+        tool_name: ctx.tool_name.clone(),
+        approval_policy: ctx.step_context.turn.approval_policy(),
         permission_profile: exec_request.permission_profile.clone(),
         sandbox_permissions: req.sandbox_permissions,
         approval_sandbox_permissions: approval_sandbox_permissions(
@@ -344,10 +364,11 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
 struct CoreShellActionProvider {
     policy: Arc<RwLock<Policy>>,
     session: Arc<crate::session::session::Session>,
-    turn: Arc<crate::session::turn_context::TurnContext>,
+    review_context: GuardianReviewContext,
     call_id: String,
     environment_id: String,
-    tool_name: GuardianCommandSource,
+    source: GuardianCommandSource,
+    tool_name: ToolName,
     approval_policy: AskForApproval,
     permission_profile: PermissionProfile,
     sandbox_permissions: SandboxPermissions,
@@ -430,77 +451,46 @@ impl CoreShellActionProvider {
         additional_permissions: Option<AdditionalPermissionProfile>,
     ) -> anyhow::Result<ReviewDecision> {
         let command = join_program_and_argv(program, argv);
-        let workdir = workdir.clone();
-        let session = self.session.clone();
-        let turn = self.turn.clone();
-        let call_id = self.call_id.clone();
-        let approval_id = Some(Uuid::new_v4().to_string());
-        let environment_id = Some(self.environment_id.clone());
-        let source = self.tool_name;
-        let guardian_review_id = routes_approval_to_guardian(&turn).then(new_guardian_review_id);
-        Ok(stopwatch
-            .pause_for(async move {
-                // 1) Run PermissionRequest hooks
-                let permission_request = PermissionRequestPayload::bash(
-                    codex_shell_command::parse_command::shlex_join(&command),
-                    /*description*/ None,
-                );
-                let effective_approval_id = approval_id.clone().unwrap_or_else(|| call_id.clone());
-                match run_permission_request_hooks(
-                    &session,
-                    &turn,
-                    &effective_approval_id,
-                    permission_request,
-                )
-                .await
-                {
-                    Some(PermissionRequestDecision::Allow) => {
-                        return ReviewDecision::Approved;
-                    }
-                    Some(PermissionRequestDecision::Deny { message }) => {
-                        return ReviewDecision::denied(message);
-                    }
-                    None => {}
-                }
-
-                // 2) Route to Guardian if configured
-                if let Some(review_id) = guardian_review_id {
-                    return review_approval_request(
-                        &session,
-                        &turn,
-                        review_id,
-                        GuardianApprovalRequest::Execve {
-                            id: call_id.clone(),
-                            source,
-                            program: program.to_string_lossy().into_owned(),
-                            argv: argv.to_vec(),
-                            cwd: workdir.clone(),
-                            additional_permissions,
-                        },
-                        Default::default(),
-                    )
-                    .await;
-                }
-
-                // 3) Fall back to regular user prompt
-                session
-                    .request_command_approval(
-                        &turn,
-                        call_id,
-                        approval_id,
-                        environment_id,
-                        command,
-                        workdir.clone(),
-                        /*reason*/ None,
-                        /*network_approval_context*/ None,
-                        /*proposed_execpolicy_amendment*/ None,
-                        additional_permissions,
-                        Some(vec![ReviewDecision::Approved, ReviewDecision::Abort]),
-                        /*plugin_attribution_override*/ None,
-                    )
+        let action = ApprovalAction::Execve {
+            id: self.call_id.clone(),
+            approval_id: Uuid::new_v4().to_string(),
+            environment_id: self.environment_id.clone(),
+            source: self.source,
+            program: program.clone(),
+            argv: argv.to_vec(),
+            command,
+            cwd: workdir.clone(),
+            additional_permissions,
+        };
+        match stopwatch
+            .pause_for(async {
+                let (turn_context, strict_auto_review) = self
+                    .session
+                    .active_turn_context_and_strict_auto_review()
                     .await
+                    .ok_or_else(|| {
+                        ToolError::Rejected(
+                            "cannot approve intercepted execution without an active turn"
+                                .to_string(),
+                        )
+                    })?;
+                let approval_ctx = ApprovalContext {
+                    review_context: GuardianReviewContext::from(turn_context),
+                    call_id: self.call_id.clone(),
+                    tool_name: self.tool_name.clone(),
+                    strict_auto_review,
+                    approval_reason: None,
+                    retry_reason: None,
+                    network_approval_context: None,
+                };
+                self.session.request_approval(action, approval_ctx).await
             })
-            .await)
+            .await
+        {
+            Ok(decision) => Ok(decision),
+            Err(ToolError::Rejected(rejection)) => Ok(ReviewDecision::denied(rejection)),
+            Err(ToolError::Codex(err)) => Err(err.into()),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -558,6 +548,13 @@ impl CoreShellActionProvider {
                         ReviewDecision::TimedOut => EscalationDecision::deny(Some(
                             crate::guardian::guardian_timeout_message(),
                         )),
+                        ReviewDecision::ApprovedMcpPolicyAmendment => {
+                            error!("Shell escalation received ApprovedMcpPolicyAmendment");
+
+                            EscalationDecision::deny(Some(
+                                "Error while requesting approval".to_string(),
+                            ))
+                        }
                         ReviewDecision::Abort => {
                             EscalationDecision::deny(Some("User cancelled execution".to_string()))
                         }
@@ -605,7 +602,7 @@ impl CoreShellActionProvider {
                 InterceptedExecPolicyContext {
                     approval_policy: self.approval_policy,
                     permission_profile: self.permission_profile.clone(),
-                    windows_sandbox_level: self.turn.windows_sandbox_level,
+                    windows_sandbox_level: self.review_context.turn().windows_sandbox_level,
                     sandbox_permissions: self.approval_sandbox_permissions,
                     enable_shell_wrapper_parsing:
                         ENABLE_INTERCEPTED_EXEC_POLICY_SHELL_WRAPPER_PARSING,
@@ -984,7 +981,7 @@ impl CoreShellCommandExecutor {
             exec_request,
             options,
             self.windows_sandbox_workspace_roots.clone(),
-        );
+        )?;
         if let Some(network) = exec_request.network.as_ref() {
             network
                 .apply_to_env_for_optional_environment(

@@ -8,7 +8,9 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex_exec::test_codex_exec;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use std::process::Stdio;
 use std::string::ToString;
+use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -131,12 +133,35 @@ async fn mount_exec_responses(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_falls_back_to_legacy_history_when_thread_store_cannot_paginate() -> anyhow::Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let test = test_codex_exec();
+    let server = MockServer::start().await;
+    let _response_mock = mount_exec_responses(&server, /*count*/ 1).await;
+    let store_id = Uuid::new_v4();
+
+    test.cmd_with_server(&server)
+        .arg("--skip-git-repo-check")
+        .arg("-c")
+        .arg(format!(
+            "experimental_thread_store={{type=\"in_memory\",id=\"{store_id}\"}}"
+        ))
+        .arg("continue without paginated history")
+        .assert()
+        .success();
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_resume_last_appends_to_existing_file() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
-    let _response_mock = responses::mount_sse_sequence(
+    let response_mock = responses::mount_sse_sequence(
         &server,
         vec![
             responses::sse(vec![
@@ -166,6 +191,14 @@ async fn exec_resume_last_appends_to_existing_file() -> anyhow::Result<()> {
     let sessions_dir = test.home_path().join("sessions");
     let path = find_session_file_containing_marker(&sessions_dir, &marker)
         .expect("no session file found after first run");
+    let content = std::fs::read_to_string(&path)?;
+    let meta: Value = serde_json::from_str(
+        content
+            .lines()
+            .next()
+            .expect("rollout should contain session metadata"),
+    )?;
+    assert_eq!(meta["payload"]["history_mode"], "paginated");
 
     // 2) Second run: resume the most recent file with a new marker.
     let marker2 = format!("resume-last-2-{}", Uuid::new_v4());
@@ -188,8 +221,8 @@ async fn exec_resume_last_appends_to_existing_file() -> anyhow::Result<()> {
         stderr
             .matches("app-server event: thread/tokenUsage/updated")
             .count(),
-        1,
-        "resume should not replay restored token usage: {stderr}"
+        2,
+        "paginated resume should replay restored token usage before the new turn: {stderr}"
     );
 
     // Ensure the same file was updated and contains both markers.
@@ -202,6 +235,11 @@ async fn exec_resume_last_appends_to_existing_file() -> anyhow::Result<()> {
     let content = std::fs::read_to_string(&resumed_path)?;
     assert!(content.contains(&marker));
     assert!(content.contains(&marker2));
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    let resumed_request = requests[1].body_json().to_string();
+    assert!(resumed_request.contains(&marker));
+    assert!(resumed_request.contains(&marker2));
     Ok(())
 }
 
@@ -830,6 +868,166 @@ async fn exec_resume_accepts_images_after_subcommand() -> anyhow::Result<()> {
         image_count, 2,
         "resume prompt should include both attached images"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_fork_creates_distinct_threads_with_and_without_a_prompt() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let test = test_codex_exec();
+    let server = MockServer::start().await;
+    let response_mock = mount_exec_responses(&server, /*count*/ 2).await;
+    let source_marker = format!("fork-source-{}", Uuid::new_v4());
+
+    test.cmd_with_server(&server)
+        .arg("--skip-git-repo-check")
+        .arg(format!("echo {source_marker}"))
+        .assert()
+        .success();
+
+    let sessions_dir = test.home_path().join("sessions");
+    let source_path = find_session_file_containing_marker(&sessions_dir, &source_marker)
+        .expect("source thread should have a rollout");
+    let source_id = extract_conversation_id(&source_path);
+    let original_source = std::fs::read_to_string(&source_path)?;
+
+    for (args, expected_error) in [
+        (
+            vec!["--image", "unused.png"],
+            "Forking with images requires a prompt",
+        ),
+        (
+            vec!["--output-schema", "unused.json"],
+            "Forking with output options requires a prompt",
+        ),
+        (
+            vec!["--output-last-message", "unused.md"],
+            "Forking with output options requires a prompt",
+        ),
+        (vec!["--ephemeral"], "Ephemeral forks require a prompt"),
+    ] {
+        let output = test
+            .cmd_with_server(&server)
+            .arg("--skip-git-repo-check")
+            .arg("fork")
+            .arg(&source_id)
+            .args(args)
+            .output()?;
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected_error),
+            "fork failed without the expected error: {output:?}"
+        );
+    }
+
+    let mut promptless_command = test.cmd_with_server(&server);
+    promptless_command
+        .arg("--skip-git-repo-check")
+        .arg("fork")
+        .arg(&source_id)
+        .arg("--json");
+    let mut child_command = tokio::process::Command::new(promptless_command.get_program());
+    child_command
+        .args(promptless_command.get_args())
+        .envs(
+            promptless_command
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        )
+        .current_dir(test.cwd_path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = child_command.spawn()?;
+    let _open_stdin = child.stdin.take().expect("stdin should be piped");
+    let promptless_output =
+        tokio::time::timeout(Duration::from_secs(/*secs*/ 10), child.wait_with_output())
+            .await
+            .context("promptless fork should not wait for stdin to close")??;
+    assert!(
+        promptless_output.status.success(),
+        "promptless fork failed: {}",
+        String::from_utf8_lossy(&promptless_output.stderr)
+    );
+    let promptless_events = String::from_utf8(promptless_output.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(promptless_events.len(), 1);
+    assert_eq!(promptless_events[0]["type"], "thread.started");
+    let promptless_thread_id = promptless_events[0]["thread_id"]
+        .as_str()
+        .expect("promptless fork should emit its new thread id");
+    assert_ne!(promptless_thread_id, source_id);
+    assert_eq!(response_mock.requests().len(), 1);
+
+    let source_name = format!("fork-named-{}", Uuid::new_v4());
+    let config = ConfigBuilder::default()
+        .codex_home(test.home_path().to_path_buf())
+        .build()
+        .await?;
+    let state_db = init_state_db(&config)
+        .await
+        .expect("state DB should initialize");
+    assert!(
+        state_db
+            .update_thread_title(ThreadId::from_string(&source_id)?, &source_name)
+            .await?
+    );
+
+    let fork_marker = format!("fork-prompt-{}", Uuid::new_v4());
+    let fork_output = test
+        .cmd_with_server(&server)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(test.home_path())
+        .arg("fork")
+        .arg(&source_name)
+        .arg("--json")
+        .arg("-")
+        .write_stdin(format!("echo {fork_marker}"))
+        .output()?;
+    assert!(
+        fork_output.status.success(),
+        "fork with prompt failed: {}",
+        String::from_utf8_lossy(&fork_output.stderr)
+    );
+    let fork_events = String::from_utf8(fork_output.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(fork_events[0]["type"], "thread.started");
+    let fork_thread_id = fork_events[0]["thread_id"]
+        .as_str()
+        .expect("fork should emit its new thread id");
+    assert_ne!(fork_thread_id, source_id);
+    assert_ne!(fork_thread_id, promptless_thread_id);
+
+    let fork_path = find_session_file_containing_marker(&sessions_dir, &fork_marker)
+        .expect("forked thread should have a separate rollout");
+    assert_ne!(fork_path, source_path);
+    assert_eq!(extract_conversation_id(&fork_path), fork_thread_id);
+    let fork_contents = std::fs::read_to_string(&fork_path)?;
+    let fork_meta: Value = serde_json::from_str(
+        fork_contents
+            .lines()
+            .next()
+            .expect("fork rollout should contain session metadata"),
+    )?;
+    assert_eq!(fork_meta["payload"]["forked_from_id"], source_id);
+    assert_eq!(fork_meta["payload"]["history_base"]["thread_id"], source_id);
+    assert!(!fork_contents.contains(&source_marker));
+    assert!(fork_contents.contains(&fork_marker));
+    assert_eq!(std::fs::read_to_string(&source_path)?, original_source);
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    let fork_request = requests[1].body_json().to_string();
+    assert!(fork_request.contains(&source_marker));
+    assert!(fork_request.contains(&fork_marker));
 
     Ok(())
 }

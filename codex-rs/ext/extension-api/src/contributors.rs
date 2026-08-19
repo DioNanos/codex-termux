@@ -29,6 +29,7 @@ pub use prompt::PromptFragment;
 pub use prompt::PromptSlot;
 pub use skill_invocation::SkillInvocationInput;
 pub use skill_invocation::SkillInvocationKind;
+pub use thread_lifecycle::ThreadIdleCause;
 pub use thread_lifecycle::ThreadIdleInput;
 pub use thread_lifecycle::ThreadOriginator;
 pub use thread_lifecycle::ThreadResumeInput;
@@ -294,16 +295,22 @@ pub trait ToolContributor: Send + Sync {
 
 /// Contributor for host-owned tool lifecycle gates.
 ///
-/// Implementations should use these callbacks to observe tool execution without
-/// inspecting or rewriting tool input/output. Use `ToolContributor` for owning a
-/// tool implementation and hooks for policy that needs tool payloads.
+/// Implementations should use these callbacks to observe tool execution and its
+/// exposed input without rewriting the invocation. Use `ToolContributor` for
+/// owning a tool implementation and hooks for policy that changes tool payloads.
 pub trait ToolLifecycleContributor: Send + Sync {
-    /// Called once the host has accepted a tool call for execution.
+    /// Called after pre-tool hooks finalize an invocation and before execution.
+    ///
+    /// Calls blocked by hooks, or whose hook-provided input cannot be applied,
+    /// do not reach this callback.
     fn on_tool_start<'a>(&'a self, _input: ToolStartInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(std::future::ready(()))
     }
 
     /// Called after the tool call returns, is blocked, fails, or is cancelled.
+    ///
+    /// A matching start callback does not exist when execution is blocked,
+    /// hook-provided input cannot be applied, or cancellation wins first.
     fn on_tool_finish<'a>(&'a self, _input: ToolFinishInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(std::future::ready(()))
     }

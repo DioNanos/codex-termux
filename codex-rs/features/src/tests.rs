@@ -29,14 +29,16 @@ fn under_development_features_are_disabled_by_default() {
 
 #[test]
 fn tool_registry_config_is_not_a_feature_toggle() {
-    let features: FeaturesToml =
-        toml::from_str("[tool_registry]\nerror_on_tool_collisions = true\n")
-            .expect("tool registry settings should deserialize");
+    let features: FeaturesToml = toml::from_str(
+        "[tool_registry]\nerror_on_tool_collisions = true\nturn_metadata_includes_tool_info = true\n",
+    )
+    .expect("tool registry settings should deserialize");
 
     assert_eq!(
         features.tool_registry,
         Some(crate::ToolRegistryConfigToml {
             error_on_tool_collisions: Some(true),
+            turn_metadata_includes_tool_info: Some(true),
         })
     );
     assert!(features.entries().is_empty());
@@ -112,6 +114,135 @@ fn code_mode_host_feature_config_preserves_boolean_toggle() {
         features.entries(),
         BTreeMap::from([("code_mode_host".to_string(), false)])
     );
+}
+
+#[test]
+fn guardian_v2_feature_config_preserves_boolean_toggle() {
+    let features: FeaturesToml =
+        toml::from_str("guardianv2 = true").expect("Guardian v2 boolean should deserialize");
+
+    assert_eq!(features.guardianv2, Some(FeatureToml::Enabled(true)));
+    assert_eq!(
+        features.entries(),
+        BTreeMap::from([("guardianv2".to_owned(), true)])
+    );
+}
+
+#[test]
+fn guardian_v2_feature_config_deserializes_classifier_and_transcript_settings() {
+    let features: FeaturesToml = toml::from_str(
+        r#"
+[guardianv2]
+enabled = true
+classifier_instructions = "Review this action"
+review_threshold = 0.65
+reasoning_effort = "minimal"
+max_action_tokens = 512
+max_classifier_instruction_tokens = 256
+
+[guardianv2.transcript]
+sources = ["tool_outputs", "reasoning"]
+max_message_entry_tokens = 128
+max_tool_entry_tokens = 128
+max_message_transcript_tokens = 512
+max_tool_transcript_tokens = 256
+max_recent_non_user_entries = 12
+"#,
+    )
+    .expect("Guardian v2 settings should deserialize");
+
+    assert_eq!(
+        features.guardianv2,
+        Some(FeatureToml::Config(crate::GuardianV2ConfigToml {
+            enabled: Some(true),
+            classifier_instructions: Some("Review this action".to_owned()),
+            review_threshold: Some(0.65),
+            reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::Minimal),
+            max_action_tokens: Some(512),
+            max_classifier_instruction_tokens: Some(256),
+            transcript: Some(crate::GuardianV2TranscriptConfigToml {
+                sources: Some(vec![
+                    crate::GuardianV2TranscriptSource::ToolOutputs,
+                    crate::GuardianV2TranscriptSource::Reasoning,
+                ]),
+                max_message_entry_tokens: Some(128),
+                max_tool_entry_tokens: Some(128),
+                max_message_transcript_tokens: Some(512),
+                max_tool_transcript_tokens: Some(256),
+                max_recent_non_user_entries: Some(12),
+            }),
+        }))
+    );
+    assert_eq!(
+        features.entries(),
+        BTreeMap::from([("guardianv2".to_owned(), true)])
+    );
+}
+
+#[test]
+fn guardian_v2_feature_config_rejects_invalid_settings() {
+    for setting in [
+        "max_action_tokens",
+        "max_classifier_instruction_tokens",
+        "transcript.max_message_entry_tokens",
+        "transcript.max_tool_entry_tokens",
+        "transcript.max_message_transcript_tokens",
+        "transcript.max_tool_transcript_tokens",
+    ] {
+        for value in [99, 100_001] {
+            let settings = format!("[guardianv2]\n{setting} = {value}");
+            assert!(
+                toml::from_str::<FeaturesToml>(&settings).is_err(),
+                "out-of-range Guardian v2 setting should fail: {setting} = {value}"
+            );
+        }
+    }
+
+    for settings in [
+        "review_threshold = -0.1",
+        "review_threshold = 1.1",
+        "review_threshold = nan",
+        "transcript.max_recent_non_user_entries = 0",
+        "transcript.max_message_entry_tokens = 200\ntranscript.max_message_transcript_tokens = 100",
+        "transcript.max_tool_entry_tokens = 200\ntranscript.max_tool_transcript_tokens = 100",
+    ] {
+        assert!(
+            toml::from_str::<FeaturesToml>(&format!("[guardianv2]\n{settings}")).is_err(),
+            "invalid Guardian v2 settings should fail: {settings}"
+        );
+    }
+}
+
+#[test]
+fn guardian_v2_feature_config_accepts_boundary_values() {
+    for (threshold, tokens) in [(0.0, 100), (1.0, 100_000)] {
+        let features: FeaturesToml = toml::from_str(&format!(
+            "[guardianv2]\n\
+             review_threshold = {threshold:.1}\n\
+             max_action_tokens = {tokens}\n\
+             max_classifier_instruction_tokens = {tokens}\n\
+             [guardianv2.transcript]\n\
+             max_message_entry_tokens = {tokens}\n\
+             max_tool_entry_tokens = {tokens}\n\
+             max_message_transcript_tokens = {tokens}\n\
+             max_tool_transcript_tokens = {tokens}\n\
+             max_recent_non_user_entries = 1"
+        ))
+        .expect("Guardian v2 boundary settings should deserialize");
+
+        assert!(matches!(features.guardianv2, Some(FeatureToml::Config(_))));
+    }
+
+    for setting in [
+        "max_message_transcript_tokens",
+        "max_tool_transcript_tokens",
+    ] {
+        let features: FeaturesToml =
+            toml::from_str(&format!("[guardianv2.transcript]\n{setting} = 100"))
+                .expect("partial Guardian v2 transcript settings should deserialize");
+
+        assert!(matches!(features.guardianv2, Some(FeatureToml::Config(_))));
+    }
 }
 
 #[test]
@@ -538,106 +669,6 @@ server_names = ["history", "notes"]
             }
         ))
     );
-}
-
-#[test]
-fn materialize_resolved_enabled_writes_all_features_and_preserves_custom_config() {
-    let mut features = Features::with_defaults();
-    features.enable(Feature::CodeMode);
-    features.enable(Feature::MultiAgentV2);
-    features.enable(Feature::NetworkProxy);
-    features.enable(Feature::NonPrefixedMcpToolNames);
-    features.enable(Feature::RespectSystemProxy);
-
-    let mut features_toml = FeaturesToml {
-        tool_registry: Some(crate::ToolRegistryConfigToml {
-            error_on_tool_collisions: Some(true),
-        }),
-        code_mode_host: Some(FeatureToml::Config(crate::CodeModeHostConfigToml {
-            enabled: Some(false),
-            disable_in_process_fallback: Some(true),
-        })),
-        multi_agent_v2: Some(FeatureToml::Config(crate::MultiAgentV2ConfigToml {
-            enabled: Some(false),
-            min_wait_timeout_ms: Some(2500),
-            subagent_developer_instructions: Some("Delegate carefully.".to_string()),
-            ..Default::default()
-        })),
-        network_proxy: Some(FeatureToml::Config(crate::NetworkProxyConfigToml {
-            enabled: Some(false),
-            proxy_url: Some("http://127.0.0.1:43128".to_string()),
-            ..Default::default()
-        })),
-        non_prefixed_mcp_tool_names: Some(FeatureToml::Config(
-            crate::NonPrefixedMcpToolNamesConfigToml {
-                enabled: Some(false),
-                server_names: Some(vec!["history".to_string(), "notes".to_string()]),
-            },
-        )),
-        entries: BTreeMap::new(),
-        ..Default::default()
-    };
-
-    features_toml.materialize_resolved_enabled(&features);
-
-    assert_eq!(
-        features_toml.tool_registry,
-        Some(crate::ToolRegistryConfigToml {
-            error_on_tool_collisions: Some(true),
-        })
-    );
-    let entries = features_toml.entries();
-    assert!(!entries.contains_key("tool_registry"));
-    for spec in crate::FEATURES {
-        assert_eq!(
-            entries.get(spec.key),
-            Some(&features.enabled(spec.id)),
-            "{}",
-            spec.key
-        );
-    }
-    assert_eq!(
-        features_toml.code_mode_host,
-        Some(FeatureToml::Config(crate::CodeModeHostConfigToml {
-            enabled: Some(true),
-            disable_in_process_fallback: Some(true),
-        }))
-    );
-    assert_eq!(
-        features_toml.multi_agent_v2,
-        Some(FeatureToml::Config(crate::MultiAgentV2ConfigToml {
-            enabled: Some(true),
-            min_wait_timeout_ms: Some(2500),
-            subagent_developer_instructions: Some("Delegate carefully.".to_string()),
-            ..Default::default()
-        }))
-    );
-    assert_eq!(
-        features_toml.network_proxy,
-        Some(FeatureToml::Config(crate::NetworkProxyConfigToml {
-            enabled: Some(true),
-            proxy_url: Some("http://127.0.0.1:43128".to_string()),
-            ..Default::default()
-        }))
-    );
-    assert_eq!(
-        features_toml.non_prefixed_mcp_tool_names,
-        Some(FeatureToml::Config(
-            crate::NonPrefixedMcpToolNamesConfigToml {
-                enabled: Some(true),
-                server_names: Some(vec!["history".to_string(), "notes".to_string()]),
-            }
-        ))
-    );
-    let replayed = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-            ..Default::default()
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-    assert_eq!(replayed.enabled(Feature::ApplyPatchFreeform), false);
 }
 
 #[test]
