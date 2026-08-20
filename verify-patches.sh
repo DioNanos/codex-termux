@@ -76,8 +76,10 @@ if grep -q 'exec "\$SCRIPT_DIR/codex.bin"' npm-package/bin/codex \
   && grep -q 'exec "\$SCRIPT_DIR/codex.bin" exec' npm-package/bin/codex-exec \
   && grep -Fq 'CODEX_SELF_EXE="$SCRIPT_DIR/codex.bin"' npm-package/bin/codex \
   && grep -Fq 'CODEX_SELF_EXE="$SCRIPT_DIR/codex.bin"' npm-package/bin/codex-exec \
-  && grep -Fq "env.CODEX_SELF_EXE = nativeBinaryPath" npm-package/bin/codex.js \
-  && grep -Fq "env.CODEX_SELF_EXE = nativeBinaryPath" npm-package/bin/codex-exec.js \
+  && grep -Fq "const binaryPath = join(__dirname, 'codex.bin')" npm-package/bin/codex.js \
+  && grep -Fq "env.CODEX_SELF_EXE = binaryPath" npm-package/bin/codex.js \
+  && grep -Fq "const binaryPath = join(__dirname, 'codex.bin')" npm-package/bin/codex-exec.js \
+  && grep -Fq "env.CODEX_SELF_EXE = binaryPath" npm-package/bin/codex-exec.js \
   && grep -q '"bin/codex.bin"' npm-package/package.json; then
   pass
 else
