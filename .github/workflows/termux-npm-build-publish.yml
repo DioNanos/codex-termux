@@ -41,6 +41,17 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
 
+      - name: Check npm launcher sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check npm-package/bin/codex.js
+          node --check npm-package/bin/codex-exec.js
+          node --check npm-package/scripts/postinstall_termux_launcher.js
+          node --check npm-package/tests/launcher_termux_shebang.test.mjs
+          node --test npm-package/tests/launcher_termux_shebang.test.mjs
+          node -e 'const fs = require("node:fs"); const p = JSON.parse(fs.readFileSync("npm-package/package.json", "utf8")); if (p.scripts?.postinstall !== "node scripts/postinstall_termux_launcher.js" || !p.files?.includes("bin/codex-exec.js") || !p.files?.includes("scripts/postinstall_termux_launcher.js")) process.exit(1);'
+
       - name: Install host dependencies
         shell: bash
         run: |
@@ -133,7 +144,7 @@ jobs:
           # under `pipefail` the pipeline reports failure — so a tarball that
           # DOES contain the file is reported as missing.
           tar -tzf "${package_tgz}" > /tmp/tarball-entries.txt
-          for required in package/bin/codex.bin package/bin/codex-code-mode-host package/bin/libc++_shared.so; do
+          for required in package/bin/codex package/bin/codex-exec package/bin/codex.js package/bin/codex-exec.js package/bin/codex.bin package/bin/codex-code-mode-host package/bin/libc++_shared.so package/scripts/postinstall_termux_launcher.js; do
             if ! grep -qxF "${required}" /tmp/tarball-entries.txt; then
               echo "packaged tarball is missing ${required}" >&2
               exit 1

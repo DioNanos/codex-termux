@@ -7,8 +7,7 @@ import { dirname, join } from 'path';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const binaryPath = join(__dirname, 'codex');
-const nativeBinaryPath = join(__dirname, 'codex.bin');
+const binaryPath = join(__dirname, 'codex.bin');
 const TERMUX_PREFIX = process.env.PREFIX || '/data/data/com.termux/files/usr';
 
 function sanitizeLdLibraryPath(binDir) {
@@ -30,7 +29,7 @@ const env = { ...process.env, CODEX_MANAGED_BY_NPM: '1' };
 const binDir = __dirname;
 // Hidden arg0 aliases must target the native ELF directly. Pointing them at
 // the shell wrapper would lose the special argv[0] when it execs codex.bin.
-env.CODEX_SELF_EXE = nativeBinaryPath;
+env.CODEX_SELF_EXE = binaryPath;
 env.LD_LIBRARY_PATH = sanitizeLdLibraryPath(binDir);
 
 let cachedSubcommands;

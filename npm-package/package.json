@@ -16,6 +16,7 @@
     "bin/codex.bin",
     "bin/codex-code-mode-host",
     "bin/libc++_shared.so",
+    "scripts/postinstall_termux_launcher.js",
     "README.md",
     "LICENSE",
     "NOTICE"
@@ -42,6 +43,9 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall_termux_launcher.js"
   },
   "os": [
     "android"
