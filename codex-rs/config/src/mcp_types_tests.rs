@@ -5,6 +5,32 @@ use std::collections::HashMap;
 use std::path::Path;
 
 #[test]
+fn app_tool_approval_restrictions_never_weaken_either_policy() {
+    use AppToolApproval::Approve;
+    use AppToolApproval::Auto;
+    use AppToolApproval::Prompt;
+    use AppToolApproval::Writes;
+
+    let modes = [Approve, Auto, Writes, Prompt];
+    let expected = [
+        [Approve, Auto, Writes, Prompt],
+        [Auto, Auto, Prompt, Prompt],
+        [Writes, Prompt, Writes, Prompt],
+        [Prompt, Prompt, Prompt, Prompt],
+    ];
+
+    for (parent_index, parent) in modes.into_iter().enumerate() {
+        for (requested_index, requested) in modes.into_iter().enumerate() {
+            assert_eq!(
+                parent.restrict_to(requested),
+                expected[parent_index][requested_index],
+                "parent: {parent:?}, requested: {requested:?}",
+            );
+        }
+    }
+}
+
+#[test]
 fn deserialize_stdio_command_server_config() {
     let cfg: McpServerConfig = toml::from_str(
         r#"
@@ -247,6 +273,7 @@ fn deserialize_streamable_http_server_config() {
             bearer_token_env_var: None,
             http_headers: None,
             env_http_headers: None,
+            http_headers_helper: None,
         }
     );
     assert!(cfg.enabled);
@@ -269,6 +296,7 @@ fn deserialize_streamable_http_server_config_with_env_var() {
             bearer_token_env_var: Some("GITHUB_TOKEN".to_string()),
             http_headers: None,
             env_http_headers: None,
+            http_headers_helper: None,
         }
     );
     assert!(cfg.enabled);
@@ -281,6 +309,7 @@ fn deserialize_streamable_http_server_config_with_headers() {
             url = "https://example.com/mcp"
             http_headers = { "X-Foo" = "bar" }
             env_http_headers = { "X-Token" = "TOKEN_ENV" }
+            http_headers_helper = "auth-cli headers"
         "#,
     )
     .expect("should deserialize http config with headers");
@@ -295,8 +324,20 @@ fn deserialize_streamable_http_server_config_with_headers() {
                 "X-Token".to_string(),
                 "TOKEN_ENV".to_string()
             )])),
+            http_headers_helper: Some("auth-cli headers".to_string()),
         }
     );
+}
+
+#[test]
+fn rejects_http_headers_helper_outside_local_http_servers() {
+    for contents in [
+        "command = \"server\"\nhttp_headers_helper = \"auth-cli headers\"",
+        "url = \"https://example.com/mcp\"\nhttp_headers_helper = \"  \"",
+        "url = \"https://example.com/mcp\"\nenvironment_id = \"remote\"\nhttp_headers_helper = \"auth-cli headers\"",
+    ] {
+        toml::from_str::<McpServerConfig>(contents).expect_err("invalid helper placement");
+    }
 }
 
 #[test]
@@ -323,6 +364,7 @@ fn deserialize_streamable_http_server_config_with_oauth_client_id() {
 
             [oauth]
             client_id = "eci-prd-pub-codex-123"
+            callback_port = 9876
         "#,
     )
     .expect("should deserialize http config with oauth client id");
@@ -331,8 +373,37 @@ fn deserialize_streamable_http_server_config_with_oauth_client_id() {
         cfg.oauth,
         Some(McpServerOAuthConfig {
             client_id: Some("eci-prd-pub-codex-123".to_string()),
+            callback_port: Some(9876),
         })
     );
+}
+
+#[test]
+fn oauth_callback_port_prefers_server_port_over_global_port() {
+    let cfg: McpServerConfig = toml::from_str(
+        r#"
+            url = "https://example.com/mcp"
+
+            [oauth]
+            callback_port = 9876
+        "#,
+    )
+    .expect("should deserialize http config with oauth callback port");
+
+    assert_eq!(cfg.oauth_callback_port(Some(4321)), Some(9876));
+}
+
+#[test]
+fn oauth_callback_port_falls_back_to_global_port() {
+    let cfg: McpServerConfig = toml::from_str(
+        r#"
+            url = "https://example.com/mcp"
+        "#,
+    )
+    .expect("should deserialize http config without oauth callback port");
+
+    assert_eq!(cfg.oauth_callback_port(Some(4321)), Some(4321));
+    assert_eq!(cfg.oauth_callback_port(/*global_callback_port*/ None), None);
 }
 
 #[test]

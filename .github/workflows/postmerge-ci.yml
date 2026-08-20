@@ -1,15 +1,14 @@
 name: postmerge-ci
 
-# The upstream full-suite matrices include platforms and private runner groups
-# that are outside this fork's Android-only release contract. Keep them
-# available for an explicit parity investigation, but do not launch them on a
-# release push.
+# This is the single entrypoint for main-only CI that is intentionally outside
+# the merge-blocking suite. It keeps the broader postmerge signal in one run.
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
 
 jobs:
-  # Keep reusable workflow calls alphabetized. Each child also retains its own
-  # workflow_dispatch trigger for a narrower manual investigation.
+  # Keep reusable workflow calls alphabetized. Each child retains its own
+  # workflow_dispatch trigger so maintainers can rerun flaky suites directly.
   rust-ci-full:
     name: rust-ci-full
     uses: ./.github/workflows/rust-ci-full.yml

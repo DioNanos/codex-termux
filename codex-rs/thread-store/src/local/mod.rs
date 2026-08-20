@@ -8,6 +8,7 @@ mod model_context;
 mod move_thread_to_section;
 mod paginated_fork;
 mod read_thread;
+mod revert_thread;
 mod rollout_migration;
 // This lands before the reader PRs that consume the shared lineage resolver.
 #[allow(dead_code)]
@@ -15,6 +16,7 @@ mod rollout_lineage;
 mod search_threads;
 mod thread_history;
 mod thread_history_materialization;
+mod thread_rollout_resolver;
 mod thread_sections;
 mod unarchive_thread;
 mod update_thread_metadata;
@@ -54,12 +56,14 @@ use crate::ListThreadsParams;
 use crate::ListTurnsParams;
 use crate::LoadThreadHistoryParams;
 use crate::MoveThreadToSectionParams;
+use crate::PersistContext;
 use crate::PrepareForkParams;
 use crate::PreparedFork;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::RenameThreadSectionParams;
 use crate::ResumeThreadParams;
+use crate::RevertThreadParams;
 use crate::SearchThreadOccurrencesParams;
 use crate::SearchThreadsParams;
 use crate::StoredModelContext;
@@ -82,6 +86,7 @@ use crate::local::writer_lock::WriterLockGuard;
 pub use rollout_migration::RolloutMigrationMode;
 pub use rollout_migration::RolloutMigrationOptions;
 pub use rollout_migration::RolloutMigrationOutcome;
+pub use rollout_migration::RolloutMigrationProgress;
 pub use rollout_migration::RolloutMigrationReport;
 pub use rollout_migration::RolloutMigrationStatus;
 
@@ -110,6 +115,9 @@ pub struct LocalThreadStore {
 
 struct LiveRecorderEntry {
     recorder: RolloutRecorder,
+    // Rollout projection rows are keyed by immutable rollout ID, not the stable thread ID used
+    // to find this live writer.
+    rollout_id: ThreadId,
     // Local rollout files are materialized lazily, but metadata updates can arrive before the
     // canonical SessionMeta is durable. Retain the mode captured when live persistence was opened
     // so missing SQLite rows can still be seeded.
@@ -289,6 +297,7 @@ impl LocalThreadStore {
         &self,
         thread_id: ThreadId,
         recorder: RolloutRecorder,
+        rollout_id: ThreadId,
         history_mode: ThreadHistoryMode,
         writer_lock: WriterLockGuard,
     ) -> ThreadStoreResult<()> {
@@ -299,6 +308,7 @@ impl LocalThreadStore {
             Entry::Vacant(entry) => {
                 entry.insert(LiveRecorderEntry {
                     recorder,
+                    rollout_id,
                     history_mode,
                     writer_lock,
                 });
@@ -399,7 +409,11 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move { live_writer::append_items(self, params).await })
     }
 
-    fn persist_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
+    fn persist_thread(
+        &self,
+        thread_id: ThreadId,
+        _context: PersistContext,
+    ) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move { live_writer::persist_thread(self, thread_id).await })
     }
 
@@ -431,6 +445,10 @@ impl ThreadStore for LocalThreadStore {
 
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
         Box::pin(async move { paginated_fork::prepare(self, params).await })
+    }
+
+    fn revert_thread(&self, params: RevertThreadParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { revert_thread::revert(self, params).await })
     }
 
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
@@ -511,8 +529,12 @@ impl ThreadStore for LocalThreadStore {
     fn update_thread_metadata(
         &self,
         params: UpdateThreadMetadataParams,
-    ) -> ThreadStoreFuture<'_, StoredThread> {
-        Box::pin(async move { update_thread_metadata::update_thread_metadata(self, params).await })
+    ) -> ThreadStoreFuture<'_, Option<StoredThread>> {
+        Box::pin(async move {
+            update_thread_metadata::update_thread_metadata(self, params)
+                .await
+                .map(Some)
+        })
     }
 
     fn move_thread_to_section(
@@ -572,7 +594,6 @@ mod tests {
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::ItemCompletedEvent;
-    use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadHistoryMode;
@@ -581,6 +602,7 @@ mod tests {
     use codex_protocol::protocol::TurnContextItem;
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
+    use codex_rollout::RolloutItem;
     use tempfile::TempDir;
 
     use super::*;
@@ -614,7 +636,7 @@ mod tests {
             .await
             .expect("append live item");
         store
-            .persist_thread(thread_id)
+            .persist_thread(thread_id, PersistContext::Standard)
             .await
             .expect("persist live thread");
         store
@@ -842,7 +864,10 @@ mod tests {
         )
         .await
         .expect("create live thread with inherited context");
-        live_thread.persist().await.expect("persist thread");
+        live_thread
+            .persist(PersistContext::Standard)
+            .await
+            .expect("persist thread");
         let inherited_metadata = runtime
             .get_thread(thread_id)
             .await
@@ -917,12 +942,15 @@ mod tests {
                     phase: Some(MessagePhase::Commentary),
                     memory_citation: None,
                 })),
-                RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
-                    id: None,
-                    call_id: "call-1".to_string(),
-                    output: FunctionCallOutputPayload::from_text("tool output".to_string()),
-                    internal_chat_message_metadata_passthrough: None,
-                }),
+                RolloutItem::ResponseItem(
+                    ResponseItem::FunctionCallOutput {
+                        id: None,
+                        call_id: "call-1".to_string(),
+                        output: FunctionCallOutputPayload::from_text("tool output".to_string()),
+                        internal_chat_message_metadata_passthrough: None,
+                    }
+                    .into(),
+                ),
                 RolloutItem::EventMsg(EventMsg::TokenCount(
                     codex_protocol::protocol::TokenCountEvent {
                         info: None,
@@ -1276,7 +1304,7 @@ mod tests {
             .await
             .expect("append initial item");
         first_store
-            .persist_thread(thread_id)
+            .persist_thread(thread_id, PersistContext::Standard)
             .await
             .expect("persist initial thread");
         first_store
@@ -1336,7 +1364,7 @@ mod tests {
                 .await
                 .expect("create live thread");
             primary
-                .persist_thread(thread_id)
+                .persist_thread(thread_id, PersistContext::Standard)
                 .await
                 .expect("persist thread for resume");
             let rollout_path = primary

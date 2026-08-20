@@ -70,6 +70,7 @@ use rmcp::model::ElicitationCapability;
 use rmcp::model::Implementation;
 use rmcp::model::InitializeRequestParams;
 use rmcp::model::ProtocolVersion;
+use rmcp::model::ServerPeerInfo;
 use rmcp::model::Tool as RmcpTool;
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
@@ -316,10 +317,10 @@ impl ManagedClientStartup {
             .startup_timeout_sec
             .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
         let cancel_token_for_fut = cancel_token;
-        let tool_catalog_fetch_ticket = tool_catalog_cache_context
-            .as_ref()
-            .map(McpToolCatalogCacheContext::begin_fetch);
         async move {
+            let tool_catalog_fetch_ticket = tool_catalog_cache_context
+                .as_ref()
+                .map(McpToolCatalogCacheContext::begin_fetch);
             let refresh_start = is_codex_apps_mcp_server.then(Instant::now);
             let outcome = match async {
                 if let Err(error) = validate_mcp_server_name(&server_name) {
@@ -879,10 +880,12 @@ async fn start_server_task(
         mcp_initialize_request_params(client_elicitation_capability, client_mcp_extensions);
     let send_elicitation = elicitation_requests.make_sender(server_name.clone(), tx_event);
 
+    let started_at = Instant::now();
     let initialize_result = client
         .initialize(params, startup_timeout, send_elicitation)
-        .await
-        .map_err(StartupOutcomeError::from)?;
+        .await;
+    record_protocol_discovery_metrics(client.protocol_mode(), started_at, &initialize_result);
+    let initialize_result = initialize_result.map_err(StartupOutcomeError::from)?;
 
     let server_disables_tool_catalog_cache = initialize_result
         .capabilities
@@ -954,6 +957,33 @@ async fn start_server_task(
     };
 
     Ok(managed)
+}
+
+fn record_protocol_discovery_metrics(
+    mode: McpProtocolMode,
+    started_at: Instant,
+    result: &Result<ServerPeerInfo>,
+) {
+    let Some(metrics) = codex_otel::global() else {
+        return;
+    };
+
+    let mode = match mode {
+        McpProtocolMode::Legacy => "legacy",
+        McpProtocolMode::V20260728 => "auto",
+    };
+    let outcome = match result {
+        Ok(result) if result.protocol_version == ProtocolVersion::V_2026_07_28 => "modern",
+        Ok(_) => "legacy",
+        Err(_) => "failure",
+    };
+    let tags = [("mode", mode), ("outcome", outcome)];
+    let _ = metrics.counter("codex.mcp.protocol_discovery", /*inc*/ 1, &tags);
+    let _ = metrics.record_duration(
+        "codex.mcp.protocol_discovery.duration_ms",
+        started_at.elapsed(),
+        &tags,
+    );
 }
 
 fn mcp_initialize_request_params(
@@ -1061,7 +1091,7 @@ async fn make_rmcp_client(
                 // `ExecutorStdioServerLauncher` once the executor-backed path
                 // preserves `LocalStdioServerLauncher` semantics.
                 Arc::new(LocalStdioServerLauncher::new(
-                    runtime_context.local_stdio_fallback_cwd(),
+                    runtime_context.local_process_cwd(),
                 )) as Arc<dyn StdioServerLauncher>
             } else {
                 let Some(environment) = resolved_environment.as_ref() else {
@@ -1092,11 +1122,11 @@ async fn make_rmcp_client(
             http_headers,
             env_http_headers,
             bearer_token_env_var,
+            http_headers_helper: _,
         } => {
-            let http_client = resolved_environment.as_ref().map_or_else(
-                || runtime_context.local_http_client(),
-                |environment| environment.get_http_client(),
-            );
+            let http_client = runtime_context
+                .http_client_for_server(server.config(), resolved_environment.as_ref())
+                .map_err(|error| StartupOutcomeError::from(anyhow!(error)))?;
             let http_client = maybe_with_openai_docs_source_attribution(&url, http_client);
             let resolved_bearer_token =
                 match resolve_bearer_token(server_name, bearer_token_env_var.as_deref()) {

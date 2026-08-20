@@ -16,8 +16,6 @@ pub use plugin_namespace::SUPPORTED_AGENT_PLUGIN_SCHEMA_URIS;
 pub use plugin_namespace::agent_plugin_schema_status;
 pub use plugin_namespace::find_plugin_manifest_path;
 pub use plugin_namespace::plugin_namespace_for_root_uri;
-pub use plugin_namespace::plugin_namespace_for_skill_path;
-pub use plugin_namespace::plugin_namespace_for_skill_uri;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum SkillDiscoveryMode {
@@ -40,4 +38,16 @@ pub struct PluginSkillRoot {
     pub plugin_namespace: String,
     pub plugin_root: AbsolutePathBuf,
     pub discovery_mode: SkillDiscoveryMode,
+}
+
+/// Directory containing private plugin metadata.
+const PLUGIN_METADATA_DIR: &str = ".codex-plugin";
+/// Directory containing commands converted into skills during plugin installation.
+const MIGRATED_COMMAND_SKILLS_DIR: &str = "migrated-command-skills";
+
+/// Returns the install-time command migration output directory for a plugin.
+pub fn migrated_command_skills_root(plugin_root: &AbsolutePathBuf) -> AbsolutePathBuf {
+    plugin_root
+        .join(PLUGIN_METADATA_DIR)
+        .join(MIGRATED_COMMAND_SKILLS_DIR)
 }

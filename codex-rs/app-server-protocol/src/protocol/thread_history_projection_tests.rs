@@ -3,18 +3,20 @@ use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
-use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::security_risk::SecurityRiskScore;
 use codex_protocol::user_input::UserInput;
+use codex_rollout::CompactedItem;
+use codex_rollout::RolloutItem;
+use codex_rollout::RolloutLine;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 
 use super::*;
 use crate::protocol::v2::ThreadItem;
@@ -200,9 +202,14 @@ fn ignores_legacy_abort_without_turn_id_and_context_only_records() {
         previous_window_id: None,
         window_id: None,
     }));
+    let security_risk = project(RolloutItem::SecurityRiskScore(SecurityRiskScore {
+        scores: BTreeMap::from([("action_risk".to_string(), 0.92)]),
+        sampled_at: None,
+    }));
 
     assert!(aborted.is_empty());
     assert!(compacted.is_empty());
+    assert!(security_risk.is_empty());
 }
 
 #[test]

@@ -35,7 +35,7 @@ What this fork does:
 - tracks upstream OpenAI Codex closely
 - builds native Android ARM64 binaries for Termux
 - applies only the compatibility patches upstream does not ship
-- publishes GitHub release assets and an npm package for Termux users
+- publishes a tested npm package for Termux users
 
 What this fork does not do:
 
@@ -49,15 +49,15 @@ What this fork does not do:
 - self-update points to `DioNanos/codex-termux` and `@mmmbuto/codex-cli-termux`
 - packaged wrappers set `CODEX_SELF_EXE` to the native ELF, sanitize `LD_LIBRARY_PATH`, and bundle `libc++_shared.so`
 - Android binaries are linked with `RUNPATH=$ORIGIN`
-- `exec`/code-mode now runs for real on Android via the in-process V8 runtime (no longer a stub) - the meaningful capability gain on Termux
+- `exec`/code-mode now runs for real on Android via the in-process V8 runtime (no longer a stub) — the meaningful capability gain on Termux
 - realtime voice/audio is no longer part of this build: upstream removed the TUI realtime voice feature (openai/codex#27801), so the fork's Android cpal/oboe enablement toggle (never usable from the Termux CLI anyway, as the backend needs an Android JavaVM/Activity) was dropped with it. Termux-native audio remains tracked on the Codex VL roadmap.
 - Android PTY and lock-handling compatibility patches remain enabled where upstream behavior still breaks on Bionic/Termux
 
 ## Releases and Updates
 
-- Latest GitHub release: [releases/latest](https://github.com/DioNanos/codex-termux/releases/latest)
-- Upstream base: OpenAI Codex `rust-v0.147.0`, published as `0.147.0` on the npm
-  `latest` channel with a matching GitHub tag and release.
+- Upstream base: OpenAI Codex `rust-v0.148.0`, published as `0.148.0` on the npm
+  `next` channel. `latest` remains on the previously validated release until an
+  explicit promotion.
 - npm package: [`@mmmbuto/codex-cli-termux`](https://www.npmjs.com/package/@mmmbuto/codex-cli-termux)
 - Legacy `@mmmbuto/codex-cli-lts` (OpenAI Codex 0.80.x) is archived; current builds live in this package or in [`@mmmbuto/codex-vl`](https://www.npmjs.com/package/@mmmbuto/codex-vl) (multi-platform).
 
@@ -67,17 +67,17 @@ Maintainer publish flow:
   immutable npm tarball
 - land the validated full tree on `develop`
 - publish that unchanged tarball to `next`
-- promote the tested sanitized commit to clean GitHub `main`
-- point `latest` and `next` at the stable version, then publish the annotated
-  tag and GitHub release from `main`
-- publish a post-release Termux device-validation summary
+- keep the candidate on its temporary sanitized CI branch until it is approved
+- publish the unchanged tarball to `next`; GitHub `main`, tags and Releases are
+  separate promotion steps requiring explicit authorization
+- publish a Termux device-validation summary before a later stable promotion
 
 ## Documentation
 
 - [Changelog](./CHANGELOG.md)
 - [Patch inventory](./patches/README.md)
 - [Building from source](./BUILDING.md)
-- On-device validation of `0.147.0` on a physical Termux install is still
+- On-device validation of `0.148.0` on a physical Termux install is still
   outstanding; in particular the TLS trust store, since the Termux-specific root
   handling was retired when upstream removed the client it wrapped.
 - [Install docs](./docs/install.md)
@@ -103,8 +103,8 @@ To report a vulnerability, see [SECURITY.md](./SECURITY.md).
 
 ## Community guides
 
-- [OpenAI Codex CLI on Android via Termux](https://timharbakon.com/openai-codex-cli-android-termux/),
-  an independent third-party walkthrough covering Termux setup, the Bionic-libc incompatibility
+- [OpenAI Codex CLI on Android via Termux](https://timharbakon.com/openai-codex-cli-android-termux/)
+  — independent third-party walkthrough covering Termux setup, the Bionic-libc incompatibility
   this package solves, and a small Hono test project.
 
 ## License

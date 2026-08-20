@@ -234,7 +234,9 @@ async fn build_test_processor(
 ) {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
     let auth_manager =
-        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false)
+            .await
+            .expect("test auth manager");
     let config_manager = ConfigManager::new(
         config.codex_home.to_path_buf(),
         Vec::new(),
@@ -688,7 +690,7 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                 && span_attr(span, "rpc.method") == Some("turn/start")
                 && span.span_context.trace_id() == remote_trace_id
         }) && spans.iter().any(|span| {
-            span_attr(span, "codex.op") == Some("user_input")
+            span_attr(span, "codex.op") == Some("turn_input")
                 && span.span_context.trace_id() == remote_trace_id
         })
     })
@@ -697,8 +699,8 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
     let server_request_span =
         find_rpc_span_with_trace(&spans, SpanKind::Server, "turn/start", remote_trace_id);
     let core_turn_span =
-        find_span_with_trace(&spans, remote_trace_id, "codex.op=user_input", |span| {
-            span_attr(span, "codex.op") == Some("user_input")
+        find_span_with_trace(&spans, remote_trace_id, "codex.op=turn_input", |span| {
+            span_attr(span, "codex.op") == Some("turn_input")
         });
 
     assert_eq!(server_request_span.parent_span_id, remote_parent_span_id);

@@ -19,21 +19,28 @@ use std::ops::Range;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 use url::Url;
 use uuid::Uuid;
 
 use self::viewer::materialize_document;
 
-pub(crate) const DIRECTIVE_PREFIX: &str = "::codex-inline-vis{";
+const DIRECTIVE_PREFIX: &str = "::codex-inline-vis{";
+const CONTENT_REFERENCE_PREFIX: &str = "\u{e200}visualize\u{e202}";
+const CONTENT_REFERENCE_SUFFIX: char = '\u{e201}';
 const MAX_FRAGMENT_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct InlineVisualizationContext {
     visualizations_dir: PathBuf,
     thread_dir: PathBuf,
+    viewer_dir: PathBuf,
+    materialized_viewers: Arc<Mutex<HashMap<PathBuf, String>>>,
 }
 
 impl InlineVisualizationContext {
+    #[cfg(test)]
     pub(crate) fn new(codex_home: &Path, thread_id: ThreadId) -> Option<Self> {
         Self::new_with_writable_roots(codex_home, thread_id, std::iter::empty())
     }
@@ -42,15 +49,33 @@ impl InlineVisualizationContext {
         config: &crate::legacy_core::config::Config,
         thread_id: ThreadId,
     ) -> Option<Self> {
-        let writable_roots = config
-            .permissions
-            .file_system_sandbox_policy()
-            .get_writable_roots_with_cwd(config.cwd.as_path());
-        Self::new_with_writable_roots(
+        let file_system_policy = config.permissions.file_system_sandbox_policy();
+        if file_system_policy.has_full_disk_write_access() {
+            return None;
+        }
+        let writable_roots = file_system_policy.get_writable_roots_with_cwd(config.cwd.as_path());
+        let context = Self::new_with_writable_roots(
             config.codex_home.as_path(),
             thread_id,
             writable_roots.iter().map(|root| root.root.as_path()),
-        )
+        )?;
+        let viewer_caches = [
+            config.codex_home.as_path().join("visualization-viewers"),
+            context.viewer_dir.parent()?.parent()?.to_path_buf(),
+        ];
+        for viewer_cache in viewer_caches {
+            if file_system_policy.can_write_path_with_cwd(&viewer_cache, config.cwd.as_path())
+                || file_system_policy
+                    .can_write_path_with_cwd(viewer_cache.parent()?, config.cwd.as_path())
+                || writable_roots.iter().any(|root| {
+                    root.is_path_writable(&viewer_cache)
+                        || root.root.as_path().starts_with(&viewer_cache)
+                })
+            {
+                return None;
+            }
+        }
+        Some(context)
     }
 
     fn new_with_writable_roots<'a>(
@@ -58,6 +83,7 @@ impl InlineVisualizationContext {
         thread_id: ThreadId,
         writable_roots: impl IntoIterator<Item = &'a Path>,
     ) -> Option<Self> {
+        let codex_home = fs::canonicalize(codex_home).ok()?;
         let thread_id = thread_id.to_string();
         let uuid = Uuid::parse_str(&thread_id).ok()?;
         let timestamp = uuid.get_timestamp()?;
@@ -72,16 +98,27 @@ impl InlineVisualizationContext {
             [thread_dir] => (*thread_dir).to_path_buf(),
             _ => visualizations_dir
                 .join(created_at.format("%Y/%m/%d").to_string())
-                .join(thread_id),
+                .join(&thread_id),
         };
+        let artifact_thread_id = thread_dir.file_name()?.to_owned();
         Some(Self {
             visualizations_dir,
             thread_dir,
+            viewer_dir: codex_home
+                .join("visualization-viewers")
+                .join(thread_id)
+                .join(artifact_thread_id),
+            materialized_viewers: Arc::default(),
         })
     }
 
     fn link_for(&self, file: &str) -> Option<Url> {
-        let relative = Path::new(file);
+        let path = Path::new(file);
+        let relative = if path.is_absolute() {
+            path.strip_prefix(&self.thread_dir).ok()?
+        } else {
+            path
+        };
         if relative
             .extension()
             .and_then(|extension| extension.to_str())
@@ -103,7 +140,9 @@ impl InlineVisualizationContext {
         if !fragment_path.starts_with(&thread_dir) {
             return None;
         }
-        let viewer_path = materialize_document(&fragment_path, &thread_dir).ok()?;
+        let viewer_path =
+            materialize_document(&fragment_path, &self.viewer_dir, &self.materialized_viewers)
+                .ok()?;
         Url::from_file_path(viewer_path).ok()
     }
 }
@@ -138,11 +177,15 @@ pub(crate) struct TrustedFileLink {
     pub(crate) markdown_destination_label: String,
 }
 
+pub(crate) fn contains_inline_visualization(markdown: &str) -> bool {
+    markdown.contains(DIRECTIVE_PREFIX) || markdown.contains(CONTENT_REFERENCE_PREFIX)
+}
+
 pub(crate) fn rewrite_inline_visualizations<'a>(
     markdown: &'a str,
     context: Option<&InlineVisualizationContext>,
 ) -> InlineVisualizationRewrite<'a> {
-    if !markdown.contains(DIRECTIVE_PREFIX) {
+    if !contains_inline_visualization(markdown) {
         return InlineVisualizationRewrite {
             markdown: Cow::Borrowed(markdown),
             trusted_file_links: HashMap::new(),
@@ -179,12 +222,15 @@ pub(crate) fn rewrite_inline_visualizations<'a>(
         let is_code = code_block_ranges
             .iter()
             .any(|range| range.start < source_offset && line_start < range.end);
-        if is_code || !trimmed.starts_with(DIRECTIVE_PREFIX) {
+        if is_code
+            || (!trimmed.starts_with(DIRECTIVE_PREFIX)
+                && !trimmed.starts_with(CONTENT_REFERENCE_PREFIX))
+        {
             rewritten.push_str(line);
         } else if let Some(file) = parse_directive_file(trimmed) {
-            if let Some(destination) = context.and_then(|context| context.link_for(file)) {
+            if let Some(destination) = context.and_then(|context| context.link_for(&file)) {
                 let placeholder = link_placeholder();
-                let (markdown_label, display_label) = visualization_link_labels(file);
+                let (markdown_label, display_label) = visualization_link_labels(&file);
                 let markdown_destination_label = escape_markdown_label(destination.as_str());
                 rewritten.push_str(&format!(
                     "{markdown_label}  \n[{markdown_destination_label}]({placeholder})"
@@ -201,7 +247,9 @@ pub(crate) fn rewrite_inline_visualizations<'a>(
             } else {
                 rewritten.push_str("_Visualization unavailable on this device._");
             }
-        } else if trimmed.ends_with('}') {
+        } else if trimmed.ends_with(CONTENT_REFERENCE_SUFFIX)
+            || (trimmed.starts_with(DIRECTIVE_PREFIX) && trimmed.ends_with('}'))
+        {
             rewritten.push_str("_Visualization unavailable on this device._");
         }
         rewritten.push_str(newline);
@@ -243,13 +291,21 @@ fn link_placeholder() -> String {
     format!("https://codex.invalid/inline-visualization/{token}")
 }
 
-fn parse_directive_file(directive: &str) -> Option<&str> {
-    let attributes = directive
-        .strip_prefix(DIRECTIVE_PREFIX)?
-        .strip_suffix('}')?
-        .trim();
-    let value = attributes.strip_prefix("file=\"")?.strip_suffix('"')?;
-    (!value.is_empty() && !value.contains('"')).then_some(value)
+fn parse_directive_file(directive: &str) -> Option<Cow<'_, str>> {
+    if let Some(attributes) = directive.strip_prefix(DIRECTIVE_PREFIX) {
+        let attributes = attributes.strip_suffix('}')?.trim();
+        let value = attributes.strip_prefix("file=\"")?.strip_suffix('"')?;
+        return (!value.is_empty() && !value.contains('"')).then_some(Cow::Borrowed(value));
+    }
+
+    let payload = directive
+        .strip_prefix(CONTENT_REFERENCE_PREFIX)?
+        .strip_suffix(CONTENT_REFERENCE_SUFFIX)?;
+    let payload = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let path = payload.get("path")?.as_str()?;
+    Path::new(path)
+        .is_absolute()
+        .then(|| Cow::Owned(path.to_string()))
 }
 
 #[cfg(test)]

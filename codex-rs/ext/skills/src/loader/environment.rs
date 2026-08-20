@@ -10,6 +10,7 @@ use codex_skills::SkillDependencies;
 use codex_skills::SkillPolicy;
 use codex_skills::parse_skill_frontmatter_metadata;
 use codex_utils_path_uri::PathUri;
+use codex_utils_plugins::SkillDiscoveryMode;
 use futures::StreamExt;
 
 use super::MAX_QUALIFIED_NAME_LEN;
@@ -71,6 +72,7 @@ impl ParsedEnvironmentSkill {
             name: base_name,
             description,
             short_description,
+            model: _,
         } = parse_skill_frontmatter_metadata(&contents, || default_skill_name(&skill.path))
             .map_err(|err| err.to_string())?;
         let (dependencies, policy) = match &skill.metadata {
@@ -120,6 +122,7 @@ pub async fn load_environment_skills_from_root(
         SkillDiscoveryOptions {
             directory_symlinks: DirectorySymlinkPolicy::Follow,
             hidden_directories: HiddenDirectoryPolicy::Include,
+            mode: SkillDiscoveryMode::Recursive,
         },
     )
     .await;
@@ -238,6 +241,7 @@ pub fn load_environment_skills_from_discovery(
             name: base_name,
             description,
             short_description,
+            model: _,
         } = match parse_skill_frontmatter_metadata(&skill.instructions.contents, || {
             default_skill_name(&skill.instructions.path)
         }) {

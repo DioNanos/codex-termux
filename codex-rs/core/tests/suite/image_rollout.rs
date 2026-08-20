@@ -1,17 +1,23 @@
 use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_core::TurnInputRequest;
 use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use codex_utils_image::data_url_from_bytes;
 use core_test_support::TempDirExt;
@@ -48,15 +54,14 @@ fn find_user_message_with_image(text: &str) -> Option<ResponseItem> {
             Ok(rollout) => rollout,
             Err(_) => continue,
         };
-        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) =
-            &rollout.item
+        if let RolloutItem::ResponseItem(envelope) = &rollout.item
+            && let ResponseItem::Message { role, content, .. } = &envelope.item
             && role == "user"
             && content
                 .iter()
                 .any(|span| matches!(span, ContentItem::InputImage { .. }))
-            && let RolloutItem::ResponseItem(item) = rollout.item.clone()
         {
-            return Some(item);
+            return Some(envelope.item.clone());
         }
     }
     None
@@ -125,8 +130,8 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
         turn_permission_fields(PermissionProfile::Disabled, cwd.path());
 
     codex
-        .submit(Op::UserInput {
-            items: vec![
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![
                 UserInput::LocalImage {
                     path: abs_path.clone(),
                     detail: None,
@@ -135,26 +140,23 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
                     text: "pasted image".to_string(),
                     text_elements: Vec::new(),
                 },
-            ],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            ])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(cwd.abs())),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: session_model,
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
@@ -224,8 +226,8 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
         turn_permission_fields(PermissionProfile::Disabled, cwd.path());
 
     codex
-        .submit(Op::UserInput {
-            items: vec![
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![
                 UserInput::Image {
                     image_url: image_url.clone(),
                     detail: None,
@@ -234,26 +236,23 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
                     text: "dropped image".to_string(),
                     text_elements: Vec::new(),
                 },
-            ],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            ])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(cwd.abs())),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: session_model,
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
@@ -326,16 +325,18 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
         .collect::<serde_json::Result<Vec<_>>>()?;
     let historical_content = rollout_lines
         .iter_mut()
-        .find_map(|line| match &mut line.item {
-            RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. })
-                if role == "user"
-                    && content.iter().any(|item| {
-                        matches!(item, ContentItem::InputText { text } if text == "historical image")
-                    }) =>
-            {
-                Some(content)
-            }
-            _ => None,
+        .find_map(|line| {
+            let RolloutItem::ResponseItem(envelope) = &mut line.item else {
+                return None;
+            };
+            let ResponseItem::Message { role, content, .. } = &mut envelope.item else {
+                return None;
+            };
+            (role == "user"
+                && content.iter().any(|item| {
+                    matches!(item, ContentItem::InputText { text } if text == "historical image")
+                }))
+            .then_some(content)
         })
         .context("historical user message in rollout")?;
     historical_content.insert(
@@ -354,6 +355,9 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
 
     let mut resume_builder = test_codex().with_config(|config| {
         let _ = config.features.enable(Feature::ImageResizeNotice);
+        let _ = config
+            .features
+            .enable(Feature::RetainClientDeveloperMessages);
     });
     let resumed = resume_builder
         .resume(&server, initial.home.clone(), rollout_path.clone())
@@ -369,16 +373,10 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
     .await;
     resumed
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Image {
-                image_url: original_image_url,
-                detail: Some(ImageDetail::High),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Image {
+            image_url: original_image_url.clone(),
+            detail: Some(ImageDetail::High),
+        }]))
         .await?;
     wait_for_event(&resumed.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -445,7 +443,7 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
 
     resumed.codex.shutdown_and_wait().await?;
     let replayed = resume_builder
-        .resume(&server, resumed.home.clone(), rollout_path)
+        .resume(&server, resumed.home.clone(), rollout_path.clone())
         .await?;
     let replayed_mock = responses::mount_sse_once(
         &server,
@@ -464,6 +462,54 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
         .filter(|text| text.starts_with("<image_resize_notice>"))
         .collect::<Vec<_>>();
     assert_eq!(replayed_notices, vec![expected_notice.to_string()]);
+
+    let replayed = test_codex()
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::ImageResizeNotice);
+            let _ = config
+                .features
+                .enable(Feature::RetainClientDeveloperMessages);
+        })
+        .restart(&server, &replayed)
+        .await?;
+    let existing_rollout_lines = fs::read_to_string(&rollout_path)?.lines().count();
+    replayed
+        .codex
+        .inject_response_items(vec![
+            ResponseInputItem::Message {
+                role: "user".to_string(),
+                content: vec![ContentItem::InputImage {
+                    image_url: original_image_url,
+                    detail: Some(ImageDetail::High),
+                }],
+                phase: None,
+            }
+            .into(),
+            ResponseInputItem::Message {
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "<image_resize_notice>client message</image_resize_notice>".to_string(),
+                }],
+                phase: None,
+            }
+            .into(),
+        ])
+        .await?;
+    let persisted_developer_metadata = fs::read_to_string(&rollout_path)?
+        .lines()
+        .skip(existing_rollout_lines)
+        .filter_map(|line| {
+            let RolloutItem::ResponseItem(envelope) = serde_json::from_str::<RolloutLine>(line)
+                .expect("new rollout line should deserialize")
+                .item
+            else {
+                return None;
+            };
+            matches!(envelope.item, ResponseItem::Message { role, .. } if role == "developer")
+                .then(|| envelope.metadata.map(|metadata| metadata.client_authored))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(persisted_developer_metadata, vec![None, Some(true)]);
 
     Ok(())
 }

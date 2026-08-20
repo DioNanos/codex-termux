@@ -1,8 +1,9 @@
 //! Replays normalized legacy rollout records into canonical paginated JSONL.
 //!
 //! `line_parser` makes old JSON shapes parseable, `legacy_event` converts obsolete completion
-//! events into modern turn items. This module assigns stable ordinals, keeps `SessionMeta` at
-//! ordinal zero, and emits the surviving history selected by the caller.
+//! events into modern turn items. Rollback planning happens before this writer sees a record, so
+//! this module only assigns stable ordinals, keeps `SessionMeta` at ordinal zero, and emits the
+//! already-selected surviving history.
 //!
 //! The goal is to preserve the model-visible conversation, not to preserve every legacy record
 //! byte-for-byte. Filesystem publishing and SQLite projection intentionally live outside this
@@ -16,11 +17,11 @@ use codex_protocol::items::parse_hook_prompt_message;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_rollout::RolloutItem;
+use codex_rollout::RolloutLine;
 use std::collections::HashSet;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -52,7 +53,6 @@ pub(super) struct LegacyRolloutCanonicalizer {
     active_turn: Option<ActiveTurn>,
     known_turn_ids: HashSet<String>,
     reasoning: Option<ReasoningItem>,
-    saw_source_session_meta: bool,
 }
 
 impl LegacyRolloutCanonicalizer {
@@ -67,16 +67,15 @@ impl LegacyRolloutCanonicalizer {
             active_turn: None,
             known_turn_ids: HashSet::new(),
             reasoning: None,
-            saw_source_session_meta: false,
         }
-    }
-
-    pub(super) fn output_byte_offset(&self) -> u64 {
-        self.output_byte_offset
     }
 
     pub(super) fn next_ordinal(&self) -> u64 {
         self.next_ordinal
+    }
+
+    pub(super) fn output_byte_offset(&self) -> u64 {
+        self.output_byte_offset
     }
 
     pub(super) async fn write_head_session_meta(
@@ -114,21 +113,14 @@ impl LegacyRolloutCanonicalizer {
         let timestamp = line.timestamp;
         let bytes_before = self.bytes_written;
         match line.item {
-            RolloutItem::SessionMeta(metadata) => {
-                if !self.saw_source_session_meta {
-                    self.saw_source_session_meta = true;
-                    return Ok(0);
-                }
-                self.write_item(writer, &timestamp, RolloutItem::SessionMeta(metadata))
-                    .await?;
-            }
-            RolloutItem::ResponseItem(ResponseItem::Other) => {
-                return Err(migration_error(
-                    "legacy rollout contains an unsupported response item",
-                ));
-            }
+            RolloutItem::SessionMeta(_) => return Ok(0),
             RolloutItem::ResponseItem(response) => {
-                let hook = match &response {
+                if matches!(&response.item, ResponseItem::Other) {
+                    return Err(migration_error(
+                        "legacy rollout contains an unsupported response item",
+                    ));
+                }
+                let hook = match &response.item {
                     ResponseItem::Message {
                         role, content, id, ..
                     } if role == "user" => parse_hook_prompt_message(id.as_deref(), content),
@@ -300,6 +292,7 @@ impl LegacyRolloutCanonicalizer {
             }
             item @ (RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::TurnContext(_)
+            | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::WorldState(_)) => {
                 self.write_item(writer, &timestamp, item).await?;
             }

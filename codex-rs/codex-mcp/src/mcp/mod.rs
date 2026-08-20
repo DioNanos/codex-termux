@@ -53,6 +53,7 @@ use crate::connection_manager::McpConnectionSet;
 use crate::runtime::McpPublicationGate;
 use crate::runtime::McpRuntimeContext;
 use crate::runtime::McpRuntimeInput;
+use crate::runtime::McpStartupPolicy;
 use crate::server::EffectiveMcpServer;
 use crate::tools::ToolInfo;
 
@@ -359,6 +360,7 @@ pub async fn read_mcp_resource(
         /*previous*/ None,
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(runtime_config),
             plugins_available: false,
             ready_selected_capability_roots: Vec::new(),
@@ -436,6 +438,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         /*previous*/ None,
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(runtime_config),
             plugins_available: false,
             ready_selected_capability_roots: Vec::new(),
@@ -562,6 +565,7 @@ fn mcp_server_config_for_url(
             bearer_token_env_var: codex_apps_mcp_bearer_token_env_var(),
             http_headers: Some(http_headers),
             env_http_headers,
+            http_headers_helper: None,
         },
         auth: auth_mode,
         environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),

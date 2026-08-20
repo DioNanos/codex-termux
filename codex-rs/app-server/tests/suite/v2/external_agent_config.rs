@@ -8,6 +8,16 @@ use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::start_analytics_events_server;
 use app_test_support::write_chatgpt_auth;
+#[cfg(unix)]
+use codex_app_server_protocol::ConfigReadParams;
+#[cfg(unix)]
+use codex_app_server_protocol::ConfigReadResponse;
+#[cfg(unix)]
+use codex_app_server_protocol::ConfigRequirementsReadResponse;
+#[cfg(unix)]
+use codex_app_server_protocol::ConfigValueWriteParams;
+#[cfg(unix)]
+use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::ExternalAgentConfigDetectResponse;
 use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
 use codex_app_server_protocol::ExternalAgentConfigImportHistoriesReadResponse;
@@ -17,6 +27,8 @@ use codex_app_server_protocol::ExternalAgentConfigImportResponse;
 use codex_app_server_protocol::ExternalAgentConfigMigrationItemType;
 use codex_app_server_protocol::ExternalAgentImportedConnectorCandidate;
 use codex_app_server_protocol::ExternalAgentImportedConnectorSource;
+#[cfg(unix)]
+use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::PluginListParams;
 use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::RequestId;
@@ -30,6 +42,8 @@ use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
+#[cfg(unix)]
+use codex_app_server_protocol::WriteStatus;
 use codex_config::types::AuthCredentialsStoreMode;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
@@ -123,6 +137,115 @@ async fn external_agent_config_detect_accepts_migration_source_and_defaults_unkn
     );
     let expected = responses[0].clone();
     assert_eq!(responses, vec![expected; 4]);
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_agent_config_detect_does_not_block_configuration_reads() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let project_root = codex_home.path().join("repo");
+    let session_dir = external_agent_home(codex_home.path()).join("projects/repo");
+    let session_path = session_dir.join("session.jsonl");
+    std::fs::create_dir_all(&project_root)?;
+    std::fs::create_dir_all(&session_dir)?;
+    let status = std::process::Command::new("mkfifo")
+        .arg(&session_path)
+        .status()?;
+    assert!(status.success());
+
+    let home_dir = codex_home.path().display().to_string();
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("HOME", Some(home_dir.as_str()))])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let detect_request_id = mcp
+        .send_raw_request(
+            "externalAgentConfig/detect",
+            Some(serde_json::json!({ "includeHome": true })),
+        )
+        .await?;
+
+    // Opening the FIFO for writing succeeds only after detection opens it for
+    // reading. Keep the writer open without writing so transcript parsing stays
+    // blocked while unrelated configuration requests run.
+    let mut blocked_session_writer = timeout(
+        DEFAULT_TIMEOUT,
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&session_path),
+    )
+    .await??;
+
+    let config_request_id = mcp
+        .send_config_read_request(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+    let _: ConfigReadResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(config_request_id)).await??;
+
+    let requirements_request_id = mcp.send_config_requirements_read_request().await?;
+    let _: ConfigRequirementsReadResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(requirements_request_id)).await??;
+
+    let write_request_id = mcp
+        .send_config_value_write_request(ConfigValueWriteParams {
+            file_path: None,
+            key_path: "model".to_string(),
+            value: serde_json::json!("gpt-concurrent"),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await?;
+    let write: ConfigWriteResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(write_request_id)).await??;
+    assert_eq!(write.status, WriteStatus::Ok);
+
+    let import_request_id = mcp
+        .send_raw_request(
+            "externalAgentConfig/import",
+            Some(serde_json::json!({ "migrationItems": [] })),
+        )
+        .await?;
+    let import_response: ExternalAgentConfigImportResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(import_request_id)).await??;
+    assert!(!import_response.import_id.is_empty());
+
+    let recent_timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let session_contents = serde_json::json!({
+        "type": "user",
+        "cwd": &project_root,
+        "timestamp": &recent_timestamp,
+        "message": { "content": "first request" },
+    })
+    .to_string();
+
+    // Later connector discovery reopens the transcript. Replace the named FIFO
+    // before releasing its existing reader so subsequent opens see a real file.
+    std::fs::remove_file(&session_path)?;
+    std::fs::write(&session_path, &session_contents)?;
+    blocked_session_writer
+        .write_all(session_contents.as_bytes())
+        .await?;
+    drop(blocked_session_writer);
+
+    let detected: ExternalAgentConfigDetectResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(detect_request_id)).await??;
+    assert_eq!(detected.items.len(), 1);
+    assert_eq!(
+        detected.items[0].item_type,
+        ExternalAgentConfigMigrationItemType::Sessions
+    );
+    assert!(
+        std::fs::read_to_string(codex_home.path().join("config.toml"))?
+            .contains("model = \"gpt-concurrent\"")
+    );
 
     Ok(())
 }
@@ -249,23 +372,13 @@ async fn external_agent_config_secondary_source_imports_session_and_plugin_end_t
 {
     let codex_home = TempDir::new()?;
     let source_home = secondary_external_agent_home(codex_home.path());
-    let project_root = codex_home.path().join("workspace with.dots_and-dashes");
+    let project_root = codex_home.path().join("my-project");
     std::fs::create_dir_all(&project_root)?;
 
     let encoded_project = project_root
         .to_string_lossy()
         .trim_start_matches(['/', '\\'])
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    #[cfg(windows)]
-    let encoded_project = encoded_project.replacen("--", "-", /*count*/ 1);
+        .replace([':', '/', '\\'], "-");
     let session_path = source_home
         .join("projects")
         .join(encoded_project)
@@ -1250,6 +1363,111 @@ async fn external_agent_config_import_completed_tracks_analytics_event() -> Resu
     assert_eq!(event_params["failure_stage"], "session_missing");
     assert_eq!(event_params["error_type"], "session_missing");
     assert_eq!(event_params["sub_error_type"], "session_not_detected");
+    assert!(event_params.get("raw_errors").is_none());
+    assert!(event_params.get("message").is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn external_agent_config_import_reports_session_config_error_subtype() -> Result<()> {
+    let analytics_server = start_analytics_events_server().await?;
+    let codex_home = TempDir::new()?;
+    write_analytics_config(codex_home.path(), &analytics_server.uri())?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let project_root = codex_home.path().join("repo");
+    let session_dir = external_agent_home(codex_home.path()).join("projects/repo");
+    let session_path = session_dir.join("session.jsonl");
+    let recent_timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    std::fs::create_dir_all(&project_root)?;
+    std::fs::create_dir_all(&session_dir)?;
+    std::fs::write(
+        &session_path,
+        serde_json::json!({
+            "type": "user",
+            "cwd": &project_root,
+            "timestamp": &recent_timestamp,
+            "message": { "content": "first request" },
+        })
+        .to_string(),
+    )?;
+
+    let home_dir = codex_home.path().display().to_string();
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("HOME", Some(home_dir.as_str()))])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "chatgpt_base_url = [",
+    )?;
+
+    let request_id = mcp
+        .send_raw_request(
+            "externalAgentConfig/import",
+            Some(serde_json::json!({
+                "source": "test_import",
+                "providerId": "test-provider-42",
+                "migrationItems": [{
+                    "itemType": "SESSIONS",
+                    "description": "Migrate recent sessions",
+                    "cwd": null,
+                    "details": {
+                        "sessions": [{
+                            "path": session_path,
+                            "cwd": project_root,
+                            "title": "first request"
+                        }]
+                    }
+                }]
+            })),
+        )
+        .await?;
+    let response: ExternalAgentConfigImportResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+    let import_id = assert_import_response(response);
+    let completed: ExternalAgentConfigImportCompletedNotification = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_notification("externalAgentConfig/import/completed"),
+    )
+    .await??;
+    assert_eq!(completed.import_id, import_id);
+    assert_eq!(completed.item_type_results.len(), 1);
+    assert_eq!(completed.item_type_results[0].successes.len(), 0);
+    assert_eq!(completed.item_type_results[0].failures.len(), 1);
+    let failure = &completed.item_type_results[0].failures[0];
+    assert_eq!(failure.failure_stage, "session_persist");
+    assert_eq!(
+        failure.sub_error_type.as_deref(),
+        Some("failed_to_load_session_config_invalid_data")
+    );
+
+    let event = wait_for_analytics_event(
+        &analytics_server,
+        DEFAULT_TIMEOUT,
+        "codex_onboarding_external_agent_import_failure",
+    )
+    .await?;
+    let event_params = &event["event_params"];
+    assert_eq!(event_params["import_id"], serde_json::json!(import_id));
+    assert_eq!(event_params["source"], "test_import");
+    assert_eq!(event_params["provider_id"], "test-provider-42");
+    assert_eq!(event_params["type"], "SESSIONS");
+    assert_eq!(event_params["failure_stage"], "session_persist");
+    assert_eq!(
+        event_params["sub_error_type"],
+        "failed_to_load_session_config_invalid_data"
+    );
     assert!(event_params.get("raw_errors").is_none());
     assert!(event_params.get("message").is_none());
 

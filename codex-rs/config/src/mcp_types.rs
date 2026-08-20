@@ -30,6 +30,22 @@ pub enum AppToolApproval {
     Approve,
 }
 
+impl AppToolApproval {
+    /// Requires approval whenever either policy could require it.
+    ///
+    /// `Auto` and `Writes` are incomparable: each can require approval for a
+    /// tool the other would approve. Their conservative intersection is `Prompt`.
+    pub fn restrict_to(self, requested: Self) -> Self {
+        match (self, requested) {
+            (Self::Prompt, _) | (_, Self::Prompt) => Self::Prompt,
+            (Self::Approve, mode) | (mode, Self::Approve) => mode,
+            (Self::Auto, Self::Auto) => Self::Auto,
+            (Self::Writes, Self::Writes) => Self::Writes,
+            (Self::Auto, Self::Writes) | (Self::Writes, Self::Auto) => Self::Prompt,
+        }
+    }
+}
+
 /// Human-readable reason a configured MCP server was disabled after requirements
 /// were applied.
 ///
@@ -129,6 +145,10 @@ pub struct McpServerOAuthConfig {
     /// Explicit OAuth client identifier to present during authorization and token exchange.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+
+    /// Fixed callback port that takes precedence over Codex's global OAuth callback port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_port: Option<u16>,
 }
 
 /// Authentication flow Codex attempts after resolving an HTTP MCP server's
@@ -256,6 +276,18 @@ impl McpServerConfig {
             .as_ref()
             .and_then(|oauth| oauth.client_id.as_deref())
     }
+
+    pub fn oauth_callback_port(&self, global_callback_port: Option<u16>) -> Option<u16> {
+        let callback_port = self.oauth.as_ref().and_then(|oauth| oauth.callback_port);
+        if let Some(callback_port) = callback_port {
+            tracing::info!(
+                callback_port,
+                ?global_callback_port,
+                "using plugin-specific MCP OAuth callback port instead of the global callback port"
+            );
+        }
+        callback_port.or(global_callback_port)
+    }
 }
 
 /// Raw MCP config shape used for deserialization and supported-field JSON
@@ -289,6 +321,7 @@ pub struct RawMcpServerConfig {
     #[schemars(skip)]
     pub bearer_token: Option<String>,
     pub bearer_token_env_var: Option<String>,
+    pub http_headers_helper: Option<String>,
 
     // shared
     #[serde(default)]
@@ -344,6 +377,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             url,
             bearer_token,
             bearer_token_env_var,
+            http_headers_helper,
             environment_id,
             auth,
             startup_timeout_sec,
@@ -386,6 +420,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
                 bearer_token_env_var.as_ref(),
             )?;
             throw_if_set("stdio", "bearer_token", bearer_token.as_ref())?;
+            throw_if_set("stdio", "http_headers_helper", http_headers_helper.as_ref())?;
             throw_if_set("stdio", "http_headers", http_headers.as_ref())?;
             throw_if_set("stdio", "env_http_headers", env_http_headers.as_ref())?;
             throw_if_set("stdio", "oauth", oauth.as_ref())?;
@@ -408,11 +443,27 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             throw_if_set("streamable_http", "env_vars", env_vars.as_ref())?;
             throw_if_set("streamable_http", "cwd", cwd.as_ref())?;
             throw_if_set("streamable_http", "bearer_token", bearer_token.as_ref())?;
+            if http_headers_helper
+                .as_deref()
+                .is_some_and(|command| command.trim().is_empty())
+            {
+                return Err("http_headers_helper must not be empty".to_string());
+            }
+            if environment_id
+                .as_deref()
+                .is_some_and(|environment_id| environment_id != DEFAULT_MCP_SERVER_ENVIRONMENT_ID)
+                && http_headers_helper.is_some()
+            {
+                return Err(
+                    "http_headers_helper is only supported for local MCP servers".to_string(),
+                );
+            }
             McpServerTransportConfig::StreamableHttp {
                 url,
                 bearer_token_env_var,
                 http_headers,
                 env_http_headers,
+                http_headers_helper,
             }
         } else {
             return Err("invalid transport".to_string());
@@ -487,6 +538,10 @@ pub enum McpServerTransportConfig {
         /// HTTP headers where the value is sourced from an environment variable.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env_http_headers: Option<HashMap<String, String>>,
+        /// Local-only shell command that prints a JSON object of dynamic HTTP headers.
+        /// The command may be visible to local process inspection; do not embed credentials.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        http_headers_helper: Option<String>,
     },
 }
 

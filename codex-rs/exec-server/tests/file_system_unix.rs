@@ -117,7 +117,7 @@ set -euo pipefail
 
 for arg in "$@"; do
   if [[ "${arg}" == "--help" ]]; then
-    echo "Usage: bwrap --argv0 --perms"
+    echo "Usage: bwrap --argv0 --perms --as-pid-1"
     exit 0
   fi
 done
@@ -628,6 +628,16 @@ async fn file_system_sandboxed_read_rejects_symlink_escape(
         Ok(_) => anyhow::bail!("read should be blocked"),
         Err(error) => error,
     };
+    assert_sandbox_denied(&error);
+
+    let error = file_system
+        .read_file_stream(
+            &PathUri::from_host_native_path(&requested_path)?,
+            Some(&sandbox),
+        )
+        .await
+        .err()
+        .context("streaming read should be blocked")?;
     assert_sandbox_denied(&error);
 
     Ok(())

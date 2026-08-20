@@ -15,6 +15,7 @@ use crate::protocol::item_builders::convert_patch_changes;
 use crate::protocol::item_builders::review_output_text;
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_extension_items::ExtensionItem;
+pub use codex_extension_items::image_generation::ImageGenerationFailure;
 pub use codex_extension_items::image_generation::ImageGenerationItem;
 pub use codex_extension_items::sleep::SleepItem;
 pub use codex_extension_items::web_search::WebSearchAction;
@@ -81,6 +82,9 @@ impl From<CoreReviewDecision> for CommandExecutionApprovalDecision {
     fn from(value: CoreReviewDecision) -> Self {
         match value {
             CoreReviewDecision::Approved => Self::Accept,
+            // MCP approvals are handled through elicitations, so an MCP policy amendment should
+            // never appear in a command execution approval. To be cautious here, we fail closed.
+            CoreReviewDecision::ApprovedMcpPolicyAmendment => Self::Decline,
             CoreReviewDecision::ApprovedExecpolicyAmendment {
                 proposed_execpolicy_amendment,
             } => Self::AcceptWithExecpolicyAmendment {
@@ -929,6 +933,7 @@ impl From<CoreTurnItem> for ThreadItem {
                     revised_prompt: image.revised_prompt,
                     result: image.result,
                     transparent_background: None,
+                    failure: None,
                     saved_path: image.saved_path,
                 })
             }

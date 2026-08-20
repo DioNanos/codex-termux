@@ -23,8 +23,8 @@ use crate::telemetry::DbKind;
 use crate::telemetry::DbTelemetry;
 use chrono::DateTime;
 use chrono::Utc;
+use codex_history::RolloutItem;
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::RolloutItem;
 use serde_json::Value;
 use sqlx::QueryBuilder;
 use sqlx::Row;
@@ -47,6 +47,7 @@ mod memories;
 mod queued_items;
 mod recovery;
 mod remote_control;
+mod rollout_migration;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod thread_section_order;

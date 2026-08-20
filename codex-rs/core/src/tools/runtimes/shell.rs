@@ -10,6 +10,8 @@ pub(crate) mod zsh_fork_backend;
 
 use crate::exec::ExecCapturePolicy;
 use crate::guardian::GuardianNetworkAccessTrigger;
+use crate::plugins::metrics::finish_and_track_measurements;
+use crate::plugins::metrics::sidecar_for_command;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::SandboxPermissions;
 use crate::sandboxing::execute_env;
@@ -35,10 +37,12 @@ use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
+use codex_core_plugins::PluginMetricsSidecar;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_sandboxing::SandboxablePreference;
+use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use codex_shell_command::powershell::prefix_powershell_script_with_utf8;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -101,7 +105,7 @@ impl ShellRuntime {
 
     fn stdout_stream(ctx: &ToolCtx) -> Option<crate::exec::StdoutStream> {
         Some(crate::exec::StdoutStream {
-            sub_id: ctx.turn.sub_id.clone(),
+            sub_id: ctx.step_context.turn.sub_id.clone(),
             call_id: ctx.call_id.clone(),
             tx_event: ctx.session.get_tx_event(),
         })
@@ -125,7 +129,7 @@ impl Approvable<ShellRequest> for ShellRuntime {
     ) -> std::io::Result<ApprovalAction> {
         Ok(ApprovalAction::Shell {
             id: call_id.to_string(),
-            environment_id: req.turn_environment.environment_id.clone(),
+            environment_id: req.turn_environment.selection.environment_id.clone(),
             command: req.command.clone(),
             hook_command: req.hook_command.clone(),
             cwd: PathUri::from_abs_path(&req.cwd),
@@ -182,7 +186,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 tty: None,
             },
             command: req.hook_command.clone(),
-            environment_id: req.turn_environment.environment_id.clone(),
+            environment_id: req.turn_environment.selection.environment_id.clone(),
             permission_profile: req.turn_environment.permission_profile().clone(),
         })
     }
@@ -207,8 +211,19 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         );
         let managed_network =
             managed_network_for_sandbox_permissions(req.network.as_ref(), sandbox_permissions);
-        let env = exec_env_for_sandbox_permissions(&req.env, sandbox_permissions);
+        let mut env = exec_env_for_sandbox_permissions(&req.env, sandbox_permissions);
         let explicit_env_overrides = req.explicit_env_overrides.clone();
+        let cwd = PathUri::from_abs_path(&req.cwd);
+        let metrics_sidecar = sidecar_for_command(
+            ctx,
+            &req.command,
+            &cwd,
+            req.turn_environment.environment.as_ref(),
+        )
+        .await;
+        if let Some(sidecar) = metrics_sidecar.as_ref() {
+            sidecar.install_output_env(&mut env);
+        }
         #[cfg(unix)]
         let (env, runtime_path_prepends) = {
             let mut env = env;
@@ -237,7 +252,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         let command = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
             req.shell_type.as_ref(),
-            attempt.sandbox,
+            attempt.sandbox_requested,
             attempt.windows_sandbox_level,
         );
         let command = if matches!(shell.shell_type, ShellType::PowerShell) {
@@ -246,39 +261,67 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             command
         };
 
-        if self.backend == ShellRuntimeBackend::ShellCommandZshFork {
-            match zsh_fork_backend::maybe_run_shell_command(req, attempt, ctx, &command).await? {
-                Some(out) => return Ok(out),
+        let zsh_fork_output = if self.backend == ShellRuntimeBackend::ShellCommandZshFork {
+            match zsh_fork_backend::maybe_run_shell_command(
+                req,
+                attempt,
+                ctx,
+                &command,
+                metrics_sidecar.as_ref(),
+            )
+            .await?
+            {
+                Some(out) => Some(out),
                 None => {
                     tracing::warn!(
                         "ZshFork backend specified, but conditions for using it were not met, falling back to normal execution",
                     );
+                    None
                 }
             }
-        }
-
-        let command =
-            build_sandbox_command(&command, &req.cwd, &env, req.additional_permissions.clone())?;
-        let mut expiration: crate::exec::ExecExpiration = req.timeout_ms.into();
-        expiration = expiration.with_cancellation(req.cancellation_token.clone());
-        if let Some(cancellation) = attempt.network_denial_cancellation_token.clone() {
-            expiration = expiration.with_cancellation(cancellation);
-        }
-        let options = ExecOptions {
-            expiration,
-            capture_policy: ExecCapturePolicy::ShellTool,
+        } else {
+            None
         };
-        let env = attempt
-            .env_for(
-                command,
-                options,
-                managed_network,
-                Some(&req.turn_environment.environment_id),
-            )
-            .map_err(ToolError::Codex)?;
-        let out = execute_env(env, Self::stdout_stream(ctx))
-            .await
-            .map_err(ToolError::Codex)?;
+        let out = if let Some(out) = zsh_fork_output {
+            out
+        } else {
+            let sidecar_permissions = metrics_sidecar
+                .as_ref()
+                .map(PluginMetricsSidecar::additional_permissions);
+            let additional_permissions = merge_permission_profiles(
+                req.additional_permissions.as_ref(),
+                sidecar_permissions.as_ref(),
+            );
+            let command = build_sandbox_command(&command, &req.cwd, &env, additional_permissions)?;
+            let mut expiration: crate::exec::ExecExpiration = req.timeout_ms.into();
+            expiration = expiration.with_cancellation(req.cancellation_token.clone());
+            if let Some(cancellation) = attempt.network_denial_cancellation_token.clone() {
+                expiration = expiration.with_cancellation(cancellation);
+            }
+            let options = ExecOptions {
+                expiration,
+                capture_policy: ExecCapturePolicy::ShellTool,
+            };
+            let env = attempt
+                .env_for(
+                    command,
+                    options,
+                    managed_network,
+                    Some(&req.turn_environment.selection.environment_id),
+                )
+                .map_err(ToolError::Codex)?;
+            execute_env(env, Self::stdout_stream(ctx))
+                .await
+                .map_err(ToolError::Codex)?
+        };
+        finish_and_track_measurements(
+            metrics_sidecar,
+            out.exit_code,
+            &ctx.session,
+            &ctx.step_context.turn,
+            &ctx.call_id,
+        )
+        .await;
         Ok(out)
     }
 }

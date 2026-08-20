@@ -7,8 +7,10 @@ use codex_config::ConfigLayerStack;
 use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
 use codex_core::StartThreadOptions;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_exec_server::CreateDirectoryOptions;
+use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ExtensionWarning;
@@ -17,7 +19,6 @@ use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use codex_skills_extension::HostSkillProvider;
 use codex_skills_extension::OrchestratorSkillProvider;
@@ -51,17 +52,20 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_remote;
 use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use sha1::Digest;
 use tempfile::TempDir;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use toml::toml;
 use wiremock::Mock;
+use wiremock::MockServer;
 use wiremock::Request;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
@@ -262,6 +266,34 @@ fn catalog_extensions(
     (Arc::new(extensions.build()), event_rx)
 }
 
+async fn wait_for_analytics_events(
+    server: &MockServer,
+    event_type: &str,
+    expected_count: usize,
+) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let events = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.url.path() == "/codex/analytics-events/events")
+            .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+            .flat_map(|payload| payload["events"].as_array().cloned().unwrap_or_default())
+            .filter(|event| event["event_type"] == event_type)
+            .collect::<Vec<_>>();
+        if events.len() >= expected_count {
+            return events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {event_type} analytics"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn configure_catalog_test(config: &mut Config) {
     config.include_skill_instructions = true;
     config
@@ -417,16 +449,10 @@ async fn rendered_catalogs_for_turns(
     let mut client_warning_messages = Vec::new();
     for _ in 0..turn_count {
         test.codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: "Inspect the available skills.".to_string(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "Inspect the available skills.".to_string(),
+                text_elements: Vec::new(),
+            }]))
             .await?;
         loop {
             match core_test_support::wait_for_event(&test.codex, |_| true).await {
@@ -554,30 +580,24 @@ async fn capability_sections_render_in_order_with_host_repo_and_plugin_skills() 
         .to_path_buf();
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![
-                UserInput::Text {
-                    text: "use all skills".to_string(),
-                    text_elements: Vec::new(),
-                },
-                UserInput::Skill {
-                    name: "host-search".to_string(),
-                    path: host_skill_path.clone(),
-                },
-                UserInput::Skill {
-                    name: "repo-search".to_string(),
-                    path: repo_skill_path.clone(),
-                },
-                UserInput::Skill {
-                    name: "sample:sample-search".to_string(),
-                    path: plugin_skill_path.clone(),
-                },
-            ],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![
+            UserInput::Text {
+                text: "use all skills".to_string(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Skill {
+                name: "host-search".to_string(),
+                path: host_skill_path.clone(),
+            },
+            UserInput::Skill {
+                name: "repo-search".to_string(),
+                path: repo_skill_path.clone(),
+            },
+            UserInput::Skill {
+                name: "sample:sample-search".to_string(),
+                path: plugin_skill_path.clone(),
+            },
+        ]))
         .await?;
 
     core_test_support::wait_for_event(&test.codex, |event| {
@@ -650,6 +670,151 @@ async fn capability_sections_render_in_order_with_host_repo_and_plugin_skills() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_plugin_skill_prompt_stays_bounded_without_skills_extension() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+
+    let codex_home = Arc::new(TempDir::new()?);
+    let plugin_root = codex_home
+        .path()
+        .join("plugins/cache/test/acme.tools/local");
+    let skill_dir = plugin_root.join("skills/review");
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::write(
+        plugin_root.join("plugin.json"),
+        r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"acme.tools","extensions":{"com.openai":{"interface":{"displayName":"Acme Developer Tools"}}}}"#,
+    )?;
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        format!(
+            "---\nname: review\ndescription: Review code\n---\n\n{}\nAGENT_SKILL_TRUNCATED_TAIL\n",
+            "x".repeat(9_000)
+        ),
+    )?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "[features]\nplugins = true\n\n[plugins.\"acme.tools@test\"]\nenabled = true\n",
+    )?;
+    let skill_path = dunce::canonicalize(skill_dir.join("SKILL.md"))?;
+    let mut builder = test_codex().with_home(codex_home);
+    let test = builder.build_with_auto_env(&server).await?;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Skill {
+            name: "acme.tools:review".into(),
+            path: skill_path,
+        }]))
+        .await?;
+    let warning = core_test_support::wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::Warning(warning)
+                if warning.message.contains("main prompt context limit")
+        )
+    })
+    .await;
+    core_test_support::wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let user_text = response
+        .single_request()
+        .message_input_texts("user")
+        .join("\n");
+    assert!(user_text.contains("acme.tools:review"));
+    assert!(!user_text.contains("AGENT_SKILL_TRUNCATED_TAIL"));
+    let EventMsg::Warning(warning) = warning else {
+        unreachable!("wait_for_event matched an Agent skill truncation warning")
+    };
+    assert!(warning.message.contains("acme.tools:review"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_skill_prompt_precedes_plugin_instructions() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+
+    let codex_home = Arc::new(TempDir::new()?);
+    let plugin_root = codex_home.path().join("plugins/cache/test/sample/local");
+    let skill_dir = plugin_root.join("skills/sample-search");
+    std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::write(
+        plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"sample","description":"inspect sample data"}"#,
+    )?;
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\ndescription: inspect sample data\n---\n\n# body\n",
+    )?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "[features]\nplugins = true\n\n[plugins.\"sample@test\"]\nenabled = true\n",
+    )?;
+    let skill_path = dunce::canonicalize(skill_dir.join("SKILL.md"))?;
+    let (extensions, _) =
+        catalog_extensions(SkillCatalog::default(), /*include_host_provider*/ true);
+    let mut builder = test_codex()
+        .with_home(codex_home)
+        .with_extensions(extensions);
+    let test = builder.build_with_auto_env(&server).await?;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![
+            UserInput::Skill {
+                name: "sample:sample-search".to_string(),
+                path: skill_path,
+            },
+            UserInput::Mention {
+                name: "sample".to_string(),
+                path: "plugin://sample@test".to_string(),
+            },
+        ]))
+        .await?;
+    core_test_support::wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let input = response.single_request().input();
+    let prompt_position = |expected: &str| {
+        input
+            .iter()
+            .position(|item| {
+                item["content"].as_array().is_some_and(|content| {
+                    content.iter().any(|part| {
+                        part["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(expected))
+                    })
+                })
+            })
+            .unwrap_or_else(|| panic!("missing prompt containing `{expected}`: {input:?}"))
+    };
+    let skill_position = prompt_position("<skill>\n<name>sample:sample-search</name>");
+    let plugin_position = prompt_position("Capabilities from the `sample` plugin:");
+    assert!(
+        skill_position < plugin_position,
+        "host skill prompts should precede plugin instructions: {input:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_only_orchestrator_skill_is_hidden_but_can_be_invoked() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -658,6 +823,10 @@ async fn explicit_only_orchestrator_skill_is_hidden_but_can_be_invoked() -> Resu
     const REFERENCED_RESOURCE: &str = "skill://demo/explicit-only/references/guide.md";
     const REFERENCED_CONTENTS: &str = "# Referenced guide";
     const READ_CALL_ID: &str = "read-explicit-only-resource";
+    const MAIN_READ_CALL_ID: &str = "read-explicit-only-main";
+    const REPEATED_MAIN_READ_CALL_ID: &str = "read-explicit-only-main-again";
+    const INVALID_CURSOR_CALL_ID: &str = "read-explicit-only-invalid-cursor";
+    const MISSING_PACKAGE_CALL_ID: &str = "read-missing-package";
 
     let server = responses::start_mock_server().await;
     let apps_server = AppsTestServer::mount(&server).await?;
@@ -671,8 +840,10 @@ async fn explicit_only_orchestrator_skill_is_hidden_but_can_be_invoked() -> Resu
                     "skills",
                     "read",
                     &json!({
-                        "authority": { "kind": "orchestrator" },
                         "package": SKILL_PACKAGE,
+                        "authority": {
+                            "kind": "orchestrator",
+                        },
                         "resource": REFERENCED_RESOURCE,
                     })
                     .to_string(),
@@ -680,6 +851,35 @@ async fn explicit_only_orchestrator_skill_is_hidden_but_can_be_invoked() -> Resu
                 ev_completed("resp-1"),
             ]),
             sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                responses::ev_function_call_with_namespace(
+                    MAIN_READ_CALL_ID,
+                    "skills",
+                    "read",
+                    &json!({ "package": SKILL_PACKAGE }).to_string(),
+                ),
+                responses::ev_function_call_with_namespace(
+                    REPEATED_MAIN_READ_CALL_ID,
+                    "skills",
+                    "read",
+                    &json!({ "package": SKILL_PACKAGE, "resource": MAIN_RESOURCE }).to_string(),
+                ),
+                responses::ev_function_call_with_namespace(
+                    INVALID_CURSOR_CALL_ID,
+                    "skills",
+                    "read",
+                    &json!({ "package": SKILL_PACKAGE, "cursor": "invalid" }).to_string(),
+                ),
+                responses::ev_function_call_with_namespace(
+                    MISSING_PACKAGE_CALL_ID,
+                    "skills",
+                    "read",
+                    &json!({ "package": "skill://demo/missing" }).to_string(),
+                ),
+                ev_completed("resp-3"),
+            ]),
+            sse(vec![ev_response_created("resp-4"), ev_completed("resp-4")]),
         ],
     )
     .await;
@@ -831,6 +1031,437 @@ async fn explicit_only_orchestrator_skill_is_hidden_but_can_be_invoked() -> Resu
             "next_cursor": null,
         })
     );
+    let events = wait_for_analytics_events(&server, "skill_invocation", /*expected_count*/ 1).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["skill_name"], "demo:explicit-only");
+    assert_eq!(events[0]["event_params"]["invoke_type"], "explicit");
+
+    test.submit_turn("Continue without explicitly selecting a skill.")
+        .await?;
+    let requests = response.requests();
+    assert_eq!(requests.len(), 4);
+    for call_id in [MAIN_READ_CALL_ID, REPEATED_MAIN_READ_CALL_ID] {
+        let output = requests[3]
+            .function_call_output_text(call_id)
+            .expect("skills.read should return the main resource");
+        assert_eq!(
+            serde_json::from_str::<Value>(&output)?["resource"],
+            MAIN_RESOURCE
+        );
+    }
+    for call_id in [INVALID_CURSOR_CALL_ID, MISSING_PACKAGE_CALL_ID] {
+        assert!(
+            requests[3].function_call_output_text(call_id).is_some(),
+            "failed skills.read should return a tool error for {call_id}"
+        );
+    }
+
+    let events = wait_for_analytics_events(&server, "skill_invocation", /*expected_count*/ 2).await;
+    assert_eq!(events.len(), 2, "repeated main reads must be deduplicated");
+    assert_eq!(events[1]["skill_name"], "demo:explicit-only");
+    assert_eq!(
+        events[1]["skill_id"],
+        format!("{:x}", sha1::Sha1::digest(MAIN_RESOURCE.as_bytes()))
+    );
+    assert_eq!(events[1]["event_params"]["invoke_type"], "implicit");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_turn_aliases_discovered_singleton_orchestrator_root() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const SKILL_ROOT: &str = "skill://plugin_connector_1p_2330815c823c8191941e5dc465bb899f";
+
+    let server = responses::start_mock_server().await;
+    let apps_server = AppsTestServer::mount(&server).await?;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex("^/api/codex/ps/mcp/?$"))
+        .and(|request: &Request| {
+            serde_json::from_slice::<Value>(&request.body)
+                .is_ok_and(|body| body["method"].as_str() == Some("resources/list"))
+        })
+        .respond_with(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body)
+                .expect("MCP resource request should be valid JSON");
+            ResponseTemplate::new(/*status*/ 200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {
+                    "resources": [{
+                        "name": "search",
+                        "uri": format!("{SKILL_ROOT}/search"),
+                        "description": "Search company knowledge.",
+                        "mimeType": "mcp/skill",
+                        "_meta": {
+                            "plugin_name": "demo",
+                            "skill_name": "search",
+                            "allow_implicit_invocation": true,
+                        },
+                    }],
+                },
+            }))
+        })
+        .with_priority(/*p*/ 1)
+        .mount(&server)
+        .await;
+
+    let mut extensions = ExtensionRegistryBuilder::new();
+    install_with_providers(
+        &mut extensions,
+        SkillProviders::new()
+            .with_orchestrator_provider(Arc::new(OrchestratorSkillProvider::new())),
+        |config: &Config| SkillsExtensionConfig {
+            include_instructions: config.include_skill_instructions,
+            bundled_skills_enabled: false,
+            orchestrator_skills_enabled: true,
+            shadow_selection_enabled: false,
+        },
+    );
+    let mut builder = apps_enabled_builder(apps_server.chatgpt_base_url)
+        .with_exec_server_url("none")
+        .with_extensions(Arc::new(extensions.build()))
+        .with_model_info_override("gpt-5.5", |model_info| {
+            model_info.context_window = Some(1_000);
+            model_info.max_context_window = None;
+        })
+        .with_config(|config| {
+            config.include_skill_instructions = true;
+            config.orchestrator_skills_enabled = true;
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    wait_for_mcp_server(&test.codex, CODEX_APPS_MCP_SERVER_NAME).await?;
+
+    test.submit_turn("Inspect the available skills.").await?;
+
+    let developer_text = response
+        .single_request()
+        .message_input_texts("developer")
+        .join("\n");
+    assert!(
+        developer_text.contains(&format!("- `o0` = `{SKILL_ROOT}`")),
+        "model request should include the discovered orchestrator root: {developer_text}"
+    );
+    assert!(
+        developer_text.lines().any(|line| {
+            line.starts_with("- demo:search:")
+                && line.ends_with("(orchestrator package: o0/search)")
+        }),
+        "model request should include the aliased orchestrator skill: {developer_text}"
+    );
+    assert!(
+        developer_text.contains("- Root aliases: Pass short package locators directly"),
+        "model request should explain how to read aliased packages: {developer_text}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_turn_aliases_executor_skill_roots() -> Result<()> {
+    const SKILL_ROOT: &str =
+        "skill://integration-executor/workspace/plugins/cache/executor-plugin/1.0.0/skills";
+
+    let server = responses::start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let catalog = SkillCatalog {
+        entries: ["search", "review", "summarize"]
+            .into_iter()
+            .map(|name| {
+                let resource = format!("{SKILL_ROOT}/{name}/SKILL.md");
+                SkillCatalogEntry::new(
+                    SkillPackageId(format!("{SKILL_ROOT}/{name}")),
+                    SkillAuthority::new(SkillSourceKind::Executor, "integration-executor"),
+                    name,
+                    "Inspect executor resources.",
+                    SkillResourceId::new(resource.clone()),
+                )
+                .with_display_path(resource)
+                .with_alias_root(SKILL_ROOT)
+            })
+            .collect(),
+        warnings: Vec::new(),
+    };
+    let (extensions, _) = catalog_extensions(catalog, /*include_host_provider*/ false);
+    let mut builder = test_codex()
+        .with_extensions(extensions)
+        .with_model_info_override("gpt-5.6-sol", |model_info| {
+            model_info.context_window = Some(3_000);
+            model_info.max_context_window = None;
+        })
+        .with_config(configure_catalog_test);
+    let test = builder.build_with_auto_env(&server).await?;
+
+    test.submit_turn("Inspect the available skills.").await?;
+
+    let developer_text = response
+        .single_request()
+        .message_input_texts("developer")
+        .join("\n");
+    assert!(
+        developer_text.contains(&format!("- `e0` = `{SKILL_ROOT}`")),
+        "model request should include the executor skill root: {developer_text}"
+    );
+    assert!(
+        developer_text.contains("executor package: e0/search"),
+        "model request should include the aliased executor skill: {developer_text}"
+    );
+    let executor_catalog = developer_text
+        .split("<skills_instructions>")
+        .filter_map(|fragment| fragment.split_once("</skills_instructions>"))
+        .map(|(fragment, _)| fragment)
+        .find(|fragment| fragment.contains("executor package: e0/search"))
+        .expect("model request should include an executor skills catalog");
+    assert!(
+        executor_catalog.contains("Read a skill package directly with `skills.read"),
+        "Sol should receive direct-read instructions for executor skills: {executor_catalog}"
+    );
+    assert!(
+        !executor_catalog.contains("### How to use skills"),
+        "Sol should omit optional skill usage instructions: {executor_catalog}"
+    );
+    assert!(
+        !executor_catalog.contains("- Root aliases: Pass short package locators directly"),
+        "Sol should not include optional resource-alias instructions: {executor_catalog}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_skill_invocation_is_environment_scoped_and_deduplicated() -> Result<()> {
+    skip_if_remote!(Ok(()), "executor fixture uses a host-local skill path");
+    skip_if_no_network!(Ok(()));
+
+    const SELECTED_RESOURCE: &str = "skill://selected-root/demo/SKILL.md";
+
+    let server = responses::start_mock_server().await;
+    let codex_home = Arc::new(TempDir::new()?);
+    let skill_path = codex_home.path().join("executor-skill/SKILL.md");
+    std::fs::create_dir_all(
+        skill_path
+            .parent()
+            .expect("skill path should have a parent"),
+    )?;
+    std::fs::write(&skill_path, "executor skill contents\n")?;
+    let skill_uri = PathUri::from_host_native_path(&skill_path)?;
+    let catalog = SkillCatalog {
+        entries: vec![
+            SkillCatalogEntry::new(
+                SkillPackageId("skill://other-root/demo".to_string()),
+                SkillAuthority::new(SkillSourceKind::Executor, "other-root"),
+                "other-environment-skill",
+                "Skill from another environment.",
+                SkillResourceId::environment(
+                    "skill://other-root/demo/SKILL.md",
+                    "other-environment",
+                    skill_uri.clone(),
+                ),
+            ),
+            SkillCatalogEntry::new(
+                SkillPackageId("skill://selected-root/demo".to_string()),
+                SkillAuthority::new(SkillSourceKind::Executor, "selected-root"),
+                "selected-environment-skill",
+                "Skill from the selected environment.",
+                SkillResourceId::environment(SELECTED_RESOURCE, LOCAL_ENVIRONMENT_ID, skill_uri),
+            ),
+        ],
+        warnings: Vec::new(),
+    };
+    let read_command = if cfg!(windows) {
+        format!("Get-Content -LiteralPath \"{}\"", skill_path.display())
+    } else {
+        format!("cat {}", skill_path.display())
+    };
+    let command = json!({
+        "cmd": read_command,
+        "login": false,
+    })
+    .to_string();
+    let response = responses::mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                responses::ev_function_call("executor-skill-first", "exec_command", &command),
+                responses::ev_function_call("executor-skill-again", "exec_command", &command),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+        ],
+    )
+    .await;
+
+    let (extensions, _) = catalog_extensions(catalog, /*include_host_provider*/ false);
+    let chatgpt_base_url = server.uri();
+    let mut builder = test_codex()
+        .with_home(codex_home)
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_extensions(extensions)
+        .with_config(move |config| {
+            configure_catalog_test(config);
+            config.chatgpt_base_url = chatgpt_base_url;
+            config.use_experimental_unified_exec_tool = true;
+            config
+                .features
+                .enable(Feature::UnifiedExec)
+                .expect("unified exec should be configurable in tests");
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    test.submit_turn("Read the executor skill twice.").await?;
+
+    for call_id in ["executor-skill-first", "executor-skill-again"] {
+        let output = response
+            .function_call_output_text(call_id)
+            .expect("executor skill command should return output");
+        assert!(
+            output.contains("executor skill contents"),
+            "command output: {output}"
+        );
+    }
+
+    let events = wait_for_analytics_events(&server, "skill_invocation", /*expected_count*/ 1).await;
+    assert_eq!(events.len(), 1, "executor skill should be counted once");
+    assert_eq!(events[0]["skill_name"], "selected-environment-skill");
+    assert_eq!(
+        events[0]["skill_id"],
+        format!("{:x}", sha1::Sha1::digest(SELECTED_RESOURCE.as_bytes()))
+    );
+    assert_eq!(events[0]["event_params"]["invoke_type"], "implicit");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_turn_aliases_combined_skill_catalogs_under_shared_budget() -> Result<()> {
+    const EXECUTOR_ROOT: &str =
+        "skill://integration-executor/workspace/plugins/cache/executor-plugin/1.0.0/skills";
+    const ORCHESTRATOR_ROOT: &str = "skill://plugin_connector_1p_2330815c823c8191941e5dc465bb899f";
+
+    let server = responses::start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let codex_home = Arc::new(
+        tempfile::Builder::new()
+            .prefix("codex-integration-shared-skill-catalog-roots-")
+            .tempdir()?,
+    );
+    write_host_skills(
+        codex_home.path(),
+        &[
+            ("host-search", "Inspect host resources."),
+            ("host-review", "Review host resources."),
+            ("host-summarize", "Summarize host resources."),
+        ],
+    )?;
+
+    let resource_catalog =
+        |kind: SkillSourceKind, authority: &str, root: &str, prefix: &str| SkillCatalog {
+            entries: ["search", "review", "summarize"]
+                .into_iter()
+                .map(|suffix| {
+                    let name = format!("{prefix}-{suffix}");
+                    let resource = format!("{root}/{name}/SKILL.md");
+                    SkillCatalogEntry::new(
+                        SkillPackageId(format!("{root}/{name}")),
+                        SkillAuthority::new(kind.clone(), authority),
+                        name,
+                        "Inspect provider resources.",
+                        SkillResourceId::new(resource.clone()),
+                    )
+                    .with_display_path(resource)
+                    .with_alias_root(root)
+                })
+                .collect(),
+            warnings: Vec::new(),
+        };
+
+    let mut extensions = ExtensionRegistryBuilder::new();
+    install_with_providers(
+        &mut extensions,
+        SkillProviders::new()
+            .with_executor_provider(Arc::new(CatalogSkillProvider {
+                catalog: resource_catalog(
+                    SkillSourceKind::Executor,
+                    "integration-executor",
+                    EXECUTOR_ROOT,
+                    "executor",
+                ),
+            }))
+            .with_orchestrator_provider(Arc::new(CatalogSkillProvider {
+                catalog: resource_catalog(
+                    SkillSourceKind::Orchestrator,
+                    "integration-orchestrator",
+                    ORCHESTRATOR_ROOT,
+                    "orchestrator",
+                ),
+            }))
+            .with_host_provider(Arc::new(HostSkillProvider::new())),
+        |config: &Config| SkillsExtensionConfig {
+            include_instructions: config.include_skill_instructions,
+            bundled_skills_enabled: false,
+            orchestrator_skills_enabled: true,
+            shadow_selection_enabled: false,
+        },
+    );
+    let mut builder = test_codex()
+        .with_home(Arc::clone(&codex_home))
+        .with_exec_server_url("none")
+        .with_extensions(Arc::new(extensions.build()))
+        .with_model_info_override("gpt-5.5", |model_info| {
+            model_info.context_window = Some(10_000);
+            model_info.max_context_window = None;
+        })
+        .with_config(|config| {
+            configure_catalog_test(config);
+            config.orchestrator_skills_enabled = true;
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    test.submit_turn("Inspect the available skills.").await?;
+
+    let developer_text = response
+        .single_request()
+        .message_input_texts("developer")
+        .join("\n");
+    let host_root = dunce::canonicalize(codex_home.path().join("skills"))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    for (alias, root) in [
+        ("e0", EXECUTOR_ROOT),
+        ("o0", ORCHESTRATOR_ROOT),
+        ("r0", host_root.as_str()),
+    ] {
+        assert!(
+            developer_text.contains(&format!("- `{alias}` = `{root}`")),
+            "model request should include the {alias} skill root: {developer_text}"
+        );
+    }
+    for (source, alias, prefix, suffix) in [
+        ("executor package", "e0", "executor", ""),
+        ("orchestrator package", "o0", "orchestrator", ""),
+        ("file", "r0", "host", "/SKILL.md"),
+    ] {
+        for name in ["search", "review", "summarize"] {
+            assert!(
+                developer_text.contains(&format!("{source}: {alias}/{prefix}-{name}{suffix}")),
+                "model request should retain the aliased {prefix}-{name} skill: {developer_text}"
+            );
+        }
+    }
 
     Ok(())
 }
@@ -1185,29 +1816,9 @@ async fn production_turn_uses_provider_host_catalog_and_core_snapshot_injection(
     let user_text = request.message_input_texts("user").join("\n");
     assert!(user_text.contains(&snapshot_contents));
     assert!(!user_text.contains(provider_contents));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let app_mentioned_event = loop {
-        let requests = server.received_requests().await.unwrap_or_default();
-        if let Some(event) = requests
-            .into_iter()
-            .filter(|request| request.url.path() == "/codex/analytics-events/events")
-            .find_map(|request| {
-                let payload: serde_json::Value = serde_json::from_slice(&request.body).ok()?;
-                payload["events"].as_array().and_then(|events| {
-                    events
-                        .iter()
-                        .find(|event| event["event_type"] == "codex_app_mentioned")
-                        .cloned()
-                })
-            })
-        {
-            break event;
-        }
-        if Instant::now() >= deadline {
-            panic!("timed out waiting for app mentioned analytics");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let app_mentioned_events =
+        wait_for_analytics_events(&server, "codex_app_mentioned", /*expected_count*/ 1).await;
+    let app_mentioned_event = &app_mentioned_events[0];
     assert_eq!(
         app_mentioned_event["event_params"]["connector_id"],
         "calendar"
@@ -1216,6 +1827,175 @@ async fn production_turn_uses_provider_host_catalog_and_core_snapshot_injection(
         app_mentioned_event["event_params"]["invoke_type"],
         "explicit"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_turn_suppresses_only_the_superseded_host_skill_prompt() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let codex_home = Arc::new(TempDir::new()?);
+    write_host_skills(
+        codex_home.path(),
+        &[
+            ("first-host", "First host skill."),
+            ("second-host", "Second host skill."),
+        ],
+    )?;
+    let first_skill_path = codex_home.path().join("skills/first-host/SKILL.md");
+    let second_skill_path = codex_home.path().join("skills/second-host/SKILL.md");
+    let first_host_contents =
+        "---\nname: first-host\ndescription: First host skill.\n---\n\nFIRST_HOST_BODY\n";
+    let second_host_contents =
+        "---\nname: second-host\ndescription: Second host skill.\n---\n\nSECOND_HOST_BODY\n";
+    std::fs::write(&first_skill_path, first_host_contents)?;
+    std::fs::write(&second_skill_path, second_host_contents)?;
+    let second_skill_path = dunce::canonicalize(second_skill_path)?;
+
+    let source_kind = SkillSourceKind::Custom("test".to_string());
+    let provider_resource = "skill://test/first-host/SKILL.md";
+    let provider_contents = "FIRST_PROVIDER_BODY";
+    let catalog = SkillCatalog {
+        entries: vec![
+            SkillCatalogEntry::new(
+                SkillPackageId("test/first-host".to_string()),
+                SkillAuthority::new(source_kind.clone(), "test"),
+                "first-host",
+                "Provider skill supersedes the matching host skill.",
+                SkillResourceId::new(provider_resource),
+            )
+            .with_display_path(provider_resource),
+        ],
+        warnings: Vec::new(),
+    };
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    install_with_providers(
+        &mut extensions,
+        SkillProviders::new().with_provider(SkillProviderSource::new(
+            source_kind,
+            "test",
+            Arc::new(StaticSkillProvider {
+                catalog,
+                main_prompt_contents: Some(provider_contents.to_string()),
+            }),
+        )),
+        |config: &Config| SkillsExtensionConfig {
+            include_instructions: config.include_skill_instructions,
+            bundled_skills_enabled: false,
+            orchestrator_skills_enabled: false,
+            shadow_selection_enabled: false,
+        },
+    );
+    let mut builder = test_codex()
+        .with_home(codex_home)
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(configure_catalog_test);
+    let test = builder.build_with_auto_env(&server).await?;
+
+    test.submit_turn("Use $first-host and $second-host.")
+        .await?;
+
+    let user_messages = response.single_request().message_input_texts("user");
+    let skill_messages = user_messages
+        .into_iter()
+        .filter(|message| message.starts_with("<skill>"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        skill_messages,
+        vec![
+            format!(
+                "<skill>\n<name>second-host</name>\n<path>{}</path>\n{second_host_contents}\n</skill>",
+                second_skill_path.display()
+            ),
+            format!(
+                "<skill>\n<name>first-host</name>\n<path>{provider_resource}</path>\n{provider_contents}\n</skill>"
+            ),
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_turn_warns_and_omits_unreadable_host_skill() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let codex_home = Arc::new(TempDir::new()?);
+    write_host_skills(
+        codex_home.path(),
+        &[
+            ("missing-host", "Missing host skill."),
+            ("available-host", "Available host skill."),
+        ],
+    )?;
+    let missing_skill_path =
+        dunce::canonicalize(codex_home.path().join("skills/missing-host/SKILL.md"))?;
+    let available_skill_path =
+        dunce::canonicalize(codex_home.path().join("skills/available-host/SKILL.md"))?;
+    let available_skill_contents = std::fs::read_to_string(&available_skill_path)?;
+    let (extensions, _) =
+        catalog_extensions(SkillCatalog::default(), /*include_host_provider*/ true);
+    let mut builder = test_codex()
+        .with_home(Arc::clone(&codex_home))
+        .with_extensions(extensions)
+        .with_config(configure_catalog_test);
+    let test = builder.build_with_auto_env(&server).await?;
+
+    std::fs::remove_file(&missing_skill_path)?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![
+            UserInput::Skill {
+                name: "missing-host".to_string(),
+                path: missing_skill_path.clone(),
+            },
+            UserInput::Skill {
+                name: "available-host".to_string(),
+                path: available_skill_path.clone(),
+            },
+        ]))
+        .await?;
+
+    let mut warnings = Vec::new();
+    loop {
+        match core_test_support::wait_for_event(&test.codex, |_| true).await {
+            EventMsg::Warning(warning) => warnings.push(warning.message),
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+
+    let expected_warning_prefix = format!(
+        "Failed to load skill missing-host at {}:",
+        missing_skill_path.display()
+    );
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].starts_with(&expected_warning_prefix),
+        "expected unreadable skill warning, got {warnings:?}"
+    );
+
+    let skill_messages = response
+        .single_request()
+        .message_input_texts("user")
+        .into_iter()
+        .filter(|message| message.starts_with("<skill>"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        skill_messages,
+        vec![format!(
+            "<skill>\n<name>available-host</name>\n<path>{}</path>\n{available_skill_contents}\n</skill>",
+            available_skill_path.display()
+        )]
+    );
+
     Ok(())
 }
 
@@ -1379,16 +2159,10 @@ async fn production_turn_keeps_orchestrator_world_state_incremental_across_turns
     ] {
         orchestrator_thread
             .thread
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: prompt.to_string(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: prompt.to_string(),
+                text_elements: Vec::new(),
+            }]))
             .await?;
         core_test_support::wait_for_event(&orchestrator_thread.thread, |event| {
             matches!(event, EventMsg::TurnComplete(_))
@@ -1398,8 +2172,9 @@ async fn production_turn_keeps_orchestrator_world_state_incremental_across_turns
 
     let requests = response.requests();
     assert_eq!(requests.len(), 2);
-    let expected_line =
-        format!("- {skill_name}: {skill_description} (orchestrator resource: {skill_resource})");
+    let expected_line = format!(
+        "- {skill_name}: {skill_description} (orchestrator package: orchestrator/orchestrator-search)"
+    );
     for (index, request) in requests.iter().enumerate() {
         let developer_texts = request.message_input_texts("developer");
         let occurrences = developer_texts
@@ -1409,6 +2184,11 @@ async fn production_turn_keeps_orchestrator_world_state_incremental_across_turns
         assert_eq!(
             occurrences, 1,
             "request {index} should contain the orchestrator catalog exactly once: {developer_texts:?}"
+        );
+        assert!(
+            developer_texts
+                .iter()
+                .any(|text| text.contains("Read a skill package directly with `skills.read"))
         );
     }
 
@@ -1558,7 +2338,10 @@ async fn production_turn_omits_host_skills_before_executor_skills_under_extreme_
     let host_lines = skill_lines(catalog_text(&developer_texts, "host"), "host");
     let executor_lines = skill_lines(catalog_text(&developer_texts, "exec"), "exec");
 
-    assert_eq!(skill_names(&host_lines), vec!["host-beta"]);
+    assert_eq!(
+        skill_names(&host_lines),
+        vec!["host-alpha", "host-beta", "host-delta"]
+    );
     assert_eq!(
         skill_names(&executor_lines),
         EXECUTOR_CATALOG
@@ -1567,7 +2350,7 @@ async fn production_turn_omits_host_skills_before_executor_skills_under_extreme_
             .collect::<Vec<_>>()
     );
     assert!(warning_messages.contains(
-        &"Exceeded skills context budget. All skill descriptions were removed and 3 additional skills were not included in the model-visible skills list."
+        &"Exceeded skills context budget. All skill descriptions were removed and 1 additional skill was not included in the model-visible skills list."
             .to_string()
     ));
 

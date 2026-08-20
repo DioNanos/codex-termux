@@ -7,14 +7,14 @@ use crate::context_manager::is_user_turn_boundary;
 use crate::event_mapping;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::build_turns_from_rollout_items;
+use codex_history::InitialHistory;
+use codex_history::RolloutItem;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
-use codex_protocol::protocol::RolloutItem;
 
 pub(crate) fn initial_history_has_prior_user_turns(conversation_history: &InitialHistory) -> bool {
     conversation_history.scan_rollout_items(rollout_item_is_user_turn_boundary)
@@ -40,11 +40,12 @@ pub(crate) fn user_message_positions_in_rollout(items: &[RolloutItem]) -> Vec<us
     let mut user_positions = Vec::new();
     for (idx, item) in items.iter().enumerate() {
         match item {
-            RolloutItem::ResponseItem(item @ ResponseItem::Message { .. })
-                if matches!(
-                    event_mapping::parse_turn_item(item),
-                    Some(TurnItem::UserMessage(_))
-                ) =>
+            RolloutItem::ResponseItem(item)
+                if matches!(&item.item, ResponseItem::Message { .. })
+                    && matches!(
+                        event_mapping::parse_turn_item(&item.item),
+                        Some(TurnItem::UserMessage(_))
+                    ) =>
             {
                 user_positions.push(idx);
             }
@@ -76,7 +77,7 @@ pub(crate) fn fork_turn_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize
     for (idx, item) in items.iter().enumerate() {
         match item {
             RolloutItem::ResponseItem(item) => {
-                let has_delivery_metadata = matches!(item, ResponseItem::AgentMessage { .. })
+                let has_delivery_metadata = matches!(&item.item, ResponseItem::AgentMessage { .. })
                     && idx.checked_sub(1).is_some_and(|previous_idx| {
                         matches!(
                             items.get(previous_idx),

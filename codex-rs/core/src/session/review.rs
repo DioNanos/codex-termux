@@ -13,6 +13,14 @@ pub(super) async fn spawn_review_thread(
         .review_model
         .clone()
         .unwrap_or_else(|| parent_turn_context.model_info.slug.clone());
+    let available_models = sess
+        .services
+        .models_manager
+        .list_models(
+            RefreshStrategy::OnlineIfUncached,
+            config.http_client_factory(),
+        )
+        .await;
     let review_model_info = sess
         .services
         .models_manager
@@ -24,14 +32,6 @@ pub(super) async fn spawn_review_thread(
     let _ = review_features.disable(Feature::WebSearchCached);
     let _ = review_features.disable(Feature::Goals);
     let review_web_search_mode = WebSearchMode::Disabled;
-    let available_models = sess
-        .services
-        .models_manager
-        .list_models(
-            RefreshStrategy::OnlineIfUncached,
-            config.http_client_factory(),
-        )
-        .await;
     let unified_exec_shell_mode = UnifiedExecShellMode::for_session(
         codex_tools::unified_exec_feature_mode_for_features(review_features.get()),
         crate::tools::tool_user_shell_type(sess.services.user_shell.as_ref()),
@@ -100,6 +100,10 @@ pub(super) async fn spawn_review_thread(
     };
     per_turn_config.service_tier = service_tier;
 
+    let auto_review_enabled = crate::guardian::routes_approval_policy_to_guardian(
+        per_turn_config.permissions.approval_policy.value(),
+        per_turn_config.approvals_reviewer,
+    );
     let per_turn_config = Arc::new(per_turn_config);
     let review_turn_id = sub_id.to_string();
     let turn_metadata_state = Arc::new(TurnMetadataState::new(
@@ -115,7 +119,12 @@ pub(super) async fn spawn_review_thread(
         &parent_turn_context.permission_profile(),
         parent_turn_context.windows_sandbox_level,
         parent_turn_context.network.is_some(),
+        auto_review_enabled,
+        &model_info,
     ));
+    if turn_metadata_state.can_start_root_turn(&session_source) {
+        turn_metadata_state.set_root_turn_id(review_turn_id.clone());
+    }
 
     let extension_data = Arc::new(codex_extension_api::ExtensionData::new(
         review_turn_id.clone(),
@@ -129,7 +138,7 @@ pub(super) async fn spawn_review_thread(
         code_mode_available: parent_turn_context.code_mode_available,
         config: per_turn_config,
         auth_manager: auth_manager_for_context,
-        model_info: model_info.clone(),
+        model_info: Arc::new(model_info.clone()),
         session_telemetry: session_telemetry_for_context,
         provider: provider_for_context,
         reasoning_effort,

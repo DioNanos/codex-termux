@@ -8,6 +8,7 @@ use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::MCP_TOOL_CODEX_APPS_META_KEY;
 use codex_mcp::McpRuntime;
 use codex_mcp::McpRuntimeInput;
+use codex_mcp::McpStartupPolicy;
 use codex_mcp::ToolInfo;
 use codex_mcp::effective_mcp_servers;
 use codex_mcp::host_owned_codex_apps_enabled;
@@ -48,7 +49,7 @@ impl AppsRequestProcessor {
         let mut snapshot_tool_count = 0;
         let result = async {
             let config = self
-                .load_apps_installed_config(params.thread_id.as_deref())
+                .load_apps_config(params.thread_id.as_deref())
                 .await?;
             let auth = self.auth_manager.auth().await;
             let apps_enabled = config
@@ -91,6 +92,7 @@ impl AppsRequestProcessor {
                         host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
                             .then(|| Arc::clone(&self.auth_manager));
                     let runtime = McpRuntime::new(McpRuntimeInput {
+                        startup_policy: McpStartupPolicy::Eager,
                         config: Arc::clone(&mcp_config),
                         plugins_available: false,
                         ready_selected_capability_roots: Vec::new(),
@@ -197,21 +199,6 @@ impl AppsRequestProcessor {
             );
         }
         result
-    }
-
-    async fn load_apps_installed_config(
-        &self,
-        thread_id: Option<&str>,
-    ) -> Result<Config, JSONRPCErrorError> {
-        let Some(thread_id) = thread_id else {
-            return self.load_latest_config(/*fallback_cwd*/ None).await;
-        };
-        let (_, thread) = self.load_thread(thread_id).await?;
-        let thread_config = thread.config().await;
-        self.config_manager
-            .load_latest_config_for_thread(thread_config.as_ref())
-            .await
-            .map_err(|err| internal_error(format!("failed to reload config: {err}")))
     }
 }
 

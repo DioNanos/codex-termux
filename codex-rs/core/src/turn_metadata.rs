@@ -12,23 +12,27 @@ use std::sync::atomic::Ordering;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
-use crate::responses_metadata::CODE_MODE_TOOL_NAMES_KEY;
+use crate::responses_metadata::AGENT_NAME_KEY;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::PARENT_TURN_ID_KEY;
+use crate::responses_metadata::ROOT_TURN_ID_KEY;
 use crate::responses_metadata::TurnMetadataWorkspace;
+use crate::responses_metadata::TurnToolNamespacesInfo;
 use crate::responses_metadata::filter_extra_metadata;
 use crate::responses_metadata::subagent_header_value;
 use crate::responses_metadata::subagent_metadata_kind;
+use crate::sandbox_tags::permission_profile_policy_tag;
 use crate::sandbox_tags::permission_profile_sandbox_tag;
 use codex_git_utils::get_git_remote_urls_assume_git_repo;
 use codex_git_utils::get_git_repo_root;
 use codex_git_utils::get_has_changes_in_repo;
 use codex_git_utils::get_head_commit_hash;
+use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
-use codex_protocol::ToolName;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSource;
@@ -77,12 +81,16 @@ pub async fn detached_memory_responses_metadata(
     window_id: String,
     session_source: &SessionSource,
     cwd: &AbsolutePathBuf,
+    permission_profile: &PermissionProfile,
     sandbox: Option<&str>,
 ) -> CodexResponsesMetadata {
     CodexResponsesMetadata {
         request_kind: Some(CodexResponsesRequestKind::Memory),
         subagent_header: subagent_header_value(session_source),
         sandbox: sandbox.map(ToString::to_string),
+        sandbox_mode: Some(
+            permission_profile_policy_tag(permission_profile, cwd.as_path()).to_string(),
+        ),
         workspaces: memory_workspaces(cwd).await,
         ..CodexResponsesMetadata::new(installation_id, session_id, thread_id, window_id)
     }
@@ -94,18 +102,26 @@ pub(crate) struct TurnMetadataState {
     repo_root: Option<PathBuf>,
     session_id: String,
     thread_id: String,
+    agent_name: String,
     forked_from_thread_id: Option<ThreadId>,
     parent_thread_id: Option<ThreadId>,
     parent_turn_id: OnceLock<String>,
+    root_turn_id: OnceLock<String>,
     subagent_header: Option<String>,
     subagent_kind: Option<String>,
     thread_source: Option<ThreadSource>,
     turn_id: String,
     sandbox: Option<String>,
+    sandbox_mode: Option<String>,
+    auto_review_enabled: bool,
+    node_repl_auto_review_required: bool,
+    node_repl_disabled: bool,
     enriched_workspaces: RwLock<Option<BTreeMap<String, TurnMetadataWorkspace>>>,
-    code_mode_tool_names: RwLock<Option<BTreeMap<String, ToolName>>>,
+    tool_namespaces_info: RwLock<Option<TurnToolNamespacesInfo>>,
     turn_started_at_unix_ms: RwLock<Option<i64>>,
+    responses_api_metadata: RwLock<BTreeMap<String, String>>,
     responsesapi_client_metadata: RwLock<BTreeMap<String, String>>,
+    root_turn_ambiguous: AtomicBool,
     user_input_requested_during_turn: AtomicBool,
     enrichment_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -124,6 +140,8 @@ impl TurnMetadataState {
         permission_profile: &PermissionProfile,
         windows_sandbox_level: WindowsSandboxLevel,
         enforce_managed_network: bool,
+        auto_review_enabled: bool,
+        model_info: &ModelInfo,
     ) -> Self {
         let repo_root = get_git_repo_root(&cwd);
         let sandbox = Some(
@@ -134,23 +152,37 @@ impl TurnMetadataState {
             )
             .to_string(),
         );
+        let sandbox_mode =
+            Some(permission_profile_policy_tag(permission_profile, cwd.as_path()).to_string());
+        let agent_name = session_source
+            .get_agent_path()
+            .unwrap_or_else(AgentPath::root)
+            .to_string();
         Self {
             cwd,
             repo_root,
             session_id,
             thread_id,
+            agent_name,
             forked_from_thread_id,
             parent_thread_id,
             parent_turn_id: OnceLock::new(),
+            root_turn_id: OnceLock::new(),
             subagent_header: subagent_header_value(session_source),
             subagent_kind: subagent_metadata_kind(session_source),
             thread_source,
             turn_id,
             sandbox,
+            sandbox_mode,
+            auto_review_enabled,
+            node_repl_auto_review_required: model_info.node_repl_auto_review_required,
+            node_repl_disabled: model_info.node_repl_disabled,
             enriched_workspaces: RwLock::new(None),
-            code_mode_tool_names: RwLock::new(None),
+            tool_namespaces_info: RwLock::new(None),
             turn_started_at_unix_ms: RwLock::new(None),
+            responses_api_metadata: RwLock::new(BTreeMap::new()),
             responsesapi_client_metadata: RwLock::new(BTreeMap::new()),
+            root_turn_ambiguous: AtomicBool::new(false),
             user_input_requested_during_turn: AtomicBool::new(false),
             enrichment_task: Mutex::new(None),
         }
@@ -160,13 +192,15 @@ impl TurnMetadataState {
         &self,
         context: McpTurnMetadataContext<'_>,
     ) -> Option<serde_json::Value> {
-        let Value::Object(mut metadata) =
-            self.responses_metadata_template().turn_metadata_value()?
-        else {
+        let mut responses_metadata = self.mcp_metadata_template();
+        // Never serialize harness-owned tool inventory for external MCP servers.
+        responses_metadata.tool_namespaces_info = None;
+        let Value::Object(mut metadata) = responses_metadata.turn_metadata_value()? else {
             return None;
         };
-        metadata.remove(CODE_MODE_TOOL_NAMES_KEY); // Precaution: avoid exposing tool data to external MCPs.
+        metadata.remove(AGENT_NAME_KEY);
         metadata.remove(PARENT_TURN_ID_KEY);
+        metadata.remove(ROOT_TURN_ID_KEY);
         metadata.insert(
             MODEL_KEY.to_string(),
             Value::String(context.model.to_string()),
@@ -215,15 +249,12 @@ impl TurnMetadataState {
             .store(true, Ordering::Relaxed);
     }
 
-    pub(crate) fn set_code_mode_tool_names(
-        &self,
-        code_mode_tool_names: BTreeMap<String, ToolName>,
-    ) {
+    pub(crate) fn set_tool_namespaces_info(&self, tool_namespaces_info: TurnToolNamespacesInfo) {
         *self
-            .code_mode_tool_names
+            .tool_namespaces_info
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            (!code_mode_tool_names.is_empty()).then_some(code_mode_tool_names);
+            (!tool_namespaces_info.is_empty()).then_some(tool_namespaces_info);
     }
 
     pub(crate) fn set_parent_turn_id(&self, parent_turn_id: String) {
@@ -231,6 +262,38 @@ impl TurnMetadataState {
             return;
         }
         let _ = self.parent_turn_id.set(parent_turn_id);
+    }
+
+    pub(crate) fn set_root_turn_id(&self, root_turn_id: String) {
+        if root_turn_id.trim().is_empty() {
+            return;
+        }
+        let _ = self.root_turn_id.set(root_turn_id);
+    }
+
+    pub(crate) fn root_turn_id(&self) -> Option<String> {
+        self.root_turn_id
+            .get()
+            .filter(|_| !self.root_turn_ambiguous.load(Ordering::Relaxed))
+            .cloned()
+    }
+
+    pub(crate) fn mark_root_turn_ambiguous(&self) {
+        self.root_turn_ambiguous.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn can_start_root_turn(&self, session_source: &SessionSource) -> bool {
+        if session_source.is_non_root_agent() {
+            return false;
+        }
+        match &self.thread_source {
+            // Desktop create/fork/send lacks trusted app-server provenance; fail closed.
+            Some(ThreadSource::Subagent | ThreadSource::MemoryConsolidation) => false,
+            Some(ThreadSource::Feature(feature)) => {
+                !matches!(feature.as_str(), "system" | "title") && !feature.starts_with("ambient")
+            }
+            Some(ThreadSource::User) | None => true,
+        }
     }
 
     pub(crate) fn set_responsesapi_client_metadata(
@@ -244,6 +307,16 @@ impl TurnMetadataState {
             filter_extra_metadata(responsesapi_client_metadata);
     }
 
+    pub(crate) fn set_responses_api_metadata(
+        &self,
+        responses_api_metadata: BTreeMap<String, String>,
+    ) {
+        *self
+            .responses_api_metadata
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = responses_api_metadata;
+    }
+
     pub(crate) fn workspace_kind(&self) -> Option<String> {
         self.responsesapi_client_metadata
             .read()
@@ -253,27 +326,53 @@ impl TurnMetadataState {
     }
 
     fn responses_metadata_template(&self) -> CodexResponsesMetadata {
+        let mut metadata = self.mcp_metadata_template();
+        metadata.extra.extend(
+            self.responses_api_metadata
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        );
+        metadata
+    }
+
+    fn mcp_metadata_template(&self) -> CodexResponsesMetadata {
+        let mut extra = self
+            .responsesapi_client_metadata
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for key in self
+            .responses_api_metadata
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+        {
+            extra.remove(key);
+        }
         CodexResponsesMetadata {
             turn_id: Some(self.turn_id.clone()),
+            agent_name: Some(self.agent_name.clone()),
             forked_from_thread_id: self.forked_from_thread_id,
             parent_thread_id: self.parent_thread_id,
             parent_turn_id: self.parent_turn_id.get().cloned(),
+            root_turn_id: self.root_turn_id(),
             subagent_header: self.subagent_header.clone(),
             subagent_kind: self.subagent_kind.clone(),
             thread_source: self.thread_source.clone(),
             sandbox: self.sandbox.clone(),
+            sandbox_mode: self.sandbox_mode.clone(),
+            auto_review_enabled: Some(self.auto_review_enabled),
+            node_repl_auto_review_required: Some(self.node_repl_auto_review_required),
+            node_repl_disabled: Some(self.node_repl_disabled),
             workspaces: self.current_workspaces(),
-            code_mode_tool_names: self
-                .code_mode_tool_names
+            tool_namespaces_info: self
+                .tool_namespaces_info
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
             turn_started_at_unix_ms: self.current_turn_started_at_unix_ms(),
-            extra: self
-                .responsesapi_client_metadata
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
+            extra,
             ..CodexResponsesMetadata::new(
                 String::new(),
                 self.session_id.clone(),

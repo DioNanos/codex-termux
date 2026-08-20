@@ -613,10 +613,10 @@ async fn build_exec_config_preserves_headless_error_when_retry_fails() {
 }
 
 #[tokio::test]
-async fn thread_start_params_include_user_thread_source() {
+async fn thread_start_params_match_history_to_persistence() {
     let codex_home = tempdir().expect("create temp codex home");
     let cwd = tempdir().expect("create temp cwd");
-    let config = ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(cwd.path().to_path_buf()))
         .build()
@@ -629,6 +629,13 @@ async fn thread_start_params_include_user_thread_source() {
         params.thread_source,
         Some(codex_app_server_protocol::ThreadSource::User)
     );
+    assert_eq!(params.history_mode, Some(ThreadHistoryMode::Paginated));
+
+    config.ephemeral = true;
+    let params = thread_start_params_from_config(&config);
+
+    assert_eq!(params.ephemeral, Some(true));
+    assert_eq!(params.history_mode, None);
 }
 
 #[tokio::test]
@@ -785,13 +792,16 @@ async fn session_configured_from_thread_response_preserves_parent_thread_id() {
         .await
         .expect("build config");
     let parent_thread_id = ThreadId::new();
+    let forked_from_id = ThreadId::new();
     let mut response = sample_thread_start_response();
     response.thread.parent_thread_id = Some(parent_thread_id.to_string());
+    response.thread.forked_from_id = Some(forked_from_id.to_string());
 
     let event = session_configured_from_thread_start_response(&response, &config)
         .expect("build bootstrap session configured event");
 
     assert_eq!(event.parent_thread_id, Some(parent_thread_id));
+    assert_eq!(event.forked_from_id, Some(forked_from_id));
 }
 
 fn sample_thread_start_response() -> ThreadStartResponse {

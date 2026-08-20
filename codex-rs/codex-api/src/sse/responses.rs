@@ -174,7 +174,15 @@ pub struct ResponsesStreamEvent {
     text: Option<String>,
     summary_index: Option<i64>,
     content_index: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
     safety_buffering: Option<Value>,
+}
+
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 impl ResponsesStreamEvent {
@@ -240,7 +248,17 @@ impl ResponsesStreamEvent {
         &self,
         treatment: &SafetyBufferingTreatment,
     ) -> Option<SafetyBuffering> {
-        let value = self.safety_buffering.as_ref()?;
+        let value = self.safety_buffering.as_ref().or_else(|| {
+            if self.kind() != "response.metadata" {
+                return None;
+            }
+
+            let metadata = self.metadata.as_ref()?;
+            if metadata.get("type").and_then(Value::as_str) != Some("safety_buffering") {
+                return None;
+            }
+            Some(metadata)
+        })?;
         let retry_model_present = value.as_object()?.contains_key("retry_model");
         let mut buffering: SafetyBuffering = serde_json::from_value(value.clone()).ok()?;
         buffering.show_buffering_ui = true;
@@ -402,6 +420,15 @@ pub fn process_responses_event(
                     } else if is_cyber_policy_error(&error) {
                         let message = cyber_policy_message(error.message);
                         response_error = ApiError::CyberPolicy { message };
+                    } else if error.code.as_deref() == Some("misalignment_policy_violation") {
+                        let message = error
+                            .message
+                            .filter(|message| !message.trim().is_empty())
+                            .unwrap_or_else(|| {
+                                "This request was blocked due to a misalignment policy violation."
+                                    .to_string()
+                            });
+                        response_error = ApiError::MisalignmentPolicyViolation { message };
                     } else if matches!(error.code.as_deref(), Some("invalid_prompt" | "bio_policy"))
                     {
                         let message = error
@@ -467,8 +494,27 @@ pub fn process_responses_event(
                 }));
             }
         }
-        _ => {
+        "codex.response.metadata"
+        | "response.content_part.added"
+        | "response.content_part.done"
+        | "response.custom_tool_call_input.done"
+        | "response.function_call_arguments.delta"
+        | "response.function_call_arguments.done"
+        | "response.in_progress"
+        | "response.metadata"
+        | "response.output_text.done"
+        | "response.reasoning_summary_part.done"
+        | "responsesapi.websocket_timing" => {
             trace!("unhandled responses event: {}", event.kind);
+        }
+        kind if kind.ends_with(".delta") => {
+            trace!("unhandled responses event: {kind}");
+        }
+        _ => {
+            debug!(
+                "unhandled responses event: {:?}",
+                event.kind.chars().take(128).collect::<String>()
+            );
         }
     }
 
@@ -536,7 +582,13 @@ async fn process_sse_with_treatment(
         let event: ResponsesStreamEvent = match serde_json::from_str(&sse.data) {
             Ok(event) => event,
             Err(e) => {
-                debug!("Failed to parse SSE event: {e}, data: {}", &sse.data);
+                debug!(
+                    error_category = ?e.classify(),
+                    error_line = e.line(),
+                    error_column = e.column(),
+                    payload_bytes = sse.data.len(),
+                    "Failed to parse SSE event"
+                );
                 continue;
             }
         };
@@ -1106,6 +1158,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn misalignment_policy_violation_error_is_fatal() {
+        let raw_error = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_fatal_misalignment","object":"response","status":"failed","error":{"type":"invalid_request_error","code":"misalignment_policy_violation","message":"This request violated the misalignment policy."}}}"#;
+
+        let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Err(ApiError::MisalignmentPolicyViolation { message }) => {
+                assert_eq!(message, "This request violated the misalignment policy.");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn misalignment_policy_violation_uses_fallback_for_blank_message() {
+        for message in ["", "   "] {
+            let raw_error = serde_json::json!({
+                "type": "response.failed",
+                "response": {
+                    "id": "resp_fatal_misalignment",
+                    "status": "failed",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "misalignment_policy_violation",
+                        "message": message,
+                    },
+                },
+            });
+            let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+            let events = collect_events(&[sse.as_bytes()]).await;
+
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                Err(ApiError::MisalignmentPolicyViolation { message }) => assert_eq!(
+                    message,
+                    "This request was blocked due to a misalignment policy violation."
+                ),
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn content_policy_errors_without_type_are_invalid_requests() {
         for (code, expected_message) in [
             (
@@ -1203,7 +1300,27 @@ mod tests {
             },
             TestCase {
                 name: "unknown",
-                event: json!({"type": "response.new_tool_event"}),
+                event: json!({"type": "response.new_tool_event", "sequence_number": 1}),
+                expect_first: is_completed,
+                expected_len: 1,
+            },
+            TestCase {
+                name: "refusal_delta",
+                event: json!({
+                    "type": "response.refusal.delta",
+                    "delta": "no",
+                    "sequence_number": 1
+                }),
+                expect_first: is_completed,
+                expected_len: 1,
+            },
+            TestCase {
+                name: "mcp_call_arguments_delta",
+                event: json!({
+                    "type": "response.mcp_call_arguments.delta",
+                    "delta": "chunk",
+                    "sequence_number": 1
+                }),
                 expect_first: is_completed,
                 expected_len: 1,
             },
@@ -1533,6 +1650,126 @@ mod tests {
                     show_buffering_ui: true,
                     faster_model: expected_faster_model.map(str::to_string),
                 }
+            );
+        }
+    }
+
+    #[test]
+    fn safety_buffering_falls_back_to_response_metadata() {
+        let treatment = SafetyBufferingTreatment {
+            faster_model: Some("gpt-fast-header".to_string()),
+        };
+        let event: ResponsesStreamEvent = serde_json::from_value(json!({
+            "type": "response.metadata",
+            "metadata": {
+                "type": "safety_buffering",
+                "use_cases": ["cyber"],
+                "reasons": ["user_risk"]
+            }
+        }))
+        .expect("deserialize safety buffering metadata event");
+
+        assert_eq!(
+            event.safety_buffering(&treatment),
+            Some(SafetyBuffering {
+                use_cases: vec!["cyber".to_string()],
+                reasons: vec!["user_risk".to_string()],
+                show_buffering_ui: true,
+                faster_model: Some("gpt-fast-header".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn safety_buffering_top_level_presence_wins_over_response_metadata() {
+        let treatment = SafetyBufferingTreatment::default();
+        let event: ResponsesStreamEvent = serde_json::from_value(json!({
+            "type": "response.metadata",
+            "safety_buffering": {
+                "use_cases": ["top_level"],
+                "reasons": ["top_level_reason"]
+            },
+            "metadata": {
+                "type": "safety_buffering",
+                "use_cases": ["nested"],
+                "reasons": ["nested_reason"]
+            }
+        }))
+        .expect("deserialize safety buffering metadata event");
+
+        assert_eq!(
+            event.safety_buffering(&treatment),
+            Some(SafetyBuffering {
+                use_cases: vec!["top_level".to_string()],
+                reasons: vec!["top_level_reason".to_string()],
+                show_buffering_ui: true,
+                faster_model: None,
+            })
+        );
+
+        for top_level in [json!(false), json!({"use_cases": ["cyber"]}), Value::Null] {
+            let event: ResponsesStreamEvent = serde_json::from_value(json!({
+                "type": "response.metadata",
+                "safety_buffering": top_level,
+                "metadata": {
+                    "type": "safety_buffering",
+                    "use_cases": ["nested"],
+                    "reasons": ["nested_reason"]
+                }
+            }))
+            .expect("deserialize safety buffering metadata event");
+
+            assert_eq!(event.safety_buffering(&treatment), None);
+        }
+    }
+
+    #[test]
+    fn safety_buffering_ignores_metadata_field_for_other_event_kinds() {
+        let event: ResponsesStreamEvent = serde_json::from_value(json!({
+            "type": "codex.response.metadata",
+            "metadata": {
+                "type": "safety_buffering",
+                "use_cases": ["cyber"],
+                "reasons": ["user_risk"]
+            }
+        }))
+        .expect("deserialize safety buffering metadata event");
+
+        assert_eq!(
+            event.safety_buffering(&SafetyBufferingTreatment::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn safety_buffering_ignores_response_metadata_without_safety_buffering_type() {
+        for metadata in [
+            json!({
+                "use_cases": ["cyber"],
+                "reasons": ["user_risk"]
+            }),
+            json!({
+                "type": "other_metadata",
+                "use_cases": ["cyber"],
+                "reasons": ["user_risk"]
+            }),
+            json!({
+                "type": "safety_buffering",
+                "safety_buffering": {
+                    "use_cases": ["cyber"],
+                    "reasons": ["user_risk"]
+                }
+            }),
+        ] {
+            let event: ResponsesStreamEvent = serde_json::from_value(json!({
+                "type": "response.metadata",
+                "metadata": metadata
+            }))
+            .expect("deserialize response metadata event");
+
+            assert_eq!(
+                event.safety_buffering(&SafetyBufferingTreatment::default()),
+                None
             );
         }
     }

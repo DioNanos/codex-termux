@@ -7,7 +7,7 @@
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
-use crate::session::turn_context::TurnContext;
+use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::state::SessionServices;
 use crate::tools::hook_names::HookToolName;
@@ -15,6 +15,7 @@ use crate::tools::network_approval::NetworkApprovalSpec;
 use codex_file_system::FileSystemSandboxContext;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::approvals::ExecPolicyAmendment;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
@@ -27,6 +28,7 @@ use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::policy_transforms::effective_permission_profile;
 use codex_tools::ToolName;
+use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use futures::Future;
 use serde::Serialize;
@@ -346,7 +348,7 @@ pub(crate) trait Sandboxable {
 
 pub(crate) struct ToolCtx {
     pub session: Arc<Session>,
-    pub turn: Arc<TurnContext>,
+    pub step_context: Arc<StepContext>,
     pub call_id: String,
     pub tool_name: ToolName,
 }
@@ -359,6 +361,10 @@ pub(crate) enum ToolError {
 
 pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
     fn turn_environment<'a>(&self, req: &'a Req) -> &'a TurnEnvironment;
+
+    fn uses_executor_managed_process_sandbox(&self, _req: &Req) -> bool {
+        false
+    }
 
     fn network_approval_spec(&self, _req: &Req, _ctx: &ToolCtx) -> Option<NetworkApprovalSpec> {
         None
@@ -393,6 +399,19 @@ pub(crate) struct SandboxAttempt<'a> {
     pub windows_sandbox_private_desktop: bool,
     pub network_denial_cancellation_token: Option<CancellationToken>,
     pub(crate) network_proxy: Option<&'a NetworkProxy>,
+}
+
+pub(crate) fn executor_windows_sandbox_level(
+    windows_sandbox_level: WindowsSandboxLevel,
+    cwd: &PathUri,
+) -> WindowsSandboxLevel {
+    if windows_sandbox_level == WindowsSandboxLevel::Disabled
+        && cwd.infer_path_convention() == Some(PathConvention::Windows)
+    {
+        WindowsSandboxLevel::RestrictedToken
+    } else {
+        windows_sandbox_level
+    }
 }
 
 impl<'a> SandboxAttempt<'a> {
@@ -434,11 +453,7 @@ impl<'a> SandboxAttempt<'a> {
             .iter()
             .map(PathUri::to_abs_path)
             .collect::<std::io::Result<Vec<_>>>()?;
-        Ok(crate::sandboxing::ExecRequest::from_sandbox_exec_request(
-            request,
-            options,
-            workspace_roots,
-        ))
+        crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options, workspace_roots)
     }
 
     pub fn env_for_exec_server(
@@ -468,15 +483,21 @@ impl<'a> SandboxAttempt<'a> {
                 windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
             })
             .map_err(CodexErr::from)?;
-        let mut exec_request =
-            crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options, Vec::new());
+        let mut exec_request = crate::sandboxing::ExecRequest::from_sandbox_exec_request(
+            request,
+            options,
+            Vec::new(),
+        )?;
         exec_request.exec_server_managed_network = managed_network;
         if self.sandbox_requested {
             exec_request.exec_server_sandbox = Some(FileSystemSandboxContext {
                 permissions: exec_server_permissions.into(),
                 cwd: Some(exec_request.windows_sandbox_policy_cwd.clone()),
                 workspace_roots: self.workspace_roots.to_vec(),
-                windows_sandbox_level: self.windows_sandbox_level,
+                windows_sandbox_level: executor_windows_sandbox_level(
+                    self.windows_sandbox_level,
+                    self.sandbox_cwd,
+                ),
                 windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
                 windows_sandbox_proxy_settings_mode: None,
                 use_legacy_landlock: self.use_legacy_landlock,

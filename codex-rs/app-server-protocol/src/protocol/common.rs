@@ -471,11 +471,32 @@ macro_rules! client_response_payload_from_impl {
     ($variant:ident, $response:ty, manual) => {};
 }
 
+/// Preserve explicit `undefined` accepted by the original stable usage request.
+///
+/// A Rust-based TypeScript proxy retains dependency discovery; a raw `#[ts(type = ...)]`
+/// override would silently omit the generated params import and schema fixture.
+#[allow(dead_code)]
+#[derive(TS)]
+#[ts(untagged)]
+enum GetAccountTokenUsageParamsTypeScript {
+    Params(v2::GetAccountTokenUsageParams),
+    #[ts(type = "undefined")]
+    Undefined,
+}
+
 client_request_definitions! {
     Initialize => "initialize" {
         params: v1::InitializeParams,
         serialization: None,
         response: v1::InitializeResponse,
+    },
+
+    #[experimental("server/diagnostics")]
+    /// Read content-free, process-local diagnostics.
+    ServerDiagnostics => "server/diagnostics" {
+        params: v2::ServerDiagnosticsParams,
+        serialization: None,
+        response: v2::ServerDiagnosticsResponse,
     },
 
     /// NEW APIs
@@ -553,6 +574,42 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadGoalClearResponse,
     },
+    #[experimental("thread/queue/add")]
+    ThreadQueueAdd => "thread/queue/add" {
+        params: v2::ThreadQueueAddParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadQueueAddResponse,
+    },
+    #[experimental("thread/queue/list")]
+    ThreadQueueList => "thread/queue/list" {
+        params: v2::ThreadQueueListParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadQueueListResponse,
+    },
+    #[experimental("thread/queue/update")]
+    ThreadQueueUpdate => "thread/queue/update" {
+        params: v2::ThreadQueueUpdateParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadQueueUpdateResponse,
+    },
+    #[experimental("thread/queue/delete")]
+    ThreadQueueDelete => "thread/queue/delete" {
+        params: v2::ThreadQueueDeleteParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadQueueDeleteResponse,
+    },
+    #[experimental("thread/queue/reorder")]
+    ThreadQueueReorder => "thread/queue/reorder" {
+        params: v2::ThreadQueueReorderParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadQueueReorderResponse,
+    },
+    #[experimental("thread/queue/start")]
+    ThreadQueueStart => "thread/queue/start" {
+        params: v2::ThreadQueueStartParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadQueueStartResponse,
+    },
     ThreadMetadataUpdate => "thread/metadata/update" {
         params: v2::ThreadMetadataUpdateParams,
         serialization: thread_id(params.thread_id),
@@ -624,6 +681,12 @@ client_request_definitions! {
         params: v2::ThreadRollbackParams,
         serialization: thread_id(params.thread_id),
         response: v2::ThreadRollbackResponse,
+    },
+    #[experimental("thread/revert")]
+    ThreadRevert => "thread/revert" {
+        params: v2::ThreadRevertParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadRevertResponse,
     },
     ThreadList => "thread/list" {
         params: v2::ThreadListParams,
@@ -1087,7 +1150,7 @@ client_request_definitions! {
     },
 
     GetAccountTokenUsage => "account/usage/read" {
-        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        params: #[ts(optional, as = "Option<GetAccountTokenUsageParamsTypeScript>", inline)] #[serde(default, skip_serializing_if = "Option::is_none")] v2::NullableGetAccountTokenUsageParams,
         serialization: None,
         response: v2::GetAccountTokenUsageResponse,
     },
@@ -1171,7 +1234,7 @@ client_request_definitions! {
     },
     ExternalAgentConfigDetect => "externalAgentConfig/detect" {
         params: v2::ExternalAgentConfigDetectParams,
-        serialization: global("config"),
+        serialization: global("external-agent-detect"),
         response: v2::ExternalAgentConfigDetectResponse,
     },
     ExternalAgentConfigImport => "externalAgentConfig/import" {
@@ -1690,10 +1753,14 @@ server_notification_definitions! {
     ThreadDeleted => "thread/deleted" (v2::ThreadDeletedNotification),
     ThreadUnarchived => "thread/unarchived" (v2::ThreadUnarchivedNotification),
     ThreadClosed => "thread/closed" (v2::ThreadClosedNotification),
+    #[experimental("thread/reverted")]
+    ThreadReverted => "thread/reverted" (v2::ThreadRevertedNotification),
     SkillsChanged => "skills/changed" (v2::SkillsChangedNotification),
     ThreadNameUpdated => "thread/name/updated" (v2::ThreadNameUpdatedNotification),
     ThreadGoalUpdated => "thread/goal/updated" (v2::ThreadGoalUpdatedNotification),
     ThreadGoalCleared => "thread/goal/cleared" (v2::ThreadGoalClearedNotification),
+    #[experimental("thread/queue/changed")]
+    ThreadQueueChanged => "thread/queue/changed" (v2::ThreadQueueChangedNotification),
     #[experimental("thread/environment/connected")]
     EnvironmentConnected => "thread/environment/connected" (v2::EnvironmentConnectionNotification),
     #[experimental("thread/environment/disconnected")]
@@ -2110,6 +2177,7 @@ mod tests {
             params: v2::PluginInstallParams {
                 marketplace_path: Some(absolute_path("/tmp/marketplace")),
                 remote_marketplace_name: None,
+                install_attempt_id: None,
                 plugin_name: "plugin-a".to_string(),
             },
         };
@@ -2186,6 +2254,7 @@ mod tests {
             params: v2::McpServerOauthLoginParams {
                 name: "server-a".to_string(),
                 thread_id: None,
+                client_registration: None,
                 scopes: None,
                 timeout_secs: None,
             },
@@ -2841,6 +2910,56 @@ mod tests {
     }
 
     #[test]
+    fn serialize_get_account_thread_usage() -> Result<()> {
+        let request = ClientRequest::GetAccountTokenUsage {
+            request_id: RequestId::Integer(1),
+            params: Some(v2::GetAccountTokenUsageParams {
+                thread_id: Some("thread-123".to_string()),
+            }),
+        };
+        assert_eq!(
+            json!({
+                "method": "account/usage/read",
+                "id": 1,
+                "params": { "threadId": "thread-123" },
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_legacy_get_account_token_usage_response() -> Result<()> {
+        let response: v2::GetAccountTokenUsageResponse = serde_json::from_value(json!({
+            "summary": {
+                "lifetimeTokens": null,
+                "peakDailyTokens": null,
+                "longestRunningTurnSec": null,
+                "currentStreakDays": null,
+                "longestStreakDays": null,
+            },
+            "dailyUsageBuckets": null,
+        }))?;
+
+        assert_eq!(
+            response,
+            v2::GetAccountTokenUsageResponse {
+                summary: v2::AccountTokenUsageSummary {
+                    lifetime_tokens: None,
+                    peak_daily_tokens: None,
+                    longest_running_turn_sec: None,
+                    current_streak_days: None,
+                    longest_streak_days: None,
+                },
+                daily_usage_buckets: None,
+                thread_usage: None,
+            },
+        );
+        assert_eq!(serde_json::to_value(response)?["threadUsage"], json!(null));
+        Ok(())
+    }
+
+    #[test]
     fn serialize_get_workspace_messages() -> Result<()> {
         let request = ClientRequest::GetWorkspaceMessages {
             request_id: RequestId::Integer(1),
@@ -3424,6 +3543,7 @@ mod tests {
             request_id: RequestId::Integer(9),
             params: v2::AppsReadParams {
                 app_ids: vec!["app-a".to_string(), "app-b".to_string()],
+                thread_id: None,
                 include_tools: true,
             },
         };
@@ -3431,7 +3551,11 @@ mod tests {
             json!({
                 "method": "app/read",
                 "id": 9,
-                "params": { "appIds": ["app-a", "app-b"], "includeTools": true }
+                "params": {
+                    "appIds": ["app-a", "app-b"],
+                    "threadId": null,
+                    "includeTools": true
+                }
             }),
             serde_json::to_value(&request)?,
         );

@@ -1,5 +1,5 @@
+use crate::RolloutItem;
 use crate::protocol::EventMsg;
-use crate::protocol::RolloutItem;
 use codex_extension_items::ExtensionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
@@ -8,7 +8,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
 /// Whether a rollout `item` should be persisted in rollout files.
 pub fn is_persisted_rollout_item(item: &RolloutItem, history_mode: ThreadHistoryMode) -> bool {
     match item {
-        RolloutItem::ResponseItem(item) => should_persist_response_item(item),
+        RolloutItem::ResponseItem(item) => should_persist_response_item(&item.item),
         RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. } => true,
         RolloutItem::EventMsg(ev) => should_persist_event_msg(ev, history_mode),
@@ -16,6 +16,7 @@ pub fn is_persisted_rollout_item(item: &RolloutItem, history_mode: ThreadHistory
         RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
+        | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::SessionMeta(_) => true,
     }
 }
@@ -120,6 +121,7 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
 
         // Transient, non-durable events.
         EventMsg::Error(_)
+        | EventMsg::ThreadQueueChanged(_)
         | EventMsg::GuardianAssessment(_)
         | EventMsg::ExecCommandEnd(_)
         | EventMsg::ViewImageToolCall(_)

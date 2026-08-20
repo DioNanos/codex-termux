@@ -1,0 +1,87 @@
+---
+source: tui/src/startup_draft_tests.rs
+expression: "snapshots.join(\"\\n---\\n\")"
+---
+resume lookup fallback:
+before:
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v<VERSION>)              │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+  Resuming session…
+
+› draft while loading
+
+
+after:
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v<VERSION>)              │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+
+
+› draft while loading
+
+
+---
+fork lookup fallback:
+before:
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v<VERSION>)              │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+  Forking session…
+
+› draft while loading
+
+
+after:
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v<VERSION>)              │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+
+
+› draft while loading
+
+
+---
+resume picker cancellation:
+before:
+hidden while picker owns input
+after:
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v<VERSION>)              │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+
+
+› Ask Codex to do anything
+
+  ? for shortcuts
+---
+fork picker cancellation:
+before:
+hidden while picker owns input
+after:
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v<VERSION>)              │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+
+
+› Ask Codex to do anything
+
+  ? for shortcuts

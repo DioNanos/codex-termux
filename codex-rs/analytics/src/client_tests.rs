@@ -20,6 +20,10 @@ use crate::events::CodexMcpToolCallEventParams;
 #[cfg(debug_assertions)]
 use crate::events::CodexMcpToolCallEventRequest;
 #[cfg(debug_assertions)]
+use crate::events::CodexPluginMeasurementEventParams;
+#[cfg(debug_assertions)]
+use crate::events::CodexPluginMeasurementEventRequest;
+#[cfg(debug_assertions)]
 use crate::events::CodexPluginMetadata;
 #[cfg(debug_assertions)]
 use crate::events::CodexPluginUsedEventRequest;
@@ -34,10 +38,28 @@ use crate::events::FinalApprovalOutcome;
 use crate::events::SkillInvocationEventParams;
 use crate::events::SkillInvocationEventRequest;
 #[cfg(debug_assertions)]
+use crate::events::ThreadArchiveAction;
+#[cfg(debug_assertions)]
+use crate::events::ThreadArchiveEvent;
+#[cfg(debug_assertions)]
+use crate::events::ThreadArchiveEventParams;
+#[cfg(debug_assertions)]
 use crate::events::ToolItemTerminalStatus;
 use crate::events::TrackEventRequest;
+#[cfg(debug_assertions)]
+use crate::events::codex_artifact_operation_event_request;
 use crate::facts::AnalyticsFact;
+#[cfg(debug_assertions)]
+use crate::facts::ArtifactOperation;
+#[cfg(debug_assertions)]
+use crate::facts::ArtifactOperationLifecycle;
+use crate::facts::CustomAnalyticsFact;
 use crate::facts::InvocationType;
+use crate::facts::PluginMeasurementRow;
+use crate::facts::PluginMeasurementsInput;
+#[cfg(debug_assertions)]
+use crate::facts::TrackEventsContext;
+use crate::reducer::MAX_PLUGIN_MEASUREMENTS_PER_BATCH;
 use codex_app_server_protocol::ApprovalsReviewer as AppServerApprovalsReviewer;
 use codex_app_server_protocol::AskForApproval as AppServerAskForApproval;
 use codex_app_server_protocol::ClientRequest;
@@ -50,6 +72,7 @@ use codex_app_server_protocol::SessionSource as AppServerSessionSource;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
+use codex_app_server_protocol::ThreadArchivedNotification;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -68,6 +91,7 @@ use codex_login::AuthManager;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::test_path_buf;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 #[cfg(debug_assertions)]
 use std::fs;
@@ -106,7 +130,7 @@ fn sample_accepted_line_fingerprint_event(thread_id: &str) -> TrackEventRequest 
                 repo_hash: None,
                 accepted_added_lines: 1,
                 accepted_deleted_lines: 0,
-                line_fingerprints: Vec::new(),
+                line_fingerprints: [],
             },
         },
     ))
@@ -129,6 +153,32 @@ fn sample_skill_track_event(thread_id: &str, plugin_id: Option<&str>) -> TrackEv
             model_slug: Some("gpt-5.1-codex".to_string()),
         },
     })
+}
+
+#[cfg(debug_assertions)]
+fn sample_artifact_operation_event(thread_id: &str) -> TrackEventRequest {
+    TrackEventRequest::ArtifactOperation(codex_artifact_operation_event_request(
+        TrackEventsContext {
+            model_slug: "gpt-5.1-codex".to_string(),
+            thread_id: thread_id.to_string(),
+            turn_id: "turn-1".to_string(),
+            product_client_id: "codex_desktop".to_string(),
+        },
+        ArtifactOperation {
+            item_id: format!("item-{thread_id}"),
+            lifecycle: ArtifactOperationLifecycle::Started,
+            occurred_at_ms: 1,
+            plugin_id: "presentations@openai-primary-runtime".to_string(),
+            script_path: "skills/presentations/container_tools/mark_artifact_operation_started.mjs"
+                .to_string(),
+            skill: "presentations".to_string(),
+            artifact_type: "presentation".to_string(),
+            operation_kind: "create".to_string(),
+            expected_output_count: 1,
+            output_format: "pptx".to_string(),
+            execution_backend: "unified_exec".to_string(),
+        },
+    ))
 }
 
 fn sample_regular_track_event(thread_id: &str) -> TrackEventRequest {
@@ -366,6 +416,22 @@ async fn api_key_auth_sends_only_plugin_events_to_codex_backend() {
     let auth_manager = codex_login::AuthManager::from_auth_for_testing(
         codex_login::CodexAuth::from_api_key("sk-test"),
     );
+    let plugin_measurement = |thread_id: &str, plugin_id: &str| {
+        TrackEventRequest::PluginMeasurement(CodexPluginMeasurementEventRequest {
+            event_type: "codex_plugin_measurement_event",
+            event_params: CodexPluginMeasurementEventParams {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "item-1".to_string(),
+                plugin_id: plugin_id.to_string(),
+                execution_id: "execution-1".to_string(),
+                operation: "security_scan".to_string(),
+                measurement_name: "findings".to_string(),
+                number_value: 1.0,
+                dimensions: None,
+            },
+        })
+    };
 
     send_track_events(
         &auth_manager,
@@ -374,10 +440,21 @@ async fn api_key_auth_sends_only_plugin_events_to_codex_backend() {
             sample_regular_track_event("non-plugin-skill"),
             sample_mcp_tool_call_event("non-plugin-mcp", /*plugin_id*/ None),
             sample_plugin_used_track_event("non-plugin-used", /*plugin_id*/ None),
+            plugin_measurement("non-plugin-measurement", /*plugin_id*/ ""),
             sample_accepted_line_fingerprint_event("other-event"),
+            TrackEventRequest::ThreadArchive(ThreadArchiveEvent {
+                event_type: "codex_thread_archive_event",
+                event_params: ThreadArchiveEventParams {
+                    thread_id: "non-plugin-thread-archive".to_string(),
+                    action: ThreadArchiveAction::Archived,
+                    occurred_at_ms: 1,
+                },
+            }),
             sample_plugin_used_track_event("plugin-used", Some("sample@test")),
             sample_skill_track_event("plugin-skill", Some("sample@test")),
             sample_mcp_tool_call_event("plugin-mcp", Some("sample@test")),
+            sample_artifact_operation_event("plugin-artifact"),
+            plugin_measurement("plugin-measurement", "sample@test"),
         ],
     )
     .await;
@@ -426,6 +503,16 @@ async fn api_key_auth_sends_only_plugin_events_to_codex_backend() {
                 "event_type": "codex_mcp_tool_call_event",
                 "plugin_id": "sample@test",
                 "thread_id": "plugin-mcp",
+            }),
+            serde_json::json!({
+                "event_type": "codex_artifact_operation",
+                "plugin_id": "presentations@openai-primary-runtime",
+                "thread_id": "plugin-artifact",
+            }),
+            serde_json::json!({
+                "event_type": "codex_plugin_measurement_event",
+                "plugin_id": "sample@test",
+                "thread_id": "plugin-measurement",
             }),
         ]
     );
@@ -604,6 +691,66 @@ fn sample_turn_steer_response() -> ClientResponsePayload {
 }
 
 #[test]
+fn track_plugin_measurements_rejects_unbounded_inputs_before_queueing() {
+    let (client, mut receiver) = client_with_receiver();
+    let measurements = |row_count| PluginMeasurementsInput {
+        thread_id: "thread-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        item_id: "item-1".to_string(),
+        plugin_id: "sample@openai-curated".to_string(),
+        execution_id: "execution-1".to_string(),
+        operation: "security_scan".to_string(),
+        rows: vec![
+            PluginMeasurementRow {
+                measurement_name: "finding_count".to_string(),
+                number_value: 1.0,
+                dimensions: BTreeMap::new(),
+            };
+            row_count
+        ],
+    };
+
+    client.track_plugin_measurements(measurements(MAX_PLUGIN_MEASUREMENTS_PER_BATCH + 1));
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+    let mut oversized_operation = measurements(1);
+    oversized_operation.operation = "o".repeat(65);
+    client.track_plugin_measurements(oversized_operation);
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+    let mut mixed_rows = measurements(4);
+    mixed_rows.rows[0].measurement_name = "m".repeat(65);
+    mixed_rows.rows[1]
+        .dimensions
+        .insert("d".repeat(65), "valid".to_string());
+    mixed_rows.rows[2]
+        .dimensions
+        .insert("valid".to_string(), "v".repeat(65));
+    client.track_plugin_measurements(mixed_rows);
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(AnalyticsEventsQueueMessage::Fact(fact))
+            if matches!(
+                fact.as_ref(),
+                AnalyticsFact::Custom(CustomAnalyticsFact::PluginMeasurements(input))
+                    if input.rows.len() == 1
+                        && input.rows[0].measurement_name == "finding_count"
+            )
+    ));
+
+    client.track_plugin_measurements(measurements(MAX_PLUGIN_MEASUREMENTS_PER_BATCH));
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(AnalyticsEventsQueueMessage::Fact(fact))
+            if matches!(
+                fact.as_ref(),
+                AnalyticsFact::Custom(CustomAnalyticsFact::PluginMeasurements(input))
+                    if input.rows.len() == MAX_PLUGIN_MEASUREMENTS_PER_BATCH
+            )
+    ));
+}
+
+#[test]
 fn track_request_only_enqueues_analytics_relevant_requests() {
     let (client, mut receiver) = client_with_receiver();
 
@@ -729,7 +876,20 @@ async fn flush_waits_for_preceding_fact_delivery() {
 
 #[tokio::test]
 async fn flush_is_noop_when_analytics_is_disabled() {
-    AnalyticsEventsClient::disabled().flush().await;
+    let client = AnalyticsEventsClient::new(
+        codex_login::AuthManager::from_auth_for_testing(
+            codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        ),
+        "https://chatgpt.com/backend-api".to_string(),
+        /*analytics_enabled*/ Some(false),
+    );
+    client.track_notification(&ServerNotification::ThreadArchived(
+        ThreadArchivedNotification {
+            thread_id: "thread-1".to_string(),
+        },
+    ));
+    assert!(client.queue.is_none());
+    client.flush().await;
 }
 
 #[test]

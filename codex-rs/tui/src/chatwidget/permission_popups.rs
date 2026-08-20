@@ -5,6 +5,7 @@
 //! `windows_sandbox_prompts`.
 
 use super::*;
+use codex_protocol::openai_models::MODEL_SPECIALTY_CYBER;
 
 impl ChatWidget {
     /// Open the permissions popup.
@@ -103,12 +104,17 @@ impl ChatWidget {
                         name: APPROVE_FOR_ME_LABEL.to_string(),
                         description: Some(AUTO_REVIEW_DESCRIPTION.to_string()),
                         is_current: current_review_policy == ApprovalsReviewer::AutoReview
-                            && Self::preset_matches_current(
+                            && (Self::preset_matches_current(
                                 current_approval,
                                 &current_permission_profile,
                                 self.config.cwd.as_path(),
                                 &preset,
-                            ),
+                            ) || (current_approval == AskForApproval::OnRequest
+                                && self
+                                    .config
+                                    .config_layer_stack
+                                    .requirements()
+                                    .auto_review_required_for_model(self.current_model()))),
                         actions: self.permission_mode_actions(
                             &preset,
                             APPROVE_FOR_ME_LABEL.to_string(),
@@ -392,8 +398,6 @@ impl ChatWidget {
                     PermissionProfile::Managed { .. }
                 ) && file_system_policy.can_write_path_with_cwd(cwd, cwd)
                     && !file_system_policy.has_full_disk_write_access()
-                    && current_permission_profile.network_sandbox_policy()
-                        == preset.permission_profile.network_sandbox_policy()
             }
             _ => current_permission_profile == &preset.permission_profile,
         }
@@ -410,7 +414,7 @@ impl ChatWidget {
         let is_cyber_model = self.model_catalog.try_list_models().is_ok_and(|models| {
             models.iter().any(|model| {
                 model.model == self.current_model()
-                    && model.model_specialty.as_deref() == Some("cyber")
+                    && model.model_specialty.as_deref() == Some(MODEL_SPECIALTY_CYBER)
             })
         });
         let title_line = Line::from("Enable full access?").bold();

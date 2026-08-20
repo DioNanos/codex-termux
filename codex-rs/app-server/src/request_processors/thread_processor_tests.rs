@@ -36,6 +36,136 @@ mod thread_list_cwd_filter_tests {
     }
 }
 
+mod persisted_resume_approval_policy_tests {
+    use super::super::latest_persisted_approval_policy;
+    use codex_protocol::config_types::ApprovalsReviewer;
+    use codex_protocol::config_types::CollaborationMode;
+    use codex_protocol::config_types::ModeKind;
+    use codex_protocol::config_types::Settings;
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::SandboxPolicy;
+    use codex_protocol::protocol::ThreadSettingsAppliedEvent;
+    use codex_protocol::protocol::ThreadSettingsSnapshot;
+    use codex_protocol::protocol::TurnContextItem;
+    use codex_protocol::protocol::TurnStartedEvent;
+    use codex_rollout::RolloutItem;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use pretty_assertions::assert_eq;
+
+    fn cwd() -> AbsolutePathBuf {
+        AbsolutePathBuf::try_from(std::env::current_dir().expect("current directory"))
+            .expect("absolute current directory")
+    }
+
+    fn settings_item(approval_policy: AskForApproval) -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+            ThreadSettingsAppliedEvent {
+                thread_settings: ThreadSettingsSnapshot {
+                    model: "gpt-5".to_string(),
+                    model_provider_id: "openai".to_string(),
+                    service_tier: None,
+                    approval_policy,
+                    approvals_reviewer: ApprovalsReviewer::User,
+                    permission_profile: PermissionProfile::read_only(),
+                    active_permission_profile: None,
+                    cwd: cwd(),
+                    reasoning_effort: None,
+                    reasoning_summary: None,
+                    personality: None,
+                    collaboration_mode: CollaborationMode {
+                        mode: ModeKind::Default,
+                        settings: Settings {
+                            model: "gpt-5".to_string(),
+                            reasoning_effort: None,
+                            developer_instructions: None,
+                        },
+                    },
+                },
+            },
+        ))
+    }
+
+    fn turn_started_item(turn_id: &str) -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: turn_id.to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }))
+    }
+
+    fn turn_context_item(turn_id: &str, approval_policy: AskForApproval) -> RolloutItem {
+        RolloutItem::TurnContext(TurnContextItem {
+            turn_id: Some(turn_id.to_string()),
+            cwd: cwd(),
+            workspace_roots: None,
+            current_date: None,
+            timezone: None,
+            approval_policy,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            network: None,
+            file_system_sandbox_policy: None,
+            model: "gpt-5".to_string(),
+            comp_hash: None,
+            personality: None,
+            collaboration_mode: None,
+            multi_agent_version: None,
+            multi_agent_mode: None,
+            realtime_active: None,
+            effort: None,
+            summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        })
+    }
+
+    #[test]
+    fn latest_settings_snapshot_wins() {
+        let history = vec![
+            settings_item(AskForApproval::Never),
+            settings_item(AskForApproval::OnRequest),
+        ];
+
+        assert_eq!(
+            latest_persisted_approval_policy(&history),
+            Some(AskForApproval::OnRequest)
+        );
+    }
+
+    #[test]
+    fn settings_applied_during_turn_wins_over_stale_compaction_context() {
+        let history = vec![
+            turn_started_item("turn-1"),
+            settings_item(AskForApproval::Never),
+            turn_context_item("turn-1", AskForApproval::OnRequest),
+        ];
+
+        assert_eq!(
+            latest_persisted_approval_policy(&history),
+            Some(AskForApproval::Never)
+        );
+    }
+
+    #[test]
+    fn later_turn_context_wins_over_earlier_settings_update() {
+        let history = vec![
+            turn_started_item("turn-1"),
+            settings_item(AskForApproval::Never),
+            turn_context_item("turn-1", AskForApproval::OnRequest),
+            turn_started_item("turn-2"),
+            turn_context_item("turn-2", AskForApproval::OnRequest),
+        ];
+
+        assert_eq!(
+            latest_persisted_approval_policy(&history),
+            Some(AskForApproval::OnRequest)
+        );
+    }
+}
+
 mod background_terminal_pagination_tests {
     use super::super::paginate_background_terminals;
     use codex_app_server_protocol::ThreadBackgroundTerminal;
@@ -124,15 +254,8 @@ mod thread_processor_behavior_tests {
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
-    use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
-    use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
-    use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
     use codex_protocol::models::PermissionProfile;
     use codex_protocol::openai_models::ReasoningEffort;
-    use codex_protocol::permissions::FileSystemAccessMode;
-    use codex_protocol::permissions::FileSystemPath;
-    use codex_protocol::permissions::FileSystemSandboxEntry;
-    use codex_protocol::permissions::NetworkSandboxPolicy;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
@@ -509,84 +632,6 @@ mod thread_processor_behavior_tests {
             summary.updated_at.as_deref(),
             Some("2025-01-02T03:04:06.789Z")
         );
-    }
-
-    #[test]
-    fn requested_permissions_trust_project_uses_permission_profile_intent() {
-        let cwd = test_path_buf("/tmp/project").abs();
-        let full_access_profile = codex_protocol::models::PermissionProfile::Disabled;
-        let workspace_write_profile = codex_protocol::models::PermissionProfile::workspace_write();
-        let read_only_profile = codex_protocol::models::PermissionProfile::read_only();
-        let split_write_profile =
-            codex_protocol::models::PermissionProfile::from_runtime_permissions(
-                &FileSystemSandboxPolicy::restricted(vec![
-                    FileSystemSandboxEntry {
-                        path: FileSystemPath::Path { path: cwd.clone() },
-                        access: FileSystemAccessMode::Write,
-                        missing_path_behavior: None,
-                    },
-                    FileSystemSandboxEntry {
-                        path: FileSystemPath::GlobPattern {
-                            pattern: "/tmp/project/**/*.env".to_string(),
-                        },
-                        access: FileSystemAccessMode::Deny,
-                        missing_path_behavior: None,
-                    },
-                ]),
-                NetworkSandboxPolicy::Restricted,
-            );
-
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                permission_profile: Some(full_access_profile),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                permission_profile: Some(workspace_write_profile),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                permission_profile: Some(split_write_profile),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                default_permissions: Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string()),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                default_permissions: Some(
-                    BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string()
-                ),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(!requested_permissions_trust_project(
-            &ConfigOverrides {
-                permission_profile: Some(read_only_profile),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(!requested_permissions_trust_project(
-            &ConfigOverrides {
-                default_permissions: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
     }
 
     #[test]
@@ -999,9 +1044,9 @@ mod thread_processor_behavior_tests {
 
     #[tokio::test]
     async fn read_summary_from_rollout_returns_empty_preview_when_no_user_message() -> Result<()> {
-        use codex_protocol::protocol::RolloutItem;
-        use codex_protocol::protocol::RolloutLine;
         use codex_protocol::protocol::SessionMetaLine;
+        use codex_rollout::RolloutItem;
+        use codex_rollout::RolloutLine;
         use std::fs;
         use std::fs::FileTimes;
 
@@ -1057,9 +1102,9 @@ mod thread_processor_behavior_tests {
 
     #[tokio::test]
     async fn read_summary_from_rollout_preserves_agent_nickname() -> Result<()> {
-        use codex_protocol::protocol::RolloutItem;
-        use codex_protocol::protocol::RolloutLine;
         use codex_protocol::protocol::SessionMetaLine;
+        use codex_rollout::RolloutItem;
+        use codex_rollout::RolloutLine;
         use std::fs;
 
         let temp_dir = TempDir::new()?;
@@ -1109,9 +1154,9 @@ mod thread_processor_behavior_tests {
 
     #[tokio::test]
     async fn read_summary_from_rollout_preserves_forked_from_id() -> Result<()> {
-        use codex_protocol::protocol::RolloutItem;
-        use codex_protocol::protocol::RolloutLine;
         use codex_protocol::protocol::SessionMetaLine;
+        use codex_rollout::RolloutItem;
+        use codex_rollout::RolloutLine;
         use std::fs;
 
         let temp_dir = TempDir::new()?;

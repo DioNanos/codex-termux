@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_rollout::RolloutItem;
 use codex_rollout::RolloutPersistenceTelemetry;
 use codex_rollout::measure_and_filter_rollout_items;
 use codex_rollout::persisted_rollout_items;
@@ -15,6 +15,7 @@ use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
 use crate::LoadThreadHistoryParams;
 use crate::LocalThreadStore;
+use crate::PersistContext;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::StoredThread;
@@ -253,8 +254,14 @@ impl LiveThread {
         Ok(items)
     }
 
-    pub async fn persist(&self) -> ThreadStoreResult<()> {
-        self.thread_store.persist_thread(self.thread_id).await?;
+    pub async fn persist(&self, context: PersistContext) -> ThreadStoreResult<()> {
+        if context == PersistContext::TurnStart {
+            self.flush_pending_metadata_update_for_existing_history()
+                .await?;
+        }
+        self.thread_store
+            .persist_thread(self.thread_id, context)
+            .await?;
         self.flush_pending_metadata_update().await
     }
 
@@ -265,9 +272,19 @@ impl LiveThread {
     }
 
     pub async fn shutdown(&self) -> ThreadStoreResult<()> {
-        self.flush_pending_metadata_update_for_existing_history()
-            .await?;
-        self.thread_store.shutdown_thread(self.thread_id).await
+        let metadata_result = self
+            .flush_pending_metadata_update_for_existing_history()
+            .await;
+        let shutdown_result = self.thread_store.shutdown_thread(self.thread_id).await;
+        match (metadata_result, shutdown_result) {
+            (Err(metadata_error), Err(shutdown_error)) => Err(ThreadStoreError::Internal {
+                message: format!(
+                    "thread metadata update failed: {metadata_error}; thread shutdown failed: {shutdown_error}"
+                ),
+            }),
+            (Err(metadata_error), Ok(())) => Err(metadata_error),
+            (Ok(()), result) => result,
+        }
     }
 
     pub async fn discard(&self) -> ThreadStoreResult<()> {
@@ -319,19 +336,31 @@ impl LiveThread {
         Ok(())
     }
 
+    /// Updates metadata while preserving this API's materialized-thread contract.
+    ///
+    /// Stores may successfully return no thread for a no-op update, so this reads the thread as a
+    /// fallback in that case.
     pub async fn update_metadata(
         &self,
         patch: ThreadMetadataPatch,
         include_archived: bool,
     ) -> ThreadStoreResult<StoredThread> {
         self.flush_pending_metadata_update().await?;
-        self.thread_store
+        let updated = self
+            .thread_store
             .update_thread_metadata(UpdateThreadMetadataParams {
                 thread_id: self.thread_id,
                 patch,
                 include_archived,
             })
-            .await
+            .await?;
+        match updated {
+            Some(thread) => Ok(thread),
+            None => {
+                self.read_thread(include_archived, /*include_history*/ false)
+                    .await
+            }
+        }
     }
 
     /// Returns the live local rollout path for legacy local-only callers.

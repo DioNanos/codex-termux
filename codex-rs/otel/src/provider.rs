@@ -11,6 +11,7 @@ use opentelemetry::Context;
 use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::trace::Span as _;
+use opentelemetry::trace::SpanBuilder;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::LogExporter;
@@ -68,6 +69,19 @@ pub struct OtelProvider {
 struct ShutdownWorker {
     provider: ManuallyDrop<OtelProvider>,
     completed_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+#[derive(Debug)]
+struct GlobalTracer {
+    service_name: &'static str,
+}
+
+impl opentelemetry::trace::Tracer for GlobalTracer {
+    type Span = global::BoxedSpan;
+
+    fn build_with_context(&self, builder: SpanBuilder, parent: &Context) -> Self::Span {
+        global::tracer(self.service_name).build_with_context(builder, parent)
+    }
 }
 
 impl OtelProvider {
@@ -156,7 +170,7 @@ impl OtelProvider {
         }
         crate::trace_context::validate_tracestate_entries(&settings.tracestate)?;
 
-        let metrics = if matches!(metric_exporter, OtelExporter::None) {
+        let mut metrics = if matches!(metric_exporter, OtelExporter::None) {
             None
         } else {
             let mut config = MetricsConfig::otlp(
@@ -196,8 +210,8 @@ impl OtelProvider {
             global::set_tracer_provider(provider);
             global::set_text_map_propagator(TraceContextPropagator::new());
         }
-        if let Some(metrics) = metrics.as_ref() {
-            crate::metrics::install_global(metrics.clone());
+        if let Some(metrics) = metrics.as_mut() {
+            *metrics = crate::metrics::install_global(metrics.clone());
             if matches!(settings.metrics_exporter, OtelExporter::Statsig) {
                 crate::metrics::install_global_statsig_settings(StatsigMetricsSettings {
                     environment: settings.environment.clone(),
@@ -217,11 +231,19 @@ impl OtelProvider {
     where
         S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
     {
-        self.logger.as_ref().map(|logger| {
-            OpenTelemetryTracingBridge::new(logger).with_filter(
-                tracing_subscriber::filter::filter_fn(OtelProvider::log_export_filter),
-            )
+        self.logger_export_layer().map(|layer| {
+            layer.with_filter(tracing_subscriber::filter::filter_fn(
+                OtelProvider::log_export_filter,
+            ))
         })
+    }
+
+    /// Returns a log-export bridge that must be installed beneath the log export filter.
+    pub fn logger_export_layer<S>(&self) -> Option<impl Layer<S> + Send + Sync>
+    where
+        S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
+    {
+        self.logger.as_ref().map(OpenTelemetryTracingBridge::new)
     }
 
     pub fn tracing_layer<S>(&self) -> Option<impl Layer<S> + Send + Sync>
@@ -235,6 +257,18 @@ impl OtelProvider {
                     OtelProvider::trace_export_filter,
                 ))
         })
+    }
+
+    /// Returns a permanent trace layer that follows the process-global tracer provider.
+    pub fn reloadable_tracing_layer<S>(service_name: &'static str) -> impl Layer<S> + Send + Sync
+    where
+        S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
+    {
+        tracing_opentelemetry::layer()
+            .with_tracer(GlobalTracer { service_name })
+            .with_filter(tracing_subscriber::filter::filter_fn(
+                Self::trace_export_filter,
+            ))
     }
 
     pub fn codex_export_filter(meta: &tracing::Metadata<'_>) -> bool {
@@ -517,8 +551,12 @@ mod tests {
     use crate::metrics::API_CALL_COUNT_METRIC;
     use crate::metrics::API_CALL_DURATION_METRIC;
     use crate::metrics::MetricsExporter;
+    use crate::metrics::RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC;
+    use crate::metrics::RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC;
+    use crate::metrics::RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC;
     use crate::metrics::TOOL_CALL_COUNT_METRIC;
     use crate::metrics::TOOL_CALL_DURATION_METRIC;
+    use crate::metrics::TURN_TOKEN_USAGE_METRIC;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
@@ -587,7 +625,44 @@ mod tests {
     }
 
     #[test]
-    fn statsig_runtime_only_metrics_are_not_exported() -> Result<(), Box<dyn Error>> {
+    fn cached_global_metrics_follow_reinstalled_provider() -> Result<(), Box<dyn Error>> {
+        let initial =
+            crate::metrics::install_global(MetricsClient::new(MetricsConfig::in_memory(
+                "test",
+                "codex-test",
+                env!("CARGO_PKG_VERSION"),
+                InMemoryMetricExporter::default(),
+            ))?);
+        let cached = crate::metrics::global().expect("initial global metrics client");
+
+        let exporter = InMemoryMetricExporter::default();
+        let replacement =
+            crate::metrics::install_global(MetricsClient::new(MetricsConfig::in_memory(
+                "test",
+                "codex-test",
+                env!("CARGO_PKG_VERSION"),
+                exporter.clone(),
+            ))?);
+        cached.counter("codex.after_transition", /*inc*/ 1, &[])?;
+        initial.shutdown()?;
+        replacement.shutdown()?;
+
+        let exported_metrics = exporter.get_finished_metrics()?;
+        let mut names: Vec<_> = exported_metrics
+            .iter()
+            .flat_map(opentelemetry_sdk::metrics::data::ResourceMetrics::scope_metrics)
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .map(opentelemetry_sdk::metrics::data::Metric::name)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names, vec!["codex.after_transition"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn statsig_disabled_metrics_are_not_exported() -> Result<(), Box<dyn Error>> {
         let exporter = InMemoryMetricExporter::default();
         let mut config = MetricsConfig::otlp(
             "test",
@@ -600,8 +675,25 @@ mod tests {
 
         metrics.counter(API_CALL_COUNT_METRIC, /*inc*/ 1, &[])?;
         metrics.record_duration(API_CALL_DURATION_METRIC, Duration::from_millis(100), &[])?;
+        metrics.counter("codex.conversation.turn.count", /*inc*/ 1, &[])?;
+        metrics.record_duration(
+            RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC,
+            Duration::from_millis(100),
+            &[],
+        )?;
+        metrics.record_duration(
+            RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC,
+            Duration::from_millis(100),
+            &[],
+        )?;
+        metrics.record_duration(
+            RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC,
+            Duration::from_millis(100),
+            &[],
+        )?;
         metrics.counter(TOOL_CALL_COUNT_METRIC, /*inc*/ 1, &[])?;
         metrics.record_duration(TOOL_CALL_DURATION_METRIC, Duration::from_millis(25), &[])?;
+        metrics.histogram(TURN_TOKEN_USAGE_METRIC, /*value*/ 100, &[])?;
         metrics.counter("codex.turns", /*inc*/ 1, &[])?;
         metrics.shutdown()?;
 

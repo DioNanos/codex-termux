@@ -27,6 +27,14 @@ use std::path::PathBuf;
 #[ts(tag = "type")]
 #[ts(export_to = "v2/")]
 pub enum ConfigLayerSource {
+    /// Default configuration supplied with the installed Codex package.
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    PackagedDefaults {
+        /// Path to the packaged default configuration file.
+        file: AbsolutePathBuf,
+    },
+
     /// Managed preferences layer delivered by MDM (macOS only).
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -102,6 +110,7 @@ impl ConfigLayerSource {
     /// from a layer with a lower precedence.
     pub fn precedence(&self) -> i16 {
         match self {
+            ConfigLayerSource::PackagedDefaults { .. } => -10,
             ConfigLayerSource::Mdm { .. } => 0,
             ConfigLayerSource::System { .. } => 10,
             ConfigLayerSource::EnterpriseManaged { .. } => 15,
@@ -394,6 +403,7 @@ pub struct ConfigRequirements {
     pub enforce_residency: Option<ResidencyRequirement>,
     #[experimental("configRequirements/read.network")]
     pub network: Option<NetworkRequirements>,
+    pub auto_review: Option<AutoReviewRequirements>,
     pub models: Option<ModelsRequirements>,
     #[schemars(with = "Option<String>")]
     pub sqlite_home: Option<PathUri>,
@@ -405,6 +415,14 @@ pub struct ConfigRequirements {
     pub allow_login_shell: Option<bool>,
     pub feedback: Option<FeedbackRequirements>,
     pub windows_sandbox_private_desktop: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AutoReviewRequirements {
+    pub required_on_models: Option<Vec<String>>,
+    pub ignore_rules: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -518,6 +536,19 @@ pub enum ConfiguredHookHandler {
         #[serde(rename = "additionalContextLimit")]
         #[ts(rename = "additionalContextLimit")]
         additional_context_limit: Option<usize>,
+    },
+    #[serde(rename = "mcp_tool")]
+    #[ts(rename = "mcp_tool")]
+    McpTool {
+        server: String,
+        tool: String,
+        input: serde_json::Map<String, serde_json::Value>,
+        #[serde(rename = "timeoutSec")]
+        #[ts(rename = "timeoutSec")]
+        timeout_sec: Option<u64>,
+        #[serde(rename = "statusMessage")]
+        #[ts(rename = "statusMessage")]
+        status_message: Option<String>,
     },
     #[serde(rename = "prompt")]
     #[ts(rename = "prompt")]

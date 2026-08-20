@@ -38,10 +38,12 @@ use tokio::sync::Mutex;
 
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
+use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::network_approval::DeferredNetworkApproval;
+use codex_core_plugins::PluginMetricsSidecar;
 
 mod async_watcher;
 mod errors;
@@ -74,15 +76,15 @@ pub(crate) const MAX_UNIFIED_EXEC_PROCESSES: usize = 64;
 
 pub(crate) struct UnifiedExecContext {
     pub session: Arc<Session>,
-    pub turn: Arc<TurnContext>,
+    pub step_context: Arc<StepContext>,
     pub call_id: String,
 }
 
 impl UnifiedExecContext {
-    pub fn new(session: Arc<Session>, turn: Arc<TurnContext>, call_id: String) -> Self {
+    pub fn new(session: Arc<Session>, step_context: Arc<StepContext>, call_id: String) -> Self {
         Self {
             session,
-            turn,
+            step_context,
             call_id,
         }
     }
@@ -166,6 +168,7 @@ impl Default for UnifiedExecProcessManager {
 
 struct ProcessEntry {
     process: Arc<UnifiedExecProcess>,
+    plugin_metrics_sidecar: Option<SharedPluginMetricsSidecar>,
     call_id: String,
     process_id: i32,
     cwd: PathUri,
@@ -175,6 +178,17 @@ struct ProcessEntry {
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
+}
+
+type SharedPluginMetricsSidecar = Arc<std::sync::Mutex<Option<PluginMetricsSidecar>>>;
+
+fn take_plugin_metrics_sidecar(
+    sidecar: &SharedPluginMetricsSidecar,
+) -> Option<PluginMetricsSidecar> {
+    sidecar
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
 }
 
 pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {

@@ -33,7 +33,6 @@ use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::AgentReasoningRawContentEvent;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
-use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ContextCompactedEvent;
 use codex_protocol::protocol::DynamicToolCallResponseEvent;
 use codex_protocol::protocol::ErrorEvent;
@@ -50,7 +49,6 @@ use codex_protocol::protocol::McpToolCallBeginEvent;
 use codex_protocol::protocol::McpToolCallEndEvent;
 use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::PatchApplyEndEvent;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -61,6 +59,8 @@ use codex_protocol::protocol::WebSearchBeginEvent;
 use codex_protocol::protocol::WebSearchEndEvent;
 #[cfg(test)]
 use codex_protocol::review_format::REVIEW_FALLBACK_MESSAGE;
+use codex_rollout::CompactedItem;
+use codex_rollout::RolloutItem;
 use std::collections::HashMap;
 use tracing::warn;
 use uuid::Uuid;
@@ -400,11 +400,12 @@ impl ThreadHistoryBuilder {
         match item {
             RolloutItem::EventMsg(event) => self.handle_event(event),
             RolloutItem::Compacted(payload) => self.handle_compacted(payload),
-            RolloutItem::ResponseItem(item) => self.handle_response_item(item),
+            RolloutItem::ResponseItem(item) => self.handle_response_item(&item.item),
             RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::SessionMeta(_) => {}
         }
     }
@@ -863,6 +864,7 @@ impl ThreadHistoryBuilder {
             revised_prompt: None,
             result: String::new(),
             transparent_background: None,
+            failure: None,
             saved_path: None,
         });
         self.upsert_item_in_current_turn(item);
@@ -875,6 +877,7 @@ impl ThreadHistoryBuilder {
             revised_prompt: payload.revised_prompt.clone(),
             result: payload.result.clone(),
             transparent_background: payload.transparent_background,
+            failure: payload.failure.clone(),
             saved_path: payload.saved_path.clone(),
         });
         self.upsert_item_in_current_turn(item);
@@ -1648,7 +1651,6 @@ mod tests {
     use codex_protocol::protocol::AgentReasoningRawContentEvent;
     use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
     use codex_protocol::protocol::CodexErrorInfo;
-    use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::DynamicToolCallResponseEvent;
     use codex_protocol::protocol::EnteredReviewModeEvent;
     use codex_protocol::protocol::ExecCommandBeginEvent;
@@ -1668,6 +1670,7 @@ mod tests {
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::protocol::WebSearchBeginEvent;
     use codex_protocol::protocol::WebSearchEndEvent;
+    use codex_rollout::CompactedItem;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
@@ -2079,6 +2082,7 @@ mod tests {
                         revised_prompt: Some("A blue square".to_string()),
                         result: "cG5n".to_string(),
                         transparent_background: Some(true),
+                        failure: None,
                         saved_path: Some(saved_path.clone()),
                     },
                 )),
@@ -2110,6 +2114,7 @@ mod tests {
                 revised_prompt: Some("A blue square".to_string()),
                 result: "cG5n".to_string(),
                 transparent_background: Some(true),
+                failure: None,
                 saved_path: Some(saved_path),
             })]
         );
@@ -2373,6 +2378,12 @@ mod tests {
                 revised_prompt: Some("final prompt".into()),
                 result: "Zm9v".into(),
                 transparent_background: Some(true),
+                failure: Some(
+                    codex_extension_items::image_generation::ImageGenerationFailure::UsageLimitExceeded {
+                        limit_id: "image_gen".into(),
+                        resets_at: Some(1_786_150_800),
+                    },
+                ),
                 saved_path: Some(test_path_buf("/tmp/ig_123.png").abs()),
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -2413,6 +2424,12 @@ mod tests {
                         revised_prompt: Some("final prompt".into()),
                         result: "Zm9v".into(),
                         transparent_background: Some(true),
+                        failure: Some(
+                            codex_extension_items::image_generation::ImageGenerationFailure::UsageLimitExceeded {
+                                limit_id: "image_gen".into(),
+                                resets_at: Some(1_786_150_800),
+                            },
+                        ),
                         saved_path: Some(test_path_buf("/tmp/ig_123.png").abs()),
                     }),
                 ],
@@ -4383,7 +4400,7 @@ mod tests {
                 local_images: Vec::new(),
                 ..Default::default()
             })),
-            RolloutItem::ResponseItem(hook_prompt),
+            RolloutItem::ResponseItem(hook_prompt.into()),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-a".into(),
                 started_at: None,
@@ -4459,15 +4476,18 @@ mod tests {
                 model_context_window: None,
                 collaboration_mode_kind: Default::default(),
             })),
-            RolloutItem::ResponseItem(codex_protocol::models::ResponseItem::Message {
-                id: Some(codex_protocol::ResponseItemId::with_suffix("msg", "1")),
-                role: "user".into(),
-                content: vec![codex_protocol::models::ContentItem::InputText {
-                    text: "plain text".into(),
-                }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            }),
+            RolloutItem::ResponseItem(
+                codex_protocol::models::ResponseItem::Message {
+                    id: Some(codex_protocol::ResponseItemId::with_suffix("msg", "1")),
+                    role: "user".into(),
+                    content: vec![codex_protocol::models::ContentItem::InputText {
+                        text: "plain text".into(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            ),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-a".into(),
                 started_at: None,

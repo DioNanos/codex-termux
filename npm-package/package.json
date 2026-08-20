@@ -1,7 +1,7 @@
 {
   "name": "@mmmbuto/codex-cli-termux",
-  "version": "0.147.3",
-  "description": "OpenAI Codex CLI upstream rust-v0.147.0 packaged for Android Termux (ARM64). Restores real code-mode (exec/wait) on the native Android build, carries RUNPATH=$ORIGIN hardening for direct native invocation, and keeps update diagnostics on fork-owned channels.",
+  "version": "0.148.1",
+  "description": "OpenAI Codex CLI upstream rust-v0.148.0 packaged for Android Termux (ARM64). Restores real code-mode (exec/wait) on the native Android build, carries RUNPATH=$ORIGIN hardening for direct native invocation, and keeps update diagnostics on fork-owned channels.",
   "type": "module",
   "main": "bin/codex.js",
   "bin": {
@@ -16,6 +16,7 @@
     "bin/codex.bin",
     "bin/codex-code-mode-host",
     "bin/libc++_shared.so",
+    "scripts/postinstall_termux_launcher.js",
     "README.md",
     "LICENSE",
     "NOTICE"
@@ -42,6 +43,9 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall_termux_launcher.js"
   },
   "os": [
     "android"
