@@ -1,3 +1,24 @@
+# [0.148.1] - 2026-08-20
+
+Fork-only patch on the upstream OpenAI Codex `rust-v0.148.0` base. The native
+payload and the existing Android V8 build are unchanged.
+
+## Fixed
+
+- Android/Termux npm launchers no longer depend on `/usr/bin/env`, which is not
+  present in the Termux userland. The Android-only postinstall rewrites the
+  installed launcher shebangs to the active Node and shell interpreters.
+- Both npm entrypoints now spawn `codex.bin` directly while preserving the
+  managed-package markers and `LD_LIBRARY_PATH` sanitization.
+
+## Verification
+
+- Cargo and npm versions are synchronized at `0.148.1`.
+- The package workflow runs targeted `node --check` and `node --test` launcher
+  checks.
+- Static release-contract checks passed; no build or device validation is
+  claimed by this candidate note.
+
 # [0.148.0] - 2026-08-20
 
 Candidate Termux release synchronized to final upstream OpenAI Codex
