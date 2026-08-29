@@ -1,0 +1,474 @@
+name: rusty-v8-android-release
+
+# Builds the aarch64-linux-android rusty_v8 prebuild from source and uploads an
+# immutable CI artifact for coordinator audit. Publishing remains a separate,
+# local operation after the artifact and its checksums have been verified.
+#
+# Why this exists: denoland/rusty_v8 does not publish android prebuilds, and
+# upstream openai/codex rusty-v8-release matrix is desktop-only
+# (darwin / linux-gnu / linux-musl / windows-msvc). The Termux Android fork
+# needs an aarch64-linux-android prebuild for code-mode (exec/wait) to run
+# for real on Termux (see codex-termux#11 carry-forward, Patch #22).
+#
+# This workflow does NOT touch the codex workspace v8 version. It just
+# produces the artifact so that future fork merges that bump
+# v8 = "=149.x.y" can swap a Cargo.lock + manifest edit instead of waiting
+# for an upstream android prebuild.
+
+"on":
+  workflow_dispatch:
+    inputs:
+      v8_version:
+        description: "denoland/rusty_v8 tag to build (e.g. 150.4.0)"
+        type: string
+        default: "150.4.0"
+      target:
+        description: "Rust target triple (only aarch64-linux-android supported)"
+        type: choice
+        options:
+          - aarch64-linux-android
+        default: aarch64-linux-android
+      sandbox:
+        description: "Build with v8_enable_sandbox (code mode requires it since rust-v0.147.0)"
+        type: boolean
+        default: true
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+concurrency:
+  group: ${{ github.workflow }}::${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    name: Build rusty_v8 ${{ inputs.v8_version }} for ${{ inputs.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      ANDROID_NDK_VERSION: "28.2.13676358"
+      # NDK release name as chromium spells it, used only for the
+      # ANDROID_NDK_VERSION_ROLL cache-busting define.
+      ANDROID_NDK_RELEASE: "r28"
+      # Pinned by chromium build/config/android/config.gni, which resolves
+      # //third_party/android_sdk/public/build-tools/<version> and
+      # platforms/android-<version> for its public SDK release.
+      ANDROID_SDK_BUILD_TOOLS_VERSION: "36.0.0"
+      ANDROID_SDK_PLATFORM_VERSION: "36"
+      RUST_VERSION: "1.95.0"
+      # chromium's bundled libc++ says so itself: "Libc++ only supports Clang 21
+      # and later". Older releases parse far enough to look plausible and then
+      # fail on missing builtins.
+      LLVM_VERSION: "21"
+      # The NDK only adds its architecture include directory when the target
+      # carries an API level, and bindgen alone would not name one.
+      ANDROID_API_LEVEL: "21"
+    steps:
+      - name: Free up disk before the V8 build
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h "$RUNNER_TEMP" / || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          # The Android SDK under ANDROID_HOME used to be deleted wholesale
+          # here, which took sdkmanager with it and left the next step unable to
+          # install the NDK. chromium's Android configuration reads an SDK as
+          # well as an NDK, so keep the SDK and drop only what no build here
+          # touches: emulator images and any preinstalled NDK, this job
+          # installing the version it pins.
+          : "${ANDROID_HOME:?ANDROID_HOME must be set on the GitHub runner}"
+          if [ -d "${ANDROID_HOME}" ]; then
+            sudo rm -rf "${ANDROID_HOME}/system-images" "${ANDROID_HOME}/emulator" \
+              "${ANDROID_HOME}/ndk" "${ANDROID_HOME}/ndk-bundle" || true
+          fi
+          sudo apt-get clean || true
+          df -h "$RUNNER_TEMP" / || true
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install host dependencies (gn / sysroot tools)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The runner image carries third-party apt sources this job never
+          # uses, and packages.microsoft.com has been answering 403, which
+          # fails the whole update. Drop those lists first: every package below
+          # comes from the Ubuntu archive.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+            /etc/apt/sources.list.d/azure-cli.list \
+            /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev protobuf-compiler \
+            python3-pip xz-utils
+          # bindgen parses chromium's bundled libc++, which states it supports
+          # Clang 21 and later. The NDK ships a libclang labelled 19.0.1 that is
+          # an Android snapshot predating builtins such as __builtin_clzg, and
+          # chromium's own clang is new enough but ships no libclang shared
+          # object at all. Take the LLVM release from apt.llvm.org, which is the
+          # only source carrying this version for this image.
+          if ! sudo apt-get install -y --no-install-recommends \
+              "libclang-${LLVM_VERSION}-dev" "clang-${LLVM_VERSION}"; then
+            wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+            chmod +x /tmp/llvm.sh
+            sudo /tmp/llvm.sh "${LLVM_VERSION}"
+            sudo apt-get install -y --no-install-recommends \
+              "libclang-${LLVM_VERSION}-dev" "clang-${LLVM_VERSION}"
+          fi
+          llvm_lib="/usr/lib/llvm-${LLVM_VERSION}/lib"
+          if [ ! -f "${llvm_lib}/libclang.so" ] && [ ! -f "${llvm_lib}/libclang.so.1" ]; then
+            echo "libclang not found under ${llvm_lib} after installation." >&2
+            ls -la /usr/lib/llvm-*/lib 2>&1 | head -20 >&2 || true
+            exit 1
+          fi
+          echo "V8_SYSTEM_LIBCLANG_DIR=${llvm_lib}" >> "${GITHUB_ENV}"
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: "${{ env.RUST_VERSION }}"
+          targets: ${{ inputs.target }}
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ANDROID_HOME:?ANDROID_HOME must be set on the GitHub runner}"
+          export PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/cmdline-tools/bin:${PATH}"
+          if ! command -v sdkmanager >/dev/null 2>&1; then
+            echo "sdkmanager is not on PATH under ${ANDROID_HOME}; the runner image layout changed or the SDK was removed." >&2
+            ls -la "${ANDROID_HOME}" "${ANDROID_HOME}/cmdline-tools" 2>&1 >&2 || true
+            exit 1
+          fi
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "ndk;${ANDROID_NDK_VERSION}"
+          # chromium's config.gni resolves fixed SDK paths, not whatever the
+          # image happens to ship: build-tools/36.0.0 and platforms/android-36
+          # for the public SDK release it targets. Install them explicitly so
+          # the build does not depend on the runner image's SDK selection.
+          sdkmanager "platforms;android-${ANDROID_SDK_PLATFORM_VERSION}" \
+            "build-tools;${ANDROID_SDK_BUILD_TOOLS_VERSION}"
+          ndk_home="${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${ndk_home}" >> "${GITHUB_ENV}"
+          echo "ANDROID_NDK_ROOT=${ndk_home}" >> "${GITHUB_ENV}"
+
+      - name: Prepare rusty_v8 source checkout at v${{ inputs.v8_version }}
+        id: prepare
+        env:
+          V8_VERSION: ${{ inputs.v8_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${V8_VERSION}"
+          checkout_root="${GITHUB_WORKSPACE}/.artifacts/rusty_v8-src"
+          checkout_dir="${checkout_root}/${tag}"
+          mkdir -p "${checkout_root}"
+          if [ ! -d "${checkout_dir}" ]; then
+            git clone --depth 1 --branch "${tag}" \
+              https://github.com/denoland/rusty_v8.git "${checkout_dir}"
+          fi
+          # A V8 source build reaches far past the four submodules the
+          # maintainer-host script pins: `gn gen` already fails on
+          # third_party/icu, and the sandbox configuration pulls in more of the
+          # tree still. Initialise the whole set, which is what the upstream
+          # rusty_v8 CI does for V8_FROM_SOURCE builds.
+          (cd "${checkout_dir}" && \
+            git submodule update --init --depth 1 --recursive)
+          # Symlink android_toolchain/ndk to the NDK we just installed, mirroring
+          # what prepare_rusty_v8_android_source.py does on a maintainer host.
+          mkdir -p "${checkout_dir}/third_party/android_toolchain"
+          ln -sfn "${ANDROID_NDK_HOME}" "${checkout_dir}/third_party/android_toolchain/ndk"
+          # chromium's build/config/android reads an SDK from this path too, not
+          # just the NDK: config.gni imports sdk.gni and resolves
+          # //third_party/android_sdk/public. Point it at the runner's SDK the
+          # same way.
+          mkdir -p "${checkout_dir}/third_party/android_sdk"
+          ln -sfn "${ANDROID_HOME}" "${checkout_dir}/third_party/android_sdk/public"
+          # build/config/android/BUILD.gn reads ${android_ndk_version} and gets
+          # it from build/config/gclient_args.gni, which chromium generates
+          # during `gclient sync`. A git submodule checkout never runs gclient,
+          # so that file is present but empty and the identifier is undefined:
+          # gn then fails while evaluating the android config. Write the value
+          # gclient would have supplied for the NDK this job installs.
+          gclient_args="${checkout_dir}/build/config/gclient_args.gni"
+          if ! grep -q '^android_ndk_version' "${gclient_args}" 2>/dev/null; then
+            printf 'android_ndk_version = "%s"\n' "${ANDROID_NDK_RELEASE}" \
+              >> "${gclient_args}"
+          fi
+          echo "gclient_args.gni:"; cat "${gclient_args}"
+          # chromium ships its own clang and its libc++ tracks it closely, using
+          # builtins that released compilers do not have yet. Fetch it now
+          # rather than letting the cargo build do it, so the next step can
+          # check the binding toolchain before the long compile instead of
+          # after it.
+          (cd "${checkout_dir}" && python3 tools/clang/scripts/update.py)
+          # build.rs configures bindgen for macos, linux and ios only. Add the
+          # android branch here rather than through the environment: cargo
+          # exports TARGET for the whole build, so even a per-target
+          # BINDGEN_EXTRA_CLANG_ARGS is read by the bindgen calls chromium runs
+          # for its own x64 host tools, which then reject their own -msse3.
+          python3 "${GITHUB_WORKSPACE}/scripts/patch_rusty_v8_android_bindgen.py" \
+            "${checkout_dir}/build.rs"
+          echo "checkout=${checkout_dir}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check the bindgen toolchain before the long build
+        env:
+          CHECKOUT: ${{ steps.prepare.outputs.checkout }}
+          TARGET: ${{ inputs.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Generating the Rust bindings is the last thing the v8 build does, so
+          # a wrong parser toolchain only shows up after roughly two hours of
+          # compiling. Reproduce that parse in seconds instead, with the same
+          # flags build.rs passes to bindgen, and fail here if it cannot work.
+          ndk_toolchain="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
+          chromium_clang="${CHECKOUT}/third_party/llvm-build/Release+Asserts"
+
+          # Probe with the driver that matches the libclang bindgen will load,
+          # not with chromium's clang. The previous version checked a different
+          # toolchain than the build uses and reported success for it, which is
+          # the failure mode this whole step exists to prevent.
+          clang_bin="${V8_SYSTEM_LIBCLANG_DIR%/lib}/bin/clang"
+          if [ ! -x "${clang_bin}" ]; then
+            echo "clang driver not found at ${clang_bin}" >&2
+            ls -la "${V8_SYSTEM_LIBCLANG_DIR%/lib}/bin" 2>&1 | head -20 >&2 || true
+            exit 1
+          fi
+          echo "parser clang (matches the libclang bindgen loads): ${clang_bin}"
+          "${clang_bin}" --version | head -1
+          echo "chromium's own clang, for reference:"
+          "${chromium_clang}/bin/clang" --version | head -1 || true
+
+          # Neither tree provides a usable libclang: chromium ships only the
+          # sanitizer runtimes, and the NDK one is too old. Use the LLVM release
+          # installed for this job.
+          libclang_dir="${V8_SYSTEM_LIBCLANG_DIR}"
+          if [ ! -d "${libclang_dir}" ]; then
+            echo "system libclang directory ${libclang_dir} is missing." >&2
+            exit 1
+          fi
+          echo "libclang dir: ${libclang_dir}"
+          resource_dir="$("${clang_bin}" -print-resource-dir)"
+          sysroot="${ndk_toolchain}/sysroot"
+
+          # One definition of the clang arguments, used by this probe and then
+          # handed to bindgen verbatim. The previous version differed from the
+          # real call in one flag - it named an API level, bindgen does not -
+          # and that single difference is why it passed while bindgen failed
+          # two hours later: without the API level the NDK does not add its
+          # architecture include directory, so <stdint.h> is unreachable and
+          # every `using_if_exists` in <cstdint> stays unresolved.
+          # Name the NDK header directories explicitly. bindgen drives
+          # libclang, not the clang binary, and libclang does not derive the C
+          # include paths from --sysroot the way the driver does: with only the
+          # sysroot it picks the compiler's freestanding <stdint.h>, and every
+          # `using_if_exists` in <cstdint> then resolves to nothing.
+          bindgen_args="--target=${TARGET}${ANDROID_API_LEVEL} --sysroot=${sysroot}"
+          bindgen_args="${bindgen_args} -isystem${sysroot}/usr/include"
+          bindgen_args="${bindgen_args} -isystem${sysroot}/usr/include/${TARGET}"
+          bindgen_args="${bindgen_args} -isystem${resource_dir}/include"
+
+          # The real bindgen call also receives the GN build's defines, which
+          # include the libc++ hardening mode; this standalone parse does not,
+          # so supply it or the probe fails on a configuration detail rather
+          # than on the toolchain it is meant to judge.
+          probe="$(mktemp -d)/probe.cc"
+          # These three headers are exactly the ones that failed with an older
+          # parser: <bit> reaches countl/countr, <algorithm> reaches sort.h,
+          # <new> reaches interference_size.h.
+          printf '#include <bit>\n#include <algorithm>\n#include <new>\n#include <cstdint>\n#include <memory>\n#include <compare>\nint probe() { return 0; }\n' > "${probe}"
+          if ! (cd "${CHECKOUT}" && "${clang_bin}" -fsyntax-only \
+              -x c++ -std=c++20 -nostdinc++ \
+              -D_LIBCPP_HARDENING_MODE_DEFAULT=_LIBCPP_HARDENING_MODE_NONE \
+              -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE \
+              -isystembuildtools/third_party/libc++ \
+              -isystemthird_party/libc++/src/include \
+              -isystemthird_party/libc++abi/src/include \
+              -isystem"${resource_dir}/include" \
+              ${bindgen_args} \
+              "${probe}"); then
+            echo "This clang cannot parse chromium's bundled libc++ for ${TARGET}; bindgen would fail after the build." >&2
+            exit 1
+          fi
+          echo "bindgen toolchain check passed"
+          echo "V8_LIBCLANG_DIR=${libclang_dir}" >> "${GITHUB_ENV}"
+          echo "V8_CLANG_RESOURCE_DIR=${resource_dir}" >> "${GITHUB_ENV}"
+          echo "V8_ANDROID_SYSROOT=${sysroot}" >> "${GITHUB_ENV}"
+          echo "V8_BINDGEN_CLANG_ARGS=${bindgen_args}" >> "${GITHUB_ENV}"
+          echo "V8_ANDROID_API_LEVEL=${ANDROID_API_LEVEL}" >> "${GITHUB_ENV}"
+
+      - name: Build rusty_v8 from source for ${{ inputs.target }}
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_HOME }}
+          CHECKOUT: ${{ steps.prepare.outputs.checkout }}
+          SANDBOX: ${{ inputs.sandbox }}
+          TARGET: ${{ inputs.target }}
+          V8_VERSION: ${{ inputs.v8_version }}
+          # V8 source build needs a recent gn and an amd64 sysroot image.
+          # We let the upstream build/linux/sysroot_scripts install-sysroot.py
+          # fetch the sysroot; gn is shipped inside the denoland checkout.
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}"
+          export LIBLZMA_NO_PKG_CONFIG=1
+          export OPENSSL_NO_PKG_CONFIG=1
+          export PKG_CONFIG_ALLOW_CROSS=1
+          # The denoland checkout ships a `gn` binary in `buildtools/` once the
+          # buildtools submodule is initialised. Export it so `cargo`/`v8` can
+          # find a recent enough `gn` to drive the V8 build.
+          if [ -x "${CHECKOUT}/buildtools/linux64/gn" ]; then
+            export GN="${CHECKOUT}/buildtools/linux64/gn"
+          fi
+          # amd64 sysroot (libc/glibc) is required by some V8 host tools even
+          # for a cross-build to android.
+          (cd "${CHECKOUT}" && \
+            python3 build/linux/sysroot_scripts/install-sysroot.py --arch=amd64)
+          # The v8 build script points bindgen at a sysroot for macos, linux and
+          # ios, but has no android branch: bindgen then parses the V8 headers
+          # against the host's glibc and fails on a missing
+          # bits/libc-header-start.h. It also warns that bindgen needs Clang 19+,
+          # and the system libclang cannot parse chromium's bundled libc++
+          # ("'_Tp' does not refer to a value"). Supply both from the NDK, which
+          # ships a new enough clang and the android sysroot, through the
+          # variables bindgen reads on its own.
+          # Values resolved and proven by the toolchain check step above.
+          export LIBCLANG_PATH="${V8_LIBCLANG_DIR}"
+          echo "LIBCLANG_PATH=${LIBCLANG_PATH}"
+          # V8_CLANG_RESOURCE_DIR, V8_ANDROID_SYSROOT and V8_ANDROID_API_LEVEL
+          # reach bindgen through the android branch patched into build.rs, so
+          # they apply to this crate's call and to nothing else in the tree.
+          echo "bindgen args for ${TARGET}: ${V8_BINDGEN_CLANG_ARGS}"
+
+          # Code mode links `v8` with `v8_enable_sandbox` (which pulls in
+          # pointer compression). Building the prebuild without the feature
+          # produces an archive that links and runs but whose
+          # `v8__V8__IsSandboxEnabled` returns false: the security barrier is
+          # silently absent. Keep the feature set here in step with
+          # codex-rs/code-mode-runtime/Cargo.toml.
+          features=()
+          if [ "${SANDBOX}" = "true" ]; then
+            features=(--features v8_enable_sandbox)
+          fi
+          (cd "${CHECKOUT}" && \
+            V8_FROM_SOURCE=1 \
+            cargo build --release --target "${TARGET}" "${features[@]}")
+
+      - name: Locate build outputs
+        id: locate
+        env:
+          CHECKOUT: ${{ steps.prepare.outputs.checkout }}
+          TARGET: ${{ inputs.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # denoland's rusty_v8 produces the static archive under
+          # target/<triple>/release/build/.../out/librusty_v8.a, and the binding
+          # next to it. Locate by name to be robust against layout changes.
+          archive="$(find "${CHECKOUT}/target/${TARGET}/release" -maxdepth 6 \
+            -type f -name 'librusty_v8.a' -print -quit || true)"
+          binding="$(find "${CHECKOUT}/target/${TARGET}/release" -maxdepth 6 \
+            -type f -name 'src_binding.rs' -print -quit || true)"
+          if [ -z "${archive}" ] || [ -z "${binding}" ]; then
+            echo "Could not locate librusty_v8.a or src_binding.rs under ${CHECKOUT}/target/${TARGET}/release" >&2
+            find "${CHECKOUT}/target/${TARGET}/release" -maxdepth 4 -type f 2>/dev/null | head -40 >&2 || true
+            exit 1
+          fi
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+          echo "binding=${binding}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify the built archive matches the requested sandbox setting
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+          ARCHIVE: ${{ steps.locate.outputs.archive }}
+          SANDBOX: ${{ inputs.sandbox }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # This is where a wrong artifact is cheapest to catch: nothing is
+          # pinned yet, so a bad build here becomes the checksum everyone else
+          # trusts. Decide it by what `v8__V8__IsSandboxEnabled` returns, which
+          # is the function the Rust side calls.
+          #
+          # This previously counted defined `v8::internal::Sandbox` symbols. That
+          # correlates on the artifacts we happen to have, but it is not the
+          # invariant: an archive built plain and carrying one extra object that
+          # merely defines some `v8::internal::Sandbox` name counts non-zero
+          # while the wrapper still returns false. The check below decodes the
+          # wrapper without a disassembler, so it works for a target the runner
+          # cannot execute and cannot be skipped for want of a tool.
+          set +e
+          python3 scripts/check_v8_sandbox.py "${ARCHIVE}"
+          verdict=$?
+          set -e
+          # 0 sandbox present, 1 sandbox absent, anything else could not be
+          # judged. The plain branch has to tell those apart: reading every
+          # failure as "confirmed plain" would publish an archive nobody looked
+          # at, under a name that says what it is.
+          case "${verdict}" in
+            0)
+              if [ "${SANDBOX}" != "true" ]; then
+                echo "Requested a non-sandbox build but this archive has the sandbox." >&2
+                exit 1
+              fi
+              ;;
+            1)
+              if [ "${SANDBOX}" = "true" ]; then
+                echo "Requested a sandbox build but this archive has none." >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "The sandbox check could not judge this archive (exit ${verdict})." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Stage and compress outputs
+        env:
+          ARCHIVE: ${{ steps.locate.outputs.archive }}
+          BINDING: ${{ steps.locate.outputs.binding }}
+          SANDBOX: ${{ inputs.sandbox }}
+          TARGET: ${{ inputs.target }}
+          V8_VERSION: ${{ inputs.v8_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The consumer derives this name from the enabled Cargo features
+          # (`prebuilt_features_suffix()` in the v8 build script), so the
+          # artifact has to carry the profile the features imply.
+          profile="release"
+          if [ "${SANDBOX}" = "true" ]; then
+            profile="ptrcomp_sandbox_release"
+          fi
+          echo "V8_PROFILE=${profile}" >> "${GITHUB_ENV}"
+          stage="dist/${TARGET}"
+          mkdir -p "${stage}"
+          cp "${ARCHIVE}" "${stage}/librusty_v8_${profile}_${TARGET}.a"
+          cp "${BINDING}" "${stage}/src_binding_${profile}_${TARGET}.rs"
+          gzip -9 -f "${stage}/librusty_v8_${profile}_${TARGET}.a"
+          (cd "${stage}" && \
+            sha256sum "librusty_v8_${profile}_${TARGET}.a.gz" \
+                      "src_binding_${profile}_${TARGET}.rs" \
+            > "rusty_v8_${profile}_${TARGET}.sha256")
+          cat "${stage}/rusty_v8_${profile}_${TARGET}.sha256"
+
+      - name: Upload staged artifacts
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: rusty-v8-android-${{ inputs.v8_version }}-${{ env.V8_PROFILE }}-${{ inputs.target }}
+          path: dist/${{ inputs.target }}/*

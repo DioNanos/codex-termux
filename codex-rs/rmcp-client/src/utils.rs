@@ -18,9 +18,15 @@ pub(crate) fn create_env_for_mcp_server(
     env_vars: &[McpServerEnvVar],
 ) -> Result<HashMap<OsString, OsString>> {
     let additional_env_vars = local_stdio_env_var_names(env_vars)?;
+    let termux_env_vars: &[&str] = if running_on_termux() {
+        TERMUX_ENV_VARS
+    } else {
+        &[]
+    };
     let mut env: HashMap<OsString, OsString> = DEFAULT_ENV_VARS
         .iter()
         .copied()
+        .chain(termux_env_vars.iter().copied())
         .chain(additional_env_vars)
         .filter_map(|var| env::var_os(var).map(|value| (OsString::from(var), value)))
         .collect();
@@ -57,6 +63,25 @@ pub(crate) fn create_env_for_mcp_server(
     });
     Ok(env)
 }
+
+/// codex-termux GitHub issue #10 fix — detect Termux at runtime via the
+/// `TERMUX_VERSION` environment variable (set by Termux init scripts and
+/// not present on ordinary Linux distributions). Runtime detection keeps the
+/// behavior tied to the Termux environment and also covers older package
+/// lines that did not use the current Android target triple.
+fn running_on_termux() -> bool {
+    env::var_os("TERMUX_VERSION").is_some()
+}
+
+// The codex-termux issue #11 TLS fix used to live here: it wrapped the
+// `reqwest` client this crate built for OAuth discovery so that Termux got
+// explicit webpki roots instead of `rustls-platform-verifier`, which panics on
+// Android without a JVM `Context`. Upstream 0.147.0 removed that client — MCP
+// OAuth discovery now runs on the injected `codex-http-client`, and `reqwest`
+// is no longer a dependency of this crate — so there is nothing left here to
+// wrap and the panicking verifier is never constructed on this path. Whether
+// the replacement's native root store works under Termux is a separate
+// question about `codex-http-client`, not about this file.
 
 pub(crate) fn create_env_overlay_for_remote_mcp_server(
     extra_env: Option<HashMap<OsString, OsString>>,
@@ -173,6 +198,46 @@ pub(crate) const DEFAULT_ENV_VARS: &[&str] = &[
     "TMPDIR",
     "TZ",
 ];
+
+/// Termux-specific environment variables required by tools spawned under
+/// `/data/data/com.termux/files`. Without these, `npx`, `npm`, `pip`, and
+/// most native helpers either fail to find their interpreters/caches
+/// (`PREFIX`, `NPM_CONFIG_PREFIX`), crash because the dynamic linker
+/// shim is missing (`LD_PRELOAD`), or load the wrong system libraries
+/// (`LD_LIBRARY_PATH`). Only chained into the allowlist when
+/// `running_on_termux()` returns true.
+///
+/// Fix for GitHub `DioNanos/codex-termux` issue #10 — `MCP client for
+/// context7 failed to start: MCP startup failed: handshaking with MCP
+/// server failed: connection closed: initialize response` when the MCP
+/// server is configured via `npx`.
+#[cfg(unix)]
+pub(crate) const TERMUX_ENV_VARS: &[&str] = &[
+    "PREFIX",
+    "TERMUX_VERSION",
+    "TERMUX_APP_PID",
+    "TERMUX_MAIN_PACKAGE_FORMAT",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "NPM_CONFIG_PREFIX",
+    "ANDROID_DATA",
+    "ANDROID_ROOT",
+    "ANDROID_RUNTIME_ROOT",
+    "BOOTCLASSPATH",
+    "XDG_RUNTIME_DIR",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+];
+
+/// Windows builds of codex-termux never run under Termux (Termux is
+/// Android/Linux with Bionic) so the allowlist is empty. Declared explicitly so
+/// that `create_env_for_mcp_server` resolves the name on every target —
+/// without this, the non-Unix typecheck of the function body would fail
+/// with `unresolved name TERMUX_ENV_VARS` (caught in the 0.134.1
+/// pre-build review, 2026-05-27).
+#[cfg(not(unix))]
+pub(crate) const TERMUX_ENV_VARS: &[&str] = &[];
 
 #[cfg(windows)]
 pub(crate) const DEFAULT_ENV_VARS: &[&str] =
@@ -337,6 +402,48 @@ mod tests {
             err.to_string().contains("requires remote MCP stdio"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    #[serial(extra_rmcp_env)]
+    fn create_env_propagates_termux_vars_when_termux_version_is_set() {
+        // GitHub DioNanos/codex-termux issue #10 regression guard.
+        let _termux_guard = EnvVarGuard::set("TERMUX_VERSION", "0.118.3");
+        let prefix_value = OsString::from("/data/data/com.termux/files/usr");
+        let _prefix_guard = EnvVarGuard::set("PREFIX", &prefix_value);
+
+        let env =
+            create_env_for_mcp_server(/*extra_env*/ None, &[]).expect("local MCP env should build");
+
+        assert_eq!(env.get(OsStr::new("PREFIX")), Some(&prefix_value));
+        assert_eq!(
+            env.get(OsStr::new("TERMUX_VERSION")),
+            Some(&OsString::from("0.118.3"))
+        );
+    }
+
+    #[test]
+    #[serial(extra_rmcp_env)]
+    fn create_env_does_not_leak_termux_vars_off_termux() {
+        // Without TERMUX_VERSION set, PREFIX from the host shell must NOT
+        // accidentally propagate to spawned MCP servers (Linux desktops
+        // often use PREFIX for unrelated build-tool conventions).
+        let original_termux = std::env::var_os("TERMUX_VERSION");
+        unsafe {
+            std::env::remove_var("TERMUX_VERSION");
+        }
+        let _prefix_guard = EnvVarGuard::set("PREFIX", "/opt/leaked");
+
+        let env =
+            create_env_for_mcp_server(/*extra_env*/ None, &[]).expect("local MCP env should build");
+
+        assert_eq!(env.get(OsStr::new("PREFIX")), None);
+
+        if let Some(value) = original_termux {
+            unsafe {
+                std::env::set_var("TERMUX_VERSION", value);
+            }
+        }
     }
 
     #[cfg(unix)]

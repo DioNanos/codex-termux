@@ -10,6 +10,9 @@ use serde::Serialize;
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HooksFile {
+    /// Optional human-readable description emitted by some plugin hook files
+    /// (e.g. security-guidance 2.0.6). Accepted at the top level while
+    /// `deny_unknown_fields` still rejects any other unknown field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default)]

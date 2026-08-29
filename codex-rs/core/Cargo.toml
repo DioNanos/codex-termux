@@ -135,6 +135,10 @@ openssl-sys = { workspace = true, features = ["vendored"] }
 [target.aarch64-unknown-linux-musl.dependencies]
 openssl-sys = { workspace = true, features = ["vendored"] }
 
+# Build OpenSSL from source for Android cross-builds.
+[target.aarch64-linux-android.dependencies]
+openssl-sys = { workspace = true, features = ["vendored"] }
+
 [target.'cfg(unix)'.dependencies]
 codex-shell-escalation = { workspace = true }
 

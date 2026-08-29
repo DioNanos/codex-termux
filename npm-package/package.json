@@ -1,0 +1,56 @@
+{
+  "name": "@mmmbuto/codex-cli-termux",
+  "version": "0.150.1",
+  "description": "OpenAI Codex CLI upstream rust-v0.150.1 packaged for Android Termux (ARM64). Final release of the fork: carries the AGENTS.md discovery, background-terminal status, remote-attachment and sandbox-approval Android compatibility fixes, RUNPATH=$ORIGIN hardening for direct native invocation, and fork-owned update diagnostics.",
+  "type": "module",
+  "main": "bin/codex.js",
+  "bin": {
+    "codex": "bin/codex.js",
+    "codex-exec": "bin/codex-exec.js"
+  },
+  "files": [
+    "bin/codex.js",
+    "bin/codex-exec.js",
+    "bin/codex",
+    "bin/codex-exec",
+    "bin/codex.bin",
+    "bin/codex-code-mode-host",
+    "bin/libc++_shared.so",
+    "scripts/postinstall_termux_launcher.js",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "keywords": [
+    "codex",
+    "openai",
+    "termux",
+    "android",
+    "arm64",
+    "cli",
+    "ai",
+    "coding-agent"
+  ],
+  "author": "DioNanos",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DioNanos/codex-termux.git"
+  },
+  "homepage": "https://github.com/DioNanos/codex-termux#readme",
+  "bugs": {
+    "url": "https://github.com/DioNanos/codex-termux/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall_termux_launcher.js"
+  },
+  "os": [
+    "android"
+  ],
+  "cpu": [
+    "arm64"
+  ]
+}

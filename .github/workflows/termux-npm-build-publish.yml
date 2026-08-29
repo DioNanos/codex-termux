@@ -1,0 +1,206 @@
+# NOTE (policy): npm publish is performed LOCALLY from the maintainer's
+# release host, never from GitHub Actions. The runner does not hold an npm
+# write token, so this workflow only BUILDS the Android arm64 payload and
+# uploads the npm tarball as an artifact. Publishing is done with a local
+# ~/.npmrc.
+name: termux-npm-build-publish
+
+on:
+  push:
+    branches:
+      - main
+      - lts
+  workflow_dispatch:
+
+jobs:
+  build-android-arm64:
+    name: Build Android ARM64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      ANDROID_NDK_VERSION: "28.2.13676358"
+      # Keep the release tarball under the
+      # registry's unpacked-size limit (~512 MiB). Default release profile
+      # produced ~520 MiB and was rejected with HTTP 413 Payload Too Large.
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "3"
+      CARGO_PROFILE_RELEASE_LTO: "thin"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_PANIC: "abort"
+      CARGO_PROFILE_RELEASE_STRIP: "symbols"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          # The release contract gate (verify-patches.sh, BASE relation) runs
+          # `git merge-base --is-ancestor rust-v* HEAD` and needs BOTH
+          # ingredients — depth gives the history, fetch-tags gives the
+          # labels. They are separate inputs in actions/checkout@v4+: a bare
+          # fetch-depth: 0 does NOT fetch tags (its default is
+          # fetch-tags: false — the first CI run failed exactly there).
+          # A bounded depth would not do either: the base tag sits 343+
+          # commits behind HEAD (further every release) and a shallow
+          # boundary between the two turns merge-base into a spurious
+          # REFUTED. Manual release workflow: full history is the cheap side.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify checked-out revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+
+      - name: Fetch declared upstream base tag for the release contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The mirror does not carry the rust-v* release tags (measured:
+          # only a handful of ancient rust-v0.0.* refs), so fetch-depth/fetch-
+          # tags alone cannot give the BASE gate its data. Fetch exactly the
+          # tag the package description declares, from upstream. The tag
+          # points at a commit already inside this branch's history, so this
+          # transfers (almost) no objects. Give the CI the data to verify
+          # provenance — never the permission not to.
+          base_tag="$(node -p "(require('./npm-package/package.json').description.match(/rust-v[0-9]+\.[0-9]+\.[0-9]+/)||[''])[0]")"
+          if [ -z "$base_tag" ]; then
+            echo "no upstream base tag declared in the package description" >&2
+            exit 1
+          fi
+          git fetch --no-tags https://github.com/openai/codex.git \
+            "refs/tags/${base_tag}:refs/tags/${base_tag}"
+          git rev-parse -q --verify "refs/tags/${base_tag}^{commit}"
+
+      - name: Check npm launcher sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check npm-package/bin/codex.js
+          node --check npm-package/bin/codex-exec.js
+          node --check npm-package/scripts/postinstall_termux_launcher.js
+          node --check npm-package/tests/launcher_termux_shebang.test.mjs
+          node --test npm-package/tests/launcher_termux_shebang.test.mjs
+          node -e 'const fs = require("node:fs"); const p = JSON.parse(fs.readFileSync("npm-package/package.json", "utf8")); if (p.scripts?.postinstall !== "node scripts/postinstall_termux_launcher.js" || !p.files?.includes("bin/codex-exec.js") || !p.files?.includes("scripts/postinstall_termux_launcher.js")) process.exit(1);'
+
+      - name: Install host dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --target aarch64-linux-android
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ANDROID_HOME:?ANDROID_HOME must be set on the GitHub runner}"
+          export PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/cmdline-tools/bin:${PATH}"
+          command -v sdkmanager
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "ndk;${ANDROID_NDK_VERSION}"
+          ndk_home="${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${ndk_home}" >> "${GITHUB_ENV}"
+          echo "ANDROID_NDK_ROOT=${ndk_home}" >> "${GITHUB_ENV}"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ANDROID_NDK_HOME:?ANDROID_NDK_HOME must point to Android NDK r27c or newer}"
+          export ANDROID_NDK_ROOT="${ANDROID_NDK_HOME}"
+          export LIBLZMA_NO_PKG_CONFIG=1
+          export PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}"
+          eval "$(python3 scripts/fetch_rusty_v8_android.py | grep '^export ' | sed 's/^export //')"
+          export RUSTY_V8_ARCHIVE RUSTY_V8_SRC_BINDING_PATH
+          # This target is cross-compiled, so nothing can be executed here and the
+          # archive itself has to answer for the sandbox. Read what
+          # `v8__V8__IsSandboxEnabled` returns: it is the function the Rust side
+          # calls, compiled from the same condition the feature controls. Counting
+          # `v8::internal::Sandbox` symbol names -- which this replaced -- is passed
+          # by a plain archive carrying one extra object that merely mentions the
+          # name, so it never separated the two builds in the first place.
+          python3 scripts/check_v8_sandbox.py "${RUSTY_V8_ARCHIVE}"
+          export CC_aarch64_linux_android="aarch64-linux-android29-clang"
+          export CXX_aarch64_linux_android="aarch64-linux-android29-clang++"
+          export AR_aarch64_linux_android="llvm-ar"
+          export RANLIB_aarch64_linux_android="llvm-ranlib"
+          export PKG_CONFIG_ALLOW_CROSS=1
+          export OPENSSL_NO_PKG_CONFIG=1
+          # v8 (code-mode JIT) references __clear_cache, a compiler-rt builtin.
+          # With the release profile's -nodefaultlibs, the NDK does not auto-link
+          # it, so link the compiler-rt builtins archive explicitly. We replicate
+          # the .cargo/config.toml android rustflags here because the per-target
+          # RUSTFLAGS env overrides (does not merge with) the config file.
+          builtins="$(find "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64" -name 'libclang_rt.builtins-aarch64-android.a' -print -quit 2>/dev/null)"
+          if [ -z "${builtins}" ]; then echo "clang_rt builtins for aarch64-android not found under NDK" >&2; exit 1; fi
+          echo "linking compiler-rt builtins: ${builtins}"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-Clink-arg=-lc++_shared -Clink-arg=-Wl,-rpath,\$ORIGIN -Clink-arg=${builtins}"
+          cd codex-rs
+          rustup run 1.95.0 cargo build --target aarch64-linux-android --release -p codex-cli -p codex-code-mode-host
+          host_path="target/aarch64-linux-android/release/codex-code-mode-host"
+          if [ ! -f "${host_path}" ]; then echo "code-mode host ${host_path} not found" >&2; exit 1; fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp codex-rs/target/aarch64-linux-android/release/codex npm-package/bin/codex.bin
+          # Code mode runs out-of-process since rust-v0.147.0 and fails closed
+          # when this binary is missing, so it must travel in the package.
+          cp codex-rs/target/aarch64-linux-android/release/codex-code-mode-host npm-package/bin/codex-code-mode-host
+          cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" npm-package/bin/libc++_shared.so
+          # Strip native binaries and libc++ to stay
+          # under npm's unpacked-size limit (~512 MiB). Without this the tarball is
+          # rejected with HTTP 413 Payload Too Large.
+          export PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}"
+          llvm-strip --strip-all npm-package/bin/codex.bin npm-package/bin/codex-code-mode-host npm-package/bin/libc++_shared.so
+          chmod 0755 npm-package/bin/codex npm-package/bin/codex-exec npm-package/bin/codex.bin npm-package/bin/codex-code-mode-host
+          chmod 0644 npm-package/bin/libc++_shared.so
+          CODEX_PUBLIC_SANITIZED_TREE=1 bash verify-patches.sh
+          cd npm-package
+          rm -f ./*.tgz
+          npm pack
+          package_tgz="$(ls -1 *.tgz)"
+          # npm pack omits a listed-but-absent file and still exits 0, so the
+          # only proof is reading the archive that will be published.
+          # List once into a file and grep that. `tar -tzf | grep -q` looks right
+          # and is not: grep exits at the first match, tar takes SIGPIPE, and
+          # under `pipefail` the pipeline reports failure — so a tarball that
+          # DOES contain the file is reported as missing.
+          tar -tzf "${package_tgz}" > /tmp/tarball-entries.txt
+          for required in package/bin/codex package/bin/codex-exec package/bin/codex.js package/bin/codex-exec.js package/bin/codex.bin package/bin/codex-code-mode-host package/bin/libc++_shared.so package/scripts/postinstall_termux_launcher.js; do
+            if ! grep -qxF "${required}" /tmp/tarball-entries.txt; then
+              echo "packaged tarball is missing ${required}" >&2
+              exit 1
+            fi
+          done
+          echo "tarball payload verified: codex.bin, codex-code-mode-host, libc++_shared.so"
+          unpacked="$(node -p "require('child_process').execSync('npm pack --dry-run --json',{stdio:['ignore','pipe','ignore']}).toString().trim()" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8'))[0].unpackedSize")"
+          echo "unpacked size: ${unpacked} bytes"
+          package_version="$(node -p "require('./package.json').version")"
+          sha256sum "${package_tgz}" | tee "${package_tgz}.sha256"
+          echo "PACKAGE_TGZ=npm-package/${package_tgz}" >> "${GITHUB_ENV}"
+          echo "PACKAGE_SHA256_FILE=npm-package/${package_tgz}.sha256" >> "${GITHUB_ENV}"
+          echo "PACKAGE_VERSION=${package_version}" >> "${GITHUB_ENV}"
+          ls -lh "${package_tgz}" "${package_tgz}.sha256"
+
+      - name: Upload npm tarball artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-cli-termux-android-arm64-${{ env.PACKAGE_VERSION }}
+          path: |
+            ${{ env.PACKAGE_TGZ }}
+            ${{ env.PACKAGE_SHA256_FILE }}
+          if-no-files-found: error
+
+      # npm publish intentionally removed: publishing is performed locally with
+      # ~/.npmrc on the maintainer's release host, never from CI. The Android
+      # arm64 npm tarball is available as the uploaded build artifact above.

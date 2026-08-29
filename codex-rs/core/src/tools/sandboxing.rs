@@ -235,16 +235,46 @@ pub(crate) enum SandboxOverride {
     BypassSandboxFirstAttempt,
 }
 
+/// True when this platform cannot provide a sandbox BY CONSTRUCTION: the
+/// Android/Termux build targets `aarch64-linux-android`, where
+/// `cfg!(target_os = "linux")` is false and no sandbox backend is compiled in
+/// at all (no seatbelt, no Linux seccomp/landlock helper, no Windows
+/// restricted token). This is a compile-time property of the binary, NOT a
+/// runtime probe: a Linux host whose sandbox is missing or broken must never
+/// match this — there the executor stays fail-closed. Tests inject the branch
+/// explicitly so they declare the platform instead of depending on the host.
+pub(crate) fn sandbox_unavailable_by_construction() -> bool {
+    cfg!(target_os = "android")
+}
+
 pub(crate) fn sandbox_override_for_first_attempt(
     sandbox_permissions: SandboxPermissions,
     exec_approval_requirement: &ExecApprovalRequirement,
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    sandbox_unavailable_by_construction: bool,
 ) -> SandboxOverride {
     // Deny-read restrictions are part of the active permission policy. Running
     // without a filesystem sandbox would discard them, even if the command was
     // otherwise approved by rules or explicit escalation.
     if !unsandboxed_execution_allowed(file_system_sandbox_policy) {
         return SandboxOverride::NoOverride;
+    }
+
+    // A NeedsApproval reaching this point has already passed the user dialog:
+    // `request_approval` returned Ok (a denial returns an error and no attempt
+    // runs at all). On a platform that cannot provide a sandbox by
+    // construction, honoring that approval means taking the existing
+    // unsandboxed path instead of sending a sandbox request the executor must
+    // refuse ("filesystem sandbox cannot be enforced on this executor").
+    // Platforms that are expected to have a sandbox never take this branch:
+    // they keep the sandboxed first attempt and stay fail-closed downstream.
+    if sandbox_unavailable_by_construction
+        && matches!(
+            exec_approval_requirement,
+            ExecApprovalRequirement::NeedsApproval { .. }
+        )
+    {
+        return SandboxOverride::BypassSandboxFirstAttempt;
     }
 
     // ExecPolicy `Allow` can intentionally imply full trust (Skip + bypass_sandbox=true),

@@ -24,6 +24,7 @@ use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::default_exec_approval_requirement;
 use crate::tools::sandboxing::sandbox_override_for_first_attempt;
+use crate::tools::sandboxing::sandbox_unavailable_by_construction;
 use crate::tools::sandboxing::unsandboxed_execution_allowed;
 use codex_otel::ToolDecisionSource;
 use codex_protocol::error::CodexErrorDetails;
@@ -229,13 +230,21 @@ impl ToolOrchestrator {
         }
 
         // 2) First attempt under the selected sandbox.
-        let unsandboxed_allowed =
-            !owner_network_policy && unsandboxed_execution_allowed(&file_system_sandbox_policy);
+        // On a platform with no sandbox backend at all (Android/Termux) an
+        // approved `apply_patch`/exec command must take the unsandboxed path
+        // (fork fix #22) instead of being refused by the executor; the deny-read
+        // guard inside `sandbox_override_for_first_attempt` still refuses the
+        // bypass when the policy forbids unsandboxed execution. Elsewhere the
+        // upstream owner-network policy decides.
+        let unsandboxed_allowed = (!owner_network_policy
+            && unsandboxed_execution_allowed(&file_system_sandbox_policy))
+            || sandbox_unavailable_by_construction();
         let sandbox_override = if unsandboxed_allowed {
             sandbox_override_for_first_attempt(
                 tool.sandbox_permissions(req),
                 &requirement,
                 &file_system_sandbox_policy,
+                sandbox_unavailable_by_construction(),
             )
         } else {
             SandboxOverride::NoOverride

@@ -1,11 +1,6 @@
-use std::sync::Mutex;
-
 use pretty_assertions::assert_eq;
 
-use super::INSTALL_URL;
-use super::InstallerHttp;
-use super::InstallerResponse;
-use super::fetch_installer_script;
+use super::install_latest_standalone;
 use super::update_modes_for_identities;
 use crate::RestartMode;
 use crate::UpdaterRefreshMode;
@@ -37,58 +32,10 @@ fn changed_updater_forces_refresh_even_when_version_may_match() {
 }
 
 #[tokio::test]
-async fn installer_fetch_uses_exact_url_and_preserves_bytes() {
-    let script = b"#!/bin/sh\nprintf 'update bytes'\n".to_vec();
-    let http = FakeInstallerHttp::new(InstallerResponse::Success(script.clone()));
-
-    assert_eq!(
-        fetch_installer_script(&http)
-            .await
-            .expect("installer fetch should succeed"),
-        script
-    );
-    assert_eq!(http.requested_urls(), vec![INSTALL_URL.to_string()]);
-}
-
-#[tokio::test]
-async fn installer_fetch_rejects_non_success_status() {
-    let http = FakeInstallerHttp::new(InstallerResponse::Unsuccessful { status: 503 });
-
-    let error = fetch_installer_script(&http)
+async fn standalone_installer_is_intentionally_a_noop() {
+    // Termux packages update through the fork-owned release channel. The
+    // upstream standalone installer must never fetch or execute here.
+    install_latest_standalone()
         .await
-        .expect_err("non-success response should fail");
-
-    assert!(error.to_string().contains("503"));
-    assert_eq!(http.requested_urls(), vec![INSTALL_URL.to_string()]);
-}
-
-struct FakeInstallerHttp {
-    response: InstallerResponse,
-    requested_urls: Mutex<Vec<String>>,
-}
-
-impl FakeInstallerHttp {
-    fn new(response: InstallerResponse) -> Self {
-        Self {
-            response,
-            requested_urls: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn requested_urls(&self) -> Vec<String> {
-        self.requested_urls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-}
-
-impl InstallerHttp for FakeInstallerHttp {
-    async fn get(&self, url: &str) -> anyhow::Result<InstallerResponse> {
-        self.requested_urls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(url.to_string());
-        Ok(self.response.clone())
-    }
+        .expect("Termux standalone updater must fail closed as a no-op");
 }

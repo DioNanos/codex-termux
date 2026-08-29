@@ -44,8 +44,16 @@ impl AgentsMdManager {
         let active_project_trust_level = config.active_project.trust_level;
         {
             let mut cache = self.cache.lock().await;
+            // The environment selection is not the only input to discovery: so
+            // are the files on disk. A session that starts without an AGENTS.md
+            // and then has one created — which is what `/init` does — kept
+            // reporting that none existed, because the selection had not
+            // changed. Skip the work only when instructions have actually been
+            // found; re-running discovery while nothing exists is a bounded set
+            // of path probes and stops costing anything as soon as they do.
             if cache.selections.as_ref() == Some(&selections)
                 && cache.active_project_trust_level == active_project_trust_level
+                && cache.loaded.is_some()
             {
                 return Ok(());
             }

@@ -9,3 +9,14 @@ rustflags = ["-C", "link-arg=/STACK:8388608", "-C", "link-arg=/arm64hazardfree"]
 
 [target.'cfg(all(windows, target_env = "gnu"))']
 rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]
+
+[target.aarch64-linux-android]
+ar = "llvm-ar"
+linker = "aarch64-linux-android29-clang"
+rustflags = ["-C", "link-arg=-lc++_shared", "-C", "link-arg=-Wl,-rpath,$ORIGIN"]
+
+[env]
+AR_aarch64_linux_android = "llvm-ar"
+CC_aarch64_linux_android = "aarch64-linux-android29-clang"
+CXX_aarch64_linux_android = "aarch64-linux-android29-clang++"
+RANLIB_aarch64_linux_android = "llvm-ranlib"

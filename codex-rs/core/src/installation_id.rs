@@ -1,4 +1,5 @@
 use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Result;
 use std::io::Seek;
@@ -16,6 +17,16 @@ use uuid::Uuid;
 
 pub(crate) const INSTALLATION_ID_FILENAME: &str = "installation_id";
 
+fn is_unsupported_file_lock_error(err: &std::io::Error) -> bool {
+    // Filesystems that do not support advisory file locking (observed on
+    // Termux storage backends under `/data/data/com.termux/files`) surface
+    // `ErrorKind::Unsupported` from `File::lock`. Detect this on every
+    // target rather than gating on `cfg!(target_os = "android")`: support
+    // for the affected filesystem behavior is a runtime property, and this
+    // also covers older Termux package lines.
+    err.kind() == ErrorKind::Unsupported
+}
+
 pub async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<String> {
     let path = codex_home.join(INSTALLATION_ID_FILENAME);
     fs::create_dir_all(codex_home).await?;
@@ -29,7 +40,11 @@ pub async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<Str
         }
 
         let mut file = options.open(&path)?;
-        file.lock()?;
+        if let Err(err) = file.lock()
+            && !is_unsupported_file_lock_error(&err)
+        {
+            return Err(err);
+        }
 
         #[cfg(unix)]
         {
@@ -66,6 +81,7 @@ pub async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::INSTALLATION_ID_FILENAME;
+    use super::is_unsupported_file_lock_error;
     use super::resolve_installation_id;
     use core_test_support::PathExt;
     use pretty_assertions::assert_eq;
@@ -145,5 +161,17 @@ mod tests {
                 .expect("read rewritten installation id"),
             resolved
         );
+    }
+
+    #[test]
+    fn unsupported_file_lock_classifier_accepts_unsupported_kind() {
+        let unsupported = std::io::Error::from(std::io::ErrorKind::Unsupported);
+        assert!(is_unsupported_file_lock_error(&unsupported));
+    }
+
+    #[test]
+    fn unsupported_file_lock_classifier_rejects_other_kinds() {
+        let other = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(!is_unsupported_file_lock_error(&other));
     }
 }

@@ -40,7 +40,9 @@ use super::npm_global_root_check;
 use super::run_command;
 
 const VERSION_FILE_NAME: &str = "version.json";
-const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
+const GITHUB_LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/DioNanos/codex-termux/releases/latest";
+const NPM_LATEST_URL: &str = "https://registry.npmjs.org/@mmmbuto%2fcodex-cli-termux/latest";
 const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 const DESKTOP_UPDATE_URL: &str = "https://persistent.oaistatic.com/codex-app-prod/appcast-x64.xml";
@@ -430,10 +432,10 @@ fn push_cached_version_details(details: &mut Vec<String>, version_file: &Path) {
 
 fn update_action_label(context: &InstallContext) -> &'static str {
     match &context.method {
-        InstallMethod::Npm => "npm install -g @openai/codex",
-        InstallMethod::Bun => "bun install -g @openai/codex",
-        InstallMethod::Pnpm => "pnpm add -g @openai/codex",
-        InstallMethod::Brew => "brew upgrade --cask codex",
+        InstallMethod::Npm => "npm install -g @mmmbuto/codex-cli-termux",
+        InstallMethod::Bun => "bun install -g @mmmbuto/codex-cli-termux",
+        InstallMethod::Pnpm => "pnpm add -g @mmmbuto/codex-cli-termux",
+        InstallMethod::Brew => "npm install -g @mmmbuto/codex-cli-termux",
         InstallMethod::Standalone { .. } => "standalone installer",
         InstallMethod::Other => "manual or unknown",
     }
@@ -441,12 +443,12 @@ fn update_action_label(context: &InstallContext) -> &'static str {
 
 fn fetch_latest_version(context: &InstallContext) -> Result<String, String> {
     match &context.method {
-        InstallMethod::Brew => fetch_homebrew_cask_version(),
-        InstallMethod::Npm
-        | InstallMethod::Bun
-        | InstallMethod::Pnpm
-        | InstallMethod::Standalone { .. }
-        | InstallMethod::Other => fetch_latest_github_release_version(),
+        InstallMethod::Npm | InstallMethod::Bun | InstallMethod::Pnpm | InstallMethod::Brew => {
+            fetch_npm_latest_version()
+        }
+        InstallMethod::Standalone { .. } | InstallMethod::Other => {
+            fetch_latest_github_release_version()
+        }
     }
 }
 
@@ -457,19 +459,21 @@ fn fetch_latest_github_release_version() -> Result<String, String> {
     }
 
     let info = http_get_json::<ReleaseInfo>(GITHUB_LATEST_RELEASE_URL)?;
-    info.tag_name
+    let tag_name = info.tag_name.as_str();
+    tag_name
         .strip_prefix("rust-v")
+        .or_else(|| tag_name.strip_prefix('v'))
         .map(str::to_string)
         .ok_or_else(|| format!("failed to parse latest tag {}", info.tag_name))
 }
 
-fn fetch_homebrew_cask_version() -> Result<String, String> {
+fn fetch_npm_latest_version() -> Result<String, String> {
     #[derive(Deserialize)]
-    struct HomebrewCaskInfo {
+    struct NpmLatestInfo {
         version: String,
     }
 
-    http_get_json::<HomebrewCaskInfo>(HOMEBREW_CASK_API_URL).map(|info| info.version)
+    http_get_json::<NpmLatestInfo>(NPM_LATEST_URL).map(|info| info.version)
 }
 
 fn http_get_json<T>(url: &str) -> Result<T, String>
@@ -633,14 +637,21 @@ mod tests {
                 method: InstallMethod::Npm,
                 package_layout: None,
             }),
-            "npm install -g @openai/codex"
+            concat!("npm install -g @mmmbuto/", "codex-cli-termux")
         );
         assert_eq!(
             update_action_label(&InstallContext {
                 method: InstallMethod::Pnpm,
                 package_layout: None,
             }),
-            "pnpm add -g @openai/codex"
+            concat!("pnpm add -g @mmmbuto/", "codex-cli-termux")
+        );
+        assert_eq!(
+            update_action_label(&InstallContext {
+                method: InstallMethod::Brew,
+                package_layout: None,
+            }),
+            concat!("npm install -g @mmmbuto/", "codex-cli-termux")
         );
         assert_eq!(
             update_action_label(&InstallContext {

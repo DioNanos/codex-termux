@@ -32,8 +32,21 @@ use crate::tui::FrameRequester;
 use crate::wrapping::RtOptions;
 use crate::wrapping::word_wrap_lines;
 
+/// Header the chat widget sets while it is only polling a background terminal.
+/// Defined here and used by the producer as well, so the two cannot drift: the
+/// indicator's animation rate keys off this exact state.
+pub(crate) const WAITING_ON_BACKGROUND_TERMINAL_HEADER: &str = "Waiting for background terminal";
+
 pub(crate) const STATUS_DETAILS_DEFAULT_MAX_LINES: usize = 3;
 const DETAILS_PREFIX: &str = "  └ ";
+
+fn frame_interval_for_header(header: &str) -> Duration {
+    if header == WAITING_ON_BACKGROUND_TERMINAL_HEADER {
+        Duration::from_millis(200)
+    } else {
+        Duration::from_millis(32)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatusDetailsCapitalization {
@@ -241,9 +254,15 @@ impl Renderable for StatusIndicatorWidget {
         }
 
         if self.animations_enabled {
-            // Schedule next animation frame.
-            self.frame_requester
-                .schedule_frame_in(Duration::from_millis(32));
+            // Schedule next animation frame. While the agent is only waiting on
+            // a background terminal there is nothing to animate at 31 fps, and
+            // the redraws are not free: on Android this measured around 30% CPU
+            // in the TUI thread, with the compiler it was waiting for running as
+            // a separate process (codex-termux#16, reported with measurements by
+            // @rebroad). Slow the indicator down for that state alone rather
+            // than everywhere, so nothing changes while the model is working.
+            let interval = frame_interval_for_header(&self.header);
+            self.frame_requester.schedule_frame_in(interval);
         }
         let now = Instant::now();
         let elapsed_duration = self.elapsed_duration_at(now);
@@ -322,6 +341,18 @@ mod tests {
         assert_eq!(fmt_elapsed_compact(/*elapsed_secs*/ 3600), "1h 00m 00s");
         assert_eq!(fmt_elapsed_compact(3600 + 60 + 1), "1h 01m 01s");
         assert_eq!(fmt_elapsed_compact(25 * 3600 + 2 * 60 + 3), "25h 02m 03s");
+    }
+
+    #[test]
+    fn frame_interval_is_mutation_sensitive_for_background_terminal_waits() {
+        assert_eq!(
+            frame_interval_for_header(WAITING_ON_BACKGROUND_TERMINAL_HEADER),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            frame_interval_for_header("Working"),
+            Duration::from_millis(32)
+        );
     }
 
     #[test]

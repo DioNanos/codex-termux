@@ -148,11 +148,27 @@ pub async fn acquire_app_server_startup_lock(
             .read(true)
             .write(true)
             .open(startup_lock_path.as_path())?;
-        file.lock()?;
+        if let Err(err) = file.lock()
+            && !is_unsupported_file_lock_error(&err)
+        {
+            return Err(err);
+        }
+        // Filesystems that do not support advisory file locking (observed
+        // on Termux storage backends under `/data/data/com.termux/files`)
+        // surface `ErrorKind::Unsupported` from `File::lock`. The startup
+        // lock is best-effort serialization of concurrent foreground
+        // `codex remote-control` invocations; degrading to "no exclusion"
+        // is preferable to refusing to start the app-server. Concurrent
+        // starts are still rejected downstream by `prepare_control_socket_path`,
+        // which detects an existing listener via `UnixStream::connect`.
         Ok(AppServerStartupLock { _file: file })
     })
     .await
     .map_err(|err| std::io::Error::other(format!("startup lock task failed: {err}")))?
+}
+
+fn is_unsupported_file_lock_error(err: &std::io::Error) -> bool {
+    err.kind() == ErrorKind::Unsupported
 }
 
 #[cfg(unix)]
@@ -186,5 +202,35 @@ impl Drop for ControlSocketFileGuard {
                 "failed to remove app-server control socket file"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unsupported_lock_helper_tests {
+    use super::is_unsupported_file_lock_error;
+    use std::io::Error;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn unsupported_kind_is_classified_as_unsupported_lock_error() {
+        assert!(is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::Unsupported
+        )));
+    }
+
+    #[test]
+    fn other_kinds_are_not_classified_as_unsupported_lock_error() {
+        assert!(!is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::NotFound
+        )));
+        assert!(!is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::WouldBlock
+        )));
+        assert!(!is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
     }
 }

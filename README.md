@@ -1,81 +1,118 @@
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
+# Codex Termux
+
+> Native Codex CLI for **Termux / Android ARM64**.
+> This fork tracks upstream OpenAI Codex main and carries only the Android/Termux compatibility delta needed to package and run it.
+
+[![npm termux](https://img.shields.io/npm/v/@mmmbuto/codex-cli-termux?style=flat-square&logo=npm)](https://www.npmjs.com/package/@mmmbuto/codex-cli-termux)
+[![latest release](https://img.shields.io/github/v/release/DioNanos/codex-termux?style=flat-square)](https://github.com/DioNanos/codex-termux/releases/latest)
+
 <p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
+  <img src="./.github/termux-robot.png" alt="Termux robot" width="80%" />
 </p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
 
----
+## Install
 
-## Quickstart
+### Termux (Android ARM64)
 
-### Installing and running Codex CLI
-
-Run the following on Mac or Linux to install Codex CLI:
-
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
+```bash
+pkg update && pkg upgrade -y
+pkg install nodejs-lts -y
+npm install -g @mmmbuto/codex-cli-termux@latest
+codex --version
+codex login
 ```
 
-Run the following on Windows to install Codex CLI:
+Requirements:
 
-```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
-```
+- Android 10+ / API 29+ (the release binary is built with the API 29 NDK target)
+- ARM64 device
+- Node.js >= 18
 
-The standalone installers download from `https://releases.openai.com/codex` by default and fall back to GitHub Releases if a metadata or asset download is unavailable. To force GitHub Releases, set `CODEX_INSTALLER_USE_RELEASES_OPENAI_COM` to `false` (`0` and `no` are also accepted):
+## Scope
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false sh
-```
+What this fork does:
 
-```powershell
-$env:CODEX_INSTALLER_USE_RELEASES_OPENAI_COM='false'; irm https://chatgpt.com/codex/install.ps1 | iex
-```
+- tracks upstream OpenAI Codex closely
+- builds native Android ARM64 binaries for Termux
+- applies only the compatibility patches upstream does not ship
+- publishes GitHub release assets and an npm package for Termux users
 
-Codex CLI can also be installed via the following package managers:
+What this fork does not do:
 
-```shell
-# Install using npm
-npm install -g @openai/codex
-```
+- maintain a broad feature fork
+- replace upstream Codex
+- carry fork-only product features unrelated to Termux compatibility
 
-```shell
-# Install using Homebrew
-brew install --cask codex
-```
+## Current Termux Delta
 
-Then simply run `codex` to get started.
+- browser login uses `termux-open-url`
+- self-update points to `DioNanos/codex-termux` and `@mmmbuto/codex-cli-termux`
+- packaged wrappers set `CODEX_SELF_EXE` to the native ELF, sanitize `LD_LIBRARY_PATH`, and bundle `libc++_shared.so`
+- Android binaries are linked with `RUNPATH=$ORIGIN`
+- `exec`/code-mode now runs for real on Android via the in-process V8 runtime (no longer a stub) — the meaningful capability gain on Termux
+- realtime voice/audio is no longer part of this build: upstream removed the TUI realtime voice feature (openai/codex#27801), so the fork's Android cpal/oboe enablement toggle (never usable from the Termux CLI anyway, as the backend needs an Android JavaVM/Activity) was dropped with it. Termux-native audio remains tracked on the Codex VL roadmap.
+- Android PTY and lock-handling compatibility patches remain enabled where upstream behavior still breaks on Bionic/Termux
+- anyone using a custom provider with an empty instruction value still receives the bundled instruction template: the symptom is that the provider works but behaves worse, not that it fails to start, because this fork checks instruction content while upstream checks only field presence
 
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+## Releases and Updates
 
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
+- Latest GitHub release: [releases/latest](https://github.com/DioNanos/codex-termux/releases/latest)
+- Upstream base: OpenAI Codex `rust-v0.149.1`, published as `0.149.2` on the npm
+  `latest` channel with a matching GitHub tag and release.
+- npm package: [`@mmmbuto/codex-cli-termux`](https://www.npmjs.com/package/@mmmbuto/codex-cli-termux)
+- Legacy `@mmmbuto/codex-cli-lts` (OpenAI Codex 0.80.x) is archived; current builds live in this package or in [`@mmmbuto/codex-vl`](https://www.npmjs.com/package/@mmmbuto/codex-vl) (multi-platform).
 
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
+Maintainer publish flow:
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
+- build the exact sanitized candidate with GitHub Actions and audit its
+  immutable npm tarball
+- land the validated full tree on `develop`
+- publish that unchanged tarball to `next`
+- promote the tested sanitized commit to clean GitHub `main`
+- point `latest` and `next` at the stable version, then publish the annotated
+  tag and GitHub release from `main`
+- publish a post-release Termux device-validation summary
 
-</details>
+## Documentation
 
-### Using Codex with your ChatGPT plan
+- [Changelog](./CHANGELOG.md)
+- [Patch inventory](./patches/README.md)
+- [Building from source](./BUILDING.md)
+- On-device validation of `0.149.2` on a physical Termux install is still
+  outstanding; in particular the TLS trust store, since the Termux-specific root
+  handling was retired when upstream removed the client it wrapped.
+- [Install docs](./docs/install.md)
+- [Authentication](./docs/authentication.md)
+- [Configuration](./docs/config.md)
 
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
+## Security
 
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
+This is a community fork of OpenAI Codex. Security-relevant properties of this build:
 
-## Docs
+- **Network**: agents bind to loopback by default; nothing is exposed externally unless you opt in.
+- **Supply chain**: builds and releases come only from fork-owned CI and the `@mmmbuto/...` npm
+  scope. This package does not silently fetch or run the upstream installer; updates flow through
+  the fork's own channel.
+- **Termux**: TLS trust uses bundled webpki roots (no Android platform-verifier dependency).
+  The daemon, history, PATH-alias, installation-id, and policy lock sites that are safe to run
+  without advisory exclusion degrade only when the filesystem reports locking as unsupported;
+  credential and certificate transactions remain fail-closed.
 
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
+For sensitive work, prefer the official Codex CLI on Linux/macOS over SSH.
 
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+To report a vulnerability, see [SECURITY.md](./SECURITY.md).
+
+## Community guides
+
+- [OpenAI Codex CLI on Android via Termux](https://timharbakon.com/openai-codex-cli-android-termux/)
+  — independent third-party walkthrough covering Termux setup, the Bionic-libc incompatibility
+  this package solves, and a small Hono test project.
+
+## License
+
+This project remains under the Apache 2.0 license inherited from OpenAI Codex.
+
+- Original work: OpenAI
+- Termux port: minimal Android compatibility patches
+
+See [LICENSE](./LICENSE).

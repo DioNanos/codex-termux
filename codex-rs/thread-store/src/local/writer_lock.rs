@@ -17,6 +17,22 @@ use crate::ThreadStoreResult;
 const WRITER_LOCK_DIR: &str = "thread-writer-locks";
 const COORDINATION_LOCK_FILE: &str = ".coordination.lock";
 
+/// Filesystems that do not support advisory file locking (observed on
+/// Termux storage backends under `/data/data/com.termux/files`) surface
+/// `ErrorKind::Unsupported` from `File::lock` / `File::try_lock`.
+/// Detect this on every target rather than gating on `cfg!(target_os = "android")`:
+/// the filesystem behavior is a runtime property, and this also covers older
+/// Termux package lines.
+///
+/// Where it is true the writer lock cannot be taken at all, so single-writer
+/// ownership stops being enforced and concurrent writers to one thread are no
+/// longer detected. That is the deliberate trade: without this the store
+/// cannot open a thread on those filesystems, which takes the whole CLI down
+/// at startup rather than weakening a guarantee.
+fn is_unsupported_file_lock_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::Unsupported
+}
+
 pub(super) struct WriterLockCoordinator {
     directory: PathBuf,
     cleanup_attempted: AtomicBool,
@@ -68,6 +84,10 @@ impl WriterLockCoordinator {
                     message: format!("thread {thread_id} already has an active writer"),
                 });
             }
+            Err(std::fs::TryLockError::Error(err)) if is_unsupported_file_lock_error(&err) => {
+                // No advisory locking on this filesystem: proceed unlocked
+                // rather than refuse to open the thread.
+            }
             Err(std::fs::TryLockError::Error(err)) => {
                 return Err(ThreadStoreError::Internal {
                     message: format!(
@@ -106,12 +126,16 @@ impl WriterLockCoordinator {
                     path.display()
                 ),
             })?;
-        file.lock().map_err(|err| ThreadStoreError::Internal {
-            message: format!(
-                "failed to acquire thread writer coordination lock {}: {err}",
-                path.display()
-            ),
-        })?;
+        if let Err(err) = file.lock()
+            && !is_unsupported_file_lock_error(&err)
+        {
+            return Err(ThreadStoreError::Internal {
+                message: format!(
+                    "failed to acquire thread writer coordination lock {}: {err}",
+                    path.display()
+                ),
+            });
+        }
         Ok(file)
     }
 
@@ -186,6 +210,37 @@ impl Drop for WriterLockGuard {
             );
         }
         drop(coordination_lock);
+    }
+}
+
+#[cfg(test)]
+mod unsupported_lock_helper_tests {
+    use super::is_unsupported_file_lock_error;
+    use std::io::Error;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn unsupported_kind_is_classified_as_unsupported_lock_error() {
+        assert!(is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::Unsupported
+        )));
+    }
+
+    #[test]
+    fn other_kinds_are_not_classified_as_unsupported_lock_error() {
+        // A real lock failure must stay fatal: degrading on these would hide
+        // a broken store behind a silently unlocked writer.
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotFound,
+            ErrorKind::WouldBlock,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !is_unsupported_file_lock_error(&Error::from(kind)),
+                "{kind:?} must not be treated as an unsupported lock"
+            );
+        }
     }
 }
 

@@ -1,0 +1,44 @@
+#!/usr/bin/env sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+TERMUX_PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+
+sanitize_ld_library_path() {
+  OLD_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+  OLD_IFS=${IFS-}
+  IFS=:
+  SANITIZED=""
+  for entry in $OLD_LD_LIBRARY_PATH; do
+    [ -z "$entry" ] && continue
+    case "$entry" in
+      "$TERMUX_PREFIX/lib"|"$TERMUX_PREFIX/libexec"|"/data/data/com.termux/files/usr/lib"|"/data/data/com.termux/files/usr/libexec")
+        continue
+        ;;
+    esac
+    if [ -z "$SANITIZED" ]; then
+      SANITIZED="$entry"
+    else
+      SANITIZED="$SANITIZED:$entry"
+    fi
+  done
+  IFS=$OLD_IFS
+
+  if [ -n "$SANITIZED" ]; then
+    printf '%s:%s' "$SCRIPT_DIR" "$SANITIZED"
+  else
+    printf '%s' "$SCRIPT_DIR"
+  fi
+}
+
+export CODEX_MANAGED_BY_NPM=1
+export CODEX_SELF_EXE="$SCRIPT_DIR/codex.bin"
+LD_LIBRARY_PATH="$(sanitize_ld_library_path)"
+export LD_LIBRARY_PATH
+
+# Dispatch the single bundled `codex` binary with the `exec` subcommand instead
+# of shipping a standalone `codex-exec.bin`. The `exec` subcommand uses the same
+# ExecCli, so behavior is identical while the package drops one V8-linked binary
+# (~150 MB). The absolute "$SCRIPT_DIR/codex.bin" path preserves the launcher
+# hardening: always run the bundled binary, never a PATH lookup.
+exec "$SCRIPT_DIR/codex.bin" exec "$@"

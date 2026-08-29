@@ -11,10 +11,21 @@ use super::PidCommandKind;
 use super::PidFileState;
 use super::PidLogTail;
 use super::PidRecord;
+use super::parse_proc_stat_start_time;
 use super::read_process_start_time;
 use super::read_stderr_log_tail;
 use super::stderr_log_file_for_pid_file;
 use super::try_lock_file;
+
+#[test]
+fn proc_stat_parser_uses_last_closing_paren_for_process_name() {
+    let stat = "123 (worker) name) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 20";
+
+    assert_eq!(
+        parse_proc_stat_start_time(stat, 123).expect("parse start time"),
+        "424242"
+    );
+}
 
 #[tokio::test]
 async fn locked_empty_pid_file_is_treated_as_active_reservation() {

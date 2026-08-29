@@ -1,0 +1,39 @@
+[versions."146.4.0"]
+source_tag = "v146.4.0"
+
+[versions."146.4.0".targets."aarch64-linux-android"]
+repository = "DioNanos/codex-termux"
+release_tag = "rusty-v8-v146.4.0"
+archive_sha256 = "a58874b88f5f1f5146c6d4821cad96c381db1934133ebc53170b17933c2abb5d"
+binding_sha256 = "09f8900ced8297c229246c7a50b2e0ec23c54d0a554f369619cc29863f38dd1a"
+
+[versions."147.4.0"]
+source_tag = "v147.4.0"
+
+[versions."147.4.0".targets."aarch64-linux-android"]
+repository = "DioNanos/codex-termux"
+release_tag = "rusty-v8-v147.4.0"
+archive_sha256 = "d33850bbe8e351a9c4ee0fdd679bd11cb9a4fa0761415809e894010128994e13"
+binding_sha256 = "09dee789aaf77fb3d5dcec556a62e78a342cc4a02f8cf36e0f48542f7645bf39"
+
+[versions."149.2.0"]
+source_tag = "v149.2.0"
+
+[versions."149.2.0".targets."aarch64-linux-android"]
+repository = "DioNanos/codex-termux"
+release_tag = "rusty-v8-v149.2.0"
+archive_sha256 = "af238c22e12ccaca5cf0224863fe9d2f5cf0e1051acffee26d958858e5eb31ee"
+binding_sha256 = "3ef8ac94e16f9d2d52ab0ed57f13319f844d726f341f632c0f4684d456069d63"
+
+[versions."150.4.0"]
+source_tag = "v150.4.0"
+
+[versions."150.4.0".targets."aarch64-linux-android"]
+repository = "DioNanos/codex-termux"
+release_tag = "rusty-v8-v150.4.0"
+archive_sha256 = "58753130e13184681966ec64fdef84ee0fb85d51a6bde8e01d54700f97a353ec"
+binding_sha256 = "c87a57bbad22339684cda2759ccb1e0fe15d0edc9dc9d70a2e1d0a40f674dee7"
+
+[versions."150.4.0".targets."aarch64-linux-android".profiles.ptrcomp_sandbox_release]
+archive_sha256 = "86e9e02d50cdb66d5d3cde1fe1224acb8630e71eb3498ea15e005941d46fb321"
+binding_sha256 = "639421ae6a0d125dde076cdb4c5d5b3afc9e3ce764acad4a772b7182ea77da66"

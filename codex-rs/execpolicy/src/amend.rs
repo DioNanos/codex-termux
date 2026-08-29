@@ -60,6 +60,43 @@ pub enum AmendError {
     },
 }
 
+/// Filesystems that do not support advisory file locking (observed on
+/// Termux storage backends under `/data/data/com.termux/files`) surface
+/// `ErrorKind::Unsupported` from `File::lock`. Detect this on every
+/// target rather than gating on `cfg!(target_os = "android")`: the filesystem
+/// behavior is a runtime property, and this also covers older Termux package
+/// lines.
+fn is_unsupported_file_lock_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::Unsupported
+}
+
+#[cfg(test)]
+mod unsupported_lock_helper_tests {
+    use super::is_unsupported_file_lock_error;
+    use std::io::Error;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn unsupported_kind_is_classified_as_unsupported_lock_error() {
+        assert!(is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::Unsupported
+        )));
+    }
+
+    #[test]
+    fn other_kinds_are_not_classified_as_unsupported_lock_error() {
+        assert!(!is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::NotFound
+        )));
+        assert!(!is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::WouldBlock
+        )));
+    }
+}
+
 /// Note this thread uses advisory file locking and performs blocking I/O, so it should be used with
 /// [`tokio::task::spawn_blocking`] when called from an async context.
 pub fn blocking_append_allow_prefix_rule(
@@ -154,10 +191,20 @@ fn append_locked_line(policy_path: &Path, line: &str) -> Result<(), AmendError> 
             path: policy_path.to_path_buf(),
             source,
         })?;
-    file.lock().map_err(|source| AmendError::LockPolicyFile {
-        path: policy_path.to_path_buf(),
-        source,
-    })?;
+    if let Err(source) = file.lock()
+        && !is_unsupported_file_lock_error(&source)
+    {
+        return Err(AmendError::LockPolicyFile {
+            path: policy_path.to_path_buf(),
+            source,
+        });
+    }
+    // Filesystems that do not support advisory file locking (observed on
+    // Termux storage backends under `/data/data/com.termux/files`) surface
+    // `ErrorKind::Unsupported` from `File::lock`. Append to the policy file
+    // without exclusion in that case. Deduplication remains best-effort when
+    // concurrent writers cannot be serialized; duplicate equivalent rules are
+    // preferable to making policy persistence unusable on those filesystems.
 
     file.seek(SeekFrom::Start(0))
         .map_err(|source| AmendError::SeekPolicyFile {

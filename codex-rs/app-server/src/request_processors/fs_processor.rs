@@ -1,3 +1,4 @@
+use crate::attachment_path_mapper::to_host_path;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::fs_watch::FsWatchManager;
@@ -29,6 +30,7 @@ use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::RemoveOptions;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::io;
 use std::sync::Arc;
@@ -65,7 +67,7 @@ impl FsRequestProcessor {
         &self,
         params: FsReadFileParams,
     ) -> Result<FsReadFileResponse, JSONRPCErrorError> {
-        let path = PathUri::from_abs_path(&params.path);
+        let path = to_host_path_uri(&params.path);
         let bytes = self
             .file_system()?
             .read_file(&path, Default::default(), /*sandbox*/ None)
@@ -85,7 +87,7 @@ impl FsRequestProcessor {
                 "fs/writeFile requires valid base64 dataBase64: {err}"
             ))
         })?;
-        let path = PathUri::from_abs_path(&params.path);
+        let path = to_host_path_uri(&params.path);
         self.file_system()?
             .write_file(&path, bytes, Default::default(), /*sandbox*/ None)
             .await
@@ -97,7 +99,7 @@ impl FsRequestProcessor {
         &self,
         params: FsCreateDirectoryParams,
     ) -> Result<FsCreateDirectoryResponse, JSONRPCErrorError> {
-        let path = PathUri::from_abs_path(&params.path);
+        let path = to_host_path_uri(&params.path);
         self.file_system()?
             .create_directory(
                 &path,
@@ -116,7 +118,7 @@ impl FsRequestProcessor {
         &self,
         params: FsGetMetadataParams,
     ) -> Result<FsGetMetadataResponse, JSONRPCErrorError> {
-        let path = PathUri::from_abs_path(&params.path);
+        let path = to_host_path_uri(&params.path);
         let metadata = self
             .file_system()?
             .get_metadata(&path, Default::default(), /*sandbox*/ None)
@@ -135,7 +137,7 @@ impl FsRequestProcessor {
         &self,
         params: FsReadDirectoryParams,
     ) -> Result<FsReadDirectoryResponse, JSONRPCErrorError> {
-        let path = PathUri::from_abs_path(&params.path);
+        let path = to_host_path_uri(&params.path);
         let entries = self
             .file_system()?
             .read_directory(&path, /*sandbox*/ None)
@@ -157,7 +159,7 @@ impl FsRequestProcessor {
         &self,
         params: FsRemoveParams,
     ) -> Result<FsRemoveResponse, JSONRPCErrorError> {
-        let path = PathUri::from_abs_path(&params.path);
+        let path = to_host_path_uri(&params.path);
         self.file_system()?
             .remove(
                 &path,
@@ -177,8 +179,8 @@ impl FsRequestProcessor {
         &self,
         params: FsCopyParams,
     ) -> Result<FsCopyResponse, JSONRPCErrorError> {
-        let source_path = PathUri::from_abs_path(&params.source_path);
-        let destination_path = PathUri::from_abs_path(&params.destination_path);
+        let source_path = to_host_path_uri(&params.source_path);
+        let destination_path = to_host_path_uri(&params.destination_path);
         self.file_system()?
             .copy(
                 &source_path,
@@ -210,6 +212,12 @@ impl FsRequestProcessor {
         self.file_system()?;
         self.fs_watch_manager.unwatch(connection_id, params).await
     }
+}
+
+fn to_host_path_uri(path: &AbsolutePathBuf) -> PathUri {
+    let path = AbsolutePathBuf::try_from(to_host_path(path.as_path()))
+        .expect("attachment path mapping preserves absolute paths");
+    PathUri::from_abs_path(&path)
 }
 
 fn map_fs_error(err: io::Error) -> JSONRPCErrorError {

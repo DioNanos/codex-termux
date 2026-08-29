@@ -112,10 +112,12 @@ async fn run_foreground_remote_control(
     arg0_paths: Arg0DispatchPaths,
     root_config_overrides: CliConfigOverrides,
 ) -> anyhow::Result<()> {
+    // Use std::env::temp_dir() so that $TMPDIR is honoured on Android/Termux
+    // where /tmp does not exist. On all other Unix platforms this resolves to
+    // $TMPDIR when set, and falls back to /tmp otherwise.
     let socket_dir = tempfile::Builder::new()
         .prefix("codex-rc-")
-        .tempdir_in("/tmp")
-        .or_else(|_| tempfile::tempdir())
+        .tempdir_in(std::env::temp_dir())
         .context("failed to create private app-server socket directory")?;
     let socket_path = socket_dir.path().join("rc.sock");
     let socket_path = AbsolutePathBuf::from_absolute_path(&socket_path)

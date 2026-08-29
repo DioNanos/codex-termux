@@ -97,7 +97,7 @@ impl ChatWidget {
             self.status_state.terminal_title_status_kind =
                 TerminalTitleStatusKind::WaitingForBackgroundTerminal;
             self.set_status(
-                "Waiting for background terminal".to_string(),
+                crate::status_indicator_widget::WAITING_ON_BACKGROUND_TERMINAL_HEADER.to_string(),
                 command_display.clone(),
                 StatusDetailsCapitalization::Preserve,
                 /*details_max_lines*/ 1,

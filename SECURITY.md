@@ -1,17 +1,25 @@
 # Security Policy
 
-Thank you for helping us keep Codex secure!
+This repository is a community fork of [openai/codex](https://github.com/openai/codex).
+Where to report a vulnerability depends on where the issue lives.
 
-## Reporting Security Issues
+## Vulnerabilities in this fork
 
-The security is essential to OpenAI's mission. We appreciate the work of security researchers acting in good faith to identify and responsibly report potential vulnerabilities, helping us maintain strong privacy and security standards for our users and technology.
+For issues in the fork's own code — Termux/Android compatibility patches, fork-owned CI and
+release workflows, or npm packaging — please report privately:
 
-Our security program is managed through Bugcrowd, and we ask that any validated vulnerabilities be reported via the [Bugcrowd program](https://bugcrowd.com/engagements/openai).
+- Open a private [GitHub Security Advisory](../../security/advisories/new) on this repository, or
+- Email security@mmmbuto.com (or dev@mmmbuto.com)
 
-## Vulnerability Disclosure Program
+Please do not open a public issue for security reports, and allow reasonable time to address the
+issue before public disclosure.
 
-Our Vulnerability Program Guidelines are defined on our [Bugcrowd program page](https://bugcrowd.com/engagements/openai).
+## Vulnerabilities in upstream Codex
 
-## How to operate CODEX safely
+For issues in unmodified upstream OpenAI Codex code, use OpenAI's program via their
+[Bugcrowd engagement](https://bugcrowd.com/engagements/openai).
 
-For details on Codex security boundaries, including sandboxing, approvals, and network controls, see [Agent approvals & security](https://developers.openai.com/codex/agent-approvals-security).
+## Operating Codex safely
+
+For Codex security boundaries — sandboxing, approvals, and network controls — see
+[Agent approvals & security](https://developers.openai.com/codex/agent-approvals-security).

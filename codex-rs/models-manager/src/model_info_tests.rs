@@ -20,6 +20,79 @@ fn config_with_personality(personality: Option<Personality>) -> ModelsManagerCon
     }
 }
 
+fn catalog_model_with_template(template: &str) -> ModelInfo {
+    let mut model = model_info_from_slug("catalog-model");
+    model.model_messages = Some(ModelMessages {
+        instructions_template: Some(template.to_string()),
+        instructions_variables: None,
+        approvals: None,
+        collaboration_modes: None,
+        auto_review: None,
+        permissions: None,
+        multi_agent: None,
+        token_budget: None,
+        guardian_v2: None,
+    });
+    model
+}
+
+fn catalog_template(model: &ModelInfo) -> Option<&str> {
+    model
+        .model_messages
+        .as_ref()
+        .and_then(|messages| messages.instructions_template.as_deref())
+}
+
+fn assert_empty_catalog_falls_back() {
+    let model = catalog_model_with_template("");
+    let updated = with_config_overrides(model, &ModelsManagerConfig::default());
+
+    assert_eq!(catalog_template(&updated), Some(BASE_INSTRUCTIONS));
+    assert_eq!(updated.get_model_instructions(None), BASE_INSTRUCTIONS);
+}
+
+#[test]
+fn missing_catalog_instructions_use_builtin_fallback() {
+    assert_empty_catalog_falls_back();
+}
+
+#[test]
+fn catalog_template_allows_missing_base_instructions() {
+    let model = catalog_model_with_template("catalog template");
+    let updated = with_config_overrides(model, &ModelsManagerConfig::default());
+
+    assert_eq!(catalog_template(&updated), Some("catalog template"));
+    assert_eq!(updated.get_model_instructions(None), "catalog template");
+    assert_empty_catalog_falls_back();
+}
+
+#[test]
+fn personality_removal_restores_fallback_after_template_removal() {
+    let model = catalog_model_with_template("# Personality\n\nRemove me");
+    let updated = with_config_overrides(model, &config_with_personality(Some(Personality::None)));
+
+    assert_eq!(catalog_template(&updated), Some(BASE_INSTRUCTIONS));
+    assert_eq!(
+        updated.get_model_instructions(Some(Personality::None)),
+        BASE_INSTRUCTIONS
+    );
+    assert_empty_catalog_falls_back();
+}
+
+#[test]
+fn explicit_empty_base_instruction_override_is_preserved() {
+    let model = catalog_model_with_template("catalog template");
+    let config = ModelsManagerConfig {
+        base_instructions: Some(String::new()),
+        ..Default::default()
+    };
+    let updated = with_config_overrides(model, &config);
+
+    assert_eq!(catalog_template(&updated), Some(""));
+    assert_eq!(updated.get_model_instructions(None), "");
+    assert_empty_catalog_falls_back();
+}
+
 #[test]
 fn base_instruction_override_is_literal_and_preserves_catalog_messages() {
     let override_instructions = "override {{ personality }}";

@@ -11,8 +11,8 @@
 //! To minimize the chance of interleaved writes when multiple processes are
 //! appending concurrently, callers should *prepare the full line* (record +
 //! trailing `\n`) and write it with a **single `write(2)` system call** while
-//! the file descriptor is opened with the `O_APPEND` flag. POSIX guarantees
-//! that writes up to `PIPE_BUF` bytes are atomic in that case.
+//! the file descriptor is opened with the `O_APPEND` flag. On Linux/Android,
+//! this keeps each append contiguous even when advisory locks are unavailable.
 
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -57,6 +57,47 @@ const HISTORY_SOFT_CAP_RATIO: f64 = 0.8;
 
 const MAX_RETRIES: usize = 10;
 const RETRY_SLEEP: Duration = Duration::from_millis(100);
+
+/// Filesystems that do not support advisory file locking (observed on
+/// Termux storage backends under `/data/data/com.termux/files`) surface
+/// `ErrorKind::Unsupported` from `File::try_lock` / `File::try_lock_shared`.
+/// Detect this on every target rather than gating on `cfg!(target_os = "android")`:
+/// the filesystem behavior is a runtime property, and this also covers older
+/// Termux package lines.
+/// When this is true, callers should proceed without the advisory lock instead
+/// of failing the operation. The single-write O_APPEND contract documented at
+/// the top of this file keeps individual lines intact on Linux/Android even
+/// without exclusion.
+fn is_unsupported_file_lock_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::Unsupported
+}
+
+#[cfg(test)]
+mod unsupported_lock_helper_tests {
+    use super::is_unsupported_file_lock_error;
+    use std::io::Error;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn unsupported_kind_is_classified_as_unsupported_lock_error() {
+        assert!(is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::Unsupported
+        )));
+    }
+
+    #[test]
+    fn other_kinds_are_not_classified_as_unsupported_lock_error() {
+        assert!(!is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::NotFound
+        )));
+        assert!(!is_unsupported_file_lock_error(&Error::from(
+            ErrorKind::WouldBlock
+        )));
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct HistoryEntry {
@@ -161,21 +202,38 @@ pub async fn append_entry(
         // Retry a few times to avoid indefinite blocking when contended.
         for _ in 0..MAX_RETRIES {
             match history_file.try_lock() {
-                Ok(()) => {
-                    // While holding the exclusive lock, write the full line.
-                    // We do not open the file with `append(true)` on Windows, so ensure the
-                    // cursor is positioned at the end before writing.
-                    history_file.seek(SeekFrom::End(0))?;
-                    history_file.write_all(line.as_bytes())?;
-                    history_file.flush()?;
-                    enforce_history_limit(&mut history_file, history_max_bytes)?;
-                    return Ok(());
-                }
+                Ok(()) => {}
                 Err(std::fs::TryLockError::WouldBlock) => {
                     std::thread::sleep(RETRY_SLEEP);
+                    continue;
+                }
+                Err(std::fs::TryLockError::Error(ref e)) if is_unsupported_file_lock_error(e) => {
+                    // Termux storage and other backends that reject advisory
+                    // file locking. Proceed without the exclusive lock; the
+                    // single-write O_APPEND contract documented at the top of
+                    // this file keeps each line intact under concurrent writes
+                    // on Linux/Android.
                 }
                 Err(e) => return Err(e.into()),
             }
+            // While holding the exclusive lock (or after detecting the
+            // filesystem cannot provide one), write the full line. We do not
+            // open the file with `append(true)` on Windows, so ensure the
+            // cursor is positioned at the end before writing.
+            history_file.seek(SeekFrom::End(0))?;
+            let written = history_file.write(line.as_bytes())?;
+            if written != line.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    format!(
+                        "partial history append: wrote {written} of {} bytes",
+                        line.len()
+                    ),
+                ));
+            }
+            history_file.flush()?;
+            enforce_history_limit(&mut history_file, history_max_bytes)?;
+            return Ok(());
         }
 
         Err(std::io::Error::new(
@@ -382,41 +440,47 @@ fn lookup_history_entry(path: &Path, log_id: u64, offset: usize) -> Option<Histo
     // Open & lock file for reading using a shared lock.
     // Retry a few times to avoid indefinite blocking.
     for _ in 0..MAX_RETRIES {
-        let lock_result = file.try_lock_shared();
-
-        match lock_result {
-            Ok(()) => {
-                let reader = BufReader::new(&file);
-                for (idx, line_res) in reader.lines().enumerate() {
-                    let line = match line_res {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to read line from history file");
-                            return None;
-                        }
-                    };
-
-                    if idx == offset {
-                        match serde_json::from_str::<HistoryEntry>(&line) {
-                            Ok(entry) => return Some(entry),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "failed to parse history entry");
-                                return None;
-                            }
-                        }
-                    }
-                }
-                // Not found at requested offset.
-                return None;
-            }
+        match file.try_lock_shared() {
+            Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
                 std::thread::sleep(RETRY_SLEEP);
+                continue;
+            }
+            Err(std::fs::TryLockError::Error(ref e)) if is_unsupported_file_lock_error(e) => {
+                // Termux storage and other backends that reject advisory
+                // file locking. Proceed without the shared lock; concurrent
+                // appends may rarely produce a torn final line which the
+                // JSON-Lines parser already tolerates by warning and
+                // returning None.
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to acquire shared lock on history file");
                 return None;
             }
         }
+
+        let reader = BufReader::new(&file);
+        for (idx, line_res) in reader.lines().enumerate() {
+            let line = match line_res {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read line from history file");
+                    return None;
+                }
+            };
+
+            if idx == offset {
+                match serde_json::from_str::<HistoryEntry>(&line) {
+                    Ok(entry) => return Some(entry),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to parse history entry");
+                        return None;
+                    }
+                }
+            }
+        }
+        // Not found at requested offset.
+        return None;
     }
 
     None

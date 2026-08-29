@@ -56,6 +56,9 @@ async fn models_client_hits_models_endpoint() {
             slug: "gpt-test".to_string(),
             display_name: "gpt-test".to_string(),
             description: Some("desc".to_string()),
+            // Fork field: this fixture builds ModelInfo exhaustively, so every
+            // upstream merge that touches it breaks this test target while
+            // `cargo check` without --all-targets stays green.
             default_reasoning_level: Some(ReasoningEffort::Medium),
             supported_reasoning_levels: vec![
                 ReasoningEffortPreset {

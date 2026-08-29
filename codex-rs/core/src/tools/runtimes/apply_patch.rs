@@ -211,12 +211,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             duration: started_at.elapsed(),
             timed_out: false,
         };
-        let sandbox_denied = failed
-            && if attempt.sandbox == SandboxType::None {
-                attempt.sandbox_requested && is_likely_executor_managed_sandbox_denied(&output)
-            } else {
-                is_likely_sandbox_denied(attempt.sandbox, &output)
-            };
+        let sandbox_denied = classify_post_run_failure_as_sandbox_denial(attempt, failed, &output);
         if sandbox_denied {
             // TODO(iceweasel): Report executor filesystem sandbox backends like process/start so
             // executor-managed apply_patch denials can emit backend-specific violation telemetry.
@@ -233,6 +228,23 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             delta: self.committed_delta.clone(),
         })
     }
+}
+
+/// Classifies a failed apply_patch run as a sandbox denial, using the REAL
+/// attempt state. The single copy of this condition lives here — tests must
+/// call this function, never restate the expression (a restated condition
+/// keeps passing when this one regresses).
+fn classify_post_run_failure_as_sandbox_denial(
+    attempt: &SandboxAttempt<'_>,
+    failed: bool,
+    output: &ExecToolCallOutput,
+) -> bool {
+    failed
+        && if attempt.sandbox == SandboxType::None {
+            attempt.sandbox_requested && is_likely_executor_managed_sandbox_denied(output)
+        } else {
+            is_likely_sandbox_denied(attempt.sandbox, output)
+        }
 }
 
 #[cfg(test)]
