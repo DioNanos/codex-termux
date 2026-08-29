@@ -1,3 +1,15 @@
+> [!WARNING]
+> ## End of Life
+>
+> **This project has reached end of life and is no longer maintained.**
+>
+> A final release aligned with the latest upstream version will be published
+> when possible. After that, no further updates, bug fixes, or support are
+> planned. Existing releases remain available as-is.
+>
+> Active development continues on [codex-vl](https://github.com/DioNanos/codex-vl),
+> an independent distribution that keeps its own improvements (including
+> Android/Termux support) without tracking upstream release-by-release.
 # Codex Termux
 
 > Native Codex CLI for **Termux / Android ARM64**.
