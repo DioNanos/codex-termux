@@ -87,9 +87,6 @@ Maintainer publish flow:
 - [Changelog](./CHANGELOG.md)
 - [Patch inventory](./patches/README.md)
 - [Building from source](./BUILDING.md)
-- On-device validation of `0.149.2` on a physical Termux install is still
-  outstanding; in particular the TLS trust store, since the Termux-specific root
-  handling was retired when upstream removed the client it wrapped.
 - [Install docs](./docs/install.md)
 - [Authentication](./docs/authentication.md)
 - [Configuration](./docs/config.md)
