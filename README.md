@@ -1,19 +1,16 @@
-> [!WARNING]
-> ## End of Life
+> [!NOTE]
+> ## Release policy
 >
-> **This project has reached end of life and is no longer maintained.**
->
-> A final release aligned with the latest upstream version will be published
-> when possible. After that, no further updates, bug fixes, or support are
-> planned. Existing releases remain available as-is.
->
-> Active development continues on [codex-vl](https://github.com/DioNanos/codex-vl),
-> an independent distribution that keeps its own improvements (including
-> Android/Termux support) without tracking upstream release-by-release.
+> This project is active and follows a **big releases only** policy.
+> It realigns with upstream Codex only for selected milestones with meaningful
+> new capabilities; it does not chase patch releases.
+> Existing releases remain available and installable.
+> For day-to-day Android/Termux improvements and multi-platform builds, see
+> [codex-vl](https://github.com/DioNanos/codex-vl).
 # Codex Termux
 
 > Native Codex CLI for **Termux / Android ARM64**.
-> This fork tracks upstream OpenAI Codex main and carries only the Android/Termux compatibility delta needed to package and run it.
+> This fork realigns with selected upstream OpenAI Codex milestones and carries only the Android/Termux compatibility delta needed to package and run it.
 
 [![npm termux](https://img.shields.io/npm/v/@mmmbuto/codex-cli-termux?style=flat-square&logo=npm)](https://www.npmjs.com/package/@mmmbuto/codex-cli-termux)
 [![latest release](https://img.shields.io/github/v/release/DioNanos/codex-termux?style=flat-square)](https://github.com/DioNanos/codex-termux/releases/latest)
@@ -44,7 +41,7 @@ Requirements:
 
 What this fork does:
 
-- tracks upstream OpenAI Codex closely
+- realigns with selected upstream OpenAI Codex milestones when an update is worth carrying
 - builds native Android ARM64 binaries for Termux
 - applies only the compatibility patches upstream does not ship
 - publishes GitHub release assets and an npm package for Termux users
@@ -69,7 +66,7 @@ What this fork does not do:
 ## Releases and Updates
 
 - Latest GitHub release: [releases/latest](https://github.com/DioNanos/codex-termux/releases/latest)
-- Upstream base: OpenAI Codex `rust-v0.149.1`, published as `0.149.2` on the npm
+- Upstream base: OpenAI Codex `rust-v0.150.1`, published as `0.150.1` on the npm
   `latest` channel with a matching GitHub tag and release.
 - npm package: [`@mmmbuto/codex-cli-termux`](https://www.npmjs.com/package/@mmmbuto/codex-cli-termux)
 - Legacy `@mmmbuto/codex-cli-lts` (OpenAI Codex 0.80.x) is archived; current builds live in this package or in [`@mmmbuto/codex-vl`](https://www.npmjs.com/package/@mmmbuto/codex-vl) (multi-platform).
