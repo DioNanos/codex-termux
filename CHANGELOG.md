@@ -1,10 +1,12 @@
 # [0.150.1] - 2026-08-29
 
-Final release of the fork, aligned with the upstream OpenAI Codex `rust-v0.150.1`
-base. The fork and its npm package are end-of-life after this release: no
-further upstream alignments, features, bug fixes, or support are planned.
-Existing releases remain available as-is. Active development continues on
-[codex-vl](https://github.com/DioNanos/codex-vl).
+This release was announced on 2026-08-29 as the final release of the fork,
+aligned with the upstream OpenAI Codex `rust-v0.150.1` base. That policy was
+superseded on 2026-09-04. The fork remains active under a **big releases only**
+policy: it realigns with upstream Codex only for selected milestones with
+meaningful new capabilities and does not chase patch releases. Existing releases
+remain available as-is for installation and reference. Active development
+continues on [codex-vl](https://github.com/DioNanos/codex-vl).
 
 ## Fork fixes carried in this release
 
