@@ -232,6 +232,8 @@ required to publish a working Android Termux package.
   these steps are gated with
   `if: ${{ github.repository == 'openai/codex' }}`
   so a fork clone of CI never publishes upstream-flavoured artifacts.
+  The upstream `rusty-v8-release.yml` applies the same repository guard to its
+  `metadata` and `publish-release` jobs, so a fork cannot rebuild or amend V8 releases.
   `termux-npm-build-publish.yml` is the fork's release pipeline:
   workflow_dispatch, builds the Android arm64 binaries with the V8 prebuilt
   flow (Patch #22), binds checkout HEAD to the workflow run `GITHUB_SHA`,

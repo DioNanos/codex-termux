@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   metadata:
+    if: ${{ github.repository == 'openai/codex' }}
     runs-on: ubuntu-latest
     outputs:
       release_tag: ${{ steps.release_tag.outputs.release_tag }}
@@ -426,6 +427,7 @@ jobs:
           path: dist/${{ matrix.target }}/*
 
   publish-release:
+    if: ${{ github.repository == 'openai/codex' }}
     needs:
       - metadata
       - build
