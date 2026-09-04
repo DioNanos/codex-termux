@@ -296,6 +296,9 @@ Run from repo root:
 bash verify-patches.sh
 ```
 
+For local checks on the coordination server, set `VERIFY_PATCHES_SKIP_CARGO=1`;
+CI leaves it unset so the cargo-backed guard still runs there.
+
 ### Patch #27 - Pairing tells the user how to start the daemon
 - Files: `codex-rs/app-server-daemon/src/lib.rs`
 - `remote-control pair` attaches to a daemon that is already running and never

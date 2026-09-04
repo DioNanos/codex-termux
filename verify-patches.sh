@@ -1,11 +1,31 @@
 #!/bin/bash
 set -euo pipefail
 
+# Set VERIFY_PATCHES_SKIP_CARGO=1 to skip the cargo-backed local guard.
+# The coordination server must never run cargo; CI leaves this switch unset.
+# All non-cargo guards still run, and the final summary determines the exit status.
+
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
 
-pass() { echo "✅ PRESENT"; }
-fail() { echo "❌ MISSING!"; exit 1; }
+PRESENT=0
+MISSING=0
+SKIPPED=0
+
+pass() {
+  PRESENT=$((PRESENT + 1))
+  echo "✅ PRESENT"
+}
+
+fail() {
+  MISSING=$((MISSING + 1))
+  echo "❌ MISSING!"
+}
+
+skip() {
+  SKIPPED=$((SKIPPED + 1))
+  echo "⏭ SKIPPED ($1)"
+}
 
 READELF_BIN="${READELF_BIN:-$(command -v llvm-readelf || command -v readelf || true)}"
 PUBLIC_SANITIZED_TREE="${CODEX_PUBLIC_SANITIZED_TREE-0}"
@@ -254,11 +274,13 @@ else
 fi
 
 printf "Patch #18b (Termux MCP Environment Propagation): "
-termux_env_block="$(awk '
+if ! termux_env_block="$(awk '
   index($0, "pub(crate) const TERMUX_ENV_VARS: &[&str] = &[") { capture = 1 }
   capture { print }
   capture && /^];$/ { exit }
-' codex-rs/rmcp-client/src/utils.rs)"
+' codex-rs/rmcp-client/src/utils.rs)"; then
+  termux_env_block=
+fi
 termux_env_count="$(printf '%s\n' "$termux_env_block" | grep -c '^    "[A-Z_]*",$' || true)"
 termux_env_complete=1
 for termux_var in \
@@ -329,12 +351,14 @@ printf "Patch #22 (V8 Android Prebuilt Infrastructure): "
 # default at all would then be judged by an unrelated one, and a non-empty
 # result is not evidence that it came from the right place. Exactly one default
 # inside the stanza, or nothing.
-v8_workflow_version="$(awk '
+if ! v8_workflow_version="$(awk '
   /^      v8_version:[[:space:]]*$/ { in_stanza = 1; next }
   in_stanza && /^      [^[:space:]]/ { in_stanza = 0 }
   in_stanza && /^        default:/ { value = $2; gsub(/[^0-9.]/, "", value); found++ }
   END { if (found == 1) print value }
-' .github/workflows/rusty-v8-android-release.yml 2>/dev/null)"
+' .github/workflows/rusty-v8-android-release.yml 2>/dev/null)"; then
+  v8_workflow_version=
+fi
 # Ask the manifest for the sandbox profile *of that version*, by full header. A
 # substring search for the profile name passes on any leftover entry, so a bump
 # to a version published plain-only would keep an old sandbox record vouching
@@ -449,8 +473,15 @@ printf "Patch #26 (Model Catalog Instruction Fallback): "
 # Run the manager test that exercises exactly that value-level contract. It
 # currently proves the fallback at models-manager/model_info.rs:98-127 and its
 # twelve-test module; it does not name the implementation hook in this guard.
-if cargo test --manifest-path codex-rs/Cargo.toml -p codex-models-manager --lib \
-  model_info::tests::missing_catalog_instructions_use_builtin_fallback -- --exact; then
+if [ "${VERIFY_PATCHES_SKIP_CARGO:-0}" = "1" ]; then
+  if [ -n "${GITHUB_ACTIONS:-}" ] || [ -n "${CI:-}" ]; then
+    echo "skip not allowed in CI"
+    fail
+  else
+    skip "cargo disabled by VERIFY_PATCHES_SKIP_CARGO"
+  fi
+elif cargo test --manifest-path codex-rs/Cargo.toml -p codex-models-manager --lib \
+    model_info::tests::missing_catalog_instructions_use_builtin_fallback -- --exact; then
   pass
 else
   fail
@@ -525,7 +556,7 @@ else
 fi
 
 printf "release version contract (Cargo/npm/notes/changelog): "
-cargo_workspace_version="$(awk '
+if ! cargo_workspace_version="$(awk '
   /^\[workspace.package\]$/ { workspace_package = 1; next }
   workspace_package && /^version = "/ {
     gsub(/^version = "/, "")
@@ -533,8 +564,12 @@ cargo_workspace_version="$(awk '
     print
     exit
   }
-' codex-rs/Cargo.toml)"
-npm_package_version="$(node -p "require('./npm-package/package.json').version")"
+' codex-rs/Cargo.toml)"; then
+  cargo_workspace_version=
+fi
+if ! npm_package_version="$(node -p "require('./npm-package/package.json').version")"; then
+  npm_package_version=
+fi
 # The release contract has two deliberately separate relationships. BASE is
 # the upstream identity: the package description's base, the release note's
 # base, and the existing upstream tag must agree (rust-v0.149.1 here). FORK is
@@ -545,10 +580,21 @@ npm_package_version="$(node -p "require('./npm-package/package.json').version")"
 # when they diverged (npm 0.149.2 vs Cargo 0.149.1) every fresh install
 # immediately showed a false "update available" banner. Fork and upstream
 # version numbers remain separate lines and must not be equated.
-upstream_base_tag="$(node -p "(require('./npm-package/package.json').description.match(/rust-v[0-9]+\\.[0-9]+\\.[0-9]+/)||[''])[0]")"
+if ! upstream_base_tag="$(node -p "(require('./npm-package/package.json').description.match(/rust-v[0-9]+\\.[0-9]+\\.[0-9]+/)||[''])[0]")"; then
+  upstream_base_tag=
+fi
 # Cross-check the release notes so the upstream base is stated deliberately in
 # two places rather than typed once into a description nobody re-reads.
-notes_base_tag="$(grep -oE 'rust-v[0-9]+\.[0-9]+\.[0-9]+' ".release/v${npm_package_version}.md" 2>/dev/null | head -1)"
+notes_base_tag=
+release_notes=".release/v${npm_package_version}.md"
+if [ -f "$release_notes" ]; then
+  if ! notes_base_tag="$(awk 'match($0, /rust-v[0-9]+\.[0-9]+\.[0-9]+/) {
+    print substr($0, RSTART, RLENGTH)
+    exit
+  }' "$release_notes" 2>/dev/null)"; then
+    notes_base_tag=
+  fi
+fi
 # BASE identity has THREE outcomes — verified / refuted / NOT VERIFIABLE —
 # and the third is a FAILURE, not a warning: a gate that cannot verify and
 # concludes "fine" is decoration. The declared upstream tag must exist
@@ -633,3 +679,9 @@ if [ -f patches/windows-link.patch ] \
 else
   fail
 fi
+
+echo "verify-patches: ${PRESENT} present, ${MISSING} missing, ${SKIPPED} skipped"
+if (( MISSING > 0 )); then
+  exit 1
+fi
+exit 0
