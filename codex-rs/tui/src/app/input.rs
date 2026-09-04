@@ -370,6 +370,17 @@ impl App {
             return;
         }
 
+        if !self.chat_widget.has_active_view()
+            && self
+                .current_displayed_thread_id()
+                .is_some_and(|id| self.thread_unavailable(id))
+            && !(key_event.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key_event.code, KeyCode::Char('c' | 'd')))
+        {
+            self.chat_widget.handle_disconnected_key(key_event);
+            return;
+        }
+
         if matches!(key_event.code, KeyCode::Esc)
             && matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
         {

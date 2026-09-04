@@ -43,6 +43,8 @@ use serde_json::json;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::PoisonError;
+use std::sync::RwLock;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -79,12 +81,29 @@ impl ThreadToolTransport {
     }
 }
 
+type ToolConnection = Arc<RwLock<Option<(AppServerRequestHandle, AppEventSender)>>>;
+
 pub(crate) struct DynamicToolMcpServer {
+    connection: ToolConnection,
     config: Value,
     task: JoinHandle<()>,
 }
 
 impl DynamicToolMcpServer {
+    pub(crate) fn suspend(&self) {
+        *self
+            .connection
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    pub(crate) fn reconnect(&self, handle: AppServerRequestHandle, events: AppEventSender) {
+        *self
+            .connection
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some((handle, events));
+    }
+
     pub(crate) async fn start(
         request_handle: AppServerRequestHandle,
         mut thread_start_params: ThreadStartParams,
@@ -122,10 +141,10 @@ impl DynamicToolMcpServer {
         if let Some(overrides) = thread_start_params.config.as_mut() {
             overrides.remove("web_search");
         }
+        let connection = Arc::new(RwLock::new(Some((request_handle, app_event_tx))));
         let handler = DynamicToolMcpHandler {
-            request_handle,
+            connection: Arc::clone(&connection),
             thread_start_params,
-            app_event_tx,
             status_updates,
             server_config: server_config.clone(),
         };
@@ -147,6 +166,7 @@ impl DynamicToolMcpServer {
             }
         });
         Ok(Self {
+            connection,
             config: server_config,
             task,
         })
@@ -177,9 +197,8 @@ async fn require_authorization(
 
 #[derive(Clone)]
 struct DynamicToolMcpHandler {
-    request_handle: AppServerRequestHandle,
+    connection: ToolConnection,
     thread_start_params: ThreadStartParams,
-    app_event_tx: AppEventSender,
     status_updates: broadcast::Sender<ThreadStatusChangedNotification>,
     server_config: Value,
 }
@@ -265,12 +284,21 @@ impl ServerHandler for DynamicToolMcpHandler {
             format!("mcp_servers.{}", dynamic_tools::NAMESPACE),
             self.server_config.clone(),
         );
+        // Snapshot once: an in-flight call must never switch connections or replay a mutation.
+        let (request_handle, app_event_tx) = self
+            .connection
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                McpError::internal_error("TUI is reconnecting; tool was not sent", None)
+            })?;
         let response = dynamic_tools::execute(
-            self.request_handle.clone(),
+            request_handle,
             params,
             thread_start_params,
             self.status_updates.subscribe(),
-            Some(&self.app_event_tx),
+            Some(&app_event_tx),
         )
         .await;
         let content = response

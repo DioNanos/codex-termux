@@ -28,6 +28,19 @@ pub(super) enum VimPending {
         scope: VimTextObjectScope,
     },
     Replace,
+    Find {
+        motion: VimFindMotion,
+        operator: Option<VimOperator>,
+    },
+}
+
+/// Line-local character motions shared by navigation, operators, and dot replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VimFindMotion {
+    Forward,
+    Backward,
+    TillForward,
+    TillBackward,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -362,6 +362,7 @@ async fn skill_mcp_dependency_oauth_uses_configured_http_client() -> Result<()> 
     let mut environments = local_selections(fixture.config.cwd.clone());
     environments.environments[0].config = EnvironmentConfigState::Ready(EnvironmentConfig {
         allow_login_shell: fixture.config.permissions.allow_login_shell,
+        workspace_roots: environments.environments[0].workspace_roots.clone(),
         permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
         shell_environment_policy: Default::default(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&fixture.config),
@@ -416,6 +417,7 @@ async fn skill_mcp_dependency_oauth_uses_configured_http_client() -> Result<()> 
             .and_then(|server| server.oauth.as_ref()),
         Some(&McpServerOAuthConfig {
             client_id: None,
+            callback_url: None,
             callback_port: Some(skill_callback_port),
         })
     );

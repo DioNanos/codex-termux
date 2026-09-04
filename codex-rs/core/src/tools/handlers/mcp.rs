@@ -17,11 +17,13 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::flat_tool_name;
 use crate::tools::hook_names::HookToolName;
+use crate::tools::lifecycle::notify_tool_start;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolTelemetryTags;
+use codex_extension_api::McpToolContext;
 use codex_mcp::ToolInfo;
 use codex_protocol::mcp::is_node_repl_backed_server;
 use codex_protocol::user_input::UserInput;
@@ -35,6 +37,7 @@ use codex_tools::agent_plugin_mcp_tool_to_responses_api_tool;
 use codex_tools::mcp_tool_to_responses_api_tool;
 use codex_utils_image::PromptImageMode;
 use codex_utils_image::load_data_url_for_prompt_uncached;
+use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_string::take_bytes_at_char_boundary;
 use futures::future::BoxFuture;
 use serde_json::Map;
@@ -161,7 +164,10 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
         )
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
@@ -171,6 +177,27 @@ impl McpHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        let prepared_mcp_call = invocation
+            .session
+            .prepare_mcp_call(
+                &self.tool_info.server_name,
+                self.tool_info.tool.name.as_ref(),
+            )
+            .await;
+        let mcp_tool = prepared_mcp_call.as_ref().map(|call| {
+            McpToolContext::from_prepared_call(
+                call,
+                invocation
+                    .turn
+                    .config
+                    .mcp_servers
+                    .get()
+                    .get(call.server_name()),
+            )
+        });
+        notify_tool_start(&invocation, mcp_tool.as_ref()).await;
+
+        let originating_item_id = invocation.originating_item_id().await;
         let ToolInvocation {
             session,
             step_context,
@@ -191,13 +218,21 @@ impl McpHandler {
             }
         };
 
+        // Capture presentation policy from the same config snapshot used for execution.
+        let truncation_policy = prepared_mcp_call
+            .as_ref()
+            .and_then(codex_mcp::PreparedMcpCall::output_token_limit)
+            .map(TruncationPolicy::Tokens)
+            .unwrap_or(turn.model_info().truncation_policy.into());
         let started = Instant::now();
         let result = handle_mcp_tool_call(
             Arc::clone(&session),
             &step_context,
             &cancellation_token,
             call_id.clone(),
+            originating_item_id,
             &self.tool_info,
+            prepared_mcp_call,
             self.hook_tool_name(),
             tool_name,
             payload,
@@ -208,8 +243,8 @@ impl McpHandler {
             result: result.result,
             tool_input: result.tool_input,
             wall_time: started.elapsed(),
-            original_image_detail_supported: can_request_original_image_detail(&turn.model_info),
-            truncation_policy: turn.model_info.truncation_policy.into(),
+            original_image_detail_supported: can_request_original_image_detail(turn.model_info()),
+            truncation_policy,
         }))
     }
 }
@@ -249,6 +284,12 @@ impl CoreToolRuntime for McpHandler {
     }
 
     fn on_tool_result_accepted(&self, invocation: &ToolInvocation, result: &dyn ToolOutput) {
+        // Direct calls also record sources, before the Code Mode-only evidence path below.
+        if let Some(recorder) = invocation.session.services.executed_tool_calls.as_ref()
+            && let Some(sources) = result.tool_result_sources()
+        {
+            recorder.record_tool_result_sources(&invocation.source, &invocation.call_id, sources);
+        }
         let ToolCallSource::CodeMode { cell_id, .. } = &invocation.source else {
             return;
         };

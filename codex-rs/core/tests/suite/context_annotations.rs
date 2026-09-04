@@ -39,6 +39,7 @@ async fn first_request_item_types_roles_and_content_annotations() -> Result<()> 
             model_info.input_modalities.push(InputModality::Audio);
         })
         .with_config(|config| {
+            config.update_plan_enabled = true;
             config.developer_instructions = Some("Keep world-state annotations aligned.".into());
             config.model_context_window = Some(128_000);
             config.current_time_reminder = Some(CurrentTimeReminderConfig::default());

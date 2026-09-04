@@ -76,6 +76,7 @@ async fn misalignment_policy_failure_stops_the_thread_and_renders_once() {
                 AppServerTurnStatus::Failed,
                 /*duration_ms*/ None,
                 Some(AppServerTurnError {
+                    misalignment: None,
                     message: ERROR_MESSAGE.to_string(),
                     codex_error_info: Some(CodexErrorInfo::MisalignmentPolicyViolation),
                     additional_details: None,

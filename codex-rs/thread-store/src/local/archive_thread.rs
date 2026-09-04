@@ -39,7 +39,8 @@ pub(super) async fn archive_threads(
         }
     }
     let _writer_guards = store.acquire_writer_locks(&lock_thread_ids).await?;
-    let reference_index = RolloutReferenceIndex::scan(store.config.codex_home.as_path())
+    // Already-archived rollouts need no move. Avoid reading the entire archive on every request.
+    let reference_index = RolloutReferenceIndex::scan_unarchived(store.config.codex_home.as_path())
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to scan thread rollout files: {err}"),

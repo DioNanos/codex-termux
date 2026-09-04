@@ -1,13 +1,25 @@
+//! Persists projects and assignments, and lists projects with computed member recency.
+//! Listing pagination precedes root hydration; cursor anchors preserve milliseconds and nulls.
+
 use std::collections::BTreeMap;
 
+use sqlx::QueryBuilder;
 use sqlx::Row;
+use sqlx::Sqlite;
 use uuid::Uuid;
 
 use super::StateRuntime;
 use crate::CreatedProject;
 use crate::Project;
 use crate::ProjectRoot;
+use crate::ProjectSortKey;
 use crate::ProjectsPage;
+use crate::SortDirection;
+
+const PROJECT_SELECT: &str = "SELECT projects.*,
+    (SELECT MAX(recency_at_ms) FROM threads
+     WHERE project_id = projects.id AND archived = 0) AS recency_at_ms
+    FROM projects";
 
 impl StateRuntime {
     pub async fn set_thread_project(
@@ -50,43 +62,27 @@ impl StateRuntime {
         &self,
         cursor: Option<&str>,
         limit: usize,
+        sort_key: ProjectSortKey,
+        sort_direction: SortDirection,
     ) -> anyhow::Result<ProjectsPage> {
-        let anchor = cursor.map(parse_project_cursor).transpose()?;
-        let mut tx = self.pool.begin().await?;
-        let rows = if let Some((position, id)) = anchor {
-            sqlx::query(
-                "SELECT id, name, metadata, position, created_at_ms, updated_at_ms FROM projects WHERE position > ? OR (position = ? AND id > ?) ORDER BY position ASC, id ASC LIMIT ?",
-            )
-            .bind(position)
-            .bind(position)
-            .bind(id)
-            .bind((limit + 1) as i64)
-            .fetch_all(&mut *tx)
-            .await?
-        } else {
-            sqlx::query(
-                "SELECT id, name, metadata, position, created_at_ms, updated_at_ms FROM projects ORDER BY position ASC, id ASC LIMIT ?",
-            )
-            .bind((limit + 1) as i64)
-            .fetch_all(&mut *tx)
-            .await?
-        };
-        let project_ids = rows
-            .iter()
-            .map(|row| row.try_get("id"))
-            .collect::<Result<Vec<String>, _>>()?;
-        let mut roots_by_project_id = project_roots_by_id_in_tx(&mut tx, &project_ids).await?;
-        let mut projects = Vec::with_capacity(rows.len());
+        let mut query = project_list_query(cursor, limit, sort_key, sort_direction)?;
+        let rows = query.build().fetch_all(self.pool.as_ref()).await?;
+        let mut projects: Vec<Project> = Vec::new();
         for row in rows {
-            let project_id: String = row.try_get("id")?;
-            let roots = roots_by_project_id.remove(&project_id).unwrap_or_default();
-            projects.push(project_from_row(&row, roots)?);
+            let id: String = row.try_get("id")?;
+            if projects.last().is_none_or(|project| project.id != id) {
+                projects.push(project_from_row(&row, Vec::new())?);
+            }
+            if let Some(path) = row.try_get::<Option<String>, _>("root_path")? {
+                let project = projects
+                    .last_mut()
+                    .ok_or_else(|| anyhow::anyhow!("project missing for root"))?;
+                project.roots.push(ProjectRoot { path });
+            }
         }
         let next_cursor = (projects.len() > limit)
-            .then(|| project_cursor(&projects[limit - 1]))
-            .flatten();
+            .then(|| project_cursor(&projects[limit - 1], sort_key, sort_direction));
         projects.truncate(limit);
-        tx.commit().await?;
         Ok(ProjectsPage {
             projects,
             next_cursor,
@@ -95,12 +91,12 @@ impl StateRuntime {
 
     pub async fn get_project(&self, id: &str) -> anyhow::Result<Option<Project>> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query(
-            "SELECT id, name, metadata, position, created_at_ms, updated_at_ms FROM projects WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let row = QueryBuilder::<Sqlite>::new(PROJECT_SELECT)
+            .push(" WHERE id = ")
+            .push_bind(id)
+            .build()
+            .fetch_optional(&mut *tx)
+            .await?;
         let project = match row {
             Some(row) => Some(project_from_row_in_tx(&mut tx, &row).await?),
             None => None,
@@ -124,12 +120,12 @@ impl StateRuntime {
             tx.commit().await?;
             return Ok(None);
         };
-        let row = sqlx::query(
-            "SELECT id, name, metadata, position, created_at_ms, updated_at_ms FROM projects WHERE id = ?",
-        )
-        .bind(&project_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let row = QueryBuilder::<Sqlite>::new(PROJECT_SELECT)
+            .push(" WHERE id = ")
+            .push_bind(&project_id)
+            .build()
+            .fetch_optional(&mut *tx)
+            .await?;
         let Some(row) = row else {
             tx.rollback().await?;
             anyhow::bail!("idempotency key refers to deleted project: {idempotency_key}");
@@ -155,12 +151,12 @@ impl StateRuntime {
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(existing_project_id) = existing_project_id {
-            let row = sqlx::query(
-                "SELECT id, name, metadata, position, created_at_ms, updated_at_ms FROM projects WHERE id = ?",
-            )
-            .bind(&existing_project_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+            let row = QueryBuilder::<Sqlite>::new(PROJECT_SELECT)
+                .push(" WHERE id = ")
+                .push_bind(&existing_project_id)
+                .build()
+                .fetch_optional(&mut *tx)
+                .await?;
             let Some(row) = row else {
                 tx.rollback().await?;
                 anyhow::bail!("idempotency key refers to deleted project: {idempotency_key}");
@@ -217,17 +213,16 @@ impl StateRuntime {
         .bind(now)
         .execute(&mut *tx)
         .await?;
+        let row = QueryBuilder::<Sqlite>::new(PROJECT_SELECT)
+            .push(" WHERE id = ")
+            .push_bind(&id)
+            .build()
+            .fetch_one(&mut *tx)
+            .await?;
+        let project = project_from_row(&row, roots)?;
         tx.commit().await?;
         Ok(CreatedProject {
-            project: Project {
-                id,
-                name,
-                roots,
-                metadata,
-                position,
-                created_at_ms: now,
-                updated_at_ms: now,
-            },
+            project,
             created: true,
         })
     }
@@ -240,12 +235,12 @@ impl StateRuntime {
         metadata: Option<BTreeMap<String, String>>,
     ) -> anyhow::Result<Option<(Project, bool)>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let row = sqlx::query(
-            "SELECT id, name, metadata, position, created_at_ms, updated_at_ms FROM projects WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let row = QueryBuilder::<Sqlite>::new(PROJECT_SELECT)
+            .push(" WHERE id = ")
+            .push_bind(id)
+            .build()
+            .fetch_optional(&mut *tx)
+            .await?;
         let Some(row) = row else {
             tx.rollback().await?;
             return Ok(None);
@@ -282,6 +277,7 @@ impl StateRuntime {
                 position: current.position,
                 created_at_ms: current.created_at_ms,
                 updated_at_ms: now,
+                recency_at_ms: current.recency_at_ms,
             },
             true,
         )))
@@ -410,35 +406,8 @@ fn project_from_row(
         position: row.try_get("position")?,
         created_at_ms: row.try_get("created_at_ms")?,
         updated_at_ms: row.try_get("updated_at_ms")?,
+        recency_at_ms: row.try_get("recency_at_ms")?,
     })
-}
-
-async fn project_roots_by_id_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    project_ids: &[String],
-) -> anyhow::Result<BTreeMap<String, Vec<ProjectRoot>>> {
-    if project_ids.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-        "SELECT project_id, path FROM project_roots WHERE project_id IN (",
-    );
-    let mut separated = builder.separated(", ");
-    for project_id in project_ids {
-        separated.push_bind(project_id);
-    }
-    builder.push(") ORDER BY project_id ASC, position ASC");
-    let rows = builder.build().fetch_all(&mut **tx).await?;
-    let mut roots_by_project_id = BTreeMap::<String, Vec<ProjectRoot>>::new();
-    for row in rows {
-        roots_by_project_id
-            .entry(row.try_get("project_id")?)
-            .or_default()
-            .push(ProjectRoot {
-                path: row.try_get("path")?,
-            });
-    }
-    Ok(roots_by_project_id)
 }
 
 async fn replace_roots(
@@ -461,30 +430,142 @@ async fn replace_roots(
     Ok(())
 }
 
-fn project_cursor(project: &Project) -> Option<String> {
-    Some(format!("{}|{}", project.position, project.id))
-}
-
-fn parse_project_cursor(cursor: &str) -> anyhow::Result<(i64, String)> {
-    let mut parts = cursor.split('|');
-    let position_component = parts.next().ok_or_else(|| invalid_project_cursor(cursor))?;
-    let position: i64 = position_component
-        .parse()
-        .map_err(|_| invalid_project_cursor(cursor))?;
-    let id = parts.next().ok_or_else(|| invalid_project_cursor(cursor))?;
-    let uuid = Uuid::parse_str(id).map_err(|_| invalid_project_cursor(cursor))?;
-    if parts.next().is_some()
-        || position < 0
-        || position.to_string() != position_component
-        || uuid.to_string() != id
-    {
-        return Err(invalid_project_cursor(cursor));
+fn project_list_query(
+    cursor: Option<&str>,
+    limit: usize,
+    sort_key: ProjectSortKey,
+    sort_direction: SortDirection,
+) -> anyhow::Result<QueryBuilder<Sqlite>> {
+    anyhow::ensure!(limit > 0, "project limit must be positive");
+    let query_limit = i64::try_from(limit)?
+        .checked_add(/*rhs*/ 1)
+        .ok_or_else(|| anyhow::anyhow!("project limit overflow"))?;
+    let column = match sort_key {
+        ProjectSortKey::Position => "p.position",
+        ProjectSortKey::RecencyAt => "p.recency_at_ms",
+    };
+    let operator = match sort_direction {
+        SortDirection::Asc => ">",
+        SortDirection::Desc => "<",
+    };
+    let mut query = QueryBuilder::new(format!(
+        "WITH project_activity AS ({PROJECT_SELECT}), page AS (SELECT * FROM project_activity p"
+    ));
+    if let Some(cursor) = cursor {
+        let (value, id) = parse_project_cursor(cursor, sort_key, sort_direction)?;
+        if let Some(value) = value {
+            query
+                .push(format!(" WHERE ({column} {operator} "))
+                .push_bind(value);
+            query.push(format!(" OR ({column} = ")).push_bind(value);
+            query
+                .push(format!(" AND p.id {operator} "))
+                .push_bind(id)
+                .push(")");
+            if sort_key == ProjectSortKey::RecencyAt {
+                query.push(" OR p.recency_at_ms IS NULL");
+            }
+            query.push(")");
+        } else {
+            query
+                .push(format!(
+                    " WHERE p.recency_at_ms IS NULL AND p.id {operator} "
+                ))
+                .push_bind(id);
+        }
     }
-    Ok((position, id.to_string()))
+    push_project_order(&mut query, sort_key, sort_direction);
+    query.push(" LIMIT ").push_bind(query_limit);
+    query.push(
+        ") SELECT p.*, roots.path AS root_path FROM page p \
+        LEFT JOIN project_roots roots ON roots.project_id = p.id",
+    );
+    push_project_order(&mut query, sort_key, sort_direction);
+    query.push(", roots.position ASC");
+    Ok(query)
 }
 
-fn invalid_project_cursor(cursor: &str) -> anyhow::Error {
-    anyhow::anyhow!("invalid project cursor: {cursor}")
+fn push_project_order(
+    query: &mut QueryBuilder<Sqlite>,
+    sort_key: ProjectSortKey,
+    sort_direction: SortDirection,
+) {
+    let direction = match sort_direction {
+        SortDirection::Asc => "ASC",
+        SortDirection::Desc => "DESC",
+    };
+    query.push(" ORDER BY ");
+    match sort_key {
+        ProjectSortKey::Position => query.push("p.position"),
+        ProjectSortKey::RecencyAt => query.push("p.recency_at_ms IS NULL ASC, p.recency_at_ms"),
+    };
+    query.push(format!(" {direction}, p.id {direction}"));
+}
+
+fn project_cursor(project: &Project, sort_key: ProjectSortKey, direction: SortDirection) -> String {
+    if sort_key == ProjectSortKey::Position && direction == SortDirection::Asc {
+        // Retain the existing format for clients reconnecting to an older server.
+        return format!("{}|{}", project.position, project.id);
+    }
+    let (key, value) = match sort_key {
+        ProjectSortKey::Position => ("position", project.position.to_string()),
+        ProjectSortKey::RecencyAt => (
+            "recencyAt",
+            project
+                .recency_at_ms
+                .map_or_else(|| "null".to_string(), |value| value.to_string()),
+        ),
+    };
+    let direction = match direction {
+        SortDirection::Asc => "asc",
+        SortDirection::Desc => "desc",
+    };
+    format!("v1|{key}|{direction}|{value}|{}", project.id)
+}
+
+fn parse_project_cursor(
+    cursor: &str,
+    sort_key: ProjectSortKey,
+    direction: SortDirection,
+) -> anyhow::Result<(Option<i64>, String)> {
+    let invalid = || anyhow::anyhow!("invalid project cursor: malformed or mismatched sort anchor");
+    if cursor.len() > 128 {
+        return Err(invalid());
+    }
+    let parts: Vec<_> = cursor.split('|').collect();
+    let key = match sort_key {
+        ProjectSortKey::Position => "position",
+        ProjectSortKey::RecencyAt => "recencyAt",
+    };
+    let order = match direction {
+        SortDirection::Asc => "asc",
+        SortDirection::Desc => "desc",
+    };
+    let (value, id) = match parts.as_slice() {
+        [value, id] if sort_key == ProjectSortKey::Position && direction == SortDirection::Asc => {
+            (*value, *id)
+        }
+        ["v1", cursor_key, cursor_order, value, id]
+            if *cursor_key == key && *cursor_order == order =>
+        {
+            (*value, *id)
+        }
+        _ => return Err(invalid()),
+    };
+    let value = if value == "null" && sort_key == ProjectSortKey::RecencyAt {
+        None
+    } else {
+        let parsed: i64 = value.parse().map_err(|_| invalid())?;
+        if parsed.to_string() != value || sort_key == ProjectSortKey::Position && parsed < 0 {
+            return Err(invalid());
+        }
+        Some(parsed)
+    };
+    let uuid = Uuid::parse_str(id).map_err(|_| invalid())?;
+    if uuid.to_string() != id {
+        return Err(invalid());
+    }
+    Ok((value, id.to_string()))
 }
 
 #[cfg(test)]

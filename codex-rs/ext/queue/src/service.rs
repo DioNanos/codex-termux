@@ -10,6 +10,7 @@ use codex_core::StartIfIdleSubmission;
 use codex_core::ThreadManager;
 use codex_core::TurnInput;
 use codex_core::TurnInputRequest;
+use codex_core::TurnStartOptions;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ThreadIdleCause;
@@ -388,7 +389,12 @@ impl QueuedItemService {
             return Err(QueueServiceError::InvalidInput);
         };
         let submission = thread
-            .start_turn_if_idle(TurnInputRequest::new(input).with_trace(trace))
+            .start_turn_if_idle(TurnInputRequest::new(input).with_trace(trace).on_start(
+                TurnStartOptions {
+                    turn_trigger: Some("queue".to_string()),
+                    ..Default::default()
+                },
+            ))
             .await?;
         if matches!(submission, StartIfIdleSubmission::Started { .. }) {
             self.delete_locked(thread_id, queued_item_id).await?;
@@ -431,7 +437,10 @@ impl QueuedItemService {
             }
 
             match thread
-                .start_turn_if_idle(TurnInputRequest::new(input))
+                .start_turn_if_idle(TurnInputRequest::new(input).on_start(TurnStartOptions {
+                    turn_trigger: Some("queue".to_string()),
+                    ..Default::default()
+                }))
                 .await
             {
                 Ok(StartIfIdleSubmission::Started { .. }) => {

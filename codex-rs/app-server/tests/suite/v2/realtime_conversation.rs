@@ -760,9 +760,38 @@ async fn realtime_conversation_streams_timeline_items() -> Result<()> {
     assert_eq!(completed.item.id, started.item.id);
     assert_eq!(delta.delta, "hello");
     assert!(matches!(
-        completed.item.content,
+        &completed.item.content,
         ThreadRealtimeItemContent::TranscriptSegment { text, .. } if text == "hello"
     ));
+
+    let closed = read_notification::<ThreadRealtimeItemCompletedNotification>(
+        &mut mcp,
+        "thread/realtime/item/completed",
+    )
+    .await?;
+    let _: ThreadRealtimeClosedNotification =
+        read_notification(&mut mcp, "thread/realtime/closed").await?;
+    let request = mcp
+        .send_thread_timeline_list_request(ThreadTimelineListParams {
+            thread_id: thread.thread.id,
+            cursor: None,
+            limit: Some(100),
+        })
+        .await?;
+    let page: ThreadTimelineListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request)).await??;
+    let persisted = page
+        .data
+        .into_iter()
+        .filter_map(|entry| match entry {
+            ThreadTimelineEntry::Realtime { item, .. } => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        persisted,
+        vec![session_completed.item, completed.item, closed.item]
+    );
 
     realtime_server.shutdown().await;
     Ok(())
@@ -1067,16 +1096,17 @@ async fn realtime_conversation_streams_v2_notifications() -> Result<()> {
             ..
         }
     )));
-    assert!(matches!(
-        history.data.last(),
-        Some(ThreadTimelineEntry::Realtime {
+    // A background handoff can append timeline entries after realtime closes.
+    assert!(history.data.iter().any(|entry| matches!(
+        entry,
+        ThreadTimelineEntry::Realtime {
             item: ThreadRealtimeItem {
                 content: ThreadRealtimeItemContent::RealtimeSessionClosed { .. },
                 ..
             },
             ..
-        })
-    ));
+        }
+    )));
 
     let connections = realtime_server.connections();
     assert_eq!(connections.len(), 1);
@@ -1185,6 +1215,10 @@ async fn realtime_timeline_splits_accepted_steering_and_persists_promoted_artifa
                 "type": "response.output_text.delta",
                 "delta": "Spoken before steering"
             })],
+            vec![json!({
+                "type": "response.output_text.delta",
+                "delta": " and after rejected steering"
+            })],
         ])]),
     )
     .await?;
@@ -1223,6 +1257,45 @@ async fn realtime_timeline_splits_accepted_steering_and_persists_promoted_artifa
 
     harness
         .append_text(harness.thread_id.clone(), "Trigger speech")
+        .await?;
+    harness
+        .read_notification::<ThreadRealtimeTranscriptDeltaNotification>(
+            "thread/realtime/transcript/delta",
+        )
+        .await?;
+
+    for (input, expected_turn_id) in [
+        (Vec::new(), turn.turn.id.clone()),
+        (
+            vec![V2UserInput::Text {
+                text: "Rejected steering".to_string(),
+                text_elements: Vec::new(),
+            }],
+            "stale-turn".to_string(),
+        ),
+    ] {
+        let request = harness
+            .mcp
+            .send_turn_steer_request(TurnSteerParams {
+                thread_id: harness.thread_id.clone(),
+                input,
+                expected_turn_id,
+                additional_context: None,
+                client_user_message_id: None,
+                responsesapi_client_metadata: None,
+            })
+            .await?;
+        let rejected = timeout(
+            DEFAULT_TIMEOUT,
+            harness
+                .mcp
+                .read_stream_until_error_message(RequestId::Integer(request)),
+        )
+        .await??;
+        assert_eq!(rejected.error.code, -32600);
+    }
+    harness
+        .append_text(harness.thread_id.clone(), "Continue speech after rejection")
         .await?;
     harness
         .read_notification::<ThreadRealtimeTranscriptDeltaNotification>(
@@ -1274,7 +1347,7 @@ async fn realtime_timeline_splits_accepted_steering_and_persists_promoted_artifa
                         ..
                     },
                     ..
-                } if text == "Spoken before steering"
+                } if text == "Spoken before steering and after rejected steering"
             )
         })
         .context("accepted steering should seal the active transcript")?;
@@ -1296,16 +1369,25 @@ async fn realtime_timeline_splits_accepted_steering_and_persists_promoted_artifa
         })
         .context("accepted steering should be included in the timeline")?;
     assert!(transcript_index < steering_index);
-    assert!(page.data.iter().any(|entry| matches!(
-        entry,
-        ThreadTimelineEntry::Realtime {
-            item: ThreadRealtimeItem {
-                content: ThreadRealtimeItemContent::BemItemPromoted { item_id, .. },
-                ..
-            },
-            ..
-        } if item_id == "promoted-message"
-    )));
+    // Inline artifacts are promoted while streaming, before their final item.
+    assert_eq!(
+        page.data
+            .iter()
+            .filter_map(|entry| match entry {
+                ThreadTimelineEntry::Item { item, .. }
+                    if matches!(item.as_ref(), ThreadItem::AgentMessage { id, .. } if id == "promoted-message") => Some("artifact"),
+                ThreadTimelineEntry::Realtime {
+                    item: ThreadRealtimeItem {
+                        content: ThreadRealtimeItemContent::BemItemPromoted { item_id, .. },
+                        ..
+                    },
+                    ..
+                } if item_id == "promoted-message" => Some("promotion"),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["promotion", "artifact"]
+    );
     for entry in &page.data {
         if let ThreadTimelineEntry::Realtime { item, .. } = entry {
             assert_eq!(Uuid::parse_str(&item.id)?.get_version_num(), 7);

@@ -178,6 +178,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             })),
             RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
                 info: None,

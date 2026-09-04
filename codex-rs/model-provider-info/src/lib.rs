@@ -468,6 +468,15 @@ impl ModelProviderInfo {
         self.name == OPENAI_PROVIDER_NAME
     }
 
+    pub fn supports_codex_backend_routes(&self) -> bool {
+        self.is_openai()
+            && self.base_url.as_deref().is_none_or(|base_url| {
+                base_url
+                    .trim_end_matches('/')
+                    .ends_with("/backend-api/codex")
+            })
+    }
+
     pub fn uses_openai_actor_authorization(&self) -> bool {
         !self.requires_openai_auth
             && self.http_headers.as_ref().is_some_and(|headers| {

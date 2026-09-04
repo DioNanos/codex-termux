@@ -13,22 +13,17 @@ use super::GuardianV2ReviewScope;
 use crate::async_scorer::transcript::truncate_entry;
 
 #[test]
-fn sandboxed_exec_commands_are_excluded_by_default() {
+fn review_scope_is_computer_use_only_by_default() {
     let config = GuardianV2Config::from_overrides(GuardianV2ConfigToml::default()).unwrap();
 
-    assert_eq!(
-        config.review_scope,
-        GuardianV2ReviewScope::Standard {
-            sandboxed_exec_commands: false,
-        }
-    );
+    assert_eq!(config.review_scope, GuardianV2ReviewScope::ComputerUseOnly);
 }
 
 #[test]
 fn sandboxed_exec_commands_can_be_included() {
     let config = GuardianV2Config::from_overrides(GuardianV2ConfigToml {
         review_scope: Some(GuardianV2ReviewScopeConfigToml {
-            computer_use_only: None,
+            computer_use_only: Some(false),
             sandboxed_exec_commands: Some(true),
         }),
         ..Default::default()

@@ -14,8 +14,10 @@ use serde::de::value::Error as ValueDeserializerError;
 use serde::de::value::StrDeserializer;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::convert::Infallible;
 use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 use wildmatch::WildMatchPattern;
 
 use super::requirements_exec_policy::RequirementsExecPolicyToml;
@@ -426,6 +428,28 @@ pub struct NetworkRequirementsToml {
     pub managed_allowed_domains_only: Option<bool>,
     pub unix_sockets: Option<NetworkUnixSocketPermissionsToml>,
     pub allow_local_binding: Option<bool>,
+    /// Requirements-only header injections. These annotate matching requests
+    /// without changing whether non-matching requests are allowed.
+    pub header_injections: Option<Vec<NetworkHeaderInjectionToml>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct NetworkHeaderInjectionToml {
+    pub host: String,
+    pub methods: Vec<String>,
+    pub path_prefixes: Vec<String>,
+    pub headers: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for NetworkHeaderInjectionToml {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkHeaderInjectionToml")
+            .field("host", &self.host)
+            .field("methods", &self.methods)
+            .field("path_prefixes", &self.path_prefixes)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -448,6 +472,7 @@ struct RawNetworkRequirementsToml {
     #[serde(default)]
     allow_unix_sockets: Option<Vec<String>>,
     allow_local_binding: Option<bool>,
+    header_injections: Option<Vec<NetworkHeaderInjectionToml>>,
 }
 
 impl<'de> Deserialize<'de> for NetworkRequirementsToml {
@@ -470,6 +495,7 @@ impl<'de> Deserialize<'de> for NetworkRequirementsToml {
             unix_sockets,
             allow_unix_sockets,
             allow_local_binding,
+            header_injections,
         } = raw;
 
         if domains.is_some() && (allowed_domains.is_some() || denied_domains.is_some()) {
@@ -497,6 +523,7 @@ impl<'de> Deserialize<'de> for NetworkRequirementsToml {
             unix_sockets: unix_sockets
                 .or_else(|| legacy_unix_socket_permissions_from_list(allow_unix_sockets)),
             allow_local_binding,
+            header_injections,
         })
     }
 }
@@ -548,6 +575,7 @@ pub struct NetworkConstraints {
     pub managed_allowed_domains_only: Option<bool>,
     pub unix_sockets: Option<NetworkUnixSocketPermissionsToml>,
     pub allow_local_binding: Option<bool>,
+    pub header_injections: Option<Vec<NetworkHeaderInjectionToml>>,
 }
 
 impl<'de> Deserialize<'de> for NetworkConstraints {
@@ -573,6 +601,7 @@ impl From<NetworkRequirementsToml> for NetworkConstraints {
             managed_allowed_domains_only,
             unix_sockets,
             allow_local_binding,
+            header_injections,
         } = value;
         Self {
             enabled,
@@ -585,6 +614,7 @@ impl From<NetworkRequirementsToml> for NetworkConstraints {
             managed_allowed_domains_only,
             unix_sockets,
             allow_local_binding,
+            header_injections,
         }
     }
 }
@@ -822,11 +852,53 @@ impl FeatureRequirementsToml {
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppToolRequirementToml {
     pub approval_mode: Option<AppToolApproval>,
+    /// Opt-in analytics extraction for this exact tool, not a tool argument.
+    /// The highest-priority rule wins as a whole, including unsupported formats.
+    pub analytics_result_source: Option<AppToolResultSourceRequirementToml>,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AppToolResultSourceRequirementToml {
+    /// Result format to parse; currently only `detailed_message_search_v1` is supported.
+    pub format: AppToolResultSourceFormat,
+    /// Source kind emitted alongside each extracted ID.
+    #[serde(rename = "type")]
+    pub source_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppToolResultSourceFormat {
+    DetailedMessageSearchV1,
+    /// Keep unknown formats so higher-priority rules still override lower ones.
+    Unknown(String),
+}
+
+impl FromStr for AppToolResultSourceFormat {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "detailed_message_search_v1" => Self::DetailedMessageSearchV1,
+            _ => Self::Unknown(value.to_string()),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for AppToolResultSourceFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
 }
 
 impl AppToolRequirementToml {
     pub fn is_empty(&self) -> bool {
-        self.approval_mode.is_none()
+        self.approval_mode.is_none() && self.analytics_result_source.is_none()
     }
 }
 
@@ -896,6 +968,9 @@ pub(crate) fn merge_app_requirements_descending(
             let base_tool = base_tools.tools.entry(tool_name).or_default();
             if base_tool.approval_mode.is_none() {
                 base_tool.approval_mode = incoming_tool.approval_mode;
+            }
+            if base_tool.analytics_result_source.is_none() {
+                base_tool.analytics_result_source = incoming_tool.analytics_result_source;
             }
         }
     }
@@ -3093,6 +3168,7 @@ allowed_approvals_reviewers = ["user"]
                                 "calendar/list_events".to_string(),
                                 AppToolRequirementToml {
                                     approval_mode: Some(AppToolApproval::Approve),
+                                    analytics_result_source: None,
                                 },
                             )]),
                         }),
@@ -3100,6 +3176,56 @@ allowed_approvals_reviewers = ["user"]
                 )]),
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn app_tool_result_source_requirements_parse_and_merge() -> Result<()> {
+        let rule = r#"
+            [apps.connector_123123.tools."messages/search"]
+            analytics_result_source = { format = "detailed_message_search_v1", type = "message_room" }
+            "#;
+        let requirements: ConfigRequirementsToml = from_str(rule)?;
+        assert!(!requirements.is_empty());
+        let source = requirements.apps.expect("apps should be present");
+
+        for higher_rule in [
+            None,
+            Some(("unsupported", "other_resource")),
+            Some(("detailed_message_search_v1", "other_resource")),
+        ] {
+            let mut merged = source.clone();
+            merged
+                .apps
+                .get_mut("connector_123123")
+                .expect("app should be present")
+                .tools
+                .as_mut()
+                .expect("tools should be present")
+                .tools
+                .get_mut("messages/search")
+                .expect("tool should be present")
+                .analytics_result_source = higher_rule.map(|(format, source_type)| {
+                from_str(&format!("format = {format:?}\ntype = {source_type:?}"))
+                    .expect("complete source rule should parse, including unknown formats")
+            });
+            let expected = if higher_rule.is_none() {
+                source.clone()
+            } else {
+                merged.clone()
+            };
+
+            merge_app_requirements_descending(&mut merged, source.clone());
+
+            assert_eq!(merged, expected);
+        }
+
+        for incomplete_rule in [
+            r#"format = "detailed_message_search_v1""#,
+            r#"type = "message_room""#,
+        ] {
+            assert!(from_str::<AppToolResultSourceRequirementToml>(incomplete_rule).is_err());
+        }
         Ok(())
     }
 
@@ -3135,6 +3261,7 @@ allowed_approvals_reviewers = ["user"]
                             tool_name.to_string(),
                             AppToolRequirementToml {
                                 approval_mode: Some(approval_mode),
+                                analytics_result_source: None,
                             },
                         )]),
                     }),
@@ -4132,6 +4259,14 @@ command = "python3 /enterprise/hooks/pre.py"
             [experimental_network.unix_sockets]
             "/tmp/example.sock" = "allow"
             "/tmp/blocked.sock" = "deny"
+
+            [[experimental_network.header_injections]]
+            host = "api.example.com"
+            methods = ["POST"]
+            path_prefixes = ["/console/v1"]
+
+            [experimental_network.header_injections.headers]
+            "x-statsig-change-source" = "codex"
         "#;
 
         let source = RequirementSource::LegacyManagedConfigTomlFromMdm;
@@ -4189,6 +4324,21 @@ command = "python3 /enterprise/hooks/pre.py"
             })
         );
         assert_eq!(sourced_network.value.allow_local_binding, Some(false));
+        assert_eq!(
+            sourced_network.value.header_injections,
+            Some(vec![NetworkHeaderInjectionToml {
+                host: "api.example.com".to_string(),
+                methods: vec!["POST".to_string()],
+                path_prefixes: vec!["/console/v1".to_string()],
+                headers: BTreeMap::from([(
+                    "x-statsig-change-source".to_string(),
+                    "codex".to_string(),
+                )]),
+            }])
+        );
+        let debug = format!("{:?}", sourced_network.value.header_injections);
+        assert!(debug.contains("x-statsig-change-source"));
+        assert!(!debug.contains("codex"));
 
         Ok(())
     }

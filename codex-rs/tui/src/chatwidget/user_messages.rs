@@ -131,6 +131,7 @@ pub(crate) struct ThreadInputState {
     pub(super) rejected_steer_history_records: VecDeque<UserMessageHistoryRecord>,
     pub(super) queued_user_messages: VecDeque<QueuedUserMessage>,
     pub(super) queued_user_message_history_records: VecDeque<UserMessageHistoryRecord>,
+    pub(crate) recovered_queue: bool,
     pub(super) user_turn_pending_start: bool,
     pub(super) submit_pending_steers_after_interrupt: bool,
     pub(super) current_collaboration_mode: CollaborationMode,

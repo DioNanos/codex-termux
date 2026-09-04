@@ -34,6 +34,7 @@ use crate::provider::ModelProvider;
 use crate::provider::ModelProviderFuture;
 use crate::provider::ProviderAccountResult;
 use crate::provider::ProviderAccountState;
+use crate::provider::ProviderAuthRecoveryMessages;
 use crate::provider::ProviderCapabilities;
 use crate::provider::ProviderUnauthorizedRecovery;
 use crate::provider::RemoteCompactionSupport;
@@ -242,6 +243,14 @@ impl ModelProvider for AmazonBedrockModelProvider {
             error,
             TransportError::Http { status, .. } if *status == http::StatusCode::UNAUTHORIZED
         ) || (self.uses_aws_auth_recovery() && error::is_refreshable_auth_error(error))
+    }
+
+    fn auth_recovery_messages(&self) -> Option<ProviderAuthRecoveryMessages> {
+        self.uses_aws_auth_recovery()
+            .then_some(ProviderAuthRecoveryMessages {
+                started: "AWS session has expired. Reauthenticating...",
+                succeeded: "Signed in with AWS.",
+            })
     }
 
     fn recover_from_unauthorized(

@@ -1,15 +1,30 @@
+mod reviewer_config;
+
 use std::sync::Arc;
 use std::sync::Weak;
 
+use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
+use codex_core::context::NodeReplReviewEvidenceMode;
+use codex_extension_api::ApprovalReviewError;
+use codex_extension_api::ApprovalReviewInput;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::InternalSessionSpawnFuture;
 use codex_extension_api::InternalSessionSpawner;
 use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadReadyInput;
+use codex_features::Feature;
+use codex_network_proxy::NetworkProxyConfig;
 use codex_protocol::ThreadId;
+use codex_protocol::openai_models::InputModality;
+use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol::user_input::UserInput;
+
+mod prompt;
 
 /// Guardian extension dependencies supplied by the host at construction time.
 #[derive(Clone, Debug)]
@@ -25,6 +40,29 @@ impl<S> GuardianExtension<S> {
             thread_manager,
             internal_session_spawner,
         }
+    }
+
+    /// Prepares reviewer options for the later synchronous reviewer implementation.
+    pub async fn prepare_reviewer_options(
+        &self,
+        parent_config: &Config,
+        parent_environments: &[TurnEnvironmentSelection],
+        parent_model: &str,
+        parent_reasoning_effort: Option<ReasoningEffort>,
+        live_network_config: Option<NetworkProxyConfig>,
+    ) -> Result<StartThreadOptions, ApprovalReviewError> {
+        let thread_manager = self.thread_manager.upgrade().ok_or_else(|| {
+            ApprovalReviewError::Failed("thread manager is no longer available".to_string())
+        })?;
+        reviewer_config::prepare(
+            &thread_manager,
+            parent_config,
+            parent_environments,
+            parent_model,
+            parent_reasoning_effort,
+            live_network_config,
+        )
+        .await
     }
 
     /// Delegates a fresh internal-session request to the host helper.
@@ -43,25 +81,66 @@ impl<S> GuardianExtension<S> {
         self.internal_session_spawner
             .spawn_internal_session(parent_thread_id, request)
     }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired by a subsequent PR"))]
+    pub(crate) async fn build_review_prompt(
+        &self,
+        input: &ApprovalReviewInput<'_>,
+        reviewer_input_modalities: &[InputModality],
+    ) -> Result<Vec<UserInput>, ApprovalReviewError> {
+        let thread_manager = self.thread_manager.upgrade().ok_or_else(|| {
+            ApprovalReviewError::Failed("parent thread manager is unavailable".to_string())
+        })?;
+        let parent = thread_manager
+            .get_thread(input.thread_id)
+            .await
+            .map_err(|error| {
+                ApprovalReviewError::Failed(format!("parent thread is unavailable: {error}"))
+            })?;
+        let parent_config = parent.config_snapshot().await;
+        let parent_permission_profile = parent
+            .restorable_thread_settings()
+            .await
+            .permission_profile
+            .ok_or_else(|| {
+                ApprovalReviewError::Failed("parent permission profile is unavailable".to_string())
+            })?;
+        let config = parent.config().await;
+        let parent_model_info = input.thread_store.get::<ModelInfo>().ok_or_else(|| {
+            ApprovalReviewError::Failed("parent model metadata is unavailable".to_string())
+        })?;
+        let enhanced_transcripts = config
+            .features
+            .enabled(Feature::GuardianEnhancedNodeReplTranscripts);
+        let node_repl_evidence_mode = if parent_model_info.node_repl_auto_review_required
+            || enhanced_transcripts
+                && config
+                    .features
+                    .enabled(Feature::GuardianNodeReplTranscriptImages)
+        {
+            NodeReplReviewEvidenceMode::Multimodal
+        } else if enhanced_transcripts {
+            NodeReplReviewEvidenceMode::TextOnly
+        } else {
+            NodeReplReviewEvidenceMode::Disabled
+        };
+        let root_authorization = parent.guardian_root_snapshot().await;
+
+        prompt::build(
+            input,
+            &parent_config,
+            &parent_permission_profile,
+            root_authorization,
+            reviewer_input_modalities,
+            node_repl_evidence_mode,
+        )
+    }
 }
 
 /// Thread-local guardian state captured after the host registers a thread.
 #[derive(Clone, Debug)]
 pub struct GuardianThreadContext {
     parent_thread_id: ThreadId,
-    parent_model: String,
-}
-
-impl GuardianThreadContext {
-    /// Returns the parent thread associated with future Guardian reviewer sessions.
-    pub fn parent_thread_id(&self) -> ThreadId {
-        self.parent_thread_id
-    }
-
-    /// Returns the parent's effective model after provider fallback.
-    pub fn parent_model(&self) -> &str {
-        &self.parent_model
-    }
 }
 
 impl<S> ThreadLifecycleContributor<Config> for GuardianExtension<S>
@@ -82,13 +161,12 @@ where
             let Some(thread_manager) = self.thread_manager.upgrade() else {
                 return;
             };
-            let Ok(parent) = thread_manager.get_thread(parent_thread_id).await else {
+            if thread_manager.get_thread(parent_thread_id).await.is_err() {
                 return;
-            };
-            input.thread_store.insert(GuardianThreadContext {
-                parent_thread_id,
-                parent_model: parent.config_snapshot().await.model,
-            });
+            }
+            input
+                .thread_store
+                .insert(GuardianThreadContext { parent_thread_id });
         })
     }
 }

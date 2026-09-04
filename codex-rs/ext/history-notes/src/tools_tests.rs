@@ -1,28 +1,24 @@
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseInputItem;
-use codex_tools::FunctionCallError;
 use codex_tools::ToolOutput;
 use codex_tools::ToolPayload;
-use codex_utils_output_truncation::TruncationPolicy;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
-use super::HistoryNotesAction;
 use super::HistoryNotesToolOutput;
 
 #[test]
 fn preserves_encrypted_history_output() {
-    let result = HistoryNotesToolOutput::new(
-        json!({"encrypted_output": "enc_payload"}),
-        TruncationPolicy::Bytes(1024),
-    )
-    .expect("bounded encrypted output should be accepted")
-    .to_response_item(
-        "call-1",
-        &ToolPayload::Function {
-            arguments: "{}".to_string(),
-        },
-    );
+    let result = HistoryNotesToolOutput::new(json!({"encrypted_output": "enc_payload"}))
+        .expect("valid output")
+        .to_response_item(
+            "call-1",
+            &ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+        );
 
     let ResponseInputItem::FunctionCallOutput { output, .. } = result else {
         panic!("expected function-call output");
@@ -39,45 +35,112 @@ fn preserves_encrypted_history_output() {
 }
 
 #[test]
-fn rejects_encrypted_history_output_over_the_tool_limit() {
+fn preserves_images_as_separate_output_items_without_logging_bytes() {
+    let output = HistoryNotesToolOutput::new(json!({
+        "encrypted_output": "enc_payload",
+        "images": [
+            {"data": "cG5n", "mime_type": "image/png", "detail": "original"},
+            {"data": "anBlZw==", "mime_type": "image/jpeg", "detail": "low"},
+            {"data": "Z2lm", "mime_type": "image/gif"},
+            {"data": "d2VicA==", "mime_type": "image/webp", "detail": null}
+        ]
+    }))
+    .expect("valid image output");
     assert_eq!(
-        HistoryNotesToolOutput::new(
-            json!({"encrypted_output": "x".repeat(1025)}),
-            TruncationPolicy::Bytes(1024),
-        )
-        .err(),
-        Some(FunctionCallError::RespondToModel(
-            "History returned an encrypted result larger than the 1024-byte tool-output limit; retry with narrower bounds".to_string()
-        ))
+        output.log_output(),
+        json!({"encrypted_output": "enc_payload"}).to_string()
     );
     assert_eq!(
-        HistoryNotesToolOutput::new(
-            json!({"encrypted_output": "x".repeat(40_001)}),
-            TruncationPolicy::Tokens(20_000),
-        )
-        .err(),
-        Some(FunctionCallError::RespondToModel(
-            "History returned an encrypted result larger than the 40000-byte tool-output limit; retry with narrower bounds".to_string()
-        ))
+        output.post_tool_use_response(
+            "call-1",
+            &ToolPayload::Function {
+                arguments: "{}".to_string()
+            }
+        ),
+        Some(json!({"encrypted_output": "enc_payload"}))
+    );
+    assert_eq!(
+        output.to_response_item(
+            "call-1",
+            &ToolPayload::Function {
+                arguments: "{}".to_string()
+            }
+        ),
+        ResponseInputItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload::from_content_items(vec![
+                FunctionCallOutputContentItem::EncryptedContent {
+                    encrypted_content: "enc_payload".to_string()
+                },
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/png;base64,cG5n".to_string(),
+                    detail: Some(ImageDetail::Original)
+                },
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/jpeg;base64,anBlZw==".to_string(),
+                    detail: Some(ImageDetail::Low)
+                },
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/gif;base64,Z2lm".to_string(),
+                    detail: None
+                },
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/webp;base64,d2VicA==".to_string(),
+                    detail: None
+                },
+            ])
+        }
     );
 }
 
 #[test]
-fn rejects_history_request_limits_before_sending_them() {
-    assert_eq!(
-        HistoryNotesAction::HistoryListItems
-            .validate_arguments(&json!({"limit": 21, "max_chars_per_item": 2_000}))
-            .err(),
-        Some(FunctionCallError::RespondToModel(
-            "History argument `limit` exceeds the maximum of 20".to_string()
-        ))
-    );
-    assert_eq!(
-        HistoryNotesAction::NotesSearchContents
-            .validate_arguments(&json!({"query": "x".repeat(1001)}))
-            .err(),
-        Some(FunctionCallError::RespondToModel(
-            "History argument `query` exceeds the maximum of 1000 characters".to_string()
-        ))
-    );
+fn accepts_empty_attachments_and_legacy_plaintext_results() {
+    for (result, expected) in [
+        (
+            json!({"encrypted_output": "enc_payload", "images": []}),
+            FunctionCallOutputPayload::from_content_items(vec![
+                FunctionCallOutputContentItem::EncryptedContent {
+                    encrypted_content: "enc_payload".to_string(),
+                },
+            ]),
+        ),
+        (
+            json!({"text": "legacy result"}),
+            FunctionCallOutputPayload::from_text(json!({"text": "legacy result"}).to_string()),
+        ),
+    ] {
+        let output = HistoryNotesToolOutput::new(result).expect("valid output");
+        assert_eq!(
+            output.to_response_item(
+                "call-1",
+                &ToolPayload::Function {
+                    arguments: "{}".to_string()
+                }
+            ),
+            ResponseInputItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: expected
+            }
+        );
+    }
+}
+
+#[test]
+fn rejects_malformed_attachments_instead_of_silently_dropping_them() {
+    for images in [
+        json!(null),
+        json!({}),
+        json!([null]),
+        json!([{"mime_type": "image/png"}]),
+        json!([{"data": "private-image-bytes"}]),
+        json!([{"data": "private-image-bytes", "mime_type": "image/png", "detail": "invalid"}]),
+    ] {
+        let result = HistoryNotesToolOutput::new(
+            json!({"encrypted_output": "enc_payload", "images": images}),
+        );
+        let Err(codex_extension_api::FunctionCallError::RespondToModel(message)) = result else {
+            panic!("expected a model-facing image error");
+        };
+        assert_eq!(message, "History backend returned invalid image content.");
+    }
 }

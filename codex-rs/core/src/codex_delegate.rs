@@ -86,13 +86,14 @@ pub(crate) async fn run_codex_thread_interactive(
     } else {
         Arc::clone(&parent_session.services.extensions)
     };
-    let (session, io) = Box::pin(Session::spawn(SessionSpawnArgs {
+    let (session, io) = Session::spawn(SessionSpawnArgs {
         config,
         allow_provider_model_fallback: false,
         user_instructions,
         installation_id: parent_session.installation_id.clone(),
         auth_manager,
         models_manager,
+        git_root_discovery: Arc::clone(&parent_session.services.git_root_discovery),
         environment_manager: parent_session
             .services
             .turn_environments
@@ -133,7 +134,7 @@ pub(crate) async fn run_codex_thread_interactive(
         inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),
         git_enrichment_policy,
         windows_sandbox_proxy_settings_mode,
-    }))
+    })
     .or_cancel(&cancel_token)
     .await??;
     let thread_config = session.thread_config_snapshot().await;
@@ -214,8 +215,10 @@ pub(crate) async fn run_codex_thread_one_shot(
         .submit_turn_input(
             TurnInputRequest::user_input(input).on_start(TurnStartOptions {
                 final_output_json_schema,
+                service_tier: None,
                 parent_turn_id: Some(parent_turn_id),
                 root_turn_id,
+                ..Default::default()
             }),
             TurnInputMode::StartIfIdle,
         )

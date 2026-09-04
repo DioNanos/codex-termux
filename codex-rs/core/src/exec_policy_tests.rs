@@ -1764,25 +1764,6 @@ async fn proposed_execpolicy_amendment_is_present_for_single_command_without_pol
 }
 
 #[tokio::test]
-async fn proposed_execpolicy_amendment_is_omitted_when_policy_prompts() {
-    assert_exec_approval_requirement_for_command(
-        ExecApprovalRequirementScenario {
-            policy_src: Some(r#"prefix_rule(pattern=["rm"], decision="prompt")"#.to_string()),
-            command: vec!["rm".to_string()],
-            approval_policy: AskForApproval::OnRequest,
-            permission_profile: PermissionProfile::Disabled,
-            sandbox_permissions: SandboxPermissions::UseDefault,
-            prefix_rule: None,
-        },
-        ExecApprovalRequirement::NeedsApproval {
-            reason: Some("`rm` requires approval by policy".to_string()),
-            proposed_execpolicy_amendment: None,
-        },
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn proposed_execpolicy_amendment_is_present_for_multi_command_scripts() {
     assert_exec_approval_requirement_for_command(
         ExecApprovalRequirementScenario {

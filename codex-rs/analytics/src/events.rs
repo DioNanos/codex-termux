@@ -25,6 +25,7 @@ use crate::facts::TurnStatus;
 use crate::facts::TurnSteerRejectionReason;
 use crate::facts::TurnSteerResult;
 use crate::facts::TurnSubmissionType;
+use crate::guardian_v2::GuardianV2EventRequest;
 use crate::now_unix_millis;
 use codex_app_server_protocol::CodexErrorInfo;
 use codex_app_server_protocol::CommandExecutionSource;
@@ -69,6 +70,7 @@ pub(crate) enum TrackEventRequest {
     ThreadInitialized(ThreadInitializedEvent),
     ThreadArchive(ThreadArchiveEvent),
     GuardianReview(Box<GuardianReviewEventRequest>),
+    GuardianV2(Box<GuardianV2EventRequest>),
     AppMentioned(CodexAppMentionedEventRequest),
     AppUsed(CodexAppUsedEventRequest),
     HookRun(CodexHookRunEventRequest),
@@ -896,6 +898,7 @@ pub(crate) struct CodexImageGenerationEventParams {
     pub(crate) revised_prompt_present: bool,
     pub(crate) saved_path_present: bool,
     pub(crate) transparent_background: Option<bool>,
+    pub(crate) imagegen_request_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1011,6 +1014,8 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) session_id: String,
     pub(crate) turn_id: String,
     pub(crate) root_turn_id: Option<String>,
+    pub(crate) turn_trigger: Option<String>,
+    pub(crate) codex_turn_source: Option<String>,
     // TODO(rhan-oai): Populate once queued/default submission type is plumbed from
     // the turn/start callsites instead of always being reported as None.
     pub(crate) submission_type: Option<TurnSubmissionType>,
@@ -1029,6 +1034,7 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) service_tier: String,
     pub(crate) approval_policy: String,
     pub(crate) approvals_reviewer: String,
+    pub(crate) guardian_v2_enabled: bool,
     pub(crate) sandbox_network_access: bool,
     pub(crate) collaboration_mode: Option<&'static str>,
     pub(crate) personality: Option<String>,
@@ -1449,8 +1455,8 @@ pub(crate) fn subagent_thread_started_event_request(
         session_id: input.session_id,
         app_server_client: CodexAppServerClientMetadata {
             product_client_id: input.product_client_id,
-            client_name: Some(input.client_name),
-            client_version: Some(input.client_version),
+            client_name: input.client_name,
+            client_version: input.client_version,
             rpc_transport: AppServerRpcTransport::InProcess,
             experimental_api_enabled: None,
         },

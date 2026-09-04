@@ -86,6 +86,7 @@ async fn misalignment_policy_blocks_queued_turns_and_goal_resumption() -> Result
     let queued_turn = next_user_turn_op(&mut op_rx);
     let failed_turn = Turn {
         error: Some(AppServerTurnError {
+            misalignment: None,
             message: "misalignment policy violation".to_string(),
             codex_error_info: Some(CodexErrorInfo::MisalignmentPolicyViolation),
             additional_details: None,
@@ -176,6 +177,7 @@ async fn misalignment_policy_in_parent_stops_active_side_conversation() -> Resul
         parent_thread_id,
         ServerNotification::Error(ErrorNotification {
             error: AppServerTurnError {
+                misalignment: None,
                 message: "misalignment policy violation".to_string(),
                 codex_error_info: Some(CodexErrorInfo::MisalignmentPolicyViolation),
                 additional_details: None,

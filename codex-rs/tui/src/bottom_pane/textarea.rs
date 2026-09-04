@@ -13,6 +13,8 @@
 //! Wrapping also reserves a visible insertion point: full logical lines get continuation rows,
 //! and trailing spaces wrap instead of moving the cursor outside the textarea. At soft word
 //! breaks, interior separators hang off the preceding row without changing the editable text.
+//! Visible web URLs carry their complete terminal hyperlink destination across wrapped rows;
+//! masked rendering never exposes hyperlink destinations.
 
 use crate::key_hint::KeyBindingListExt;
 use crate::key_hint::is_altgr;
@@ -21,6 +23,7 @@ use crate::keymap::KeymapContext;
 use crate::keymap::RuntimeKeymap;
 use crate::keymap::VimNormalKeymap;
 use crate::keymap::VimOperatorKeymap;
+use crate::keymap::VimSearchKeymap;
 use crate::keymap::VimTextObjectKeymap;
 use crate::width::display_width;
 use codex_protocol::user_input::ByteRange;
@@ -38,14 +41,17 @@ use ratatui::text::Span;
 use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::WidgetRef;
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::cell::Ref;
 use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 
+mod hyperlinks;
 mod vim;
 mod vim_commands;
+mod vim_search;
 mod wrapping;
 use self::vim::VimMode;
 use self::vim::VimMotion;
@@ -57,6 +63,7 @@ use self::vim_commands::VimAction;
 use self::vim_commands::VimCommandState;
 use self::vim_commands::VimEditTarget;
 use self::vim_commands::VimInsertPosition;
+pub(crate) use self::vim_commands::VimPersistentState;
 
 const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 
@@ -137,9 +144,12 @@ pub(crate) struct TextArea {
     vim_mode: VimMode,
     vim_pending: VimPending,
     vim_commands: VimCommandState,
+    vim_search: vim_search::VimSearch,
+    vim_search_enabled: bool,
     editor_keymap: Arc<EditorKeymap>,
     vim_normal_keymap: VimNormalKeymap,
     vim_operator_keymap: VimOperatorKeymap,
+    vim_search_keymap: VimSearchKeymap,
     vim_text_object_keymap: VimTextObjectKeymap,
 }
 
@@ -147,6 +157,7 @@ pub(crate) struct TextArea {
 struct WrapCache {
     width: u16,
     lines: Vec<Range<usize>>,
+    hyperlinks: OnceCell<hyperlinks::HyperlinkCache>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -179,9 +190,12 @@ impl TextArea {
             vim_mode: VimMode::Insert,
             vim_pending: VimPending::None,
             vim_commands: VimCommandState::default(),
+            vim_search: vim_search::VimSearch::default(),
+            vim_search_enabled: false,
             editor_keymap: defaults.editor,
             vim_normal_keymap: defaults.vim_normal,
             vim_operator_keymap: defaults.vim_operator,
+            vim_search_keymap: defaults.vim_search,
             vim_text_object_keymap: defaults.vim_text_object,
         }
     }
@@ -196,6 +210,7 @@ impl TextArea {
         self.editor_keymap = Arc::clone(&keymap.editor);
         self.vim_normal_keymap = keymap.vim_normal.clone();
         self.vim_operator_keymap = keymap.vim_operator.clone();
+        self.vim_search_keymap = keymap.vim_search.clone();
         self.vim_text_object_keymap = keymap.vim_text_object.clone();
     }
 
@@ -248,6 +263,7 @@ impl TextArea {
         self.wrap_cache.replace(None);
         self.preferred_col = None;
         self.vim_pending = VimPending::None;
+        self.vim_search = vim_search::VimSearch::default();
         self.vim_commands = VimCommandState::default();
     }
 
@@ -260,6 +276,7 @@ impl TextArea {
     pub(crate) fn set_vim_enabled(&mut self, enabled: bool) {
         self.vim_enabled = enabled;
         self.vim_pending = VimPending::None;
+        self.vim_search = vim_search::VimSearch::default();
         self.vim_commands = VimCommandState::default();
         self.vim_mode = if enabled {
             VimMode::Normal
@@ -296,17 +313,17 @@ impl TextArea {
     /// This is observable so the composer can avoid stealing the second key of
     /// `d{motion}` or `y{motion}` for higher-level shortcuts.
     pub(crate) fn is_vim_operator_pending(&self) -> bool {
-        !matches!(self.vim_pending, VimPending::None)
+        self.vim_query().is_some() || !matches!(self.vim_pending, VimPending::None)
     }
 
     /// Return the keymap context that owns the next editing key.
     pub(crate) fn keymap_context(&self) -> KeymapContext {
-        if !self.vim_enabled || self.vim_mode == VimMode::Insert {
+        if !self.vim_enabled || self.vim_mode == VimMode::Insert || self.vim_query().is_some() {
             return KeymapContext::Editor;
         }
         match self.vim_pending {
             VimPending::None => KeymapContext::VimNormal,
-            VimPending::Replace => KeymapContext::Editor,
+            VimPending::Replace | VimPending::Find { .. } => KeymapContext::Editor,
             VimPending::Operator(_) => KeymapContext::VimOperator,
             VimPending::TextObject { .. } => KeymapContext::VimTextObject,
         }
@@ -321,6 +338,10 @@ impl TextArea {
         if self.vim_enabled {
             self.vim_mode = VimMode::Insert;
             self.vim_pending = VimPending::None;
+            self.cancel_vim_search();
+            if self.vim_commands.pending_change.is_empty() && !self.vim_commands.replaying {
+                self.start_vim_edit(VimAction::Insert(VimInsertPosition::Cursor));
+            }
         }
     }
 
@@ -334,6 +355,7 @@ impl TextArea {
         if self.vim_enabled {
             self.vim_mode = VimMode::Normal;
             self.vim_pending = VimPending::None;
+            self.cancel_vim_search();
             self.preferred_col = None;
         }
     }
@@ -358,7 +380,7 @@ impl TextArea {
     /// transition rather than a popup cancel/backtrack or turn-interrupt shortcut.
     pub(crate) fn should_handle_vim_insert_escape(&self, event: KeyEvent) -> bool {
         self.vim_enabled
-            && (self.vim_mode == VimMode::Insert || !matches!(self.vim_pending, VimPending::None))
+            && (self.vim_mode == VimMode::Insert || self.is_vim_operator_pending())
             && event.code == KeyCode::Esc
             && event.modifiers == KeyModifiers::NONE
             && matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
@@ -674,6 +696,9 @@ impl TextArea {
     }
 
     fn handle_vim_input(&mut self, event: KeyEvent) {
+        if self.handle_vim_search_key(event) {
+            return;
+        }
         let prior_mode = self.vim_mode;
         match self.vim_mode {
             VimMode::Insert => self.handle_vim_insert(event),
@@ -713,7 +738,7 @@ impl TextArea {
                 self.handle_vim_text_object(operator, scope, event);
                 return;
             }
-            VimPending::Replace => {
+            VimPending::Replace | VimPending::Find { .. } => {
                 self.handle_vim_pending_command(pending, event);
                 return;
             }
@@ -825,6 +850,7 @@ impl TextArea {
         }
         if self.vim_normal_keymap.cancel_operator.is_pressed(event) {
             self.vim_pending = VimPending::None;
+            self.cancel_vim_search();
             return;
         }
         self.handle_vim_extra_command(event);
@@ -871,7 +897,7 @@ impl TextArea {
             self.start_vim_edit(VimAction::Change(VimEditTarget::Line));
             return true;
         }
-        false
+        self.handle_vim_operator_command(op, event)
     }
 
     fn handle_vim_text_object(
@@ -1994,7 +2020,11 @@ impl TextArea {
             if needs_recalc {
                 let display_text = text_for_display(&self.text);
                 let lines = wrapping::wrapped_lines(display_text.as_ref(), width);
-                *cache = Some(WrapCache { width, lines });
+                *cache = Some(WrapCache {
+                    width,
+                    lines,
+                    hyperlinks: OnceCell::new(),
+                });
             }
         }
 
@@ -2107,7 +2137,7 @@ impl TextArea {
         highlights: &[(Range<usize>, Style)],
     ) {
         let element_style = base_style.fg(Color::Cyan);
-        for (row, idx) in range.enumerate() {
+        for (row, idx) in range.clone().enumerate() {
             let r = &lines[idx];
             let y = area.y + row as u16;
             let visible = wrapping::visible_prefix(&self.text[r.start..r.end - 1], area.width);
@@ -2148,6 +2178,12 @@ impl TextArea {
                     style,
                 );
             }
+        }
+        if let Some(wrap_cache) = self.wrap_cache.borrow().as_ref() {
+            wrap_cache
+                .hyperlinks
+                .get_or_init(|| hyperlinks::HyperlinkCache::new(&self.text, lines))
+                .mark(buf, area, &self.text, lines, range);
         }
     }
 

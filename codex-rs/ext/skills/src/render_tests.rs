@@ -220,6 +220,20 @@ fn catalog_budget_uses_context_percentage_or_character_fallback() {
 #[test]
 fn host_only_prompts_preserve_existing_behavior_with_and_without_aliases() {
     let root = "/Users/test/.codex/plugins/cache/openai-curated/host-plugin/1.0.0/skills-with-a-long-shared-root";
+    let unaliased_catalog = SkillCatalog {
+        entries: [
+            ("alpha", "Alpha skill."),
+            ("beta", "Beta skill."),
+            ("gamma", "Gamma skill."),
+        ]
+        .into_iter()
+        .map(|(name, description)| {
+            entry(name, description, /*short_description*/ None)
+                .with_display_path(format!("{root}/{name}/SKILL.md"))
+        })
+        .collect(),
+        warnings: Vec::new(),
+    };
     let catalog = SkillCatalog {
         entries: [
             ("alpha", "Alpha skill."),
@@ -237,7 +251,7 @@ fn host_only_prompts_preserve_existing_behavior_with_and_without_aliases() {
     };
 
     let unaliased = available_skills_fragment(
-        &catalog,
+        &unaliased_catalog,
         /*include_skills_usage_instructions*/ true,
         SkillCatalogRenderPolicy::CoreCompatible,
         SkillMetadataBudget::Characters(usize::MAX),
@@ -310,7 +324,7 @@ fn host_only_prompts_preserve_existing_behavior_with_and_without_aliases() {
 }
 
 #[test]
-fn path_aliases_are_not_used_without_budget_pressure() {
+fn path_aliases_are_used_without_budget_pressure_when_they_reduce_prompt_size() {
     let root = "/Users/test/.codex/plugins/cache/openai-curated/example/hash/skills";
     let catalog = SkillCatalog {
         entries: vec![
@@ -332,12 +346,8 @@ fn path_aliases_are_not_used_without_budget_pressure() {
     )
     .expect("catalog should render");
 
-    assert!(!fragment.body().contains("### Skill roots"));
-    assert!(
-        fragment
-            .body()
-            .contains(&format!("(file: {root}/alpha/SKILL.md)"))
-    );
+    assert!(fragment.body().contains("### Skill roots"));
+    assert!(fragment.body().contains("(file: r0/alpha/SKILL.md)"));
 }
 
 #[test]

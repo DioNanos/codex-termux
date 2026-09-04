@@ -1,9 +1,9 @@
 use super::*;
 use crate::PluginGitMode;
-use codex_config::ConfigLayerEntry;
-use codex_config::ConfigLayerSource;
-use codex_config::ConfigRequirements;
-use codex_config::ConfigRequirementsToml;
+use codex_config::CONFIG_TOML_FILE;
+use codex_config::LoaderOverrides;
+use codex_config::loader::load_config_layers_state;
+use codex_exec_server::LOCAL_FS;
 use pretty_assertions::assert_eq;
 use std::path::Path;
 use std::path::PathBuf;
@@ -31,7 +31,7 @@ last_revision = "abc123"
     .expect("write config");
 
     assert_eq!(
-        read_configured_git_marketplace(codex_home.path(), "good")
+        read_configured_git_marketplace(&config_reloader(codex_home.path()), "good")
             .expect("read configured marketplace"),
         Some(ConfiguredGitMarketplace {
             name: "good".to_string(),
@@ -65,12 +65,14 @@ source = {good_url:?}
 "#
     );
     std::fs::write(codex_home.path().join(CONFIG_TOML_FILE), &config).expect("write config");
-    let stack = config_layer_stack(codex_home.path(), &config);
+    let reload_config = config_reloader(codex_home.path());
+    let stack = reload_config().expect("load config");
 
     let outcome = upgrade_configured_git_marketplaces(
         codex_home.path(),
         &stack,
         /*marketplace_name*/ None,
+        &reload_config,
     );
 
     assert_eq!(
@@ -103,12 +105,14 @@ fn automatic_marketplace_git_ignores_inherited_repository_configuration() {
         let config =
             format!("[marketplaces.trusted]\nsource_type = \"git\"\nsource = {source:?}\n");
         std::fs::write(codex_home.join(CONFIG_TOML_FILE), &config).expect("write config");
-        let stack = config_layer_stack(&codex_home, &config);
+        let reload_config = config_reloader(&codex_home);
+        let stack = reload_config().expect("load config");
         let outcome = upgrade_configured_git_marketplaces_with_mode(
             &codex_home,
             &stack,
             /*marketplace_name*/ None,
             PluginGitMode::Automatic,
+            &reload_config,
         );
         assert_eq!(
             outcome,
@@ -255,6 +259,7 @@ ref = "missing-ref"
         codex_home.path(),
         &install_root,
         &marketplace,
+        &config_reloader(codex_home.path()),
         Some(&normalized_source),
         PluginGitMode::Manual,
     )
@@ -299,6 +304,7 @@ fn up_to_date_fast_path_validates_marketplace_name() {
         codex_home.path(),
         &install_root,
         &marketplace,
+        &config_reloader(codex_home.path()),
         Some(&normalized_source),
         PluginGitMode::Manual,
     )
@@ -380,21 +386,149 @@ fn stale_activation_restores_newer_concurrently_installed_marketplace() {
     ));
 }
 
-fn config_layer_stack(codex_home: &Path, config: &str) -> ConfigLayerStack {
-    let config_file =
-        AbsolutePathBuf::try_from(codex_home.join(CONFIG_TOML_FILE)).expect("absolute config path");
-    ConfigLayerStack::new(
-        vec![ConfigLayerEntry::new(
-            ConfigLayerSource::User {
-                file: config_file,
-                profile: None,
-            },
-            toml::from_str(config).expect("parse config"),
-        )],
-        ConfigRequirements::default(),
-        ConfigRequirementsToml::default(),
-    )
-    .expect("build config layer stack")
+fn config_reloader(codex_home: &Path) -> ConfigLayerReload {
+    let codex_home = codex_home.to_path_buf();
+    let options = LoaderOverrides {
+        system_config_path: Some(codex_home.join("system.toml")),
+        managed_config_path: Some(codex_home.join("managed.toml")),
+        system_requirements_path: Some(codex_home.join("requirements.toml")),
+        ..LoaderOverrides::without_managed_config_for_tests()
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create config loading runtime");
+    Arc::new(move || {
+        runtime.block_on(load_config_layers_state(
+            LOCAL_FS.as_ref(),
+            &codex_home,
+            Some(AbsolutePathBuf::try_from(codex_home.join("project"))?),
+            &[],
+            options.clone(),
+            &codex_config::NoopThreadConfigLoader,
+        ))
+    })
+}
+
+fn system_marketplace_stack(codex_home: &Path, system: &str, user: &str) -> ConfigLayerStack {
+    let system_file = AbsolutePathBuf::try_from(codex_home.join("system.toml")).unwrap();
+    std::fs::write(&system_file, system).unwrap();
+    if !user.is_empty() {
+        std::fs::write(codex_home.join(CONFIG_TOML_FILE), user).unwrap();
+    }
+    config_reloader(codex_home)().expect("load system and user config")
+}
+
+#[test]
+fn system_marketplace_downloads_and_updates_without_writing_user_config() {
+    for user_config in ["", "[marketplaces.good]\nsparse_paths = []\n"] {
+        let codex_home = TempDir::new().unwrap();
+        let remote = TempDir::new().unwrap();
+        init_marketplace_repo(remote.path(), "good");
+        run_git(remote.path(), &["checkout", "-b", "release"]);
+        std::fs::write(remote.path().join("marker"), "release").unwrap();
+        run_git(remote.path(), &["add", "."]);
+        run_git(remote.path(), &["commit", "-m", "release"]);
+        run_git(remote.path(), &["checkout", "-b", "other"]);
+        std::fs::write(remote.path().join("marker"), "wrong branch").unwrap();
+        run_git(remote.path(), &["commit", "-am", "other"]);
+        let source = url::Url::from_directory_path(remote.path())
+            .unwrap()
+            .to_string();
+        let system = format!(
+            "[marketplaces.good]\nsource_type = \"git\"\nsource = {source:?}\nref = \"release\"\n"
+        );
+        let stack = system_marketplace_stack(codex_home.path(), &system, user_config);
+        let reload_config = config_reloader(codex_home.path());
+        let root =
+            AbsolutePathBuf::try_from(marketplace_install_root(codex_home.path()).join("good"))
+                .unwrap();
+        for marker in ["release", "updated"] {
+            if marker == "updated" {
+                run_git(remote.path(), &["checkout", "release"]);
+                std::fs::write(remote.path().join("marker"), marker).unwrap();
+                run_git(remote.path(), &["commit", "-am", "update release"]);
+            }
+            assert_eq!(
+                upgrade_configured_git_marketplaces_with_mode(
+                    codex_home.path(),
+                    &stack,
+                    Some("good"),
+                    PluginGitMode::Automatic,
+                    &reload_config,
+                ),
+                ConfiguredMarketplaceUpgradeOutcome {
+                    selected_marketplaces: vec!["good".to_string()],
+                    upgraded_roots: vec![root.clone()],
+                    errors: Vec::new(),
+                },
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("marker")).unwrap(),
+                marker
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(codex_home.path().join("system.toml")).unwrap(),
+            system
+        );
+        let user_file = codex_home.path().join(CONFIG_TOML_FILE);
+        if user_config.is_empty() {
+            assert!(!user_file.exists());
+        } else {
+            assert_eq!(std::fs::read_to_string(user_file).unwrap(), user_config);
+        }
+    }
+}
+
+#[test]
+fn changed_config_rolls_back_marketplace_activation() {
+    let codex_home = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    init_marketplace_repo(remote.path(), "good");
+    let source = url::Url::from_directory_path(remote.path())
+        .unwrap()
+        .to_string();
+    let system = format!("[marketplaces.good]\nsource_type = \"git\"\nsource = {source:?}\n");
+    let stack = system_marketplace_stack(codex_home.path(), &system, "");
+    let reload_config = config_reloader(codex_home.path());
+    let initial = upgrade_configured_git_marketplaces(
+        codex_home.path(),
+        &stack,
+        Some("good"),
+        &reload_config,
+    );
+    assert!(initial.all_succeeded());
+    let root = &initial.upgraded_roots[0];
+    let original_metadata = std::fs::read(root.join(".codex-marketplace-install.json")).unwrap();
+    std::fs::write(remote.path().join("new-file"), "new revision").unwrap();
+    run_git(remote.path(), &["add", "."]);
+    run_git(remote.path(), &["commit", "-m", "update"]);
+    for (file, changed_config) in [
+        ("system.toml", format!("{system}ref = \"different\"\n")),
+        ("system.toml", String::new()),
+        (
+            CONFIG_TOML_FILE,
+            "[marketplaces.good]\nref = \"user-override\"\n".to_string(),
+        ),
+        (CONFIG_TOML_FILE, "invalid = [".to_string()),
+    ] {
+        std::fs::write(codex_home.path().join("system.toml"), &system).unwrap();
+        std::fs::write(codex_home.path().join(file), changed_config).unwrap();
+        let outcome = upgrade_configured_git_marketplaces(
+            codex_home.path(),
+            &stack,
+            Some("good"),
+            &reload_config,
+        );
+        assert_eq!(outcome.upgraded_roots, Vec::new());
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(!root.join("new-file").exists());
+        assert_eq!(
+            std::fs::read(root.join(".codex-marketplace-install.json")).unwrap(),
+            original_metadata
+        );
+    }
 }
 
 fn init_marketplace_repo(repo: &Path, marketplace_name: &str) {

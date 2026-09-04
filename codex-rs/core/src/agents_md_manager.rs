@@ -2,7 +2,7 @@ use crate::agents_md::LoadedAgentsMd;
 use crate::agents_md::load_project_instructions;
 use crate::config::Config;
 use crate::environment_selection::TurnEnvironmentSnapshot;
-use codex_extension_api::UserInstructions;
+use codex_extension_api::Instructions;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use std::io;
@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 /// Owns the inputs and cached result of AGENTS.md discovery for a session.
 pub(crate) struct AgentsMdManager {
-    user_instructions: Option<UserInstructions>,
+    user_instructions: Option<Instructions>,
     cache: Mutex<AgentsMdCache>,
 }
 
@@ -23,7 +23,7 @@ struct AgentsMdCache {
 }
 
 impl AgentsMdManager {
-    pub(crate) fn new(user_instructions: Option<UserInstructions>) -> Self {
+    pub(crate) fn new(user_instructions: Option<Instructions>) -> Self {
         Self {
             user_instructions: user_instructions
                 .filter(|instructions| !instructions.text.trim().is_empty()),
@@ -77,7 +77,7 @@ impl AgentsMdManager {
         self.cache.lock().await.loaded.clone()
     }
 
-    pub(crate) fn user_instructions(&self) -> Option<UserInstructions> {
+    pub(crate) fn user_instructions(&self) -> Option<Instructions> {
         self.user_instructions.clone()
     }
 }

@@ -132,6 +132,63 @@ fn file_exists(path: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
+// Store PowerShell can be inaccessible to the elevated sandbox account;
+// WindowsApps also contains valid Codex frameworks.
+fn is_inaccessible_windows_apps_powershell_path(path: &std::path::Path) -> bool {
+    path.as_os_str()
+        .to_string_lossy()
+        .split(['\\', '/'])
+        .skip_while(|component| !component.eq_ignore_ascii_case("WindowsApps"))
+        .nth(1)
+        .is_some_and(|component| {
+            component.eq_ignore_ascii_case("pwsh.exe")
+                || component.eq_ignore_ascii_case("powershell.exe")
+                || component
+                    .to_ascii_lowercase()
+                    .starts_with("microsoft.powershell")
+        })
+}
+
+fn targets_inaccessible_windows_apps_powershell(path: &std::path::Path) -> bool {
+    is_inaccessible_windows_apps_powershell_path(path)
+        || std::fs::canonicalize(path)
+            .ok()
+            .is_some_and(|resolved| is_inaccessible_windows_apps_powershell_path(&resolved))
+}
+
+fn is_elevated_sandbox_compatible_powershell_path(path: &std::path::Path) -> bool {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return false;
+    }
+
+    !targets_inaccessible_windows_apps_powershell(path)
+}
+
+fn get_elevated_sandbox_compatible_powershell_path(
+    binary_name: &str,
+    fallback_paths: &[&str],
+) -> Option<PathBuf> {
+    if let Ok(mut paths) = which::which_all(binary_name)
+        && let Some(path) = paths.find(|path| is_elevated_sandbox_compatible_powershell_path(path))
+    {
+        return Some(path);
+    }
+
+    for path in fallback_paths {
+        let path = std::path::Path::new(path);
+        if is_elevated_sandbox_compatible_powershell_path(path)
+            && let Some(path) = file_exists(path)
+        {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
 fn get_shell_path(
     shell_type: ShellType,
     binary_name: &str,
@@ -223,6 +280,29 @@ fn get_powershell_shell() -> Option<DetectedShell> {
     })
 }
 
+/// Returns a replacement only when shell_path targets Store PowerShell and
+/// an elevated sandbox-compatible PowerShell executable can be discovered.
+///
+/// The caller owns the elevated-sandbox policy decision. Normal shell discovery
+/// intentionally keeps the user's ordered PATH selection unchanged.
+pub fn fallback_powershell_shell_for_elevated_windows_sandbox(
+    shell_path: &std::path::Path,
+) -> Option<DetectedShell> {
+    if !cfg!(windows) || !targets_inaccessible_windows_apps_powershell(shell_path) {
+        return None;
+    }
+
+    let shell_path = get_elevated_sandbox_compatible_powershell_path("pwsh", PWSH_FALLBACK_PATHS)
+        .or_else(|| {
+        get_elevated_sandbox_compatible_powershell_path("powershell", POWERSHELL_FALLBACK_PATHS)
+    })?;
+
+    Some(DetectedShell {
+        shell_type: ShellType::PowerShell,
+        shell_path,
+    })
+}
+
 fn get_cmd_shell() -> Option<DetectedShell> {
     let shell_path = get_shell_path(ShellType::Cmd, "cmd", &[]);
 
@@ -293,6 +373,58 @@ pub fn default_user_shell_from_path(user_shell_path: Option<PathBuf>) -> Detecte
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn elevated_sandbox_filter_rejects_store_and_script_powershell_paths() {
+        for path in [
+            r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe\pwsh.exe",
+            r"C:\Program Files\WindowsApps\Microsoft.PowerShellPreview_8wekyb3d8bbwe\pwsh.exe",
+            r"C:\Users\user\AppData\Local\Microsoft\WindowsApps\pwsh.exe",
+            r"C:\Users\user\AppData\Local\Microsoft\WindowsApps\powershell.exe",
+            r"C:\Users\user\AppData\Local\Microsoft\WindowsApps\Microsoft.PowerShell_8wekyb3d8bbwe\pwsh.exe",
+            r"C:\PROGRAM FILES\WINDOWSAPPS\MICROSOFT.POWERSHELL\PWSH.EXE",
+            r"C:\portable\pwsh.cmd",
+        ] {
+            assert!(!is_elevated_sandbox_compatible_powershell_path(
+                std::path::Path::new(path)
+            ));
+        }
+
+        for path in [
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            r"C:\Program Files\WindowsApps\OpenAI.CodexPrimaryRuntime.v26-813-10124-0_26.813.10124.0_x64__3k8sg7r9htsxt\dependencies\native\powershell\pwsh.exe",
+            r"C:\Program Files\WindowsApps\OpenAI.CodexPrimaryRuntime.v26-813-10124-0_26.813.10124.0_arm64__3k8sg7r9htsxt\dependencies\native\powershell\pwsh.exe",
+            r"C:\PROGRAM FILES\WINDOWSAPPS\OPENAI.CODEXPRIMARYRUNTIME.V26-813-10124-0\DEPENDENCIES\NATIVE\POWERSHELL\PWSH.EXE",
+            r"\\?\C:\Program Files\WindowsApps\OpenAI.CodexPrimaryRuntime.v26-813-10124-0\dependencies\native\powershell\pwsh.exe",
+            r"C:\Users\user\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\powershell\pwsh.exe",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            r"C:\portable\NotWindowsApps\pwsh.EXE",
+        ] {
+            assert!(is_elevated_sandbox_compatible_powershell_path(
+                std::path::Path::new(path)
+            ));
+        }
+    }
+
+    #[test]
+    fn elevated_sandbox_filter_preserves_ordered_fallback() {
+        let portable = PathBuf::from(
+            r"C:\Users\user\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\powershell\pwsh.exe",
+        );
+        let found = [
+            PathBuf::from(
+                r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe\pwsh.exe",
+            ),
+            PathBuf::from(r"C:\Users\user\AppData\Local\Microsoft\WindowsApps\pwsh.exe"),
+            PathBuf::from(r"C:\runtime\dependencies\bin\fallback\pwsh.cmd"),
+            portable.clone(),
+            PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+        ]
+        .into_iter()
+        .find(|path| is_elevated_sandbox_compatible_powershell_path(path));
+
+        assert_eq!(found, Some(portable));
+    }
 
     #[test]
     fn test_detect_shell_type() {

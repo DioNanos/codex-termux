@@ -50,6 +50,7 @@ use codex_config::MatcherGroup as CoreMatcherGroup;
 use codex_config::ResidencyRequirement as CoreResidencyRequirement;
 use codex_config::SandboxModeRequirement as CoreSandboxModeRequirement;
 use codex_core::ThreadManager;
+use codex_features::Feature;
 use codex_features::canonical_feature_for_key;
 use codex_features::feature_for_key;
 use codex_model_provider::create_model_provider;
@@ -58,8 +59,12 @@ use codex_protocol::config_types::WebSearchMode;
 use serde_json::json;
 use std::path::PathBuf;
 
+const BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE: &str =
+    "background_paginated_rollout_migration";
+
 const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
     "auth_elicitation",
+    BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE,
     "mcp_2026_07_28",
     "memories",
     "mentions_v2",
@@ -287,6 +292,18 @@ impl ConfigRequestProcessor {
             return Ok(ExperimentalFeatureEnablementSetResponse { enablement });
         }
 
+        // Most runtime features are read later from config. Background migration is a one-shot
+        // process-scoped task, so start it when runtime enablement first changes it to on.
+        let feature = Feature::BackgroundPaginatedRolloutMigration;
+        let should_start_background_rollout_migration = enablement
+            .get(BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE)
+            .is_some_and(|enabled| *enabled)
+            && !self
+                .load_latest_config(/*fallback_cwd*/ None)
+                .await?
+                .features
+                .enabled(feature);
+
         self.config_manager
             .extend_runtime_feature_enablement(
                 enablement
@@ -295,7 +312,10 @@ impl ConfigRequestProcessor {
             )
             .map_err(|_| internal_error("failed to update feature enablement"))?;
 
-        self.load_latest_config(/*fallback_cwd*/ None).await?;
+        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        if should_start_background_rollout_migration && config.features.enabled(feature) {
+            self.thread_manager.start_background_rollout_migration();
+        }
 
         Ok(ExperimentalFeatureEnablementSetResponse { enablement })
     }

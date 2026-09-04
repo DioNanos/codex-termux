@@ -145,7 +145,6 @@ impl ChatWidget {
     }
 
     pub(super) fn dispatch_command(&mut self, cmd: SlashCommand) {
-        self.flush_completed_command_activity();
         if !self.ensure_slash_command_allowed_in_side_conversation(cmd) {
             return;
         }
@@ -258,7 +257,7 @@ impl ChatWidget {
                     .send(AppEvent::OpenDesktopThread { thread_id });
             }
             SlashCommand::Init => {
-                const INIT_PROMPT: &str = include_str!("../../prompt_for_init_command.md");
+                const INIT_PROMPT: &str = include_str!("../../assets/prompt_for_init_command.md");
                 self.submit_user_message(INIT_PROMPT.to_string().into());
             }
             SlashCommand::Compact => {
@@ -272,6 +271,16 @@ impl ChatWidget {
                 }
                 self.input_queue.user_turn_pending_start = true;
                 self.app_event_tx.compact();
+            }
+            SlashCommand::Recap => {
+                let Some(thread_id) = self.thread_id else {
+                    self.add_error_message(
+                        "Session is still starting; try /recap again in a moment.".to_string(),
+                    );
+                    return;
+                };
+                self.app_event_tx
+                    .send(AppEvent::GenerateRecap { thread_id });
             }
             SlashCommand::Review => {
                 self.open_review_popup();
@@ -655,6 +664,9 @@ impl ChatWidget {
             .set_composer_text(String::new(), Vec::new(), Vec::new());
         self.bottom_pane.set_composer_pending_pastes(Vec::new());
         self.bottom_pane.drain_pending_submission_state();
+        if self.bottom_pane.composer_is_vim_enabled() {
+            self.bottom_pane.enable_vim_in_insert_mode();
+        }
     }
 
     fn prepared_inline_user_message(
@@ -1139,6 +1151,7 @@ impl ChatWidget {
             | SlashCommand::Diff
             | SlashCommand::App
             | SlashCommand::Rename
+            | SlashCommand::Recap
             | SlashCommand::TestApproval => QueueDrain::Continue,
             SlashCommand::Cd => match self.thread_id {
                 Some(thread_id) if self.can_change_working_directory(thread_id) => QueueDrain::Stop,

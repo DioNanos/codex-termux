@@ -14,7 +14,6 @@ use codex_mcp::effective_mcp_servers;
 use codex_mcp::host_owned_codex_apps_enabled;
 use codex_mcp::tool_is_model_visible;
 use codex_protocol::mcp::ClientMcpExtensions;
-use codex_protocol::models::PermissionProfile;
 
 #[cfg(test)]
 #[path = "installed_tests.rs"]
@@ -57,12 +56,10 @@ impl AppsRequestProcessor {
                 .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend));
 
             let mcp_manager = self.thread_manager.mcp_manager();
-            let mut mcp_config = mcp_manager.runtime_config(&config).await;
-            // Installed-app discovery has no active turn or reviewer.
-            mcp_config.permission_profile = PermissionProfile::default();
-            let mcp_config = Arc::new(mcp_config);
+            let mcp_config = mcp_manager.runtime_config(&config).await;
             let mut mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
             mcp_servers.retain(|name, _| name == CODEX_APPS_MCP_SERVER_NAME);
+            let mcp_config = Arc::new(mcp_config.for_threadless_operations(&mcp_servers));
             let cache_key = connector_runtime_context_key(auth.as_ref());
             let previous_snapshot = mcp_manager
                 .codex_apps_tools_cache()
@@ -100,7 +97,7 @@ impl AppsRequestProcessor {
                         codex_apps_tools_cache_key: cache_key.clone(),
                         client_mcp_extensions: ClientMcpExtensions::default(),
                         auth: auth.clone(),
-                        codex_apps_auth_manager,
+                        auth_manager: codex_apps_auth_manager,
                         elicitation_reviewer: None,
                         elicitation_lifecycle: None,
                     })

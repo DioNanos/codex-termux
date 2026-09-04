@@ -192,7 +192,10 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
         ThreadItem::EnteredReviewMode { .. } => return Some("Entered review mode".to_string()),
         ThreadItem::ExitedReviewMode { .. } => return Some("Exited review mode".to_string()),
         ThreadItem::ContextCompaction { .. } => return Some("Compacted context".to_string()),
-        ThreadItem::UserMessage { .. } | ThreadItem::HookPrompt { .. } | ThreadItem::Sleep(_) => {
+        ThreadItem::UserMessage { .. }
+        | ThreadItem::HookPrompt { .. }
+        | ThreadItem::FunctionCallOutput { .. }
+        | ThreadItem::Sleep(_) => {
             return None;
         }
     };

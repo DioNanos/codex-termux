@@ -63,7 +63,7 @@ pub(super) struct ListTool {
     pub(super) context: SkillToolContext,
 }
 
-impl ToolExecutor<ToolCall> for ListTool {
+impl<'call> ToolExecutor<ToolCall<'call>> for ListTool {
     fn tool_name(&self) -> ToolName {
         skill_tool_name(TOOL_NAME)
     }
@@ -75,7 +75,10 @@ impl ToolExecutor<ToolCall> for ListTool {
         )
     }
 
-    fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
         Box::pin(async move {
             let args: ListArgs = parse_args(&call)?;
             let response_byte_budget = call.response_byte_budget(MAX_SKILL_RESPONSE_BYTES);

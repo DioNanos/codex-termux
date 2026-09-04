@@ -31,6 +31,8 @@ use codex_app_server_protocol::ThreadStartResponse;
 use codex_core::config::set_project_trust_level;
 use codex_http_client::HttpClientBuilder;
 use codex_protocol::config_types::TrustLevel;
+use codex_rmcp_client::McpOAuthCallbackMode;
+use codex_rmcp_client::resolve_mcp_oauth_callback_url;
 use core_test_support::skip_if_remote;
 use core_test_support::stdio_server_bin;
 use pretty_assertions::assert_eq;
@@ -67,16 +69,73 @@ use wiremock::matchers::path;
 
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[test_case(false, None, None, None, true; "legacy callback")]
+#[test_case(
+    false,
+    Some("http://127.0.0.1/callback/registered"),
+    None,
+    None,
+    true;
+    "ordinary configured callback falls back to default"
+)]
+#[test_case(
+    false,
+    Some("http://127.0.0.1/callback/registered"),
+    Some("http://127.0.0.1/global/callback"),
+    None,
+    true;
+    "ordinary configured callback falls back to global"
+)]
+#[test_case(
+    false,
+    Some("http://127.0.0.1/callback/registered"),
+    Some("http://127.0.0.1/global/callback"),
+    Some("https://unexpected.example"),
+    false;
+    "legacy callback fallback rejects mismatched issuer"
+)]
+#[test_case(
+    true,
+    Some("http://127.0.0.1/callback"),
+    None,
+    Some("matching"),
+    true;
+    "matching issuer"
+)]
+#[test_case(
+    true,
+    Some("http://127.0.0.1/callback"),
+    None,
+    Some("https://unexpected.example"),
+    false;
+    "mismatched issuer"
+)]
+#[test_case(
+    true,
+    Some("http://127.0.0.1/callback"),
+    None,
+    None,
+    false;
+    "missing issuer"
+)]
 #[tokio::test]
-async fn oauth_login_uses_http_headers_helper() -> Result<()> {
+async fn oauth_login_validates_callback_issuer_and_uses_http_headers_helper(
+    issuer_supported: bool,
+    configured_callback: Option<&str>,
+    global_callback: Option<&str>,
+    callback_issuer: Option<&str>,
+    expected_success: bool,
+) -> Result<()> {
     let oauth = MockServer::start().await;
+    let issuer = format!("{}/mcp", oauth.uri());
     Mock::given(method("GET"))
         .and(path("/.well-known/oauth-authorization-server/mcp"))
         .and(header("x-gateway", "gateway-token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "issuer": format!("{}/mcp", oauth.uri()),
+            "issuer": issuer,
             "authorization_endpoint": format!("{}/oauth/authorize", oauth.uri()),
             "token_endpoint": format!("{}/oauth/token", oauth.uri()),
+            "authorization_response_iss_parameter_supported": issuer_supported,
         })))
         .mount(&oauth)
         .await;
@@ -87,7 +146,7 @@ async fn oauth_login_uses_http_headers_helper() -> Result<()> {
             "access_token": "oauth-token",
             "token_type": "Bearer",
         })))
-        .expect(1)
+        .expect(u64::from(expected_success))
         .mount(&oauth)
         .await;
 
@@ -97,15 +156,23 @@ async fn oauth_login_uses_http_headers_helper() -> Result<()> {
     } else {
         r#"printf '{"X-Gateway":"gateway-token"}'"#
     };
+    let saved_callback = configured_callback
+        .map(|callback| format!("callback_url = \"{callback}\"\n"))
+        .unwrap_or_default();
+    let global_callback_config = global_callback
+        .map(|callback| format!("mcp_oauth_callback_url = \"{callback}\"\n"))
+        .unwrap_or_default();
     std::fs::write(
         codex_home.path().join("config.toml"),
         format!(
             "mcp_oauth_credentials_store = \"file\"\n\
+             {global_callback_config}\
              [mcp_servers.gateway]\n\
              url = \"{}/mcp\"\n\
              http_headers_helper = {}\n\
              [mcp_servers.gateway.oauth]\n\
-             client_id = \"test-client\"\n",
+             client_id = \"test-client\"\n\
+             {saved_callback}",
             oauth.uri(),
             toml::Value::String(helper_command.to_string()),
         ),
@@ -126,10 +193,32 @@ async fn oauth_login_uses_http_headers_helper() -> Result<()> {
     let authorization_url = Url::parse(&response.authorization_url)?;
     let query: BTreeMap<_, _> = authorization_url.query_pairs().into_owned().collect();
     let mut callback_url = Url::parse(&query["redirect_uri"])?;
+    let expected_callback = if issuer_supported {
+        configured_callback
+            .expect("issuer-bound cases configure a stable callback")
+            .to_string()
+    } else {
+        resolve_mcp_oauth_callback_url(
+            &issuer,
+            global_callback,
+            McpOAuthCallbackMode::CallbackSpecific,
+        )?
+    };
+    assert_eq!(callback_url.path(), Url::parse(&expected_callback)?.path());
     callback_url
         .query_pairs_mut()
         .append_pair("code", "test-code")
         .append_pair("state", &query["state"]);
+    if let Some(callback_issuer) = callback_issuer {
+        let callback_issuer = if callback_issuer == "matching" {
+            issuer.as_str()
+        } else {
+            callback_issuer
+        };
+        callback_url
+            .query_pairs_mut()
+            .append_pair("iss", callback_issuer);
+    }
     HttpClientBuilder::new()
         .build_direct()?
         .get(callback_url)
@@ -142,13 +231,13 @@ async fn oauth_login_uses_http_headers_helper() -> Result<()> {
     )
     .await??;
     assert_eq!(
-        completed,
-        McpServerOauthLoginCompletedNotification {
-            name: "gateway".to_string(),
-            thread_id: None,
-            success: true,
-            error: None,
-        }
+        (
+            completed.name.as_str(),
+            completed.thread_id,
+            completed.success,
+            completed.error.is_some(),
+        ),
+        ("gateway", None, expected_success, !expected_success)
     );
     oauth.verify().await;
     Ok(())

@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use codex_analytics::InvocationType;
@@ -54,7 +55,7 @@ pub(super) struct ReadTool {
     pub(super) context: SkillToolContext,
 }
 
-impl ToolExecutor<ToolCall> for ReadTool {
+impl<'call> ToolExecutor<ToolCall<'call>> for ReadTool {
     fn tool_name(&self) -> ToolName {
         skill_tool_name(TOOL_NAME)
     }
@@ -66,7 +67,10 @@ impl ToolExecutor<ToolCall> for ReadTool {
         )
     }
 
-    fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
         Box::pin(async move {
             let args: ReadArgs = parse_args(&call)?;
             let response_byte_budget = call.response_byte_budget(MAX_SKILL_RESPONSE_BYTES);
@@ -183,6 +187,7 @@ impl ToolExecutor<ToolCall> for ReadTool {
                         .read_skill(
                             &self.context.providers,
                             SkillReadRequest {
+                                _lifetime: PhantomData,
                                 authority: authority.clone(),
                                 package: package.clone(),
                                 resource: requested_resource.clone(),

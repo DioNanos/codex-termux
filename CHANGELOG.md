@@ -1,3 +1,37 @@
+# [0.153.2] - 2026-09-04
+
+## GPT-6-Astra now available in the model picker
+
+This release makes GPT-6-Astra selectable in the bundled model catalog and aligns the fork with upstream OpenAI Codex rust-v0.153.2.
+
+This release aligns the fork with the upstream OpenAI Codex `rust-v0.153.2`
+base and keeps the Termux compatibility work carried by this distribution.
+
+## Fork fixes
+
+- Background-terminal polling keeps the dedicated "Waiting for background
+  terminal" state and its reduced animation rate.
+- Remote attachment paths continue to resolve to the client's real files.
+- Android approval handling continues to honor approved operations where a
+  sandbox cannot exist by construction, with deny-read restrictions preserved.
+- Update diagnostics continue to use the fork npm package for npm, Bun,
+  Vite+, pnpm, Homebrew, and standalone install contexts.
+
+## Upstream alignment (rust-v0.150.1 -> rust-v0.153.2)
+
+Highlights from upstream include structured asynchronous user input requests,
+experimental context management, broader Guardian model and approval
+handling, remote marketplace and plugin reconciliation support, richer app
+link and model metadata, improved TUI reconnect and session navigation, Vim
+history improvements, and the native voice lifecycle foundation.
+
+## Compatibility
+
+- The package remains `@mmmbuto/codex-cli-termux` for Android ARM64
+  (Android 10+ / API 29+).
+- Update diagnostics stay on fork-owned channels; the upstream base is
+  declared in the package description and in these release notes.
+
 # [0.150.1] - 2026-08-29
 
 This release was announced on 2026-08-29 as the final release of the fork,

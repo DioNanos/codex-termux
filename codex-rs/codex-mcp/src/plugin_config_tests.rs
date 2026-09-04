@@ -582,6 +582,7 @@ fn declared_placement_preserves_local_plugin_normalization() {
         scopes: None,
         oauth: Some(McpServerOAuthConfig {
             client_id: Some("client-id".to_string()),
+            callback_url: Some("http://127.0.0.1/callback/registered".to_string()),
             callback_port: Some(9876),
         }),
         oauth_resource: None,
@@ -611,7 +612,7 @@ fn declared_placement_preserves_local_plugin_normalization() {
             "hosted": {
                 "type": "http",
                 "url": "https://example.com/mcp",
-                "oauth": {"clientId": "client-id", "callbackPort": 9876}
+                "oauth": {"clientId": "client-id", "callbackUrl": "http://127.0.0.1/callback/registered", "callbackPort": 9876}
             },
             "helper": {"type":"http","url":"https://example.com/mcp","http_headers_helper":"./auth.sh"}
         }"#,

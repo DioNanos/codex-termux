@@ -54,7 +54,10 @@ impl ToolExecutor<ToolInvocation> for PlanHandler {
         create_update_plan_tool()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
@@ -81,7 +84,7 @@ impl PlanHandler {
             }
         };
 
-        if turn.mode == ModeKind::Plan {
+        if turn.mode() == ModeKind::Plan {
             return Err(FunctionCallError::RespondToModel(
                 "update_plan is a TODO/checklist tool and is not allowed in Plan mode".to_string(),
             ));

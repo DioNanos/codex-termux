@@ -44,6 +44,20 @@ fn bedrock_auth() -> BedrockApiKeyAuth {
     }
 }
 
+#[test]
+fn bedrock_api_key_debug_redacts_secret() {
+    let auth = bedrock_auth();
+
+    assert_eq!(
+        format!("{auth:?}"),
+        r#"BedrockApiKeyAuth { api_key: "<redacted>", region: "us-east-1" }"#
+    );
+    assert_eq!(
+        format!("{:?}", CodexAuth::BedrockApiKey(auth)),
+        r#"BedrockApiKey(BedrockApiKeyAuth { api_key: "<redacted>", region: "us-east-1" })"#
+    );
+}
+
 #[tokio::test]
 #[serial(codex_auth_env)]
 async fn login_with_bedrock_api_key_replaces_openai_auth() -> anyhow::Result<()> {

@@ -36,6 +36,7 @@ members = [
     "collaboration-mode-templates",
     "connectors",
     "config",
+    "config-schema",
     "context-fragments",
     "shell-command",
     "shell-escalation",
@@ -44,6 +45,7 @@ members = [
     "core-api",
     "core-plugins",
     "diagnostics",
+    "guardian-context",
     "hooks",
     "history",
     "http-client",
@@ -84,6 +86,8 @@ members = [
     "network-proxy",
     "ollama",
     "process-hardening",
+    "realtime-webrtc",
+    "voice-host",
     "protocol",
     "prompts",
     "rollout",
@@ -94,10 +98,12 @@ members = [
     "sandboxing",
     "stdio-to-uds",
     "otel",
+    "otel-trace-websocket",
     "tui",
     "tools",
     "v8-poc",
     "websocket-client",
+    "worktree",
     "workload-identity",
     "utils/absolute-path",
     "utils/audio",
@@ -105,6 +111,7 @@ members = [
     "utils/cargo-bin",
     "git-utils",
     "utils/cache",
+    "utils/git-discovery",
     "utils/image",
     "utils/json-to-toml",
     "utils/home-dir",
@@ -140,7 +147,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.150.1"
+version = "0.153.2"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -150,6 +157,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 # Internal
+codex-realtime-webrtc = { path = "realtime-webrtc" }
 app_test_support = { path = "app-server/tests/common" }
 codex-analytics = { path = "analytics" }
 codex-agent-graph-store = { path = "agent-graph-store" }
@@ -211,6 +219,7 @@ codex-install-context = { path = "install-context" }
 codex-file-search = { path = "file-search" }
 codex-file-watcher = { path = "file-watcher" }
 codex-git-utils = { path = "git-utils" }
+codex-guardian-context = { path = "guardian-context" }
 codex-hooks = { path = "hooks" }
 codex-history = { path = "history" }
 codex-keyring-store = { path = "keyring-store" }
@@ -230,6 +239,7 @@ codex-models-manager = { path = "models-manager" }
 codex-network-proxy = { path = "network-proxy" }
 codex-ollama = { path = "ollama" }
 codex-otel = { path = "otel" }
+codex-otel-trace-websocket = { path = "otel-trace-websocket" }
 codex-plugin = { path = "plugin" }
 codex-model-provider = { path = "model-provider" }
 codex-process-hardening = { path = "process-hardening" }
@@ -263,6 +273,7 @@ codex-utils-cargo-bin = { path = "utils/cargo-bin" }
 codex-utils-cli = { path = "utils/cli" }
 codex-utils-elapsed = { path = "utils/elapsed" }
 codex-utils-fuzzy-match = { path = "utils/fuzzy-match" }
+codex-utils-git-discovery = { path = "utils/git-discovery" }
 codex-utils-home-dir = { path = "utils/home-dir" }
 codex-utils-image = { path = "utils/image" }
 codex-utils-json-to-toml = { path = "utils/json-to-toml" }
@@ -289,6 +300,7 @@ mcp_test_support = { path = "mcp-server/tests/common" }
 age = "0.11.1"
 ansi-to-tui = "8.0.1"
 anyhow = "1"
+appcontainer_common = { git = "https://github.com/microsoft/mxc", rev = "6cd3d58f05d3447e67109cfb75e042803b843ca4" }
 arboard = { version = "3", features = ["wayland-data-control"] }
 arc-swap = "1.9.0"
 assert_cmd = "2"
@@ -338,6 +350,7 @@ flate2 = "1.1.8"
 futures = { version = "0.3", default-features = false }
 gethostname = "1.1.0"
 gix = { version = "0.81.0", default-features = false, features = ["sha1"] }
+gix-url = "0.35.2"
 glob = "0.3"
 globset = "0.4"
 hmac = "0.12.1"

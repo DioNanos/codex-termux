@@ -5,8 +5,10 @@ use codex_protocol::models::NetworkPermissions;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSandboxPolicyContext;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
@@ -17,6 +19,15 @@ fn file_system_permissions(entries: Vec<FileSystemSandboxEntry>) -> AdditionalPe
             glob_scan_max_depth: None,
         }),
         ..Default::default()
+    }
+}
+
+fn local_context(cwd: &PathUri) -> FileSystemSandboxPolicyContext<'_> {
+    FileSystemSandboxPolicyContext {
+        cwd,
+        workspace_roots: std::slice::from_ref(cwd),
+        temporary_directories: None,
+        user_home_dir: None,
     }
 }
 
@@ -35,9 +46,10 @@ fn preapproval_accepts_reordered_replay_of_one_accumulated_grant() {
     });
     let replay = file_system_permissions(vec![write]);
     let effective = merge_permission_profiles(Some(&replay), Some(&granted)).expect("permissions");
+    let cwd = PathUri::from_host_native_path(cwd.path()).expect("cwd URI");
 
     assert_eq!(
-        preapproved_permission_profile(&effective, &granted, cwd.path()),
+        preapproved_permission_profile(&effective, &granted, &local_context(&cwd)),
         Some(granted)
     );
 }
@@ -50,6 +62,8 @@ fn preapproval_requires_fresh_read_and_write_beneath_a_deny() {
         FileSystemSandboxEntry::new(root.clone().into(), FileSystemAccessMode::Write),
         FileSystemSandboxEntry::new(root.join("secrets").into(), FileSystemAccessMode::Deny),
     ]);
+    let cwd = PathUri::from_host_native_path(cwd.path()).expect("cwd URI");
+    let context = local_context(&cwd);
 
     let preapproved = [FileSystemAccessMode::Read, FileSystemAccessMode::Write].map(|access| {
         let requested = file_system_permissions(vec![FileSystemSandboxEntry::new(
@@ -59,7 +73,7 @@ fn preapproval_requires_fresh_read_and_write_beneath_a_deny() {
         let effective =
             merge_permission_profiles(Some(&requested), Some(&granted)).expect("permissions");
 
-        preapproved_permission_profile(&effective, &granted, cwd.path())
+        preapproved_permission_profile(&effective, &granted, &context)
     });
 
     assert_eq!(preapproved, [None, None]);
@@ -74,9 +88,10 @@ fn preapproval_fails_closed_when_materialization_rejects_both_profiles() {
         },
         FileSystemAccessMode::Write,
     )]);
+    let cwd = PathUri::from_host_native_path(cwd.path()).expect("cwd URI");
 
     assert_eq!(
-        preapproved_permission_profile(&invalid, &invalid, cwd.path()),
+        preapproved_permission_profile(&invalid, &invalid, &local_context(&cwd)),
         None
     );
 }

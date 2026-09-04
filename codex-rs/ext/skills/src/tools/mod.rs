@@ -11,6 +11,7 @@ use codex_analytics::SkillInvocationLocation;
 use codex_analytics::build_track_events_context;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_extension_api::ExtensionData;
+use codex_extension_api::ExtensionMetrics;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::JsonToolOutput;
 use codex_extension_api::ResponsesApiTool;
@@ -24,6 +25,7 @@ use codex_extension_api::ToolSpec;
 use codex_extension_api::parse_tool_input_schema;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::McpResourceClient;
+use codex_otel::sanitize_metric_tag_value;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::default_namespace_description;
@@ -43,6 +45,7 @@ use crate::shadow_selection_experiment::ShadowSelectionExperiment;
 use crate::sources::SkillProviders;
 use crate::state::SkillsSessionState;
 use crate::state::SkillsThreadState;
+use crate::telemetry::ActiveSkillTurnMetrics;
 
 mod list;
 mod read;
@@ -60,7 +63,7 @@ pub(crate) fn skill_tools(
     selected_plugins: Option<Arc<SelectedPluginSnapshot>>,
     sandbox_contexts: Option<Arc<HashMap<String, FileSystemSandboxContext>>>,
     shadow_selection: Arc<ShadowSelectionExperiment>,
-) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
     let Some(thread_state) = thread_store.get::<SkillsThreadState>() else {
         return Vec::new();
     };
@@ -96,6 +99,8 @@ pub(crate) fn skill_tools(
 #[derive(Clone)]
 pub(crate) struct SkillAnalytics {
     client: AnalyticsEventsClient,
+    metrics: Option<Arc<dyn ExtensionMetrics>>,
+    active_turn: Arc<ActiveSkillTurnMetrics>,
     thread_id: String,
     product_client_id: String,
 }
@@ -110,6 +115,10 @@ impl SkillAnalytics {
 
         Some(Self {
             client: client.as_ref().clone(),
+            metrics: session_store
+                .get::<SkillsSessionState>()
+                .and_then(|state| state.extension_metrics.clone()),
+            active_turn: thread_store.get_or_init(ActiveSkillTurnMetrics::default),
             thread_id: thread_store.level_id().to_string(),
             product_client_id: originator.0.clone(),
         })
@@ -122,6 +131,42 @@ impl SkillAnalytics {
         turn_id: String,
         invocation_type: InvocationType,
     ) {
+        let turn_metrics = self
+            .active_turn
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upgrade()
+            .filter(|turn| turn.turn_id == turn_id);
+        if let Some(turn_metrics) = &turn_metrics {
+            turn_metrics.record_plugin(skill.plugin_id.as_deref());
+        }
+        if let Some(metrics) = &self.metrics {
+            let skill_name_tag = sanitize_metric_tag_value(skill.name.as_str());
+            let plugin_id_tag =
+                sanitize_metric_tag_value(skill.plugin_id.as_deref().unwrap_or("unattributed"));
+            let model_slug_tag = sanitize_metric_tag_value(model.as_str());
+            let reasoning_effort = turn_metrics
+                .as_ref()
+                .map(|turn| turn.reasoning_effort.as_str())
+                .unwrap_or("unknown");
+            let invoke_type = match invocation_type {
+                InvocationType::Explicit => "explicit",
+                InvocationType::Implicit => "implicit",
+            };
+            metrics.counter(
+                "codex.skill.injected",
+                /*inc*/ 1,
+                &[
+                    ("status", "ok"),
+                    ("skill", skill_name_tag.as_str()),
+                    ("invoke_type", invoke_type),
+                    ("plugin_id", plugin_id_tag.as_str()),
+                    ("model_slug", model_slug_tag.as_str()),
+                    ("reasoning_effort", reasoning_effort),
+                ],
+            );
+        }
         self.client.track_skill_invocations(
             build_track_events_context(
                 model,
@@ -269,7 +314,7 @@ fn skill_function_tool<I: JsonSchema, O: JsonSchema>(name: &str, description: &s
     })
 }
 
-fn parse_args<T: for<'de> Deserialize<'de>>(call: &ToolCall) -> Result<T, FunctionCallError> {
+fn parse_args<T: for<'de> Deserialize<'de>>(call: &ToolCall<'_>) -> Result<T, FunctionCallError> {
     let arguments = call.function_arguments()?;
     let value = if arguments.trim().is_empty() {
         Value::Object(serde_json::Map::new())

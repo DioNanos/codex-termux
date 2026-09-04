@@ -16,6 +16,7 @@ mod thread_sections;
 mod types;
 
 pub use codex_state::MAX_QUEUE_ITEMS;
+pub use codex_state::ProjectSortKey;
 pub use codex_state::QueuedUserSubmissionRecord;
 pub use error::ThreadStoreError;
 pub use error::ThreadStoreResult;

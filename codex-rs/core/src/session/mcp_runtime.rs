@@ -37,13 +37,12 @@ impl Session {
         next: &SessionConfiguration,
         updates: &SessionSettingsUpdate,
     ) -> bool {
-        // TODO(anp): Reconcile invalidation with TurnEnvironment::sandbox_context.
-        // This gap predates that API: an internal Windows-level-only settings update
-        // can leave the published MCP configuration stale.
         current.cwd() != next.cwd()
-            || current.approval_policy.value() != next.approval_policy.value()
-            || current.approvals_reviewer != next.approvals_reviewer
+            || current.step_settings.approval_policy.value()
+                != next.step_settings.approval_policy.value()
+            || current.step_settings.approvals_reviewer != next.step_settings.approvals_reviewer
             || current.permission_profile() != next.permission_profile()
+            || current.windows_sandbox_level != next.windows_sandbox_level
             || updates.environments.as_ref().is_some_and(|environments| {
                 environments.environments != self.services.turn_environments.selections()
             })
@@ -163,10 +162,22 @@ impl Session {
                 }
 
                 let environment_id = &selected.selection.environment_id;
-                let servers = match environment
+                let discovery = environment
                     .discover_http_mcp_servers(selected.cwd().clone())
-                    .await
-                {
+                    .await;
+                let outcome = if discovery.is_ok() {
+                    "success"
+                } else {
+                    "error"
+                };
+                // Count completed discovery attempts, including refreshes, before host policy
+                // or MCP startup determines whether the server's tools become available.
+                self.services.session_telemetry.counter(
+                    "codex.mcp.executor_discovery",
+                    /*inc*/ 1,
+                    &[("outcome", outcome)],
+                );
+                let servers = match discovery {
                     Ok(servers) => servers,
                     Err(error) => {
                         tracing::warn!(
@@ -178,6 +189,16 @@ impl Session {
                     }
                 };
                 for (name, mut server) in servers {
+                    let outcome = if server.enabled {
+                        "found"
+                    } else {
+                        "unavailable"
+                    };
+                    self.services.session_telemetry.counter(
+                        "codex.mcp.executor_discovery.server",
+                        /*inc*/ 1,
+                        &[("server_name", name.as_str()), ("outcome", outcome)],
+                    );
                     if name == CODEX_APPS_MCP_SERVER_NAME
                         || !server.is_local_environment()
                         || projection
@@ -332,8 +353,17 @@ impl Session {
             .environment_cwds
             .entry(codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string())
             .or_insert_with(|| PathUri::from_abs_path(&desired.config.cwd));
+        let mcp_servers = effective_mcp_servers(&config, auth.as_ref());
+        config.set_server_permission_profiles(
+            &mcp_servers,
+            desired.environments.turn_environments().map(|environment| {
+                (
+                    environment.selection.environment_id.clone(),
+                    environment.permission_profile_with_workspace_roots(),
+                )
+            }),
+        );
         let mcp_config = Arc::new(config);
-        let mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
         let runtime_context = McpRuntimeContext::new(
             self.services.turn_environments.environment_manager(),
             desired.local_process_cwd.clone(),
@@ -350,10 +380,6 @@ impl Session {
                 })
                 .collect(),
         );
-        let codex_apps_auth_manager =
-            codex_mcp::host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
-                .then(|| Arc::clone(&self.services.auth_manager));
-
         McpRuntimeInput {
             startup_policy: if matches!(desired.session_source, SessionSource::SubAgent(_)) {
                 McpStartupPolicy::LazyWhenCached
@@ -373,7 +399,7 @@ impl Session {
             codex_apps_tools_cache_key: connector_runtime_context_key(auth.as_ref()),
             client_mcp_extensions: self.services.client_mcp_extensions.for_mcp_servers(),
             auth,
-            codex_apps_auth_manager,
+            auth_manager: Some(Arc::clone(&self.services.auth_manager)),
             elicitation_reviewer,
             elicitation_lifecycle: Some(self.mcp_elicitation_lifecycle()),
         }

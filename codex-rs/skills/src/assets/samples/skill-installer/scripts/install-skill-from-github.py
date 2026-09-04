@@ -15,6 +15,7 @@ import urllib.parse
 import zipfile
 
 from github_utils import github_request
+
 DEFAULT_REF = "main"
 
 
@@ -97,7 +98,9 @@ def _download_repo_zip(owner: str, repo: str, ref: str, dest_dir: str) -> str:
 
 
 def _run_git(args: list[str]) -> None:
-    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    result = subprocess.run(
+        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
     if result.returncode != 0:
         raise InstallError(result.stderr.strip() or "Git command failed.")
 
@@ -125,7 +128,9 @@ def _validate_skill_name(name: str) -> None:
         raise InstallError("Invalid skill name.")
 
 
-def _git_sparse_checkout(repo_url: str, ref: str, paths: list[str], dest_dir: str) -> str:
+def _git_sparse_checkout(
+    repo_url: str, ref: str, paths: list[str], dest_dir: str
+) -> str:
     repo_dir = os.path.join(dest_dir, "repo")
     clone_cmd = [
         "git",
@@ -165,7 +170,10 @@ def _validate_skill(path: str, repo_root: str) -> None:
     resolved_repo_root = os.path.realpath(repo_root)
     resolved_path = os.path.realpath(path)
     try:
-        inside_repo = os.path.commonpath([resolved_repo_root, resolved_path]) == resolved_repo_root
+        inside_repo = (
+            os.path.commonpath([resolved_repo_root, resolved_path])
+            == resolved_repo_root
+        )
     except ValueError:
         inside_repo = False
     if not inside_repo:
@@ -194,12 +202,15 @@ def _validate_skill(path: str, repo_root: str) -> None:
                 resolved_entry = os.path.realpath(entry_path)
                 try:
                     inside_skill = (
-                        os.path.commonpath([resolved_path, resolved_entry]) == resolved_path
+                        os.path.commonpath([resolved_path, resolved_entry])
+                        == resolved_path
                     )
                 except ValueError:
                     inside_skill = False
                 if not inside_skill or not os.path.isfile(resolved_entry):
-                    raise InstallError(f"Unsupported symbolic link in skill: {relative_entry}")
+                    raise InstallError(
+                        f"Unsupported symbolic link in skill: {relative_entry}"
+                    )
                 continue
             if not os.path.isdir(entry_path) and not os.path.isfile(entry_path):
                 raise InstallError(f"Unsupported file type in skill: {relative_entry}")

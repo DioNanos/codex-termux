@@ -287,6 +287,12 @@ pub struct ConfigToml {
     /// to 127.0.0.1 (using `mcp_oauth_callback_port` when provided).
     pub mcp_oauth_callback_url: Option<String>,
 
+    /// Milliseconds to wait for optional MCP servers while building the initial tool catalog.
+    ///
+    /// Defaults to 1000. Set to 0 to disable the shared grace and wait for each
+    /// server's configured `startup_timeout_sec` instead.
+    pub mcp_optional_startup_grace_ms: Option<u64>,
+
     /// User-defined provider entries that extend the built-in list. Built-in
     /// IDs cannot be overridden.
     #[serde(default, deserialize_with = "deserialize_model_providers")]
@@ -481,9 +487,7 @@ pub struct ConfigToml {
     /// Defaults to `true`.
     pub check_for_update_on_startup: Option<bool>,
 
-    /// When true, disables burst-paste detection for typed input entirely.
-    /// All characters are inserted as they are received, and no buffering
-    /// or placeholder replacement will occur for fast keypress bursts.
+    /// Legacy fallback for `tui.disable_paste_burst`. Prefer the setting under `[tui]`.
     pub disable_paste_burst: Option<bool>,
 
     /// When `false`, disables analytics across Codex product surfaces in this machine.
@@ -626,7 +630,7 @@ pub struct ExperimentalRequestUserInput {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct UpdatePlanToolConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
 }
 

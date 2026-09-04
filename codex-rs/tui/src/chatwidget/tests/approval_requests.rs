@@ -10,6 +10,7 @@ async fn exec_approval_emits_proposed_command_and_decision_history() {
 
     // Trigger an exec approval request with a short, single-line command.
     let ev = ExecApprovalRequestEvent {
+        kind: Default::default(),
         call_id: "call-short".into(),
         approval_id: Some("call-short".into()),
         turn_id: "turn-short".into(),
@@ -84,6 +85,42 @@ fn app_server_exec_approval_request_splits_shell_wrapped_command() {
             script.to_string(),
         ]
     );
+}
+
+#[tokio::test]
+async fn app_server_write_stdin_approval_renders_terminal_input() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let event = exec_approval_request_from_params(
+        AppServerCommandExecutionRequestApprovalParams {
+            kind: codex_app_server_protocol::CommandExecutionApprovalKind::WriteStdin,
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "item-1".to_string(),
+            started_at_ms: 0,
+            approval_id: Some("approval-1".to_string()),
+            environment_id: None,
+            reason: None,
+            network_approval_context: None,
+            command: Some(
+                shlex::try_join(["write_stdin", "--session-id", "42", "confirm\n"])
+                    .expect("round-trippable write_stdin input"),
+            ),
+            cwd: Some(test_path_buf("/tmp").abs().into()),
+            command_actions: None,
+            additional_permissions: None,
+            proposed_execpolicy_amendment: None,
+            proposed_network_policy_amendments: None,
+            available_decisions: None,
+        },
+        &test_path_buf("/tmp").abs(),
+    );
+
+    handle_exec_approval_request(&mut chat, "approval-1", event);
+
+    let area = Rect::new(0, 0, 80, chat.desired_height(/*width*/ 80));
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    chat.render(area, &mut buf);
+    assert_snapshot!("write_stdin_approval_modal", format!("{buf:?}"));
 }
 
 #[test]
@@ -338,6 +375,7 @@ async fn exec_approval_uses_approval_id_when_present() {
         &mut chat,
         "sub-short",
         ExecApprovalRequestEvent {
+            kind: Default::default(),
             call_id: "call-parent".into(),
             approval_id: Some("approval-subcommand".into()),
             turn_id: "turn-short".into(),
@@ -381,6 +419,7 @@ async fn exec_approval_decision_truncates_multiline_and_long_commands() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     let ev_multi = ExecApprovalRequestEvent {
+        kind: Default::default(),
         call_id: "call-multi".into(),
         approval_id: Some("call-multi".into()),
         turn_id: "turn-multi".into(),
@@ -433,6 +472,7 @@ async fn exec_approval_decision_truncates_multiline_and_long_commands() {
 
     let long = format!("echo {}", "a".repeat(200));
     let ev_long = ExecApprovalRequestEvent {
+        kind: Default::default(),
         call_id: "call-long".into(),
         approval_id: Some("call-long".into()),
         turn_id: "turn-long".into(),

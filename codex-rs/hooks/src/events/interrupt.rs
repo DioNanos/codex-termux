@@ -8,11 +8,14 @@ use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use serde_json::Map;
+use serde_json::Value;
 
 use super::common;
 use crate::engine::ClaudeHooksEngine;
 use crate::engine::ConfiguredHandler;
 use crate::engine::HandlerRunResult;
+use crate::engine::HandlerSourcePath;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
 use crate::schema::InterruptCommandInput;
@@ -26,6 +29,7 @@ pub struct InterruptRequest {
     pub transcript_path: Option<PathBuf>,
     pub model: String,
     pub permission_mode: String,
+    pub request_metadata: Option<Map<String, Value>>,
 }
 
 #[derive(Debug, Default)]
@@ -43,6 +47,8 @@ pub(crate) fn preview(handlers: &[ConfiguredHandler]) -> Vec<HookRunSummary> {
         /*matcher_input*/ None,
     )
     .into_iter()
+    // Executor-scoped hooks run asynchronously and do not emit public hook lifecycle events.
+    .filter(|handler| matches!(handler.source_path, HandlerSourcePath::Local(_)))
     .map(|handler| dispatcher::running_summary(&handler))
     .collect()
 }
@@ -64,6 +70,7 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: InterruptRequest) -
         transcript_path,
         model,
         permission_mode,
+        request_metadata,
     } = request;
     let input_json = match serde_json::to_string(&InterruptCommandInput {
         session_id: session_id.to_string(),
@@ -86,12 +93,13 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: InterruptRequest) -
         }
     };
 
-    let results = dispatcher::execute_handlers(
+    let results = dispatcher::execute_handlers_with_metadata(
         engine,
         matched,
         input_json,
         cwd.as_path(),
         Some(turn_id),
+        request_metadata.as_ref(),
         parse_completed,
     )
     .await;

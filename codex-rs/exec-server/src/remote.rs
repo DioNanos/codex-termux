@@ -15,6 +15,7 @@ use http::HeaderValue;
 use http::StatusCode;
 use serde::Deserialize;
 use tokio::time::sleep;
+use tokio::time::timeout_at;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::debug;
 use tracing::info;
@@ -51,6 +52,8 @@ use crate::trace_context::current_trace_context_headers;
 
 const ERROR_BODY_PREVIEW_BYTES: usize = 4096;
 const NOISE_RELAY_SECURITY_PROFILE: &str = "noise_hybrid_ik_v1";
+
+mod registration_retry;
 
 #[derive(Clone)]
 struct EnvironmentRegistryClient {
@@ -132,6 +135,7 @@ impl EnvironmentRegistryClient {
         environment_id: &str,
         executor_public_key: &NoiseChannelPublicKey,
     ) -> Result<EnvironmentRegistryRegistrationResponse, ExecServerError> {
+        let deadline = tokio::time::Instant::now() + self.connect_timeout;
         let url = endpoint_url(
             &self.base_url,
             &format!("/cloud/environment/{environment_id}/register"),
@@ -140,16 +144,40 @@ impl EnvironmentRegistryClient {
             security_profile: NOISE_RELAY_SECURITY_PROFILE.to_string(),
             executor_public_key: executor_public_key.clone(),
         };
-        let response = self
-            .http
-            .post(url)
-            .headers(self.resolve_auth_headers().await?)
-            .headers(current_trace_context_headers())
-            .json(&body)
-            .send()
-            .await?;
+        let response = timeout_at(deadline, async {
+            self.http
+                .post(url)
+                .headers(self.resolve_auth_headers().await?)
+                .headers(current_trace_context_headers())
+                .json(&body)
+                .send()
+                .await
+                .map_err(ExecServerError::EnvironmentRegistryRequest)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(ExecServerError::EnvironmentRegistryRequest(
+                codex_http_client::RouteAwareRequestError::Timeout,
+            ))
+        })?;
+        let status = response.status();
+        // Read diagnostics within the same attempt budget, preserving a known error status.
         let response: EnvironmentRegistryRegistrationResponse =
-            self.parse_json_response(response).await?;
+            timeout_at(deadline, self.parse_json_response(response))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(match status {
+                        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                            environment_registry_auth_error(status, "response body timed out")
+                        }
+                        status if !status.is_success() => {
+                            environment_registry_http_error(status, "response body timed out")
+                        }
+                        _ => ExecServerError::EnvironmentRegistryRequest(
+                            codex_http_client::RouteAwareRequestError::Timeout,
+                        ),
+                    })
+                })?;
         if response.environment_id != environment_id {
             return Err(ExecServerError::Protocol(
                 "environment registry returned a different environment id".to_string(),
@@ -616,7 +644,7 @@ async fn run_remote_environment_connections<H: NoiseStreamHandler>(
     })?;
     let mut backoff = Duration::from_secs(1);
     let mut response = client
-        .register_environment(&config.environment_id, &identity.public_key())
+        .register_environment_with_retry(&config.environment_id, &identity.public_key())
         .await?;
 
     loop {
@@ -674,7 +702,10 @@ async fn run_remote_environment_connections<H: NoiseStreamHandler>(
                 if registration_rejected {
                     config.telemetry.remote_reconnect("registration_rejected");
                     response = client
-                        .register_environment(&config.environment_id, &identity.public_key())
+                        .register_environment_with_retry(
+                            &config.environment_id,
+                            &identity.public_key(),
+                        )
                         .await?;
                 } else {
                     config.telemetry.remote_reconnect("connect_failed");

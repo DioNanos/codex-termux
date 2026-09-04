@@ -357,6 +357,7 @@ async fn write_value_supports_nested_app_paths() -> Result<()> {
                     default_tools_approval_mode: Some(AppToolApproval::Prompt),
                     default_tools_enabled: None,
                     tools: None,
+                    links: None,
                 },
             )]),
         })

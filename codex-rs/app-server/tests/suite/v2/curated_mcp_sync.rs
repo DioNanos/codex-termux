@@ -47,7 +47,8 @@ struct CuratedMcpSyncFixture {
 impl CuratedMcpSyncFixture {
     async fn set_up() -> Result<Self> {
         let responses_server = responses::start_mock_server().await;
-        let (mcp_server_url, mcp_server_handle) = start_mcp_server().await?;
+        let (mcp_server_url, mcp_server_handle) =
+            start_mcp_server(/*sensitive_action*/ None).await?;
         let fixture_root = TempDir::new()?;
         let codex_home = fixture_root.path().join("codex-home");
         let curated_repo = fixture_root.path().join("plugins.git");

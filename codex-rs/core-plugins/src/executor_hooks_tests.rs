@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use codex_config::HookEventsToml;
+use codex_config::MatcherGroup;
 use codex_exec_server::CapabilityRootDiscovery;
 use codex_exec_server::CapabilityTextFile;
 use codex_exec_server::DiscoveredPluginFiles;
@@ -78,6 +80,8 @@ fn expected_source(index: usize) -> ExecutorPluginHookSource {
     ExecutorPluginHookSource {
         plugin_id: PluginId::parse("computer-use@openai-bundled").expect("plugin id"),
         environment_id: "executor-a".to_string(),
+        mcp_environment_id: None,
+        mcp_metadata: None,
         plugin_root: PathUri::parse("file:///plugins/computer-use").expect("plugin root"),
         manifest_path: PathUri::parse("file:///plugins/computer-use/.codex-plugin/plugin.json")
             .expect("manifest path"),
@@ -105,24 +109,20 @@ fn expected_source(index: usize) -> ExecutorPluginHookSource {
 
 #[test]
 fn discovers_allowlisted_executor_plugin_hook_sources() {
-    let mut manifest = cleanup_hook_manifest();
-    manifest["hooks"]["hooks"]["Stop"][0]["hooks"]
-        .as_array_mut()
-        .expect("stop hooks")
-        .push(json!({
-            "type": "command",
-            "command": "echo ignored"
-        }));
-    manifest["hooks"]["hooks"]["UserPromptSubmit"] = json!([{
-        "hooks": [{
-            "type": "mcp_tool",
-            "server": "other",
-            "tool": "ignored"
-        }]
-    }]);
-    let second_hook_file = cleanup_hook_manifest()["hooks"].clone();
-    let first_hook_file = manifest["hooks"].take();
-    manifest["hooks"] = json!([first_hook_file, second_hook_file]);
+    let cleanup_hooks = cleanup_hook_manifest()["hooks"]["hooks"]["Stop"].clone();
+    let manifest = json!({
+        "name": "computer-use",
+        "hooks": [
+            { "hooks": { "Stop": cleanup_hooks } },
+            { "hooks": { "Interrupt": cleanup_hooks } },
+            { "hooks": {
+                "Stop": cleanup_hooks,
+                "Interrupt": cleanup_hooks,
+                "UserPromptSubmit": cleanup_hooks
+            } },
+            { "hooks": { "UserPromptSubmit": cleanup_hooks } }
+        ]
+    });
     let snapshot = snapshot_for_manifest(
         "computer-use@openai-bundled",
         "executor-a",
@@ -130,11 +130,80 @@ fn discovers_allowlisted_executor_plugin_hook_sources() {
         manifest,
     );
 
-    let sources = executor_plugin_hook_sources(&snapshot);
+    let sources = executor_plugin_hook_sources(&snapshot, |_, _| None);
+    let mut interrupt_source = expected_source(/*index*/ 1);
+    interrupt_source.hooks.interrupt = std::mem::take(&mut interrupt_source.hooks.stop);
+    let mut stop_and_interrupt_source = expected_source(/*index*/ 2);
+    stop_and_interrupt_source.hooks.interrupt = stop_and_interrupt_source.hooks.stop.clone();
 
     assert_eq!(
         sources,
-        vec![expected_source(/*index*/ 0), expected_source(/*index*/ 1)]
+        vec![
+            expected_source(/*index*/ 0),
+            interrupt_source,
+            stop_and_interrupt_source,
+        ]
+    );
+}
+
+#[test]
+fn discovers_unified_computer_use_cleanup_hooks() {
+    let mut manifest = cleanup_hook_manifest();
+    manifest["name"] = json!("unified-computer-use");
+    manifest["hooks"]["hooks"]["Stop"][0]["hooks"][0]["server"] = json!("cua_repl");
+    let snapshot = snapshot_for_manifest(
+        "unified-computer-use@openai-bundled",
+        "executor-a",
+        "file:///plugins/computer-use/.codex-plugin/plugin.json",
+        manifest,
+    );
+    let mut expected = expected_source(/*index*/ 0);
+    expected.plugin_id = PluginId::parse("unified-computer-use@openai-bundled").expect("plugin id");
+    let HookHandlerConfig::McpTool { server, .. } = &mut expected.hooks.stop[0].hooks[0] else {
+        panic!("expected an MCP tool hook");
+    };
+    *server = "cua_repl".to_string();
+
+    assert_eq!(
+        executor_plugin_hook_sources(&snapshot, |_, _| None),
+        vec![expected]
+    );
+}
+
+#[test]
+fn filters_mixed_handlers_without_rewriting_allowed_groups() {
+    let mut expected = expected_source(/*index*/ 0);
+    let mut second_handler = expected.hooks.stop[0].hooks[0].clone();
+    let HookHandlerConfig::McpTool { input, .. } = &mut second_handler else {
+        panic!("expected an MCP tool hook");
+    };
+    input.insert("order".to_string(), json!(2));
+    expected.hooks.stop[0].hooks.push(second_handler.clone());
+    expected.hooks.stop.push(MatcherGroup {
+        matcher: None,
+        hooks: vec![second_handler],
+    });
+
+    let mut manifest = cleanup_hook_manifest();
+    manifest["hooks"]["hooks"]["Stop"] =
+        serde_json::to_value(&expected.hooks.stop).expect("serialize stop hooks");
+    manifest["hooks"]["hooks"]["Stop"][0]["hooks"]
+        .as_array_mut()
+        .expect("stop handlers")
+        .insert(
+            /*index*/ 0,
+            json!({ "type": "mcp_tool", "server": "node_repl", "tool": "other" }),
+        );
+    let snapshot = snapshot_for_manifest(
+        "computer-use@openai-bundled",
+        "executor-a",
+        "file:///plugins/computer-use/.codex-plugin/plugin.json",
+        manifest,
+    );
+
+    assert_eq!(
+        executor_plugin_hook_sources(&snapshot, |_, _| None),
+        vec![expected]
     );
 }
 
@@ -145,6 +214,7 @@ fn preserves_allowlisted_executor_plugin_hook_options() {
     handler["input"] = json!({ "untrusted": "manifest-provided input" });
     handler["timeout"] = json!(30);
     handler["statusMessage"] = json!("Cleaning up Computer Use");
+    manifest["hooks"]["hooks"]["Interrupt"] = manifest["hooks"]["hooks"]["Stop"].clone();
     let snapshot = snapshot_for_manifest(
         "computer-use@openai-bundled",
         "executor-a",
@@ -161,8 +231,141 @@ fn preserves_allowlisted_executor_plugin_hook_options() {
         timeout_sec: Some(30),
         status_message: Some("Cleaning up Computer Use".to_string()),
     };
+    expected.hooks.interrupt = expected.hooks.stop.clone();
 
-    assert_eq!(executor_plugin_hook_sources(&snapshot), vec![expected]);
+    assert_eq!(
+        executor_plugin_hook_sources(&snapshot, |_, _| None),
+        vec![expected]
+    );
+}
+
+#[test]
+fn resolves_apps_hook_metadata_from_the_registered_connector() {
+    let mut manifest = cleanup_hook_manifest();
+    manifest["name"] = json!("browser");
+    let handler = &mut manifest["hooks"]["hooks"]["Stop"][0]["hooks"][0];
+    handler["server"] = json!("codex_apps");
+    handler["tool"] = json!("browser.turn_ended");
+    handler["input"] = json!({});
+    let mut expected = expected_source(/*index*/ 0);
+    expected.plugin_id = PluginId::parse("browser@openai-curated-remote").expect("plugin id");
+    expected.mcp_environment_id = Some(DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string());
+    let routing = json!({
+        "resource_uri": "/connector_openai_browser/browser-link/turn_ended",
+        "contains_mcp_source": true,
+    });
+    expected.mcp_metadata = Some(Map::from_iter([(
+        MCP_TOOL_CODEX_APPS_META_KEY.to_string(),
+        routing.clone(),
+    )]));
+
+    for (name, event, connector_id, input, routing_metadata, admitted) in [
+        (
+            "registered app",
+            "Stop",
+            Some("connector_openai_browser"),
+            json!({}),
+            routing.clone(),
+            true,
+        ),
+        (
+            "colliding tool name",
+            "Stop",
+            Some("connector_other_browser"),
+            json!({}),
+            routing.clone(),
+            false,
+        ),
+        (
+            "unavailable tool",
+            "Stop",
+            None,
+            json!({}),
+            routing.clone(),
+            false,
+        ),
+        (
+            "registered subagent app",
+            "SubagentStop",
+            Some("connector_openai_browser"),
+            json!({}),
+            routing.clone(),
+            true,
+        ),
+        (
+            "colliding subagent tool name",
+            "SubagentStop",
+            Some("connector_other_browser"),
+            json!({}),
+            routing.clone(),
+            false,
+        ),
+        (
+            "manifest arguments",
+            "Stop",
+            Some("connector_openai_browser"),
+            json!({ "untrusted": "manifest-provided input" }),
+            routing,
+            false,
+        ),
+        (
+            "missing routing metadata",
+            "Stop",
+            Some("connector_openai_browser"),
+            json!({}),
+            json!(null),
+            false,
+        ),
+        (
+            "invalid resource URI",
+            "Stop",
+            Some("connector_openai_browser"),
+            json!({}),
+            json!({ "resource_uri": 42 }),
+            false,
+        ),
+    ] {
+        let mut manifest = manifest.clone();
+        manifest["hooks"]["hooks"]["Stop"][0]["hooks"][0]["input"] = input;
+        let events = manifest["hooks"]["hooks"]
+            .as_object_mut()
+            .expect("hook events");
+        let groups = events.remove("Stop").expect("stop groups");
+        events.insert(event.to_string(), groups);
+        let mut expected = expected.clone();
+        expected.hooks = serde_json::from_value(manifest["hooks"]["hooks"].clone()).expect("hooks");
+        let snapshot = snapshot_for_manifest(
+            "browser@openai-curated-remote",
+            "executor-a",
+            "file:///plugins/computer-use/.codex-plugin/plugin.json",
+            manifest,
+        );
+        let tool_info = connector_id.map(|connector_id| {
+            serde_json::from_value::<ToolInfo>(json!({
+                "server_name": "codex_apps",
+                "tool_name": "turn_ended",
+                "tool_namespace": "browser",
+                "connector_id": connector_id,
+                "tool": {
+                    "name": "browser.turn_ended",
+                    "inputSchema": { "type": "object" },
+                    "_meta": { "_codex_apps": routing_metadata },
+                },
+            }))
+            .expect("listed tool")
+        });
+        let actual = executor_plugin_hook_sources(&snapshot, |server, tool| {
+            tool_info
+                .as_ref()
+                .filter(|info| info.server_name == server && info.tool.name == tool)
+        });
+        let expected = if admitted {
+            vec![expected.clone()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(actual, expected, "{name}");
+    }
 }
 
 #[test]
@@ -186,8 +389,23 @@ fn ignores_unallowlisted_executor_plugin_hooks() {
     wrong_matcher["hooks"]["hooks"]["Stop"][0]["matcher"] = json!("unexpected");
     for (name, plugin_id, manifest) in [
         (
-            "wrong plugin id",
+            "unallowlisted bundled plugin",
+            "another-plugin@openai-bundled",
+            cleanup_hook_manifest(),
+        ),
+        (
+            "wrong marketplace",
             "computer-use@other",
+            cleanup_hook_manifest(),
+        ),
+        (
+            "bundled alpha marketplace",
+            "computer-use@openai-bundled-alpha",
+            cleanup_hook_manifest(),
+        ),
+        (
+            "bundled marketplace suffix",
+            "computer-use@fake-openai-bundled",
             cleanup_hook_manifest(),
         ),
         ("wrong event", "computer-use@openai-bundled", wrong_event),
@@ -212,7 +430,7 @@ fn ignores_unallowlisted_executor_plugin_hooks() {
         );
 
         assert_eq!(
-            executor_plugin_hook_sources(&snapshot),
+            executor_plugin_hook_sources(&snapshot, |_, _| None),
             Vec::<ExecutorPluginHookSource>::new(),
             "{name}"
         );
@@ -232,7 +450,7 @@ fn ignores_file_backed_executor_plugin_hooks() {
     );
 
     assert_eq!(
-        executor_plugin_hook_sources(&file_backed),
+        executor_plugin_hook_sources(&file_backed, |_, _| None),
         Vec::<ExecutorPluginHookSource>::new()
     );
 }

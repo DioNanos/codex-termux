@@ -1,7 +1,10 @@
 use anyhow::Context;
 use anyhow::Result;
 use codex_config::McpServerConfig;
+use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::EnvironmentConfig;
+use codex_core::StartThreadOptions;
+use codex_core::TurnInputRequest;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::ExecServerRuntimePaths;
@@ -11,32 +14,48 @@ use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfileSnapshot;
 use codex_protocol::protocol::EnvironmentConfigState;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
+use codex_protocol::user_input::UserInput;
+use codex_utils_path_uri::PathUri;
+use core_test_support::apps_test_server::AppsTestServer;
+use core_test_support::apps_test_server::apps_enabled_builder;
+use core_test_support::apps_test_server::recorded_apps_tool_calls;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_sse_sequence;
+use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::sse;
+use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_remote;
 use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_event;
 use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
+use test_case::test_case;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::Request;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::body_partial_json;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
@@ -96,6 +115,93 @@ async fn executor_stop_hook_runs_after_attachment() -> Result<()> {
         fixture.test.session_configured.thread_id.to_string()
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_interrupt_hook_runs_after_attachment() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let fixture = executor_hook_fixture(vec![
+        completed_turn_response("turn").set_delay(Duration::from_secs(60)),
+    ])
+    .await?;
+    fixture.attach().await?;
+    fixture
+        .test
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "interrupt this turn".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    // The model request confirms discovery was saved, without requiring a target shell.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while fixture.responses.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("interrupted turn should reach the model request")?;
+    fixture.test.codex.submit(Op::Interrupt).await?;
+    wait_for_event(&fixture.test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+    fixture.wait_for_hook_call().await?;
+
+    let calls = fixture.calls().await?;
+    assert_eq!(calls.len(), 1);
+    let call = &calls[0]["params"];
+    let response = fixture.responses.single_request().body_json();
+    let turn_id = &response["client_metadata"]["turn_id"];
+    assert_eq!(call["name"], "turn_ended");
+    assert_eq!(
+        call["arguments"],
+        json!({
+            "hook_event_name": "Interrupt",
+            "session_id": fixture.test.session_configured.thread_id.to_string(),
+            "turn_id": turn_id,
+        })
+    );
+    assert_eq!(call["_meta"]["x-codex-turn-metadata"]["turn_id"], *turn_id);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_interrupt_hook_skips_turn_without_step_context() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_remote!(
+        Ok(()),
+        "standalone user shell commands require a local environment"
+    );
+
+    let fixture = executor_hook_fixture(vec![completed_turn_response("first-turn")]).await?;
+    fixture.attach().await?;
+    fixture
+        .test
+        .submit_text_turn("populate executor discovery")
+        .await?;
+    fixture.wait_for_hook_call().await?;
+
+    // Standalone shell turns have no model step, despite the previous turn's discovery.
+    fixture
+        .test
+        .codex
+        .submit(Op::RunUserShellCommand {
+            command: "sleep 60".to_string(),
+            timeout_ms: None,
+        })
+        .await?;
+    fixture.interrupt_running_command().await?;
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), fixture.hook_called.notified())
+            .await
+            .is_err(),
+        "executor hooks must not reuse a previous turn's step context",
+    );
     Ok(())
 }
 
@@ -256,7 +362,264 @@ async fn executor_stop_hook_rejects_mismatched_environment() -> Result<()> {
     Ok(())
 }
 
-async fn executor_stop_hook_fixture() -> Result<ExecutorStopHookFixture> {
+#[test_case("Stop", "", "", 1; "enabled")]
+#[test_case("SubagentStop", "", "", 1; "subagent_enabled")]
+#[test_case(
+    "Stop",
+    "[apps.connector_openai_browser]\nenabled = false\n",
+    "",
+    0;
+    "user_disabled"
+)]
+#[test_case(
+    "Stop",
+    "[apps.connector_openai_browser]\nenabled = true\n",
+    "[apps.connector_openai_browser]\nenabled = false\n",
+    0;
+    "managed_disabled"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_browser_and_computer_use_stop_hooks_use_separate_mcp_routes(
+    hook_event: &'static str,
+    user_config: &'static str,
+    requirements: &'static str,
+    expected_browser_calls: usize,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let apps_server = start_mock_server().await;
+    let apps = AppsTestServer::mount(&apps_server).await?;
+    let routing = json!({
+        "resource_uri": "/connector_openai_browser/browser-link/turn_ended",
+        "contains_mcp_source": true,
+    });
+    let listed_routing = routing.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/codex/ps/mcp"))
+        .and(body_partial_json(json!({ "method": "tools/list" })))
+        .respond_with(move |request: &Request| {
+            let request: Value = serde_json::from_slice(&request.body).expect("valid Apps request");
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": { "tools": [{
+                    "name": "browser.turn_ended",
+                    "inputSchema": { "type": "object" },
+                    "_meta": {
+                        "connector_id": "connector_openai_browser",
+                        "connector_name": "Browser",
+                        "ui": { "visibility": ["app"] },
+                        "_codex_apps": listed_routing,
+                    },
+                }] },
+            }))
+        })
+        .with_priority(1)
+        .mount(&apps_server)
+        .await;
+
+    let plugins = [
+        (
+            "browser@openai-curated-remote",
+            json!({
+                "name": "browser",
+                "hooks": { "hooks": {
+                    "Stop": [{ "hooks": [{
+                        "type": "mcp_tool",
+                        "server": "codex_apps",
+                        "tool": "browser.turn_ended",
+                        "input": {},
+                    }] }],
+                    "SubagentStop": [{ "hooks": [{
+                        "type": "mcp_tool",
+                        "server": "codex_apps",
+                        "tool": "browser.turn_ended",
+                        "input": {},
+                    }] }],
+                } },
+            }),
+        ),
+        ("computer-use@openai-bundled", computer_use_hook_manifest()),
+    ];
+    let mut fixture = executor_plugin_hook_fixture(
+        apps_enabled_builder(apps.chatgpt_base_url)
+            .with_pre_build_hook(move |home| {
+                std::fs::write(home.join("config.toml"), user_config)
+                    .expect("write Browser app configuration");
+            })
+            .with_cloud_config_bundle(
+                CloudConfigBundleFixture::loader_with_enterprise_requirement(requirements),
+            ),
+        &plugins,
+        vec![completed_turn_response("browser-turn")],
+    )
+    .await?;
+    if hook_event == "SubagentStop" {
+        let child = fixture
+            .test
+            .thread_manager
+            .start_thread(StartThreadOptions {
+                session_source: Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: fixture.test.session_configured.thread_id,
+                    depth: 1,
+                    agent_path: None,
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+                thread_source: Some(ThreadSource::Subagent),
+                environments: Some(fixture.test.codex.environment_selections().await),
+                ..StartThreadOptions::new(fixture.test.config.clone())
+            })
+            .await?;
+        fixture.test.codex = child.thread;
+        fixture.test.session_configured = child.session_configured;
+    }
+    fixture.attach().await?;
+    if hook_event == "SubagentStop" {
+        // Cached subagent MCP servers start on first use; cleanup must not start them.
+        fixture
+            .test
+            .codex
+            .call_mcp_tool(
+                "node_repl",
+                "js",
+                Some(json!({ "code": "1 + 1" })),
+                /*meta*/ None,
+            )
+            .await?;
+    }
+    fixture.test.submit_text_turn("finish browsing").await?;
+    fixture.wait_for_hook_call().await?;
+    let node_calls = fixture.calls().await?;
+    let expected_node_tools = if hook_event == "SubagentStop" {
+        vec!["js", "turn_ended"]
+    } else {
+        vec!["turn_ended"]
+    };
+    assert_eq!(
+        node_calls
+            .iter()
+            .map(|call| call["params"]["name"].as_str().expect("Node tool name"))
+            .collect::<Vec<_>>(),
+        expected_node_tools
+    );
+    let node_params = &node_calls.last().context("Node cleanup call")?["params"];
+    assert_eq!(node_params["arguments"]["hook_event_name"], hook_event);
+    assert!(node_params["_meta"].get("_codex_apps").is_none());
+
+    // Executor cleanup runs in the background, so observe a no-call window after Node runs.
+    let browser_timeout = if expected_browser_calls == 0 {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(10)
+    };
+    let calls = tokio::time::timeout(browser_timeout, async {
+        loop {
+            let calls = recorded_apps_tool_calls(&apps_server).await;
+            if !calls.is_empty() {
+                break calls;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_default();
+    assert_eq!(calls.len(), expected_browser_calls);
+    if calls.is_empty() {
+        return Ok(());
+    }
+    let browser_params = &calls[0]["params"];
+    let response_body = fixture.responses.single_request().body_json();
+    let thread_id = fixture.test.session_configured.thread_id.to_string();
+    assert_eq!(browser_params["name"], "browser.turn_ended");
+    assert_eq!(browser_params["arguments"], json!({}));
+    assert_eq!(browser_params["_meta"]["_codex_apps"], routing);
+    let turn_metadata = &browser_params["_meta"]["x-codex-turn-metadata"];
+    assert_eq!(
+        node_params["_meta"]["x-codex-turn-metadata"],
+        *turn_metadata
+    );
+    assert_eq!(turn_metadata["thread_id"], thread_id);
+    if hook_event == "SubagentStop" {
+        assert_eq!(turn_metadata["thread_source"], "subagent");
+    }
+    assert_eq!(
+        turn_metadata["turn_id"],
+        response_body["client_metadata"]["turn_id"]
+    );
+    Ok(())
+}
+
+fn completed_turn_response(id: &str) -> ResponseTemplate {
+    sse_response(sse(vec![
+        ev_response_created(id),
+        ev_assistant_message(id, "done"),
+        ev_completed(id),
+    ]))
+}
+
+async fn executor_stop_hook_fixture() -> Result<ExecutorHookFixture> {
+    executor_hook_fixture(
+        ["first-turn", "second-turn"]
+            .map(completed_turn_response)
+            .to_vec(),
+    )
+    .await
+}
+
+async fn executor_hook_fixture(responses: Vec<ResponseTemplate>) -> Result<ExecutorHookFixture> {
+    executor_plugin_hook_fixture(
+        test_codex(),
+        &[("computer-use@openai-bundled", computer_use_hook_manifest())],
+        responses,
+    )
+    .await
+}
+
+fn computer_use_hook_manifest() -> Value {
+    json!({
+        "name": "computer-use",
+        // Separate entries must all survive registration in the same environment.
+        "hooks": [
+            { "hooks": { "Interrupt": [{ "hooks": [{
+                "type": "mcp_tool",
+                "server": "node_repl",
+                "tool": "turn_ended",
+                "input": {
+                    "hook_event_name": "${hook_event_name}",
+                    "session_id": "${session_id}",
+                    "turn_id": "${turn_id}",
+                },
+            }] }] } },
+            { "hooks": { "Stop": [{ "hooks": [{
+                "type": "mcp_tool",
+                "server": "node_repl",
+                "tool": "turn_ended",
+                "input": {
+                    "hook_event_name": "${hook_event_name}",
+                    "session_id": "${session_id}",
+                    "turn_id": "${turn_id}",
+                },
+            }] }] } },
+            { "hooks": { "SubagentStop": [{ "hooks": [{
+                "type": "mcp_tool",
+                "server": "node_repl",
+                "tool": "turn_ended",
+                "input": {
+                    "hook_event_name": "${hook_event_name}",
+                    "session_id": "${session_id}",
+                    "turn_id": "${turn_id}",
+                },
+            }] }] } },
+        ],
+    })
+}
+
+async fn executor_plugin_hook_fixture(
+    builder: TestCodexBuilder,
+    plugins: &[(&'static str, Value)],
+    responses: Vec<ResponseTemplate>,
+) -> Result<ExecutorHookFixture> {
     let server = start_mock_server().await;
     let hook_called = Arc::new(Notify::new());
     let hook_called_for_server = Arc::clone(&hook_called);
@@ -272,12 +635,14 @@ async fn executor_stop_hook_fixture() -> Result<ExecutorStopHookFixture> {
                     "serverInfo": { "name": "node_repl", "version": "1.0.0" },
                 }),
                 Some("notifications/initialized") => return ResponseTemplate::new(202),
-                Some("tools/list") => json!({ "tools": [{
-                    "name": "turn_ended",
-                    "inputSchema": { "type": "object" },
-                }] }),
+                Some("tools/list") => json!({ "tools": [
+                    { "name": "js", "inputSchema": { "type": "object" } },
+                    { "name": "turn_ended", "inputSchema": { "type": "object" } },
+                ] }),
                 Some("tools/call") => {
-                    hook_called_for_server.notify_one();
+                    if request["params"]["name"] == "turn_ended" {
+                        hook_called_for_server.notify_one();
+                    }
                     json!({ "content": [{ "type": "text", "text": "ok" }] })
                 }
                 method => panic!("unexpected Node REPL request: {method:?}"),
@@ -292,7 +657,7 @@ async fn executor_stop_hook_fixture() -> Result<ExecutorStopHookFixture> {
         .await;
 
     let node_repl_url = format!("{}/node-repl", server.uri());
-    let mut builder = test_codex().with_config(move |config| {
+    let mut builder = builder.with_config(move |config| {
         config
             .features
             .enable(Feature::ExecutorCapabilityDiscovery)
@@ -318,71 +683,54 @@ async fn executor_stop_hook_fixture() -> Result<ExecutorStopHookFixture> {
     let test = builder.build_with_auto_env(&server).await?;
     wait_for_mcp_server(&test.codex, "node_repl").await?;
 
-    let plugin_root = test.workspace_path_uri("computer-use")?;
-    let plugin_directory = plugin_root.join(".codex-plugin")?;
-    let manifest_path = plugin_directory.join("plugin.json")?;
+    let mut plugin_roots = Vec::new();
     let filesystem = test.fs();
-    filesystem
-        .create_directory(
-            &plugin_directory,
-            CreateDirectoryOptions {
-                recursive: true,
-                follow_symlinks: true,
-            },
-            /*sandbox*/ None,
-        )
-        .await?;
-    filesystem
-        .write_file(
-            &manifest_path,
-            serde_json::to_vec(&json!({
-                "name": "computer-use",
-                "hooks": { "hooks": { "Stop": [{ "hooks": [{
-                    "type": "mcp_tool",
-                    "server": "node_repl",
-                    "tool": "turn_ended",
-                    "input": {
-                        "hook_event_name": "${hook_event_name}",
-                        "session_id": "${session_id}",
-                        "turn_id": "${turn_id}",
-                    },
-                }] }] } },
-            }))?,
-            Default::default(),
-            /*sandbox*/ None,
-        )
-        .await?;
+    for (plugin_id, manifest) in plugins {
+        let plugin_root =
+            test.workspace_path_uri(manifest["name"].as_str().context("plugin name")?)?;
+        let plugin_directory = plugin_root.join(".codex-plugin")?;
+        let manifest_path = plugin_directory.join("plugin.json")?;
+        filesystem
+            .create_directory(
+                &plugin_directory,
+                CreateDirectoryOptions {
+                    recursive: true,
+                    follow_symlinks: true,
+                },
+                /*sandbox*/ None,
+            )
+            .await?;
+        filesystem
+            .write_file(
+                &manifest_path,
+                serde_json::to_vec(manifest)?,
+                Default::default(),
+                /*sandbox*/ None,
+            )
+            .await?;
+        plugin_roots.push((*plugin_id, plugin_root));
+    }
 
-    let responses = mount_sse_sequence(
-        &server,
-        ["first-turn", "second-turn"]
-            .map(|id| {
-                sse(vec![
-                    ev_response_created(id),
-                    ev_assistant_message(id, "done"),
-                    ev_completed(id),
-                ])
-            })
-            .to_vec(),
-    )
-    .await;
+    let responses = mount_response_sequence(&server, responses).await;
 
-    Ok(ExecutorStopHookFixture {
+    Ok(ExecutorHookFixture {
         server,
         test,
         responses,
         hook_called,
+        plugin_roots,
     })
 }
 
-struct ExecutorStopHookFixture {
+struct ExecutorHookFixture {
     server: MockServer,
     test: TestCodex,
     responses: ResponseMock,
     hook_called: Arc<Notify>,
+    plugin_roots: Vec<(&'static str, PathUri)>,
 }
 
-impl ExecutorStopHookFixture {
+impl ExecutorHookFixture {
     async fn attach(&self) -> Result<TurnEnvironmentSelection> {
         let selection = self
             .test
@@ -398,6 +746,7 @@ impl ExecutorStopHookFixture {
                 &selection,
                 EnvironmentConfig {
                     allow_login_shell: false,
+                    workspace_roots: selection.workspace_roots.clone(),
                     permission_profile: PermissionProfileSnapshot::legacy(
                         self.test.config.permissions.permission_profile().clone(),
                     ),
@@ -412,13 +761,17 @@ impl ExecutorStopHookFixture {
                     exec_policy: None,
                     mcp_policy: None,
                     network_policy: None,
-                    selected_capability_roots: vec![SelectedCapabilityRoot {
-                        id: "computer-use@openai-bundled".to_string(),
-                        location: CapabilityRootLocation::Environment {
-                            environment_id: selection.environment_id.clone(),
-                            path: self.test.workspace_path_uri("computer-use")?,
-                        },
-                    }],
+                    selected_capability_roots: self
+                        .plugin_roots
+                        .iter()
+                        .map(|(plugin_id, plugin_root)| SelectedCapabilityRoot {
+                            id: plugin_id.to_string(),
+                            location: CapabilityRootLocation::Environment {
+                                environment_id: selection.environment_id.clone(),
+                                path: plugin_root.clone(),
+                            },
+                        })
+                        .collect(),
                 },
             )
             .await?;
@@ -426,10 +779,23 @@ impl ExecutorStopHookFixture {
         Ok(selection)
     }
 
+    async fn interrupt_running_command(&self) -> Result<()> {
+        wait_for_event(&self.test.codex, |event| {
+            matches!(event, EventMsg::ExecCommandBegin(_))
+        })
+        .await;
+        self.test.codex.submit(Op::Interrupt).await?;
+        wait_for_event(&self.test.codex, |event| {
+            matches!(event, EventMsg::TurnAborted(_))
+        })
+        .await;
+        Ok(())
+    }
+
     async fn wait_for_hook_call(&self) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(10), self.hook_called.notified())
             .await
-            .context("attached executor Stop hook should call turn_ended")?;
+            .context("attached executor hook should call turn_ended")?;
 
         Ok(())
     }

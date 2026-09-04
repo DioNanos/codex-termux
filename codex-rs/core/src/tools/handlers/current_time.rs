@@ -80,7 +80,10 @@ impl ToolExecutor<ToolInvocation> for CurrentTimeHandler {
         })
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             if !matches!(invocation.payload, ToolPayload::Function { .. }) {
                 return Err(FunctionCallError::RespondToModel(format!(
@@ -104,4 +107,8 @@ impl ToolExecutor<ToolInvocation> for CurrentTimeHandler {
     }
 }
 
-impl CoreToolRuntime for CurrentTimeHandler {}
+impl CoreToolRuntime for CurrentTimeHandler {
+    fn is_builtin_control_tool(&self) -> bool {
+        true
+    }
+}

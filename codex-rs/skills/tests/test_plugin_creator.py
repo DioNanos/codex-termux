@@ -33,7 +33,9 @@ class PluginCreatorSecurityTests(unittest.TestCase):
         self.marketplace_path = self.root / "marketplace.json"
         self.plugin_root = self.root / "plugins" / "demo"
 
-    def run_script(self, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+    def run_script(
+        self, script: str, *arguments: str
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, "-B", str(SCRIPTS / script), *arguments],
             capture_output=True,
@@ -65,7 +67,9 @@ class PluginCreatorSecurityTests(unittest.TestCase):
             scaffold = runpy.run_path(str(SCRIPTS / "create_basic_plugin.py"))
             validator = runpy.run_path(str(SCRIPTS / "validate_plugin.py"))
 
-        manifest = scaffold["build_plugin_json"]("demo", with_mcp=False, with_apps=False)
+        manifest = scaffold["build_plugin_json"](
+            "demo", with_mcp=False, with_apps=False
+        )
         manifest["name"] = name
         errors: list[str] = []
         validator["validate_manifest_shape"](self.plugin_root, manifest, errors)
@@ -163,7 +167,9 @@ class PluginCreatorSecurityTests(unittest.TestCase):
             with self.subTest(name=name):
                 manifest_path = self.write_plugin(name)
                 original = manifest_path.read_bytes()
-                result = self.run_script("update_plugin_cachebuster.py", str(self.plugin_root))
+                result = self.run_script(
+                    "update_plugin_cachebuster.py", str(self.plugin_root)
+                )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(manifest_path.read_bytes(), original)
@@ -206,7 +212,12 @@ class PluginCreatorSecurityTests(unittest.TestCase):
         app_manifest.write_text('{"apps":{"existing":{}}}', encoding="utf-8")
         originals = {
             path: path.read_bytes()
-            for path in (self.marketplace_path, plugin_manifest, mcp_manifest, app_manifest)
+            for path in (
+                self.marketplace_path,
+                plugin_manifest,
+                mcp_manifest,
+                app_manifest,
+            )
         }
 
         result = self.run_script(
@@ -241,7 +252,12 @@ class PluginCreatorSecurityTests(unittest.TestCase):
         app_manifest.write_text('{"apps":{"existing":{}}}', encoding="utf-8")
         originals = {
             path: path.read_bytes()
-            for path in (self.marketplace_path, plugin_manifest, mcp_manifest, app_manifest)
+            for path in (
+                self.marketplace_path,
+                plugin_manifest,
+                mcp_manifest,
+                app_manifest,
+            )
         }
 
         result = self.run_script(
@@ -264,7 +280,9 @@ class PluginCreatorSecurityTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(path.read_bytes(), original)
 
-    def test_scaffold_rejects_duplicate_marketplace_entry_before_creating_files(self) -> None:
+    def test_scaffold_rejects_duplicate_marketplace_entry_before_creating_files(
+        self,
+    ) -> None:
         self.marketplace_path.write_text(
             json.dumps({"name": "team-local", "plugins": [{"name": "demo"}]}),
             encoding="utf-8",

@@ -194,7 +194,8 @@ pub(crate) fn apply_network_proxy_feature_config(
     }
 }
 
-pub(crate) fn resolve_permission_profile(
+/// Resolves a named permission profile and its inherited configuration.
+pub fn resolve_permission_profile(
     permissions: &PermissionsToml,
     profile_name: &str,
 ) -> io::Result<PermissionProfileToml> {
@@ -347,7 +348,8 @@ pub(crate) fn network_proxy_config_for_profile_selection(
     ))
 }
 
-pub(crate) fn compile_permission_profile(
+/// Compiles a named permission profile into filesystem and network policies.
+pub fn compile_permission_profile(
     permissions: &PermissionsToml,
     profile_name: &str,
     startup_warnings: &mut Vec<String>,

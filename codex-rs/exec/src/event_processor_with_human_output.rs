@@ -239,6 +239,14 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 CodexStatus::Running
             }
             ServerNotification::Warning(notification) => self.process_warning(notification.message),
+            ServerNotification::AuthRecoveryStarted(notification) => {
+                eprintln!("{}", notification.message);
+                CodexStatus::Running
+            }
+            ServerNotification::AuthRecoveryCompleted(notification) => {
+                eprintln!("{}", notification.message.style(self.green));
+                CodexStatus::Running
+            }
             ServerNotification::Error(notification) => {
                 eprintln!(
                     "{} {}",

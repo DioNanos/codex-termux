@@ -211,6 +211,7 @@ fn format_labeled_requests_snapshot(
 }
 
 fn enable_deferred_tool_world_state_without_agents(config: &mut Config) {
+    config.update_plan_enabled = true;
     config.agents_enabled = false;
     config
         .features
@@ -489,6 +490,7 @@ async fn root_reconciliation_reuses_pending_apps_startup() -> Result<()> {
             &selection,
             EnvironmentConfig {
                 allow_login_shell: false,
+                workspace_roots: selection.workspace_roots.clone(),
                 permission_profile: PermissionProfileSnapshot::legacy(
                     test.config.permissions.permission_profile().clone(),
                 ),
@@ -563,6 +565,98 @@ async fn root_reconciliation_reuses_pending_apps_startup() -> Result<()> {
         "shared Apps tools should remain model-visible after root reconciliation: {body}"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeout_refresh_replaces_pending_startup_and_reuses_ready_connection() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let pending_mock = responses::start_mock_server().await;
+    let (pending_server, pending_startup) =
+        AppsTestServer::mount_with_startup_control(&pending_mock).await?;
+    let release_startup = pending_startup.hold_next_successful_initialize();
+    let ready_mock = responses::start_mock_server().await;
+    let (ready_server, ready_startup) =
+        AppsTestServer::mount_with_startup_control(&ready_mock).await?;
+    let test = core_test_support::test_codex::test_codex()
+        .with_config(move |config| {
+            config
+                .mcp_servers
+                .set(
+                    [("pending", pending_server), ("ready", ready_server)]
+                        .into_iter()
+                        .map(|(name, server)| {
+                            (
+                                name.to_string(),
+                                serde_json::from_value(json!({
+                                    "url": format!("{}/api/codex/ps/mcp", server.chatgpt_base_url),
+                                    "startup_timeout_sec": 60,
+                                }))
+                                .expect("valid MCP config"),
+                            )
+                        })
+                        .collect(),
+                )
+                .expect("test config should allow MCP servers");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pending_startup.initialize_attempts() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pending startup should begin before refresh");
+    let ready_result = test
+        .codex
+        .call_mcp_tool(
+            "ready",
+            "calendar_list_events",
+            /*arguments*/ None,
+            /*meta*/ None,
+        )
+        .await?;
+
+    let mut refresh_config = test.config.clone();
+    let mut servers = refresh_config.mcp_servers.get().clone();
+    for config in servers.values_mut() {
+        config.startup_timeout_sec = None;
+    }
+    refresh_config.mcp_servers.set(servers)?;
+    test.codex.refresh_mcp_config(refresh_config).await;
+    // Publish without waiting for the held initialize to finish.
+    let error = test
+        .codex
+        .read_mcp_resource("unknown", ReadResourceRequestParams::new("test://resource"))
+        .await
+        .expect_err("the unknown server should not exist");
+    assert_eq!(error.to_string(), "unknown MCP server 'unknown'");
+    release_startup
+        .send(())
+        .expect("the mock initialize should remain held until publication");
+
+    for name in ["pending", "ready"] {
+        let result = test
+            .codex
+            .call_mcp_tool(
+                name,
+                "calendar_list_events",
+                /*arguments*/ None,
+                /*meta*/ None,
+            )
+            .await?;
+        assert_eq!(result, ready_result);
+    }
+    assert_eq!(
+        (
+            pending_startup.initialize_attempts(),
+            ready_startup.initialize_attempts(),
+        ),
+        (2, 1)
+    );
     Ok(())
 }
 
@@ -1055,6 +1149,7 @@ async fn apps_guidance_and_deferred_namespace_appear_after_recovery_within_a_tur
     let mut builder = search_capable_apps_builder(apps_server.chatgpt_base_url.clone())
         .with_extensions(Arc::new(extensions.build()))
         .with_config(|config| {
+            config.update_plan_enabled = true;
             config
                 .features
                 .enable(Feature::DefaultModeRequestUserInput)

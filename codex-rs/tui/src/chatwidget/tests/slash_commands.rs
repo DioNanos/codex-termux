@@ -178,6 +178,22 @@ async fn slash_compact_eagerly_queues_follow_up_before_turn_start() {
 }
 
 #[tokio::test]
+async fn slash_recap_requests_generation_for_current_thread() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+
+    chat.dispatch_command(SlashCommand::Recap);
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::GenerateRecap {
+            thread_id: requested_thread_id,
+        }) if requested_thread_id == thread_id
+    );
+}
+
+#[tokio::test]
 async fn queued_slash_compact_dispatches_after_active_turn() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
@@ -807,8 +823,12 @@ async fn goal_control_slash_commands_emit_goal_events() {
         chat.set_feature_enabled(Feature::Goals, /*enabled*/ true);
         let thread_id = ThreadId::new();
         chat.thread_id = Some(thread_id);
+        chat.bottom_pane.set_vim_enabled(/*enabled*/ true);
 
-        submit_composer_text(&mut chat, command);
+        chat.bottom_pane
+            .set_composer_text(command.into(), Vec::new(), Vec::new());
+        chat.handle_key_event(KeyCode::Esc.into());
+        chat.handle_key_event(KeyCode::Enter.into());
 
         match status {
             Some(status) => {
@@ -834,6 +854,11 @@ async fn goal_control_slash_commands_emit_goal_events() {
                 assert_eq!(actual_thread_id, thread_id);
             }
         }
+        chat.handle_key_event(KeyCode::Char('x').into());
+        chat.handle_key_event(KeyCode::Right.into());
+        chat.handle_key_event(KeyCode::Esc.into());
+        chat.handle_key_event(KeyCode::Char('.').into());
+        assert_eq!(chat.bottom_pane.composer_text(), "xx");
     }
 }
 
@@ -1623,7 +1648,6 @@ async fn completed_token_activity_refresh_waits_for_active_hook() {
         ),
     );
 
-    assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
     assert_matches!(rx.try_recv(), Ok(AppEvent::CommitPendingUsageOutput));
 }
 

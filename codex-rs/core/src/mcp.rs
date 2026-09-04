@@ -17,6 +17,7 @@ use codex_extension_api::McpServerContribution;
 use codex_extension_api::McpServerContributionContext;
 use codex_extension_api::SelectedPluginIdentity;
 use codex_extension_api::SelectedPluginSnapshot;
+use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::EffectiveMcpServer;
@@ -160,6 +161,7 @@ impl McpManager {
         let mut selected_plugin_connector_sources = Vec::new();
         let mut selected_plugin_registrations = Vec::new();
         let mut selected_plugins = Vec::new();
+        let mut disabled_plugin_roots = Vec::new();
         let mut overlays = Vec::new();
         // A contributor can emit multiple ordered actions, so order each action globally rather
         // than enumerating contributors.
@@ -200,6 +202,11 @@ impl McpManager {
                             *config,
                         ),
                     ),
+                    McpServerContribution::SelectedPluginPackage {
+                        selected_root_id, ..
+                    } if !config.features.enabled(Feature::Plugins) => {
+                        disabled_plugin_roots.push(selected_root_id);
+                    }
                     McpServerContribution::SelectedPluginPackage {
                         selected_root_id,
                         plugin_id,
@@ -322,6 +329,7 @@ impl McpManager {
             plugins_available,
             selected_plugins: SelectedPluginSnapshot {
                 plugins: selected_plugins,
+                disabled_plugin_roots,
             },
         }
     }

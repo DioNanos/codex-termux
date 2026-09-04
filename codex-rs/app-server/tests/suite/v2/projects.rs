@@ -22,11 +22,16 @@ use codex_app_server_protocol::ProjectMoveResponse;
 use codex_app_server_protocol::ProjectReadParams;
 use codex_app_server_protocol::ProjectReadResponse;
 use codex_app_server_protocol::ProjectRoot;
+use codex_app_server_protocol::ProjectSortKey;
 use codex_app_server_protocol::ProjectUpdateParams;
 use codex_app_server_protocol::ProjectUpdateResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::SortDirection;
+use codex_app_server_protocol::ThreadArchiveParams;
+use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
@@ -46,6 +51,155 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use uuid::Uuid;
+
+#[tokio::test]
+async fn projects_list_by_recency_and_preserve_metadata_timestamps() -> Result<()> {
+    let responses = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&responses.uri())
+        .enable_feature(Feature::Sqlite)
+        .write(codex_home.path())?;
+    let mut server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let mut projects = Vec::new();
+    let mut threads = Vec::new();
+    for name in ["first", "second", "empty"] {
+        let created: ProjectCreateResponse = server
+            .request(|request_id| ClientRequest::ProjectCreate {
+                request_id,
+                params: ProjectCreateParams {
+                    name: name.to_string(),
+                    roots: Vec::new(),
+                    metadata: None,
+                    idempotency_key: name.to_string(),
+                },
+            })
+            .await?;
+        assert_eq!(created.project.recency_at, None);
+        let mut expected = created.project;
+        if name != "empty" {
+            let started = server
+                .start_thread(ThreadStartParams {
+                    project_id: Some(expected.id.clone()),
+                    ..Default::default()
+                })
+                .await?;
+            server
+                .start_turn_and_wait_for_completion(TurnStartParams {
+                    thread_id: started.thread.id.clone(),
+                    input: vec![UserInput::Text {
+                        text: "Hello".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    ..Default::default()
+                })
+                .await?;
+            let listed: ThreadListResponse = server
+                .request(|request_id| ClientRequest::ThreadList {
+                    request_id,
+                    params: ThreadListParams {
+                        cursor: None,
+                        limit: Some(10),
+                        sort_key: None,
+                        sort_direction: None,
+                        model_providers: None,
+                        source_kinds: None,
+                        archived: None,
+                        section_id: None,
+                        project_id: Some(Some(expected.id.clone())),
+                        cwd: None,
+                        use_state_db_only: true,
+                        search_term: None,
+                        parent_thread_id: None,
+                        ancestor_thread_id: None,
+                    },
+                })
+                .await?;
+            expected.recency_at = listed.data[0].recency_at;
+            assert!(expected.recency_at.is_some());
+            threads.push(started.thread.id);
+        }
+        let read: ProjectReadResponse = server
+            .request(|request_id| ClientRequest::ProjectRead {
+                request_id,
+                params: ProjectReadParams {
+                    project_id: expected.id.clone(),
+                },
+            })
+            .await?;
+        assert_eq!(read.project, expected);
+        projects.push(expected);
+    }
+    for (sort_key, sort_direction, order) in [
+        (None, None, [0, 1, 2]),
+        (Some(ProjectSortKey::RecencyAt), None, [1, 0, 2]),
+        (
+            Some(ProjectSortKey::RecencyAt),
+            Some(SortDirection::Asc),
+            [0, 1, 2],
+        ),
+    ] {
+        let mut cursor = None;
+        for index in order {
+            let page: ProjectListResponse = server
+                .request(|request_id| ClientRequest::ProjectList {
+                    request_id,
+                    params: ProjectListParams {
+                        cursor: cursor.clone(),
+                        limit: Some(1),
+                        sort_key,
+                        sort_direction,
+                    },
+                })
+                .await?;
+            assert_eq!(page.data, vec![projects[index].clone()]);
+            cursor = page.next_cursor;
+        }
+        assert_eq!(cursor, None);
+    }
+    let _: ThreadArchiveResponse = server
+        .request(|request_id| ClientRequest::ThreadArchive {
+            request_id,
+            params: ThreadArchiveParams {
+                thread_id: threads[1].clone(),
+            },
+        })
+        .await?;
+    projects[1].recency_at = None;
+    let archived: ProjectReadResponse = server
+        .request(|request_id| ClientRequest::ProjectRead {
+            request_id,
+            params: ProjectReadParams {
+                project_id: projects[1].id.clone(),
+            },
+        })
+        .await?;
+    assert_eq!(archived.project, projects[1]);
+
+    for params in [
+        ProjectListParams {
+            cursor: None,
+            limit: None,
+            sort_key: None,
+            sort_direction: Some(SortDirection::Desc),
+        },
+        ProjectListParams {
+            cursor: Some(format!("0|{}", projects[0].id)),
+            limit: None,
+            sort_key: Some(ProjectSortKey::RecencyAt),
+            sort_direction: None,
+        },
+    ] {
+        let id = server.send_project_list_request(params).await?;
+        let error = server
+            .read_stream_until_error_message(RequestId::Integer(id))
+            .await?;
+        assert_eq!(error.error.code, -32602);
+    }
+    Ok(())
+}
 
 #[tokio::test]
 async fn projects_persist_and_assign_threads() -> Result<()> {
@@ -315,6 +469,10 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
         })
         .await?;
     assert_eq!(updated.project.name, "Renamed");
+    assert_eq!(
+        updated.project.recency_at,
+        reassigned_list.data[0].recency_at
+    );
     assert!(updated.project.roots.is_empty());
     assert!(updated.project.metadata.is_empty());
     let updated_notification: ProjectChangedNotification =
@@ -350,6 +508,8 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
         .request(|request_id| ClientRequest::ProjectList {
             request_id,
             params: ProjectListParams {
+                sort_key: None,
+                sort_direction: None,
                 cursor: None,
                 limit: Some(10),
             },
@@ -384,6 +544,8 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
         .request(|request_id| ClientRequest::ProjectList {
             request_id,
             params: ProjectListParams {
+                sort_key: None,
+                sort_direction: None,
                 cursor: None,
                 limit: Some(10),
             },
@@ -435,6 +597,8 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
         .request(|request_id| ClientRequest::ProjectList {
             request_id,
             params: ProjectListParams {
+                sort_key: None,
+                sort_direction: None,
                 cursor: None,
                 limit: Some(10),
             },
@@ -640,6 +804,8 @@ async fn project_import_is_atomic_and_notifies_after_commit_in_order() -> Result
         .request(|request_id| ClientRequest::ProjectList {
             request_id,
             params: ProjectListParams {
+                sort_key: None,
+                sort_direction: None,
                 cursor: None,
                 limit: Some(10),
             },
@@ -664,6 +830,8 @@ async fn project_import_is_atomic_and_notifies_after_commit_in_order() -> Result
         .request(|request_id| ClientRequest::ProjectList {
             request_id,
             params: ProjectListParams {
+                sort_key: None,
+                sort_direction: None,
                 cursor: None,
                 limit: Some(10),
             },
@@ -694,6 +862,8 @@ async fn project_import_is_atomic_and_notifies_after_commit_in_order() -> Result
         .request(|request_id| ClientRequest::ProjectList {
             request_id,
             params: ProjectListParams {
+                sort_key: None,
+                sort_direction: None,
                 cursor: None,
                 limit: Some(10),
             },
@@ -741,6 +911,8 @@ async fn projects_validate_filters_cursors_and_sqlite_less_assignment() -> Resul
     }
     let cursor_id = server
         .send_project_list_request(ProjectListParams {
+            sort_key: None,
+            sort_direction: None,
             cursor: Some("123|not-a-uuid|extra".to_string()),
             limit: Some(10),
         })
@@ -855,6 +1027,7 @@ async fn assigned_forks_inherit_projects_for_persistent_and_ephemeral_children()
     let started = server
         .start_thread(ThreadStartParams {
             project_id: Some(project.project.id.clone()),
+            history_mode: Some(ThreadHistoryMode::Legacy),
             ..Default::default()
         })
         .await?;

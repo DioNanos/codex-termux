@@ -49,7 +49,9 @@ def display_name_from_plugin_name(plugin_name: str) -> str:
     return " ".join(part.capitalize() for part in re.split(r"[-_]+", plugin_name))
 
 
-def build_plugin_json(plugin_name: str, *, with_mcp: bool, with_apps: bool) -> dict[str, Any]:
+def build_plugin_json(
+    plugin_name: str, *, with_mcp: bool, with_apps: bool
+) -> dict[str, Any]:
     display_name = display_name_from_plugin_name(plugin_name)
     payload: dict[str, Any] = {
         "name": plugin_name,
@@ -126,7 +128,9 @@ def load_validated_marketplace(
     if marketplace_path.exists():
         payload = load_json(marketplace_path)
     else:
-        payload = build_default_marketplace(marketplace_name or DEFAULT_MARKETPLACE_NAME)
+        payload = build_default_marketplace(
+            marketplace_name or DEFAULT_MARKETPLACE_NAME
+        )
 
     if not isinstance(payload, dict):
         raise ValueError(f"{marketplace_path} must contain a JSON object.")
@@ -134,7 +138,10 @@ def load_validated_marketplace(
     validate_marketplace_interface(payload)
 
     existing_marketplace_name = payload.get("name")
-    if not isinstance(existing_marketplace_name, str) or not existing_marketplace_name.strip():
+    if (
+        not isinstance(existing_marketplace_name, str)
+        or not existing_marketplace_name.strip()
+    ):
         raise ValueError(f"{marketplace_path} must contain a non-empty string 'name'.")
     validate_marketplace_name(existing_marketplace_name)
 
@@ -150,7 +157,8 @@ def load_validated_marketplace(
     if not isinstance(plugins, list):
         raise ValueError(f"{marketplace_path} field 'plugins' must be an array.")
     if not force and any(
-        isinstance(entry, dict) and entry.get("name") == plugin_name for entry in plugins
+        isinstance(entry, dict) and entry.get("name") == plugin_name
+        for entry in plugins
     ):
         raise FileExistsError(
             f"Marketplace entry '{plugin_name}' already exists in {marketplace_path}. "
@@ -169,10 +177,14 @@ def update_marketplace_json(
     category: str,
     force: bool,
 ) -> None:
-    payload = load_validated_marketplace(marketplace_path, marketplace_name, plugin_name, force)
+    payload = load_validated_marketplace(
+        marketplace_path, marketplace_name, plugin_name, force
+    )
     plugins = payload["plugins"]
 
-    new_entry = build_marketplace_entry(plugin_name, install_policy, auth_policy, category)
+    new_entry = build_marketplace_entry(
+        plugin_name, install_policy, auth_policy, category
+    )
 
     for index, entry in enumerate(plugins):
         if isinstance(entry, dict) and entry.get("name") == plugin_name:
@@ -215,12 +227,24 @@ def parse_args() -> argparse.Namespace:
             "Pass an explicit repo path only when a repo/team plugin is intended."
         ),
     )
-    parser.add_argument("--with-skills", action="store_true", help="Create skills/ directory")
-    parser.add_argument("--with-hooks", action="store_true", help="Create hooks/ directory")
-    parser.add_argument("--with-scripts", action="store_true", help="Create scripts/ directory")
-    parser.add_argument("--with-assets", action="store_true", help="Create assets/ directory")
-    parser.add_argument("--with-mcp", action="store_true", help="Create .mcp.json placeholder")
-    parser.add_argument("--with-apps", action="store_true", help="Create .app.json placeholder")
+    parser.add_argument(
+        "--with-skills", action="store_true", help="Create skills/ directory"
+    )
+    parser.add_argument(
+        "--with-hooks", action="store_true", help="Create hooks/ directory"
+    )
+    parser.add_argument(
+        "--with-scripts", action="store_true", help="Create scripts/ directory"
+    )
+    parser.add_argument(
+        "--with-assets", action="store_true", help="Create assets/ directory"
+    )
+    parser.add_argument(
+        "--with-mcp", action="store_true", help="Create .mcp.json placeholder"
+    )
+    parser.add_argument(
+        "--with-apps", action="store_true", help="Create .app.json placeholder"
+    )
     parser.add_argument(
         "--with-marketplace",
         action="store_true",
@@ -271,7 +295,9 @@ def main() -> None:
     raw_plugin_name = args.plugin_name
     plugin_name = normalize_plugin_name(raw_plugin_name)
     if plugin_name != raw_plugin_name:
-        print(f"Note: Normalized plugin name from '{raw_plugin_name}' to '{plugin_name}'.")
+        print(
+            f"Note: Normalized plugin name from '{raw_plugin_name}' to '{plugin_name}'."
+        )
     validate_plugin_name(plugin_name)
     marketplace_name = None
     if args.marketplace_name is not None:
@@ -280,15 +306,19 @@ def main() -> None:
 
     if args.with_marketplace:
         marketplace_path = Path(args.marketplace_path).expanduser().resolve()
-        load_validated_marketplace(marketplace_path, marketplace_name, plugin_name, args.force)
+        load_validated_marketplace(
+            marketplace_path, marketplace_name, plugin_name, args.force
+        )
 
-    plugin_root = (Path(args.path).expanduser().resolve() / plugin_name)
+    plugin_root = Path(args.path).expanduser().resolve() / plugin_name
     plugin_root.mkdir(parents=True, exist_ok=True)
 
     plugin_json_path = plugin_root / ".codex-plugin" / "plugin.json"
     write_json(
         plugin_json_path,
-        build_plugin_json(plugin_name, with_mcp=args.with_mcp, with_apps=args.with_apps),
+        build_plugin_json(
+            plugin_name, with_mcp=args.with_mcp, with_apps=args.with_apps
+        ),
         args.force,
     )
 

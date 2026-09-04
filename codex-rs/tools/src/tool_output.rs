@@ -23,6 +23,12 @@ pub trait ToolOutput: Send {
         false
     }
 
+    /// Overrides history's fallback token limit after tool-specific truncation.
+    /// Include any serialization allowance; history uses this limit unchanged.
+    fn fallback_token_limit_override(&self) -> Option<usize> {
+        None
+    }
+
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem;
 
     /// Returns the tool call id exposed to `PostToolUse` hooks for this output.
@@ -49,6 +55,11 @@ pub trait ToolOutput: Send {
     fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
         response_input_to_code_mode_result(self.to_response_item("", payload))
     }
+
+    /// Reports configured source capture only after acceptance; `None` means no capture attempt.
+    fn tool_result_sources(&self) -> Option<codex_protocol::models::ToolResultSources> {
+        None
+    }
 }
 
 impl<T> ToolOutput for Box<T>
@@ -65,6 +76,10 @@ where
 
     fn contains_external_context(&self) -> bool {
         (**self).contains_external_context()
+    }
+
+    fn fallback_token_limit_override(&self) -> Option<usize> {
+        (**self).fallback_token_limit_override()
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -85,6 +100,10 @@ where
 
     fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
         (**self).code_mode_result(payload)
+    }
+
+    fn tool_result_sources(&self) -> Option<codex_protocol::models::ToolResultSources> {
+        (**self).tool_result_sources()
     }
 }
 

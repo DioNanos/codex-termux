@@ -523,6 +523,7 @@ mod tests {
 
     fn handler(event_name: HookEventName) -> ConfiguredHandler {
         ConfiguredHandler {
+            builtin: false,
             event_name,
             matcher: None,
             timeout_sec: 5,

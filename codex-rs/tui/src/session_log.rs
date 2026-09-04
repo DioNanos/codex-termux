@@ -123,6 +123,20 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
     log_inbound_app_event_with(&LOGGER, event);
 }
 
+/// Keep the session-log format even though ticks no longer use the app-event queue.
+pub(crate) fn log_commit_tick() {
+    if !LOGGER.is_enabled() {
+        return;
+    }
+    let value = json!({
+        "ts": now_ts(),
+        "dir": "to_tui",
+        "kind": "app_event",
+        "variant": "CommitTick",
+    });
+    LOGGER.write_json_line(value);
+}
+
 fn log_inbound_app_event_with(logger: &SessionLogger, event: &AppEvent) {
     // Log only if enabled
     if !logger.is_enabled() {

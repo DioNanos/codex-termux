@@ -5,6 +5,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_app_server_protocol::CodexErrorInfo;
 use codex_app_server_protocol::ThreadTimelineEntry;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -663,7 +664,7 @@ pub struct GitInfoPatch {
         skip_serializing_if = "Option::is_none",
         with = "optional_option"
     )]
-    pub origin_url: ClearableField<String>,
+    pub origin_url: ClearableField<SanitizedGitUrl>,
 }
 
 impl GitInfoPatch {

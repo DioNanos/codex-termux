@@ -222,7 +222,7 @@ impl SkillsThreadState {
     pub(crate) async fn read_skill(
         &self,
         providers: &SkillProviders,
-        request: SkillReadRequest,
+        request: SkillReadRequest<'_>,
     ) -> SkillProviderResult<SkillReadResult> {
         if request.authority.kind != SkillSourceKind::Orchestrator {
             return providers.read(request).await;
@@ -349,8 +349,8 @@ struct SkillReadCacheKey {
     resource: SkillResourceId,
 }
 
-impl From<&SkillReadRequest> for SkillReadCacheKey {
-    fn from(request: &SkillReadRequest) -> Self {
+impl From<&SkillReadRequest<'_>> for SkillReadCacheKey {
+    fn from(request: &SkillReadRequest<'_>) -> Self {
         Self {
             authority: request.authority.clone(),
             package: request.package.clone(),

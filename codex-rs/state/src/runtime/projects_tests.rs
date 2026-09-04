@@ -6,6 +6,8 @@ use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 
 use super::*;
+use crate::ProjectSortKey;
+use crate::SortDirection;
 use crate::ThreadMetadataBuilder;
 use crate::runtime::test_support::unique_temp_dir;
 
@@ -63,6 +65,13 @@ async fn project_lifecycle_preserves_order_and_clears_assignments() -> anyhow::R
         .unwrap();
     assert!(!unchanged.1);
     assert_eq!(unchanged.0.updated_at_ms, project.updated_at_ms);
+    runtime
+        .touch_thread_updated_at(thread_id, chrono::Utc::now())
+        .await?;
+    assert_eq!(
+        runtime.get_project(&project.id).await?,
+        Some(project.clone())
+    );
 
     runtime
         .mark_archived(
@@ -70,6 +79,23 @@ async fn project_lifecycle_preserves_order_and_clears_assignments() -> anyhow::R
             home.join("archived.jsonl").as_path(),
             chrono::Utc::now(),
         )
+        .await?;
+    assert_eq!(
+        runtime.get_project(&project.id).await?,
+        Some(Project {
+            recency_at_ms: None,
+            ..project.clone()
+        })
+    );
+    runtime
+        .mark_unarchived(thread_id, &metadata.rollout_path)
+        .await?;
+    assert_eq!(
+        runtime.get_project(&project.id).await?,
+        Some(project.clone())
+    );
+    runtime
+        .mark_archived(thread_id, &metadata.rollout_path, chrono::Utc::now())
         .await?;
     let active_thread_id = ThreadId::default();
     let active_metadata = ThreadMetadataBuilder::new(
@@ -84,6 +110,46 @@ async fn project_lifecycle_preserves_order_and_clears_assignments() -> anyhow::R
         .set_thread_project(&active_thread_id.to_string(), Some(&project.id))
         .await?
         .expect("active thread exists");
+    let active_recency = runtime
+        .get_thread(active_thread_id)
+        .await?
+        .unwrap()
+        .recency_at
+        .timestamp_millis();
+    runtime
+        .mark_unarchived(thread_id, &metadata.rollout_path)
+        .await?;
+    let active_project = Project {
+        recency_at_ms: Some(active_recency),
+        ..project.clone()
+    };
+    assert_eq!(
+        runtime.get_project(&project.id).await?,
+        Some(active_project)
+    );
+    runtime
+        .set_thread_project(&active_thread_id.to_string(), /*project_id*/ None)
+        .await?;
+    assert_eq!(
+        runtime.get_project(&project.id).await?,
+        Some(project.clone())
+    );
+    runtime
+        .set_thread_project(&active_thread_id.to_string(), Some(&project.id))
+        .await?;
+    runtime.delete_thread(active_thread_id).await?;
+    assert_eq!(
+        runtime.get_project(&project.id).await?,
+        Some(project.clone())
+    );
+    // Restore the active fixture for the project-deletion assertions below.
+    runtime.upsert_thread(&active_metadata).await?;
+    runtime
+        .set_thread_project(&active_thread_id.to_string(), Some(&project.id))
+        .await?;
+    runtime
+        .mark_archived(thread_id, &metadata.rollout_path, chrono::Utc::now())
+        .await?;
     let (affected_active_thread_ids, affected_archived_thread_ids) =
         runtime.delete_project(&project.id).await?.unwrap();
     assert_eq!(
@@ -192,7 +258,12 @@ async fn project_import_rejects_unknown_thread_without_partial_project() -> anyh
     assert!(error.to_string().contains("thread not found"));
     assert!(
         runtime
-            .list_projects(/*cursor*/ None, /*limit*/ 10)
+            .list_projects(
+                /*cursor*/ None,
+                /*limit*/ 10,
+                ProjectSortKey::Position,
+                SortDirection::Asc
+            )
             .await?
             .projects
             .is_empty()
@@ -276,7 +347,12 @@ async fn project_list_rejects_malformed_cursors() -> anyhow::Result<()> {
         "not-a-position|00000000-0000-0000-0000-000000000000",
     ] {
         let error = runtime
-            .list_projects(Some(cursor), /*limit*/ 10)
+            .list_projects(
+                Some(cursor),
+                /*limit*/ 10,
+                ProjectSortKey::Position,
+                SortDirection::Asc,
+            )
             .await
             .expect_err("malformed cursor should fail");
         assert!(error.to_string().starts_with("invalid project cursor:"));
@@ -298,14 +374,213 @@ async fn project_list_cursor_round_trips_across_pages() -> anyhow::Result<()> {
             .await?;
     }
 
-    let first = runtime.list_projects(/*cursor*/ None, /*limit*/ 1).await?;
+    let first = runtime
+        .list_projects(
+            /*cursor*/ None,
+            /*limit*/ 1,
+            ProjectSortKey::Position,
+            SortDirection::Asc,
+        )
+        .await?;
     assert_eq!(first.projects.len(), 1);
     let cursor = first.next_cursor.expect("next cursor");
-    let second = runtime.list_projects(Some(&cursor), /*limit*/ 1).await?;
+    let second = runtime
+        .list_projects(
+            Some(&cursor),
+            /*limit*/ 1,
+            ProjectSortKey::Position,
+            SortDirection::Asc,
+        )
+        .await?;
     assert_eq!(second.projects.len(), 1);
     assert_ne!(first.projects[0].id, second.projects[0].id);
     assert_eq!(second.next_cursor, None);
     Ok(())
+}
+
+#[tokio::test]
+async fn project_list_orders_and_pages_recency_with_roots_and_nulls() -> anyhow::Result<()> {
+    let home = unique_temp_dir();
+    let runtime = StateRuntime::init(
+        crate::SqliteConfig::new_for_testing(home.as_path().abs()),
+        "test-provider".to_string(),
+    )
+    .await?;
+    let mut projects = Vec::new();
+    for (name, recency_at_ms, archived) in [
+        ("older", Some(1_700_000_000_001), false),
+        ("tie-a", Some(1_700_000_000_002), false),
+        ("tie-b", Some(1_700_000_000_002), false),
+        ("empty", None, false),
+        ("archived", Some(1_700_000_010_000), true),
+    ] {
+        let mut threads = Vec::new();
+        if let Some(timestamp) = recency_at_ms {
+            for timestamp in [timestamp - 1, timestamp] {
+                let id = ThreadId::default();
+                let mut metadata = ThreadMetadataBuilder::new(
+                    id,
+                    home.join(format!("{id}.jsonl")),
+                    chrono::DateTime::from_timestamp_millis(timestamp).unwrap(),
+                    SessionSource::Exec,
+                )
+                .build("test-provider");
+                metadata.archived_at = archived.then(chrono::Utc::now);
+                runtime.upsert_thread(&metadata).await?;
+                // Force exact ties despite the monotonic timestamp allocator.
+                sqlx::query("UPDATE threads SET recency_at_ms = ?, recency_at = ? WHERE id = ?")
+                    .bind(timestamp)
+                    .bind(timestamp / 1000)
+                    .bind(id.to_string())
+                    .execute(runtime.pool.as_ref())
+                    .await?;
+                threads.push(id.to_string());
+            }
+        }
+        let project = runtime
+            .create_project(
+                name.to_string(),
+                vec![
+                    ProjectRoot {
+                        path: "/tmp/z".to_string(),
+                    },
+                    ProjectRoot {
+                        path: "/tmp/a".to_string(),
+                    },
+                ],
+                BTreeMap::new(),
+                &threads,
+                name,
+            )
+            .await?
+            .project;
+        let expected = Project {
+            recency_at_ms: recency_at_ms.filter(|_| !archived),
+            ..project.clone()
+        };
+        assert_eq!(project, expected);
+        assert_eq!(
+            runtime.get_project(&project.id).await?,
+            Some(expected.clone())
+        );
+        projects.push(expected);
+    }
+    let mut ties = projects[1..3].to_vec();
+    ties.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut empty = projects[3..].to_vec();
+    empty.sort_by(|a, b| a.id.cmp(&b.id));
+    let ascending = [vec![projects[0].clone()], ties.clone(), empty.clone()].concat();
+    ties.reverse();
+    empty.reverse();
+    let descending = [ties, vec![projects[0].clone()], empty].concat();
+    for (key, direction, expected) in [
+        (
+            ProjectSortKey::Position,
+            SortDirection::Asc,
+            projects.clone(),
+        ),
+        (
+            ProjectSortKey::Position,
+            SortDirection::Desc,
+            projects.into_iter().rev().collect(),
+        ),
+        (ProjectSortKey::RecencyAt, SortDirection::Asc, ascending),
+        (
+            ProjectSortKey::RecencyAt,
+            SortDirection::Desc,
+            descending.clone(),
+        ),
+    ] {
+        for limit in [1, 2, 3, 10] {
+            let mut cursor = None;
+            let mut actual = Vec::new();
+            loop {
+                let page = runtime
+                    .list_projects(cursor.as_deref(), limit, key, direction)
+                    .await?;
+                actual.extend(page.projects);
+                assert!(
+                    actual.len() <= expected.len(),
+                    "pagination repeated a project"
+                );
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+    let first = runtime
+        .list_projects(
+            /*cursor*/ None,
+            /*limit*/ 1,
+            ProjectSortKey::RecencyAt,
+            SortDirection::Desc,
+        )
+        .await?;
+    runtime.delete_project(&first.projects[0].id).await?;
+    let rest = runtime
+        .list_projects(
+            first.next_cursor.as_deref(),
+            /*limit*/ 10,
+            ProjectSortKey::RecencyAt,
+            SortDirection::Desc,
+        )
+        .await?;
+    assert_eq!(
+        rest,
+        ProjectsPage {
+            projects: descending[1..].to_vec(),
+            next_cursor: None
+        }
+    );
+
+    let query = project_list_query(
+        /*cursor*/ None,
+        /*limit*/ 50,
+        ProjectSortKey::RecencyAt,
+        SortDirection::Desc,
+    )?;
+    let plan = QueryBuilder::<Sqlite>::new("EXPLAIN QUERY PLAN ")
+        .push(query.sql().as_str())
+        .build()
+        .bind(/*value*/ 51_i64)
+        .fetch_all(runtime.pool.as_ref())
+        .await?;
+    let details = plan
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+    assert!(
+        details
+            .iter()
+            .any(|detail| detail.contains("USING COVERING INDEX idx_threads_project_recency")),
+        "{details:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn project_list_rejects_cursor_sort_mismatches() {
+    for cursor in [
+        "1|00000000-0000-0000-0000-000000000000",
+        "v1|position|desc|1|00000000-0000-0000-0000-000000000000",
+        "v1|recencyAt|asc|1|00000000-0000-0000-0000-000000000000",
+        "v2|recencyAt|desc|1|00000000-0000-0000-0000-000000000000",
+        "v1|recencyAt|desc|01|00000000-0000-0000-0000-000000000000",
+        "v1|recencyAt|desc|null|not-a-uuid",
+    ] {
+        assert!(
+            project_list_query(
+                Some(cursor),
+                /*limit*/ 10,
+                ProjectSortKey::RecencyAt,
+                SortDirection::Desc
+            )
+            .is_err()
+        );
+    }
 }
 
 #[tokio::test]
@@ -351,7 +626,14 @@ async fn project_move_reorders_projects_and_preserves_no_op_timestamp() -> anyho
         runtime.move_project(&three.id, Some(&one.id)).await?,
         Some(true)
     );
-    let reordered = runtime.list_projects(/*cursor*/ None, /*limit*/ 10).await?;
+    let reordered = runtime
+        .list_projects(
+            /*cursor*/ None,
+            /*limit*/ 10,
+            ProjectSortKey::Position,
+            SortDirection::Asc,
+        )
+        .await?;
     assert_eq!(
         reordered
             .projects

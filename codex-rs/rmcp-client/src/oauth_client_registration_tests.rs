@@ -128,20 +128,47 @@ async fn authorization(
 }
 
 #[tokio::test]
-async fn automatic_cimd_uses_callback_specific_identity() -> Result<()> {
-    for host in ["127.0.0.1", "localhost"] {
-        let server = oauth_server(json!({})).await;
-        let redirect = format!("http://{host}:43123/callback/{CALLBACK_ID}");
+async fn automatic_cimd_uses_stable_or_callback_specific_identity() -> Result<()> {
+    for (host, supports_issuer, expected_client_id, expected_redirect) in [
+        (
+            "127.0.0.1",
+            false,
+            "https://chatgpt.com/oauth/codex/abc123ABC_-x/client.json",
+            "http://127.0.0.1:43123/callback/abc123ABC_-x",
+        ),
+        (
+            "localhost",
+            false,
+            "https://chatgpt.com/oauth/codex/abc123ABC_-x/client.json",
+            "http://localhost:43123/callback/abc123ABC_-x",
+        ),
+        (
+            "127.0.0.1",
+            true,
+            "https://chatgpt.com/oauth/codex/client.json",
+            "http://127.0.0.1:43123/callback",
+        ),
+    ] {
+        let server = oauth_server(json!({
+            "authorization_response_iss_parameter_supported": supports_issuer,
+        }))
+        .await;
+        let redirect = format!("http://{host}:43123/callback");
         let (mut state, query) =
             authorization(&server, &redirect, McpOAuthClientRegistration::Auto).await?;
-        let expected_id = format!("https://chatgpt.com/oauth/codex/{CALLBACK_ID}/client.json");
-        assert_eq!(query["client_id"], expected_id);
-        assert_eq!(query["redirect_uri"], redirect);
+        assert_eq!(query["client_id"], expected_client_id);
+        assert_eq!(query["redirect_uri"], expected_redirect);
         assert_eq!(query["code_challenge_method"], "S256");
         assert_eq!(query["scope"], "read offline_access");
 
         state
-            .handle_callback_with_issuer("valid-authorization-code", &query["state"], None)
+            .handle_callback_with_issuer(
+                "valid-authorization-code",
+                &query["state"],
+                supports_issuer
+                    .then(|| format!("{}/mcp", server.uri()))
+                    .as_deref(),
+            )
             .await?;
         let token_requests = requests_to(&server, "/token").await;
         assert_eq!(token_requests.len(), 1);
@@ -149,8 +176,8 @@ async fn automatic_cimd_uses_callback_specific_identity() -> Result<()> {
         let body: HashMap<_, _> = url::form_urlencoded::parse(&request.body)
             .into_owned()
             .collect();
-        assert_eq!(body["client_id"], expected_id);
-        assert_eq!(body["redirect_uri"], redirect);
+        assert_eq!(body["client_id"], expected_client_id);
+        assert_eq!(body["redirect_uri"], expected_redirect);
         assert_eq!(body["grant_type"], "authorization_code");
         assert!(body.contains_key("code_verifier"));
         assert!(!body.contains_key("client_secret"));
@@ -170,6 +197,7 @@ async fn automatic_cimd_uses_callback_specific_identity() -> Result<()> {
 #[tokio::test]
 async fn registration_selection_preserves_dcr_capabilities_and_exact_redirects() -> Result<()> {
     let native = "http://localhost:43123/callback/abc123ABC_-x";
+    let shared_native = "http://localhost:43123/callback";
     let custom = "https://callbacks.example.com/oauth/callback/abc123ABC_-x";
     for (metadata, redirect, registration, expected_redirect) in [
         (
@@ -193,9 +221,9 @@ async fn registration_selection_preserves_dcr_capabilities_and_exact_redirects()
         (json!({}), custom, McpOAuthClientRegistration::Auto, custom),
         (
             json!({"authorization_response_iss_parameter_supported": true}),
-            native,
+            shared_native,
             McpOAuthClientRegistration::Dcr,
-            native,
+            shared_native,
         ),
     ] {
         let server = oauth_server(metadata).await;
@@ -485,6 +513,14 @@ async fn resource_headers_follow_same_origin_registration_redirect_and_sdk_auth_
 async fn invalid_cimd_metadata_and_redirects_fail_without_dynamic_registration() {
     let valid = "http://127.0.0.1:43123/callback/abc123ABC_-x";
     for (metadata, redirect, expected_error) in [
+        (
+            json!({
+                "authorization_response_iss_parameter_supported": true,
+                "issuer": null,
+            }),
+            valid,
+            "issuer-bound callbacks require an authorization server issuer",
+        ),
         (
             json!({"token_endpoint_auth_methods_supported": ["private_key_jwt"]}),
             valid,

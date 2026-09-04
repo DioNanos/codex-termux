@@ -434,6 +434,7 @@ fn update_action_label(context: &InstallContext) -> &'static str {
     match &context.method {
         InstallMethod::Npm => "npm install -g @mmmbuto/codex-cli-termux",
         InstallMethod::Bun => "bun install -g @mmmbuto/codex-cli-termux",
+        InstallMethod::VitePlus => "vp install -g @mmmbuto/codex-cli-termux",
         InstallMethod::Pnpm => "pnpm add -g @mmmbuto/codex-cli-termux",
         InstallMethod::Brew => "npm install -g @mmmbuto/codex-cli-termux",
         InstallMethod::Standalone { .. } => "standalone installer",
@@ -443,9 +444,11 @@ fn update_action_label(context: &InstallContext) -> &'static str {
 
 fn fetch_latest_version(context: &InstallContext) -> Result<String, String> {
     match &context.method {
-        InstallMethod::Npm | InstallMethod::Bun | InstallMethod::Pnpm | InstallMethod::Brew => {
-            fetch_npm_latest_version()
-        }
+        InstallMethod::Npm
+        | InstallMethod::Bun
+        | InstallMethod::VitePlus
+        | InstallMethod::Pnpm
+        | InstallMethod::Brew => fetch_npm_latest_version(),
         InstallMethod::Standalone { .. } | InstallMethod::Other => {
             fetch_latest_github_release_version()
         }
@@ -645,6 +648,13 @@ mod tests {
                 package_layout: None,
             }),
             concat!("pnpm add -g @mmmbuto/", "codex-cli-termux")
+        );
+        assert_eq!(
+            update_action_label(&InstallContext {
+                method: InstallMethod::VitePlus,
+                package_layout: None,
+            }),
+            concat!("vp install -g @mmmbuto/", "codex-cli-termux")
         );
         assert_eq!(
             update_action_label(&InstallContext {

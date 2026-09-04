@@ -4,6 +4,10 @@ use super::*;
 use crate::bottom_pane::BottomPaneView;
 
 impl ChatWidget {
+    pub(crate) fn set_agents_navigation_enabled(&mut self, enabled: bool) {
+        self.bottom_pane.set_agents_navigation_enabled(enabled);
+    }
+
     pub(crate) fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
         self.bottom_pane.keymap_contexts()
     }
@@ -25,7 +29,6 @@ impl ChatWidget {
             let should_pause_active_goal = self
                 .bottom_pane
                 .active_view_will_interrupt_turn_on_key_event(key_event);
-            self.flush_completed_command_activity();
             self.bottom_pane.handle_key_event(key_event);
             if should_pause_active_goal {
                 self.pause_active_goal_for_interrupt();
@@ -176,10 +179,8 @@ impl ChatWidget {
                 let had_modal_or_popup = !self.bottom_pane.no_modal_or_popup_active();
                 let should_pause_active_goal =
                     self.bottom_pane.should_interrupt_running_task(key_event);
-                if key_event.code == KeyCode::Enter {
-                    self.flush_completed_command_activity();
-                }
                 let input_result = self.bottom_pane.handle_key_event(key_event);
+                self.sync_backend_banner_view();
                 if should_pause_active_goal {
                     self.pause_active_goal_for_interrupt();
                 }
@@ -246,6 +247,10 @@ impl ChatWidget {
 
     pub(crate) fn selected_index_for_present_view(&self, view_id: &'static str) -> Option<usize> {
         self.bottom_pane.selected_index_for_present_view(view_id)
+    }
+
+    pub(crate) fn selected_index_for_active_view(&self, view_id: &'static str) -> Option<usize> {
+        self.bottom_pane.selected_index_for_active_view(view_id)
     }
 
     pub(crate) fn replace_selection_view_if_present(

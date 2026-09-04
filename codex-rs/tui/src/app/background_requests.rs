@@ -73,22 +73,33 @@ impl App {
     /// Spawns a background task to fetch account rate limits and deliver the
     /// result as a `RateLimitsLoaded` event.
     ///
-    /// The `origin` is forwarded to the completion handler so it can distinguish
-    /// a startup prefetch (which updates cached snapshots and may surface a
-    /// reset-credit notice) from a `/status`-triggered refresh (which must
-    /// finalize the corresponding status card).
+    /// Recovery requests are coalesced and bounded by the reset-request timeout. The origin
+    /// also identifies command-specific completion work, such as finalizing a `/status` card,
+    /// without confusing sparse inference notifications with authoritative usage responses.
     pub(super) fn refresh_rate_limits(
         &mut self,
         app_server: &AppServerSession,
         origin: RateLimitRefreshOrigin,
     ) {
+        if matches!(
+            origin,
+            RateLimitRefreshOrigin::Recovery | RateLimitRefreshOrigin::ResetConsume { .. }
+        ) {
+            self.chat_widget.hold_rate_limit_recovery();
+        }
+        let Some((request_id, hard_stop_generation)) = self
+            .rate_limit_refresh_state
+            .start(origin, &mut self.rate_limit_hard_stop_generation)
+        else {
+            return;
+        };
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
-        let hard_stop_generation = self.rate_limit_hard_stop_generation;
         tokio::spawn(async move {
             let request = fetch_account_rate_limits(request_handle);
             let result = match origin {
-                RateLimitRefreshOrigin::ResetConsume { .. }
+                RateLimitRefreshOrigin::Recovery
+                | RateLimitRefreshOrigin::ResetConsume { .. }
                 | RateLimitRefreshOrigin::ResetPicker { .. } => {
                     tokio::time::timeout(RATE_LIMIT_RESET_REQUEST_TIMEOUT, request)
                         .await
@@ -102,6 +113,7 @@ impl App {
                 }
             };
             app_event_tx.send(AppEvent::RateLimitsLoaded {
+                request_id,
                 origin,
                 hard_stop_generation,
                 result,
@@ -208,6 +220,7 @@ impl App {
     pub(super) fn send_add_credits_nudge_email(
         &mut self,
         app_server: &AppServerSession,
+        request_id: Uuid,
         credit_type: AddCreditsNudgeCreditType,
     ) {
         let request_handle = app_server.request_handle();
@@ -216,7 +229,7 @@ impl App {
             let result = send_add_credits_nudge_email(request_handle, credit_type)
                 .await
                 .map_err(|err| err.to_string());
-            app_event_tx.send(AppEvent::AddCreditsNudgeEmailFinished { result });
+            app_event_tx.send(AppEvent::AddCreditsNudgeEmailFinished { request_id, result });
         });
     }
 

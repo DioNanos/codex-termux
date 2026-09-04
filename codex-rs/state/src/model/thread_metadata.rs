@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::DateTime;
 use chrono::Utc;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
@@ -183,7 +184,7 @@ pub struct ThreadMetadata {
     /// The git branch name, if known.
     pub git_branch: Option<String>,
     /// The git origin URL, if known.
-    pub git_origin_url: Option<String>,
+    pub git_origin_url: Option<SanitizedGitUrl>,
 }
 
 /// Builder data required to construct [`ThreadMetadata`] without parsing filenames.
@@ -228,7 +229,7 @@ pub struct ThreadMetadataBuilder {
     /// The git branch name, if known.
     pub git_branch: Option<String>,
     /// The git origin URL, if known.
-    pub git_origin_url: Option<String>,
+    pub git_origin_url: Option<SanitizedGitUrl>,
 }
 
 impl ThreadMetadataBuilder {
@@ -626,7 +627,8 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
             project_id,
             git_sha,
             git_branch,
-            git_origin_url,
+            git_origin_url: git_origin_url
+                .and_then(|origin_url| SanitizedGitUrl::try_from(origin_url).ok()),
         })
     }
 }
@@ -693,6 +695,7 @@ mod tests {
     use super::ThreadRow;
     use chrono::DateTime;
     use chrono::Utc;
+    use codex_protocol::SanitizedGitUrl;
     use codex_protocol::ThreadId;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::ThreadHistoryMode;
@@ -810,7 +813,10 @@ mod tests {
         reconciled.history_mode = ThreadHistoryMode::Paginated;
         reconciled.git_sha = Some("rollout-sha".to_string());
         reconciled.git_branch = Some("rollout-branch".to_string());
-        reconciled.git_origin_url = Some("rollout-origin".to_string());
+        reconciled.git_origin_url = Some(
+            SanitizedGitUrl::try_from("https://example.com/rollout-origin")
+                .expect("valid git remote URL"),
+        );
         let existing = expected_thread_metadata(/*reasoning_effort*/ None);
         let expected = reconciled.clone();
 

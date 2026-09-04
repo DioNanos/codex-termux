@@ -60,6 +60,7 @@ fn session_end_ignores_successful_output() {
 
 fn handler(matcher: Option<&str>) -> ConfiguredHandler {
     ConfiguredHandler {
+        builtin: false,
         event_name: HookEventName::SessionEnd,
         matcher: matcher.map(str::to_string),
         timeout_sec: 2,

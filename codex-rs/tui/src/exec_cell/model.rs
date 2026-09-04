@@ -14,8 +14,6 @@ use codex_app_server_protocol::CommandExecutionSource as ExecCommandSource;
 use codex_protocol::parse_command::ParsedCommand;
 use itertools::Either;
 
-const MAX_GROUPED_COMMANDS: usize = 32;
-
 #[derive(Debug, Default)]
 pub(crate) struct CommandOutput {
     pub(crate) exit_code: i32,
@@ -106,38 +104,7 @@ impl ExecCell {
             duration: None,
             interaction_input,
         };
-        let has_failed_call = self.calls.iter().any(|existing| {
-            existing
-                .output
-                .as_ref()
-                .is_some_and(|output| output.exit_code != 0)
-        });
-        if (self.calls.len() >= MAX_GROUPED_COMMANDS && !self.is_active())
-            || (!Self::is_groupable_source(call.source) && !self.is_active())
-            || (has_failed_call && !self.is_active())
-        {
-            return false;
-        }
-
-        let continues_exploration = Self::is_exploring_call(&call)
-            && (self.is_exploring_cell()
-                || self.calls.last().is_some_and(|existing| {
-                    existing.duration.is_none() && Self::is_exploring_call(existing)
-                }))
-            && (self.is_active()
-                || self
-                    .calls
-                    .iter()
-                    .all(|existing| Self::is_groupable_source(existing.source)));
-        let continues_compact_group = self.calls.iter().all(|existing| {
-            Self::is_groupable_source(existing.source)
-                && existing.duration.is_some()
-                && existing
-                    .output
-                    .as_ref()
-                    .is_some_and(|output| output.exit_code == 0)
-        });
-        if continues_exploration || continues_compact_group {
+        if self.is_exploring_cell() && Self::is_exploring_call(&call) {
             self.calls.push(call);
             true
         } else {
@@ -167,28 +134,11 @@ impl ExecCell {
 
     pub(crate) fn should_flush(&self) -> bool {
         if self.calls.iter().any(|call| {
-            !Self::is_groupable_source(call.source)
-                || call
-                    .output
-                    .as_ref()
-                    .is_some_and(|output| output.exit_code != 0)
+            call.output
+                .as_ref()
+                .is_some_and(|output| output.exit_code != 0)
         }) {
             return !self.is_active();
-        }
-
-        if self.calls.len() >= MAX_GROUPED_COMMANDS {
-            return !self.is_active();
-        }
-
-        if self.calls.iter().all(|call| {
-            Self::is_groupable_source(call.source)
-                && call.duration.is_some()
-                && call
-                    .output
-                    .as_ref()
-                    .is_some_and(|output| output.exit_code == 0)
-        }) {
-            return false;
         }
 
         !self.is_exploring_cell() && self.calls.iter().all(|c| c.duration.is_some())
@@ -259,13 +209,6 @@ impl ExecCell {
                         | ParsedCommand::Search { .. }
                 )
             })
-    }
-
-    fn is_groupable_source(source: ExecCommandSource) -> bool {
-        matches!(
-            source,
-            ExecCommandSource::Agent | ExecCommandSource::UnifiedExecStartup
-        )
     }
 }
 

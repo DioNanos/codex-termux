@@ -2,4 +2,4 @@
 source: tui/src/chatwidget/tests/helpers.rs
 expression: combined
 ---
-• Interrupt (completed) says: Heads up from the hook
+↳ Hook · Heads up from the hook

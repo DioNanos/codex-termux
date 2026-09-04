@@ -36,7 +36,6 @@ use codex_protocol::protocol::SessionSource;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use rmcp::handler::server::ServerHandler;
-use rmcp::model::BooleanSchema;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResult;
 use rmcp::model::ElicitRequestParams;
@@ -47,7 +46,6 @@ use rmcp::model::ListResourcesResult;
 use rmcp::model::ListToolsResult;
 use rmcp::model::MetaObject;
 use rmcp::model::PaginatedRequestParams;
-use rmcp::model::PrimitiveSchemaDefinition;
 use rmcp::model::ProtocolVersion;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
@@ -62,6 +60,7 @@ use rmcp::transport::StreamableHttpService;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use serde_json::json;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -72,6 +71,7 @@ pub(super) const TEST_WIDGET_RESOURCE_URI: &str = "ui://widget/checkout-session.
 const TEST_BLOB_RESOURCE_URI: &str = "test://codex/resource.bin";
 const TEST_RESOURCE_BLOB: &str = "YmluYXJ5LXJlc291cmNl";
 const TEST_RESOURCE_TEXT: &str = "Resource body from the MCP server.";
+const TEST_ERROR_RESOURCE_URI: &str = "test://codex/error";
 const TEST_ELICITATION_RESOURCE_URI: &str = "test://codex/elicitation";
 const TEST_ELICITATION_RESOURCE_TEXT: &str = "Threadless elicitation was declined.";
 const SKILL_NAME: &str = "demo-plugin:deploy";
@@ -129,6 +129,77 @@ async fn mcp_resource_read_returns_resource_contents() -> Result<()> {
         })
         .await?;
     assert_eq!(read_response, expected_resource_read_response());
+
+    apps_server_handle.abort();
+    let _ = apps_server_handle.await;
+    Ok(())
+}
+
+#[test_case(ProtocolVersion::V_2025_06_18; "legacy")]
+#[test_case(ProtocolVersion::V_2026_07_28; "modern")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_resource_read_preserves_protocol_errors(protocol: ProtocolVersion) -> Result<()> {
+    let responses_server = responses::start_mock_server().await;
+    let (apps_server_url, _calls, apps_server_handle) = start_resource_apps_mcp_server().await?;
+    let codex_home = TempDir::new()?;
+    let config = MockResponsesConfig::new(&responses_server.uri()).with_extra_config(&format!(
+        "[mcp_servers.resource_server]\nurl = \"{apps_server_url}/api/codex/ps/mcp\""
+    ));
+    let config = if protocol == ProtocolVersion::V_2026_07_28 {
+        config.enable_feature(Feature::Mcp20260728)
+    } else {
+        config.disable_feature(Feature::Mcp20260728)
+    };
+    config.write(codex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let ThreadStartResponse { thread, .. } = mcp.start_thread(ThreadStartParams::default()).await?;
+
+    for (server, expected_error) in [
+        (
+            "resource_server",
+            json!({
+                "code": -32042,
+                "message": "resource authorization required",
+                "data": {
+                    "uri": TEST_ERROR_RESOURCE_URI,
+                    "protocolVersion": protocol,
+                    "_meta": {"_codex_apps": {"connector_auth_failure": {
+                        "is_auth_failure": true,
+                        "connector_id": "calendar",
+                        "requested_scopes": ["calendar.read"],
+                    }}},
+                },
+            }),
+        ),
+        (
+            "missing",
+            json!({"code": -32603, "message": "unknown MCP server 'missing'"}),
+        ),
+    ] {
+        for thread_id in [Some(thread.id.clone()), None] {
+            let request_id = mcp
+                .send_mcp_resource_read_request(McpResourceReadParams {
+                    thread_id,
+                    origin_call_id: None,
+                    server: server.to_string(),
+                    uri: TEST_ERROR_RESOURCE_URI.to_string(),
+                    connector_id: None,
+                })
+                .await?;
+            let error = timeout(
+                DEFAULT_READ_TIMEOUT,
+                mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+            )
+            .await??;
+            assert_eq!(
+                serde_json::to_value(error)?,
+                json!({"id": request_id, "error": expected_error})
+            );
+        }
+    }
 
     apps_server_handle.abort();
     let _ = apps_server_handle.await;
@@ -268,7 +339,12 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
 
     let developer_messages = first_request.message_input_texts("developer");
     let catalog_line =
-        format!("- {SKILL_NAME}: {SKILL_DESCRIPTION} (orchestrator package: {SKILL_RESOURCE_URI})");
+        format!("- {SKILL_NAME}: {SKILL_DESCRIPTION} (orchestrator package: o0/deploy)");
+    assert!(
+        developer_messages
+            .iter()
+            .any(|text| text.contains("- `o0` = `skill://plugin_demo`"))
+    );
     assert_eq!(
         1,
         developer_messages
@@ -569,7 +645,8 @@ async fn mcp_resource_read_returns_contents_and_declines_elicitation_without_thr
             r#"
 chatgpt_base_url = "{apps_server_url}"
 mcp_oauth_credentials_store = "file"
-approval_policy = "on-request"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
 
 [features]
 apps = true
@@ -947,6 +1024,21 @@ impl ServerHandler for ResourceAppsMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ReadResourceResponse, rmcp::ErrorData> {
         let uri = request.uri;
+        if uri == TEST_ERROR_RESOURCE_URI {
+            return Err(rmcp::ErrorData::new(
+                rmcp::model::ErrorCode(-32042),
+                "resource authorization required",
+                Some(json!({
+                    "uri": uri,
+                    "protocolVersion": context.protocol_version(),
+                    "_meta": {"_codex_apps": {"connector_auth_failure": {
+                        "is_auth_failure": true,
+                        "connector_id": "calendar",
+                        "requested_scopes": ["calendar.read"],
+                    }}},
+                })),
+            ));
+        }
         if uri == TEST_WIDGET_RESOURCE_URI {
             let request_meta = context
                 .meta
@@ -979,10 +1071,6 @@ impl ServerHandler for ResourceAppsMcpServer {
         }
         if uri == TEST_ELICITATION_RESOURCE_URI {
             let requested_schema = ElicitationSchema::builder()
-                .required_property(
-                    "confirmed",
-                    PrimitiveSchemaDefinition::Boolean(BooleanSchema::new()),
-                )
                 .build()
                 .map_err(|err| rmcp::ErrorData::internal_error(err.to_string(), None))?;
             let result = context

@@ -141,7 +141,7 @@ async fn update_plan_tool_emits_plan_update_event() -> anyhow::Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| config.update_plan_enabled = true);
     let TestCodex {
         codex,
         cwd,
@@ -233,7 +233,7 @@ async fn update_plan_tool_rejects_malformed_payload() -> anyhow::Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| config.update_plan_enabled = true);
     let TestCodex {
         codex,
         cwd,

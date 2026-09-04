@@ -467,6 +467,74 @@ fn converts_absolute_api_paths_using_the_inferred_convention() {
 }
 
 #[test]
+fn resolves_legacy_paths_against_executor_context() {
+    for (cwd, path, user_home_dir, expected) in [
+        (
+            "file:///workspace",
+            "relative.txt",
+            None,
+            "file:///workspace/relative.txt",
+        ),
+        (
+            "file:///C:/workspace",
+            "/Windows",
+            None,
+            "file:///C:/Windows",
+        ),
+        (
+            "file:///C:/workspace",
+            "//server/share/file.txt",
+            None,
+            "file://server/share/file.txt",
+        ),
+        (
+            "file:///workspace",
+            "~//notes",
+            Some("file:///home/executor"),
+            "file:///home/executor/notes",
+        ),
+        (
+            "file:///C:/workspace",
+            r"~\\notes",
+            Some("file:///C:/Users/executor"),
+            "file:///C:/Users/executor/notes",
+        ),
+    ] {
+        let cwd = PathUri::parse(cwd).expect("valid cwd");
+        let user_home_dir = user_home_dir.map(|home| PathUri::parse(home).expect("valid home"));
+
+        assert_eq!(
+            LegacyAppPathString::from_string(path).resolve_against(&cwd, user_home_dir.as_ref()),
+            Ok(PathUri::parse(expected).expect("valid expected path")),
+            "resolving {path:?} against {cwd}"
+        );
+    }
+}
+
+#[test]
+fn rejects_legacy_paths_without_executor_context() {
+    let cwd = PathUri::parse("file:///workspace").expect("valid cwd");
+
+    assert_eq!(
+        LegacyAppPathString::from_string(r"C:\\tmp")
+            .resolve_against(&cwd, /*user_home_dir*/ None),
+        Err(LegacyAppPathStringError::MismatchedConvention {
+            path: r"C:\\tmp".to_string(),
+            path_convention: PathConvention::Windows,
+            cwd: cwd.to_string(),
+            convention: PathConvention::Posix,
+        })
+    );
+    assert_eq!(
+        LegacyAppPathString::from_string("~/secret")
+            .resolve_against(&cwd, /*user_home_dir*/ None),
+        Err(LegacyAppPathStringError::MissingHomeDirectory {
+            path: "~/secret".to_string(),
+        })
+    );
+}
+
+#[test]
 fn ambiguous_absolute_api_paths_preserve_their_inferred_convention() {
     for (raw_path, convention) in [
         ("/C:/secret", PathConvention::Posix),

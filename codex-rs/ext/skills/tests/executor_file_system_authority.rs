@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -318,6 +319,7 @@ async fn windows_executor_skill_read_rejects_disabled_sandbox_on_any_orchestrato
     );
     let error = provider
         .read(SkillReadRequest {
+            _lifetime: PhantomData,
             authority: SkillAuthority::new(SkillSourceKind::Executor, "windows-root"),
             package: SkillPackageId("skill://windows-root/C:/skill".into()),
             resource,
@@ -876,6 +878,7 @@ async fn high_level_discovery_reuses_materialized_skill_contents_for_reads() {
         panic!("expected exactly one skill");
     };
     let request = SkillReadRequest {
+        _lifetime: PhantomData,
         authority: entry.authority.clone(),
         package: entry.id.clone(),
         resource: entry.main_prompt.clone(),

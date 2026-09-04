@@ -8,6 +8,11 @@ use codex_config::types::ToolSuggestDiscoverableType;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core_plugins::startup_sync::curated_plugins_repo_path;
+use codex_extension_api::ExtensionFuture;
+use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::McpServerContribution;
+use codex_extension_api::McpServerContributionContext;
+use codex_extension_api::McpServerContributor;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
@@ -40,6 +45,7 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
+use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::sync::Arc;
@@ -49,6 +55,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tempfile::TempDir;
 use test_case::test_case;
+use tokio::sync::Notify;
 use wiremock::Mock;
 use wiremock::MockGuard;
 use wiremock::MockServer;
@@ -70,6 +77,31 @@ const CALENDAR_CONNECTOR_ID: &str = "calendar";
 const CALENDAR_NAMESPACE: &str = "mcp__codex_apps__calendar";
 const CALENDAR_CREATE_EVENT_TOOL: &str = "_create_event";
 const STEP_PREPARATION_MCP_SERVER: &str = "step_preparation";
+
+struct StartupMcpBarrier {
+    block_next: AtomicBool,
+    entered: Notify,
+    release: Notify,
+}
+
+impl McpServerContributor<Config> for StartupMcpBarrier {
+    fn id(&self) -> &'static str {
+        "startup_recommendation_barrier"
+    }
+
+    fn contribute<'a>(
+        &'a self,
+        _context: McpServerContributionContext<'a, Config>,
+    ) -> ExtensionFuture<'a, Vec<McpServerContribution>> {
+        Box::pin(async move {
+            if self.block_next.swap(false, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Vec::new()
+        })
+    }
+}
 
 fn tool_names(body: &Value) -> Vec<String> {
     body.get("tools")
@@ -124,6 +156,25 @@ async fn mount_recommendations(server: &wiremock::MockServer, response: Response
         .respond_with(response)
         .mount(server)
         .await;
+}
+
+async fn wait_for_startup_recommendations(server: &MockServer) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|request| request.url.path() == "/ps/plugins/suggested/codex")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("session startup should request recommendations before the first turn")
 }
 
 fn assert_legacy_tools(body: &Value) {
@@ -186,6 +237,7 @@ async fn build_gated_step_preparation_test(
                 serde_json::from_value(json!({
                     "command": command.clone(),
                     "environment_id": environment_id.clone(),
+                    "cwd": config.cwd,
                     "env": {
                         "MCP_TEST_INITIALIZE_BARRIER_FILE": barrier_file,
                         "MCP_TEST_PID_FILE": pid_file,
@@ -204,6 +256,15 @@ async fn build_gated_step_preparation_test(
 }
 
 async fn start_gated_step_preparation(test: &TestCodex, server: &MockServer) -> Result<PathUri> {
+    // Settle startup work before clearing its cache so these tests still exercise
+    // a fresh recommendation fetch alongside first-turn MCP discovery.
+    wait_for_startup_recommendations(server).await?;
+    let plugins_manager = test.thread_manager.plugins_manager();
+    let auth = test.thread_manager.auth_manager().auth().await;
+    plugins_manager
+        .recommended_plugins_mode_for_config(&test.config.plugins_config_input(), auth.as_ref())
+        .await;
+    plugins_manager.clear_recommended_plugins_cache();
     let prior_recommendation_count = server
         .received_requests()
         .await
@@ -385,6 +446,124 @@ async fn mount_remote_calendar_installed_plugins(server: &wiremock::MockServer) 
         .await;
 }
 
+#[test_case(Feature::ToolSuggest, None; "tool suggest")]
+#[test_case(Feature::RecommendedPlugins, None; "recommended plugins")]
+#[test_case(Feature::RecommendedPlugins, Some(Feature::Apps); "apps disabled")]
+#[test_case(Feature::RecommendedPlugins, Some(Feature::Plugins); "plugins disabled")]
+#[test_case(Feature::RecommendedPlugins, Some(Feature::RemotePlugin); "remote plugins disabled")]
+#[test_case(Feature::RecommendedPlugins, Some(Feature::RecommendedPlugins); "recommendations disabled")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_recommendations(
+    feature: Feature,
+    disabled_feature: Option<Feature>,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let expect_recommendations = disabled_feature.is_none();
+    let server = start_mock_server().await;
+    let apps_server = AppsTestServer::mount(&server).await?;
+    let recommendation_started = Arc::new(Notify::new());
+    let started = Arc::clone(&recommendation_started);
+    let response = ResponseTemplate::new(200).set_body_json(json!({
+        "enabled": true,
+        "plugins": [{
+            "id": "plugin_github",
+            "name": "github",
+            "display_name": "GitHub"
+        }]
+    }));
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/suggested/codex"))
+        .respond_with(move |_: &wiremock::Request| {
+            started.notify_one();
+            response.clone()
+        })
+        .expect(u64::from(expect_recommendations))
+        .mount(&server)
+        .await;
+    let model_response = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("startup-recommendations"),
+            ev_assistant_message("startup-recommendations-message", "done"),
+            ev_completed("startup-recommendations"),
+        ]),
+    )
+    .await;
+    let barrier = Arc::new(StartupMcpBarrier {
+        block_next: AtomicBool::new(true),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.mcp_server_contributor(barrier.clone());
+    let mut builder = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            configure_apps_without_search_tool(config, &apps_server.chatgpt_base_url);
+            config.model_provider.supports_websockets = false;
+            for suggestion_feature in [Feature::ToolSuggest, Feature::RecommendedPlugins] {
+                config
+                    .features
+                    .disable(suggestion_feature)
+                    .expect("test config should allow feature update");
+            }
+            config
+                .features
+                .enable(feature)
+                .expect("test config should allow feature update");
+            if let Some(disabled_feature) = disabled_feature {
+                config
+                    .features
+                    .disable(disabled_feature)
+                    .expect("test config should allow feature update");
+            }
+        });
+    let startup = builder.build_with_auto_env(&server);
+    tokio::pin!(startup);
+
+    tokio::select! {
+        result = &mut startup => {
+            result?;
+            anyhow::bail!("session startup should remain blocked in MCP configuration");
+        }
+        _ = barrier.entered.notified() => {}
+    }
+    if expect_recommendations {
+        tokio::time::timeout(Duration::from_secs(5), recommendation_started.notified())
+            .await
+            .context("recommendations must start before MCP configuration is released")?;
+    }
+    assert!(futures::poll!(&mut startup).is_pending());
+    assert!(model_response.requests().is_empty());
+    barrier.release.notify_one();
+    let test = startup.await?;
+
+    test.submit_turn("suggest a plugin").await?;
+
+    let request = model_response.single_request();
+    let user_context = request.message_input_texts("user").join("\n");
+    assert_eq!(
+        user_context.contains("<recommended_plugins>"),
+        expect_recommendations,
+    );
+    assert_eq!(
+        user_context.contains("- GitHub (github@openai-curated-remote)"),
+        expect_recommendations,
+    );
+    let tools = tool_names(&request.body_json());
+    assert_eq!(
+        tools
+            .iter()
+            .any(|name| name == REQUEST_PLUGIN_INSTALL_TOOL_NAME),
+        expect_recommendations && feature == Feature::ToolSuggest,
+    );
+    test.codex.shutdown_and_wait().await?;
+    server.verify().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_discovery_overlaps_endpoint_plugin_recommendations() -> Result<()> {
     skip_if_wine_exec!(
@@ -509,17 +688,17 @@ async fn interrupting_concurrent_step_preparation_prevents_sampling() -> Result<
     Ok(())
 }
 
+#[test_case(ResponseTemplate::new(200).set_body_json(json!({"enabled": false, "plugins": []})); "endpoint disabled")]
+#[test_case(ResponseTemplate::new(503); "fetch failure")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_false_preserves_legacy_workflow() -> Result<()> {
+async fn unavailable_recommendations_preserve_legacy_workflow(
+    response: ResponseTemplate,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
     let apps_server = AppsTestServer::mount(&server).await?;
-    mount_recommendations(
-        &server,
-        ResponseTemplate::new(200).set_body_json(json!({"enabled": false, "plugins": []})),
-    )
-    .await;
+    mount_recommendations(&server, response).await;
     let call_id = "list-installable-tools";
     let mock = mount_sse_sequence(
         &server,

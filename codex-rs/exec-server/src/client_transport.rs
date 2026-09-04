@@ -103,6 +103,8 @@ pub(crate) enum ExecServerReconnectStrategy {
     Accepted(AcceptedConnectionSource),
     WebSocket(RemoteExecServerConnectArgs),
     NoiseRendezvous {
+        // The executor that created the session, not the latest recovery lookup.
+        executor_public_key: crate::NoiseChannelPublicKey,
         provider: Arc<dyn NoiseRendezvousConnectProvider>,
         identity: NoiseChannelIdentity,
         client_name: String,
@@ -126,6 +128,7 @@ impl ExecServerReconnectStrategy {
                 Ok(ReconnectAttempt::new(connection, args.into()))
             }
             Self::NoiseRendezvous {
+                executor_public_key: _,
                 provider,
                 identity,
                 client_name,
@@ -201,20 +204,22 @@ impl ExecServerClient {
                 initialize_timeout,
             } => (websocket_url, connect_timeout, initialize_timeout),
             ExecServerTransportParams::NoiseRendezvous { provider, identity } => {
+                let (connection, options, executor_public_key) =
+                    Self::open_initial_noise_rendezvous_connection(
+                        &provider,
+                        &identity,
+                        http_client_factory.clone(),
+                    )
+                    .await?;
                 let reconnect_strategy = ExecServerReconnectStrategy::NoiseRendezvous {
-                    provider: Arc::clone(&provider),
-                    identity: identity.clone(),
+                    executor_public_key,
+                    provider,
+                    identity,
                     client_name: ENVIRONMENT_CLIENT_NAME.to_string(),
                     connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
                     initialize_timeout: DEFAULT_REMOTE_EXEC_SERVER_INITIALIZE_TIMEOUT,
-                    http_client_factory: http_client_factory.clone(),
-                };
-                let (connection, options) = Self::open_initial_noise_rendezvous_connection(
-                    &provider,
-                    &identity,
                     http_client_factory,
-                )
-                .await?;
+                };
                 return Self::connect_with_recovery(connection, options, Some(reconnect_strategy))
                     .await;
             }
@@ -247,7 +252,14 @@ impl ExecServerClient {
         provider: &Arc<dyn NoiseRendezvousConnectProvider>,
         identity: &NoiseChannelIdentity,
         http_client_factory: HttpClientFactory,
-    ) -> Result<(JsonRpcConnection, ExecServerClientConnectOptions), ExecServerError> {
+    ) -> Result<
+        (
+            JsonRpcConnection,
+            ExecServerClientConnectOptions,
+            crate::NoiseChannelPublicKey,
+        ),
+        ExecServerError,
+    > {
         let open_connection = |bundle: NoiseRendezvousConnectBundle| {
             Self::open_noise_rendezvous_connection(NoiseRendezvousConnectArgs {
                 bundle,
@@ -299,6 +311,7 @@ impl ExecServerClient {
                 }
                 Err(error) => return Err(error),
             };
+            let executor_public_key = bundle.executor_public_key.clone();
             match open_connection(bundle).await {
                 Err(error)
                     if !refreshed_unauthorized_bundle
@@ -317,7 +330,10 @@ impl ExecServerClient {
                     retries = 0;
                     result = connect_bundle().await;
                 }
-                result => return result,
+                result => {
+                    return result
+                        .map(|(connection, options)| (connection, options, executor_public_key));
+                }
             }
         }
     }

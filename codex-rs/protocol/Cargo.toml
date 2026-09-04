@@ -26,6 +26,7 @@ codex-utils-path-uri = { workspace = true }
 codex-utils-redacted-string = { workspace = true }
 codex-utils-string = { workspace = true }
 encoding_rs = { workspace = true }
+gix-url = { workspace = true }
 globset = { workspace = true }
 http = { workspace = true }
 icu_decimal = { workspace = true }

@@ -209,6 +209,24 @@ pub struct AppToolsConfig {
     pub tools: HashMap<String, AppToolConfig>,
 }
 
+/// Approval settings for a connected account within an app.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub struct AppLinkConfig {
+    pub approvals_reviewer: Option<ApprovalsReviewer>,
+    pub default_tools_approval_mode: Option<AppToolApproval>,
+}
+
+/// Account settings for a single app.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub struct AppLinksConfig {
+    #[serde(default, flatten)]
+    pub links: HashMap<String, AppLinkConfig>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export_to = "v2/")]
@@ -221,6 +239,8 @@ pub struct AppConfig {
     pub default_tools_approval_mode: Option<AppToolApproval>,
     pub default_tools_enabled: Option<bool>,
     pub tools: Option<AppToolsConfig>,
+    /// Per-account approval settings keyed by link ID.
+    pub links: Option<AppLinksConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

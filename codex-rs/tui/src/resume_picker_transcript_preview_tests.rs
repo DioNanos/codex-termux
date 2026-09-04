@@ -42,6 +42,7 @@ fn rollout_agent_message(text: &str) -> RolloutItem {
         phase: None,
         memory_citation: None,
         delivery: None,
+        questions: None,
     }))
 }
 
@@ -73,11 +74,14 @@ fn legacy_transcript_preview_scans_tail_across_compaction() {
             RolloutItem::Compacted(CompactedItem {
                 message: String::from("summary that is not transcript text"),
                 replacement_history: None,
+                guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             rollout_user_message("recent user"),
             rollout_agent_message("commentary one\ncommentary two"),
@@ -204,11 +208,14 @@ fn legacy_transcript_preview_falls_back_for_oversized_hidden_record() {
             RolloutItem::Compacted(CompactedItem {
                 message: "x".repeat(MAX_LEGACY_TRANSCRIPT_PREVIEW_SCAN_BYTES),
                 replacement_history: None,
+                guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             rollout_agent_message("recent assistant"),
         ],
@@ -231,11 +238,14 @@ fn legacy_transcript_preview_falls_back_when_scan_budget_is_exhausted() {
     let compacted = RolloutItem::Compacted(CompactedItem {
         message: "x".repeat(MAX_LEGACY_TRANSCRIPT_PREVIEW_SCAN_BYTES / 8),
         replacement_history: None,
+        guardian_history: None,
         mcp_resource_origins: None,
         window_number: None,
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     });
     let mut items = vec![rollout_user_message("older user")];
     items.extend(std::iter::repeat_n(compacted, 9));
@@ -260,6 +270,7 @@ fn transcript_preview_reverse_scan_stops_before_older_items() {
         phase: None,
         memory_citation: None,
         delivery: None,
+        questions: None,
     };
     let mut lines = Vec::new();
 

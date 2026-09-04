@@ -1629,6 +1629,7 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
         priority: 1,
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),

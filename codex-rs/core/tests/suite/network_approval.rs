@@ -887,7 +887,7 @@ async fn user_network_approval_once_session_and_denial_semantics() -> Result<()>
     assert_eq!(approval.approval_id.as_deref(), None);
     let first_approval_call_id = approval.call_id.clone();
     assert!(!approval.turn_id.is_empty());
-    assert_eq!(approval.cwd, test.config.cwd);
+    assert_eq!(approval.cwd, test.config.cwd.clone().into());
     assert_eq!(
         approval.reason.as_deref(),
         Some("codex-network-test.invalid is not in the allowed_domains")
@@ -1387,7 +1387,7 @@ async fn unattributed_network_request_uses_active_turn_environment_fallback() ->
     let proxy_request = tokio::spawn(raw_http_proxy_request(proxy_addr, NETWORK_TEST_HOST));
     let approval = expect_network_approval(&test, LOCAL_ENVIRONMENT_ID).await?;
     assert_eq!(approval.command, ["network-access", NETWORK_TEST_TARGET]);
-    assert_eq!(approval.cwd, test.config.cwd);
+    assert_eq!(approval.cwd, test.config.cwd.clone().into());
     test.codex
         .submit(Op::ExecApproval {
             id: approval.effective_approval_id(),
@@ -2020,6 +2020,7 @@ async fn owner_network_policy_follows_the_selected_remote_command() -> Result<()
             proxy_config.set_allowed_domains(vec![allowed_domain.to_string()]);
             let owner_config = EnvironmentConfig {
                 allow_login_shell: test.config.permissions.allow_login_shell,
+                workspace_roots: remote.workspace_roots.clone(),
                 permission_profile: PermissionProfileSnapshot::legacy(if restricted {
                     PermissionProfile::workspace_write()
                 } else {
@@ -2042,6 +2043,7 @@ async fn owner_network_policy_follows_the_selected_remote_command() -> Result<()
             };
             let mut primary = local(test.cwd.path().abs());
             primary.config = EnvironmentConfigState::Ready(EnvironmentConfig {
+                workspace_roots: primary.workspace_roots.clone(),
                 permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
                 network_policy: None,
                 ..owner_config.clone()

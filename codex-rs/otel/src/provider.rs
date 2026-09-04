@@ -328,7 +328,14 @@ impl OtelProvider {
     }
 
     pub fn trace_export_filter(meta: &tracing::Metadata<'_>) -> bool {
-        meta.is_span() || is_trace_safe_target(meta.target())
+        let target = meta.target();
+        if meta.is_span() {
+            // h2 creates explicit-root spans that escape the SDK's telemetry suppression.
+            // Exporting them would make OTLP transport generate more OTLP exports.
+            target != "h2" && !target.starts_with("h2::")
+        } else {
+            is_trace_safe_target(target)
+        }
     }
 
     pub fn metrics(&self) -> Option<&MetricsClient> {

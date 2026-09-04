@@ -281,6 +281,99 @@ async fn shell_mode_for_environment_uses_direct_mode_for_remote_environments() -
 }
 
 #[tokio::test]
+#[cfg(not(windows))]
+async fn exec_command_reuses_foreign_windows_grant() {
+    use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
+    use codex_features::Feature;
+    use codex_protocol::models::AdditionalPermissionProfile;
+    use codex_protocol::models::FileSystemPermissions;
+    use codex_utils_path_uri::PathUri;
+
+    let (session, mut turn, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        codex_login::CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config
+                .features
+                .enable(Feature::RequestPermissionsTool)
+                .expect("test setup should allow request permissions");
+        },
+    )
+    .await;
+
+    let cwd = PathUri::parse("file:///C:/workspace").expect("valid Windows cwd");
+    let granted_permissions = AdditionalPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_path_uris(
+            /*read*/ Some(Vec::new()),
+            /*write*/
+            Some(vec![
+                PathUri::parse("file:///C:/workspace/granted").expect("valid Windows grant"),
+            ]),
+        )),
+        ..Default::default()
+    };
+    *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+    let turn_state = {
+        let active_turn = session.active_turn.lock().await;
+        Arc::clone(&active_turn.as_ref().expect("active turn").turn_state)
+    };
+    turn_state.lock().await.record_granted_permissions(
+        codex_exec_server::REMOTE_ENVIRONMENT_ID,
+        granted_permissions.clone(),
+    );
+
+    {
+        let turn = Arc::get_mut(&mut turn).expect("turn should be uniquely owned");
+        let TurnEnvironmentState::Ready(environment) = turn
+            .environments
+            .environments
+            .first_mut()
+            .expect("primary environment")
+        else {
+            panic!("primary environment should be ready");
+        };
+        environment.selection.environment_id = codex_exec_server::REMOTE_ENVIRONMENT_ID.to_string();
+        environment.selection.cwd = cwd.clone();
+        environment.selection.workspace_roots = vec![cwd.clone()];
+        environment.config_mut().workspace_roots = vec![cwd];
+        environment.environment = Arc::new(
+            Environment::create_for_tests(Some("ws://127.0.0.1:1/remote-exec-server".to_string()))
+                .expect("remote environment"),
+        );
+    }
+
+    let response = ExecCommandHandler::default()
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "foreign-windows-grant".to_string(),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "cmd": "*** Begin Patch\n*** Add File: granted/file.txt\n+text\n*** End Patch",
+                    "workdir": "nested",
+                    "sandbox_permissions": "with_additional_permissions",
+                    "additional_permissions": granted_permissions,
+                })
+                .to_string(),
+            },
+        })
+        .await;
+
+    let Err(FunctionCallError::RespondToModel(message)) = response else {
+        panic!("raw patch should stop before remote execution");
+    };
+    assert!(
+        message.contains("apply_patch verification failed"),
+        "matching foreign grant should reach patch interception: {message}"
+    );
+}
+
+#[tokio::test]
 async fn exec_command_pre_tool_use_payload_uses_raw_command() {
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({ "cmd": "printf exec command" }).to_string(),

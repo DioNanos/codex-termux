@@ -117,8 +117,12 @@ pub(super) async fn handle_message_string_tool(
             receiver_thread_id,
             communication,
             context,
-            parent_turn_id,
-            turn.turn_metadata_state.root_turn_id(),
+            crate::TurnStartOptions {
+                parent_turn_id,
+                root_turn_id: turn.turn_metadata_state.root_turn_id(),
+                cyber_access_program: turn.cyber_access_program,
+                ..Default::default()
+            },
         )
         .await
         .map_err(|err| collab_agent_error(receiver_thread_id, err));

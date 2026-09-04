@@ -102,16 +102,18 @@ async fn responses_lite_uses_input_items_for_instructions_and_tools() -> Result<
     )
     .await;
 
-    let mut builder = test_codex()
-        .with_model_info_override("gpt-5.4", |model_info| {
-            model_info.use_responses_lite = true;
-            model_info.tool_mode = Some(ToolMode::CodeMode);
-        })
-        .with_config(|config| {
-            config.base_instructions = Some("test instructions".to_string());
-            config.code_mode.disable_in_process_fallback = true;
-        });
-    let test = builder.build(&server).await?;
+    let builder = || {
+        test_codex()
+            .with_model_info_override("gpt-5.4", |model_info| {
+                model_info.use_responses_lite = true;
+                model_info.tool_mode = Some(ToolMode::CodeMode);
+            })
+            .with_config(|config| {
+                config.base_instructions = Some("test instructions".to_string());
+                config.code_mode.disable_in_process_fallback = true;
+            })
+    };
+    let test = builder().build(&server).await?;
 
     test.submit_turn("hello").await?;
 
@@ -124,9 +126,20 @@ async fn responses_lite_uses_input_items_for_instructions_and_tools() -> Result<
         .context("Responses request input should be an array")?;
     assert_eq!(input[0]["type"], "additional_tools");
     assert_eq!(input[0]["role"], "developer");
+    assert!(
+        input[0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("at_"))
+    );
+    assert!(
+        input[1]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_"))
+    );
     assert_eq!(
         input[1],
         serde_json::json!({
+            "id": input[1]["id"],
             "type": "message",
             "role": "developer",
             "content": [{
@@ -163,6 +176,15 @@ async fn responses_lite_uses_input_items_for_instructions_and_tools() -> Result<
     )?;
 
     assert!(turn_metadata.get("tool_namespaces_info").is_none());
+
+    let followup = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![responses::ev_completed("resp-2")]),
+    )
+    .await;
+    let resumed = builder().restart(&server, &test).await?;
+    resumed.submit_turn("continue").await?;
+    assert_eq!(&followup.single_request().input()[..2], &input[..2]);
 
     Ok(())
 }

@@ -19,6 +19,7 @@ use codex_model_provider::ProviderAccountResult;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::ContentItem;
@@ -689,6 +690,12 @@ async fn memories_startup_phase1_provider_default_drives_request_model() -> anyh
         request.body_json()["model"].as_str(),
         Some(MOCK_PROVIDER_PHASE_ONE_MODEL)
     );
+    let input: Vec<ResponseItem> = serde_json::from_value(request.body_json()["input"].clone())?;
+    let message = input
+        .iter()
+        .find(|item| item.is_user_message())
+        .expect("phase-one input message");
+    assert!(message.id().is_some_and(ResponseItemId::is_prefixed));
 
     Ok(())
 }

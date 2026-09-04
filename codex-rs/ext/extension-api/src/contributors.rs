@@ -26,6 +26,7 @@ mod world_state;
 pub use approval_review::ApprovalAssessment;
 pub use approval_review::ApprovalReviewError;
 pub use approval_review::ApprovalReviewInput;
+pub use approval_review::GuardianV2Enabled;
 pub use context::TurnContextContributionInput;
 pub use mcp::McpServerContribution;
 pub use mcp::McpServerContributionContext;
@@ -42,6 +43,9 @@ pub use thread_lifecycle::ThreadReadyInput;
 pub use thread_lifecycle::ThreadResumeInput;
 pub use thread_lifecycle::ThreadStartInput;
 pub use thread_lifecycle::ThreadStopInput;
+pub use tool_lifecycle::McpToolContext;
+pub use tool_lifecycle::McpToolResultInput;
+pub use tool_lifecycle::McpToolSource;
 pub use tool_lifecycle::ToolCallOutcome;
 pub use tool_lifecycle::ToolFinishInput;
 pub use tool_lifecycle::ToolLifecycleFuture;
@@ -225,7 +229,7 @@ pub trait TurnInputContributor: Send + Sync {
     /// capability is bound to the effective model for that turn.
     fn contribute<'a>(
         &'a self,
-        input: TurnInputContext,
+        input: TurnInputContext<'a>,
         extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
         session_store: &'a ExtensionData,
         thread_store: &'a ExtensionData,
@@ -275,6 +279,13 @@ pub trait TokenUsageContributor: Send + Sync {
 /// Implementations should treat the skill resource as an opaque identity and keep this callback
 /// cheap because it runs inline with skill loading or command dispatch.
 pub trait SkillInvocationContributor: Send + Sync {
+    /// Whether this contributor needs a snapshot of host-owned skills.
+    ///
+    /// The default preserves legacy discovery for contributors that do not explicitly opt out.
+    fn requires_host_skill_discovery(&self) -> bool {
+        true
+    }
+
     /// Called after one explicit skill load or deduplicated implicit skill invocation is observed.
     fn on_skill_invocation<'a>(
         &'a self,
@@ -294,7 +305,7 @@ pub trait ToolContributor: Send + Sync {
         &self,
         session_store: &ExtensionData,
         thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>>;
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>>;
 
     /// Returns native tools bound to one sampling step.
     fn tools_for_step(
@@ -302,22 +313,27 @@ pub trait ToolContributor: Send + Sync {
         session_store: &ExtensionData,
         thread_store: &ExtensionData,
         _step_store: &ExtensionData,
-    ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
         self.tools(session_store, thread_store)
     }
 }
 
 /// Contributor for host-owned tool lifecycle gates.
 ///
-/// Implementations should use these callbacks to observe tool execution and its
-/// exposed input without rewriting the invocation. Use `ToolContributor` for
-/// owning a tool implementation and hooks for policy that changes tool payloads.
+/// Implementations can observe tool execution and process MCP responses without
+/// rewriting the invocation. Use `ToolContributor` for owning a tool implementation
+/// and hooks for policy that changes tool payloads.
 pub trait ToolLifecycleContributor: Send + Sync {
     /// Called after pre-tool hooks finalize an invocation and before execution.
     ///
     /// Calls blocked by hooks, or whose hook-provided input cannot be applied,
     /// do not reach this callback.
     fn on_tool_start<'a>(&'a self, _input: ToolStartInput<'a>) -> ToolLifecycleFuture<'a> {
+        Box::pin(std::future::ready(()))
+    }
+
+    /// Runs before the MCP result is sent to the client and model.
+    fn on_mcp_tool_result<'a>(&'a self, _input: McpToolResultInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(std::future::ready(()))
     }
 

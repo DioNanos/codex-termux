@@ -1,26 +1,43 @@
 use super::super::TextArea;
 use super::VimAction;
+use crate::keymap::KeyChordMatch;
+use crate::keymap::KeyChordMatcher;
+use crate::keymap::RuntimeKeymap;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use pretty_assertions::assert_eq;
+use tokio::time::Instant;
 
 fn vim_textarea(text: &str, cursor: usize) -> TextArea {
     let mut textarea = TextArea::new();
     textarea.insert_str(text);
     textarea.set_cursor(cursor);
     textarea.set_vim_enabled(/*enabled*/ true);
+    textarea.enable_vim_search();
     textarea
 }
 
 fn keys(textarea: &mut TextArea, keys: &str) {
+    let keymap = RuntimeKeymap::defaults();
+    let mut matcher = KeyChordMatcher::default();
     for key in keys.chars() {
-        let code = if key == '\n' {
-            KeyCode::Enter
-        } else {
-            KeyCode::Char(key)
+        let code = match key {
+            '\n' => KeyCode::Enter,
+            '\x1b' => KeyCode::Esc,
+            ch => KeyCode::Char(ch),
         };
-        textarea.input(KeyEvent::new(code, KeyModifiers::NONE));
+        let event = KeyEvent::new(code, KeyModifiers::NONE);
+        match matcher.advance(
+            event,
+            &keymap.chords,
+            textarea.keymap_contexts(),
+            Instant::now(),
+        ) {
+            KeyChordMatch::PassThrough => textarea.input(event),
+            KeyChordMatch::Completed(event) => textarea.input(event),
+            KeyChordMatch::Pending(_) | KeyChordMatch::Cancelled | KeyChordMatch::Ignored => {}
+        }
     }
 }
 
@@ -150,7 +167,7 @@ fn repeat_omits_ineffective_deletions_before_inserted_text() {
     ] {
         let mut textarea = vim_textarea("one two\n", cursor);
         keys(&mut textarea, "i");
-        textarea.apply_vim_insert_action(action);
+        textarea.apply_vim_insert_action(action.clone());
         keys(&mut textarea, "X");
         escape(&mut textarea);
         textarea.set_cursor(repeat_cursor);
@@ -301,6 +318,222 @@ fn change_accepts_word_line_and_repeated_operator_motions() {
 }
 
 #[test]
+fn character_find_is_line_local_and_works_as_operator_motion() {
+    let mut textarea = vim_textarea("alpha beta\nbeta", /*cursor*/ 0);
+    keys(&mut textarea, "fb");
+    assert_eq!(textarea.cursor(), "alpha ".len());
+    keys(&mut textarea, "Fa");
+    assert_eq!(textarea.cursor(), "alpha".len() - 1);
+    keys(&mut textarea, "fz");
+    assert_eq!(textarea.cursor(), "alpha".len() - 1);
+
+    for (motion, cursor, destination, range) in [
+        ("fr", 0, 3, 0..4),
+        ("tr", 0, 2, 0..3),
+        ("Fb", 3, 1, 1..3),
+        ("Tb", 3, 2, 2..3),
+    ] {
+        let text = "abcrdef";
+        let mut textarea = vim_textarea(text, cursor);
+        keys(&mut textarea, motion);
+        assert_eq!((textarea.text(), textarea.cursor()), (text, destination));
+        for operator in ['c', 'd', 'y'] {
+            let mut textarea = vim_textarea(text, cursor);
+            keys(&mut textarea, &format!("{operator}{motion}"));
+            let expected = if operator == 'y' {
+                text.to_owned()
+            } else {
+                format!("{}{}", &text[..range.start], &text[range.end..])
+            };
+            let mode = if operator == 'c' { "Insert" } else { "Normal" };
+            assert_eq!(
+                (
+                    textarea.text(),
+                    textarea.cursor(),
+                    textarea.vim_mode_label(),
+                    textarea.kill_buffer.as_str()
+                ),
+                (
+                    expected.as_str(),
+                    range.start,
+                    Some(mode),
+                    &text[range.clone()]
+                ),
+                "{operator}{motion}",
+            );
+        }
+    }
+
+    let mut textarea = vim_textarea("\nabc", /*cursor*/ 0);
+    keys(&mut textarea, "fx");
+    assert_eq!(textarea.text(), "\nabc");
+    assert_eq!(textarea.cursor(), 0);
+}
+
+#[test]
+fn find_and_till_handle_missing_cancelled_and_adjacent_targets() {
+    for motion in ['f', 'F', 't', 'T'] {
+        for operator in ["", "c", "d", "y"] {
+            let mut textarea = vim_textarea("abc\nz", /*cursor*/ 1);
+            keys(&mut textarea, &format!("{operator}{motion}z"));
+            assert_eq!(
+                (
+                    textarea.text(),
+                    textarea.cursor(),
+                    textarea.vim_mode_label()
+                ),
+                ("abc\nz", 1, Some("Normal"))
+            );
+            keys(&mut textarea, &format!("{operator}{motion}"));
+            escape(&mut textarea);
+            assert!(!textarea.is_vim_operator_pending());
+        }
+    }
+    for (cursor, command, expected) in [(0, "ctb", "bc"), (2, "cTb", "abc")] {
+        let mut textarea = vim_textarea("abc", cursor);
+        keys(&mut textarea, command);
+        assert_eq!(
+            (textarea.text(), textarea.vim_mode_label()),
+            (expected, Some("Insert"))
+        );
+    }
+}
+
+#[test]
+fn dot_repeat_replays_character_find_and_buffer_jump_operators() {
+    let mut textarea = vim_textarea("one:two:three", /*cursor*/ 0);
+    keys(&mut textarea, "df:.");
+    assert_eq!(textarea.text(), "three");
+
+    for (cursor, command, repeat, expected) in [
+        (0, "cfrX", "w.", "X X"),
+        (0, "ctrX", "w.", "Xr Xr"),
+        (3, "cFbX", concat!("w", "lll."), "aXr aXr"),
+        (3, "cTbX", concat!("w", "lll."), "abXr abXr"),
+    ] {
+        let mut textarea = vim_textarea("abcr abcr", cursor);
+        keys(&mut textarea, command);
+        escape(&mut textarea);
+        keys(&mut textarea, repeat);
+        assert_eq!(
+            (textarea.text(), textarea.vim_mode_label()),
+            (expected, Some("Normal"))
+        );
+    }
+
+    let mut textarea = vim_textarea("one\ntwo\nthree\nfour\nfive", "one\n".len());
+    keys(&mut textarea, "dggj.");
+    assert_eq!(textarea.text(), "five");
+}
+
+#[test]
+fn character_find_never_splits_extended_graphemes() {
+    let mut textarea = vim_textarea("a👩‍💻z", /*cursor*/ 0);
+    keys(&mut textarea, "f💻");
+    assert_eq!(textarea.cursor(), 0);
+    keys(&mut textarea, "f👩rX");
+    assert_eq!(textarea.text(), "aXz");
+    for (text, command, expected, cursor) in [
+        ("a👩‍💻r", "tr", "a👩‍💻r", 1),
+        ("aहिr", "tr", "aहिr", 1),
+        ("aहिr", "dfह", "r", 0),
+    ] {
+        let mut textarea = vim_textarea(text, /*cursor*/ 0);
+        keys(&mut textarea, command);
+        assert_eq!((textarea.text(), textarea.cursor()), (expected, cursor));
+    }
+    let mut textarea = vim_textarea("a", /*cursor*/ 0);
+    textarea.set_cursor(/*pos*/ 1);
+    textarea.insert_element("[image]");
+    textarea.insert_str("r");
+    textarea.set_cursor(/*pos*/ 0);
+    keys(&mut textarea, "t]");
+    assert_eq!(textarea.cursor(), 0);
+    keys(&mut textarea, "tr");
+    assert_eq!(textarea.cursor(), 1);
+    textarea.set_cursor(/*pos*/ 0);
+    keys(&mut textarea, "ctr");
+    assert_eq!((textarea.text(), textarea.elements.len()), ("r", 0));
+
+    let prefix = "earlier line\na";
+    for (command, cursor) in [("Fa", prefix.len() - 1), ("Ta", prefix.len())] {
+        let mut textarea = vim_textarea(prefix, /*cursor*/ 0);
+        textarea.set_cursor(prefix.len());
+        textarea.insert_element("[aaaa]");
+        textarea.insert_str("z");
+        textarea.set_cursor(textarea.text().len() - 1);
+        keys(&mut textarea, command);
+        assert_eq!(
+            (textarea.text(), textarea.cursor()),
+            ("earlier line\na[aaaa]z", cursor)
+        );
+    }
+}
+
+#[test]
+fn character_find_and_operator_motion_use_configured_bindings() {
+    let mut keymap = crate::keymap::RuntimeKeymap::defaults();
+    keymap.vim_normal.find_forward = vec![crate::key_hint::plain(KeyCode::Char('z'))];
+    keymap.vim_operator.motion_find_forward = vec![crate::key_hint::plain(KeyCode::Char('z'))];
+    keymap.vim_normal.till_forward = vec![crate::key_hint::plain(KeyCode::Char('q'))];
+    keymap.vim_operator.motion_till_forward = vec![crate::key_hint::plain(KeyCode::Char('q'))];
+    for (motion, cursor, expected) in [("zb", 6, "eta gamma"), ("qb", 5, "beta gamma")] {
+        let mut textarea = vim_textarea("alpha beta gamma", /*cursor*/ 0);
+        textarea.set_keymap_bindings(&keymap);
+        keys(&mut textarea, motion);
+        assert_eq!(textarea.cursor(), cursor);
+        textarea.set_cursor(/*pos*/ 0);
+        keys(&mut textarea, &format!("d{motion}"));
+        assert_eq!(textarea.text(), expected);
+    }
+}
+
+#[test]
+fn uppercase_commands_accept_shift_only_terminal_events() {
+    let mut textarea = vim_textarea("alpha\nbeta", /*cursor*/ 0);
+    textarea.input(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::SHIFT));
+    assert_eq!(textarea.cursor(), "alpha\n".len());
+
+    textarea.set_cursor("alpha\nbe".len());
+    textarea.input(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::SHIFT));
+    keys(&mut textarea, "b");
+    assert_eq!(textarea.cursor(), "alpha\n".len());
+    textarea.set_cursor("alpha\nbe".len());
+    textarea.input(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::SHIFT));
+    keys(&mut textarea, "b");
+    assert_eq!(textarea.cursor(), "alpha\nb".len());
+}
+
+#[test]
+fn buffer_jumps_target_first_non_blank_and_support_operators() {
+    let mut textarea = vim_textarea("  first\n  second\n  third", /*cursor*/ 2);
+    keys(&mut textarea, "G");
+    assert_eq!(textarea.cursor(), "  first\n  second\n  ".len());
+    keys(&mut textarea, "gg");
+    assert_eq!(textarea.cursor(), 2);
+
+    let mut textarea = vim_textarea("first\nsecond\nthird", "first\n".len());
+    keys(&mut textarea, "dG");
+    assert_eq!(textarea.text(), "first\n");
+
+    let mut textarea = vim_textarea("first\nsecond\nthird", "first\n".len());
+    keys(&mut textarea, "dgg");
+    assert_eq!(textarea.text(), "third");
+
+    let mut textarea = vim_textarea("one\ntwo\nthree\nfour", "one\n".len());
+    keys(&mut textarea, "dggp");
+    assert_eq!(textarea.text(), "three\none\ntwo\nfour");
+
+    let mut textarea = vim_textarea("one\ntwo\nthree", "one\n".len());
+    keys(&mut textarea, "yGp");
+    assert_eq!(textarea.text(), "one\ntwo\ntwo\nthree\nthree");
+
+    let mut textarea = vim_textarea("one\ntwo\nthree", "one\n".len());
+    keys(&mut textarea, "cG");
+    assert_eq!(textarea.vim_mode_label(), Some("Insert"));
+}
+
+#[test]
 fn pending_replacement_owns_escape_before_turn_interruption() {
     let mut textarea = vim_textarea("alpha", /*cursor*/ 0);
     let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -353,4 +586,91 @@ fn dot_repeat_has_visual_snapshot_coverage() {
     .: gamma delta
     ^
     "###);
+}
+
+#[test]
+fn find_and_navigation_have_visual_snapshot_coverage() {
+    let mut textarea = vim_textarea("alpha beta\ngamma delta", /*cursor*/ 0);
+    let mut states = Vec::new();
+    for command in ["tb", "fb", "Ta", "Fa", "G", "gg"] {
+        keys(&mut textarea, command);
+        states.push(format!(
+            "{command}: {}\n{}^",
+            textarea.text().replace('\n', "\\n"),
+            " ".repeat(textarea.cursor())
+        ));
+    }
+    insta::assert_snapshot!(states.join("\n\n"), @r###"
+    tb: alpha beta\ngamma delta
+         ^
+
+    fb: alpha beta\ngamma delta
+          ^
+
+    Ta: alpha beta\ngamma delta
+         ^
+
+    Fa: alpha beta\ngamma delta
+        ^
+
+    G: alpha beta\ngamma delta
+               ^
+
+    gg: alpha beta\ngamma delta
+    ^
+    "###);
+}
+
+#[test]
+fn search_motions_compose_with_operators_and_repeat() {
+    for (commands, text, cursor, mode) in [
+        ("/b\n", "a b c b d b", 2, "Normal"),
+        ("/b\nn", "a b c b d b", 6, "Normal"),
+        ("/b\nnN", "a b c b d b", 2, "Normal"),
+        ("/b\nnnn", "a b c b d b", 2, "Normal"),
+        ("?b\n", "a b c b d b", 10, "Normal"),
+        ("?b\nn", "a b c b d b", 6, "Normal"),
+        ("?b\nN", "a b c b d b", 2, "Normal"),
+        ("d/b\n", "b c b d b", 0, "Normal"),
+        ("c/b\n", "b c b d b", 0, "Insert"),
+        ("y/b\np", "aa  b c b d b", 3, "Normal"),
+        ("/b\ndn", "a b d b", 2, "Normal"),
+        ("?b\ndN", "a b", 2, "Normal"),
+        ("?b\nd?b\n", "a b c b", 6, "Normal"),
+        ("?b\ny?b\n", "a b c b d b", 6, "Normal"),
+        ("d/missing\n", "a b c b d b", 0, "Normal"),
+        ("/b\nc?missing\x1bn", "a b c b d b", 6, "Normal"),
+        ("c/b\nX\x1bl.", "XXb d b", 1, "Normal"),
+    ] {
+        let mut area = vim_textarea("a b c b d b", /*cursor*/ 0);
+        keys(&mut area, commands);
+        assert_eq!(
+            (area.text(), area.cursor(), area.vim_mode_label()),
+            (text, cursor, Some(mode)),
+            "{commands:?}"
+        );
+    }
+    for (cursor, commands, expected) in [
+        (1, "d/xyz\n", "a\nxyz"),
+        (0, "d/xyz\n", "xyz"),
+        (0, "c/xyz\nQ\x1b", "Q\nxyz"),
+        (1, "c/xyz\nQ\x1b", "aQ\nxyz"),
+        (0, "y/xyz\np", "abc\nabc\nxyz"),
+    ] {
+        let mut area = vim_textarea("abc\nxyz", cursor);
+        keys(&mut area, commands);
+        assert_eq!(area.text(), expected, "{commands:?}");
+    }
+}
+
+#[test]
+fn search_skips_atomic_elements_and_partial_graphemes() {
+    let mut area = vim_textarea("é e\u{301}\n", /*cursor*/ 0);
+    area.insert_element("[photo.png]");
+    keys(&mut area, "/photo\n");
+    assert_eq!(area.cursor(), "[photo.png]".len());
+    keys(&mut area, "/\u{301}\n");
+    assert_eq!(area.cursor(), "[photo.png]".len());
+    keys(&mut area, "/e\u{301}\n");
+    assert_eq!(area.cursor(), "[photo.png]é ".len());
 }

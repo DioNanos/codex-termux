@@ -34,6 +34,12 @@ use std::sync::Arc;
 
 mod bindings;
 mod chords;
+mod vim_search;
+pub(crate) use vim_search::VimSearchKeymap;
+
+#[cfg(test)]
+#[path = "keymap/conflict_tests.rs"]
+mod conflict_tests;
 
 pub(crate) use bindings::KeymapContext;
 pub(crate) use bindings::bindings_for_action;
@@ -66,6 +72,7 @@ pub(crate) struct RuntimeKeymap {
     pub(crate) editor: Arc<EditorKeymap>,
     pub(crate) vim_normal: VimNormalKeymap,
     pub(crate) vim_operator: VimOperatorKeymap,
+    pub(crate) vim_search: VimSearchKeymap,
     pub(crate) vim_text_object: VimTextObjectKeymap,
     pub(crate) pager: PagerKeymap,
     pub(crate) list: ListKeymap,
@@ -186,6 +193,12 @@ pub(crate) struct VimNormalKeymap {
     pub(crate) move_word_end: Vec<KeyBinding>,
     pub(crate) move_line_start: Vec<KeyBinding>,
     pub(crate) move_line_end: Vec<KeyBinding>,
+    pub(crate) find_forward: Vec<KeyBinding>,
+    pub(crate) find_backward: Vec<KeyBinding>,
+    pub(crate) till_forward: Vec<KeyBinding>,
+    pub(crate) till_backward: Vec<KeyBinding>,
+    pub(crate) jump_top: Vec<KeyBinding>,
+    pub(crate) jump_bottom: Vec<KeyBinding>,
     pub(crate) delete_char: Vec<KeyBinding>,
     pub(crate) replace_char: Vec<KeyBinding>,
     pub(crate) repeat_last_change: Vec<KeyBinding>,
@@ -197,6 +210,8 @@ pub(crate) struct VimNormalKeymap {
     pub(crate) start_delete_operator: Vec<KeyBinding>,
     pub(crate) start_yank_operator: Vec<KeyBinding>,
     pub(crate) start_change_operator: Vec<KeyBinding>,
+    pub(crate) undo: Vec<KeyBinding>,
+    pub(crate) redo: Vec<KeyBinding>,
     pub(crate) cancel_operator: Vec<KeyBinding>,
 }
 
@@ -219,6 +234,12 @@ pub(crate) struct VimOperatorKeymap {
     pub(crate) motion_word_end: Vec<KeyBinding>,
     pub(crate) motion_line_start: Vec<KeyBinding>,
     pub(crate) motion_line_end: Vec<KeyBinding>,
+    pub(crate) motion_find_forward: Vec<KeyBinding>,
+    pub(crate) motion_find_backward: Vec<KeyBinding>,
+    pub(crate) motion_till_forward: Vec<KeyBinding>,
+    pub(crate) motion_till_backward: Vec<KeyBinding>,
+    pub(crate) motion_jump_top: Vec<KeyBinding>,
+    pub(crate) motion_jump_bottom: Vec<KeyBinding>,
     pub(crate) select_inner_text_object: Vec<KeyBinding>,
     pub(crate) select_around_text_object: Vec<KeyBinding>,
     pub(crate) cancel: Vec<KeyBinding>,
@@ -550,7 +571,15 @@ impl RuntimeKeymap {
     /// parsing `TuiKeymap`, because doing so would ignore explicit user
     /// unbindings and conflict diagnostics.
     pub(crate) fn defaults() -> Self {
-        Self::built_in_defaults()
+        static DEFAULTS: std::sync::OnceLock<RuntimeKeymap> = std::sync::OnceLock::new();
+
+        DEFAULTS
+            .get_or_init(|| {
+                Self::from_config(&TuiKeymap::default()).unwrap_or_else(|error| {
+                    panic!("built-in keymap defaults must be valid: {error}")
+                })
+            })
+            .clone()
     }
 
     /// Resolve a runtime keymap from config, applying precedence and validation.
@@ -572,25 +601,12 @@ impl RuntimeKeymap {
                     || configured_context_alias_is_used(&keymap.list, alias)
                     || configured_context_alias_is_used(&keymap.approval, alias)
             });
-        let open_agents_default_is_shadowed = keymap.global.open_agents.is_none()
-            && (configured_main_surface_alias_is_used(keymap, "alt-a")
-                || configured_context_alias_is_used(&keymap.list, "alt-a")
-                || configured_context_alias_is_used(&keymap.approval, "alt-a")
-                || chords.bindings.iter().any(|binding| {
-                    binding.action.context.overlaps(KeymapContext::Global)
-                        && binding.chord.prefix.parts() == key_hint::alt(KeyCode::Char('a')).parts()
-                }));
-
         let app = AppKeymap {
-            open_agents: if open_agents_default_is_shadowed {
-                Vec::new()
-            } else {
-                resolve_bindings(
-                    keymap.global.open_agents.as_ref(),
-                    &defaults.app.open_agents,
-                    "tui.keymap.global.open_agents",
-                )?
-            },
+            open_agents: resolve_bindings(
+                keymap.global.open_agents.as_ref(),
+                &defaults.app.open_agents,
+                "tui.keymap.global.open_agents",
+            )?,
             open_transcript: resolve_bindings(
                 keymap.global.open_transcript.as_ref(),
                 &defaults.app.open_transcript,
@@ -716,6 +732,12 @@ impl RuntimeKeymap {
             move_word_end: resolve_local!(keymap, defaults, vim_normal, move_word_end),
             move_line_start: resolve_local!(keymap, defaults, vim_normal, move_line_start),
             move_line_end: resolve_local!(keymap, defaults, vim_normal, move_line_end),
+            find_forward: resolve_local!(keymap, defaults, vim_normal, find_forward),
+            find_backward: resolve_local!(keymap, defaults, vim_normal, find_backward),
+            till_forward: resolve_local!(keymap, defaults, vim_normal, till_forward),
+            till_backward: resolve_local!(keymap, defaults, vim_normal, till_backward),
+            jump_top: resolve_local!(keymap, defaults, vim_normal, jump_top),
+            jump_bottom: resolve_local!(keymap, defaults, vim_normal, jump_bottom),
             delete_char: resolve_local!(keymap, defaults, vim_normal, delete_char),
             replace_char: resolve_local!(keymap, defaults, vim_normal, replace_char),
             repeat_last_change: resolve_local!(keymap, defaults, vim_normal, repeat_last_change),
@@ -737,6 +759,8 @@ impl RuntimeKeymap {
                 vim_normal,
                 start_change_operator
             ),
+            undo: resolve_local!(keymap, defaults, vim_normal, undo),
+            redo: resolve_local!(keymap, defaults, vim_normal, redo),
             cancel_operator: resolve_local!(keymap, defaults, vim_normal, cancel_operator),
         };
 
@@ -802,6 +826,30 @@ impl RuntimeKeymap {
                 vim_normal.move_line_end.as_slice(),
             ),
             (
+                keymap.vim_normal.find_forward.as_ref(),
+                vim_normal.find_forward.as_slice(),
+            ),
+            (
+                keymap.vim_normal.find_backward.as_ref(),
+                vim_normal.find_backward.as_slice(),
+            ),
+            (
+                keymap.vim_normal.till_forward.as_ref(),
+                vim_normal.till_forward.as_slice(),
+            ),
+            (
+                keymap.vim_normal.till_backward.as_ref(),
+                vim_normal.till_backward.as_slice(),
+            ),
+            (
+                keymap.vim_normal.jump_top.as_ref(),
+                vim_normal.jump_top.as_slice(),
+            ),
+            (
+                keymap.vim_normal.jump_bottom.as_ref(),
+                vim_normal.jump_bottom.as_slice(),
+            ),
+            (
                 keymap.vim_normal.delete_char.as_ref(),
                 vim_normal.delete_char.as_slice(),
             ),
@@ -845,6 +893,8 @@ impl RuntimeKeymap {
                 keymap.vim_normal.start_change_operator.as_ref(),
                 vim_normal.start_change_operator.as_slice(),
             ),
+            (keymap.vim_normal.undo.as_ref(), vim_normal.undo.as_slice()),
+            (keymap.vim_normal.redo.as_ref(), vim_normal.redo.as_slice()),
             (
                 keymap.vim_normal.cancel_operator.as_ref(),
                 vim_normal.cancel_operator.as_slice(),
@@ -879,7 +929,42 @@ impl RuntimeKeymap {
                     })
             });
         }
-
+        for (configured, bindings) in [
+            (
+                keymap.vim_normal.find_forward.as_ref(),
+                &mut vim_normal.find_forward,
+            ),
+            (
+                keymap.vim_normal.find_backward.as_ref(),
+                &mut vim_normal.find_backward,
+            ),
+            (
+                keymap.vim_normal.till_forward.as_ref(),
+                &mut vim_normal.till_forward,
+            ),
+            (
+                keymap.vim_normal.till_backward.as_ref(),
+                &mut vim_normal.till_backward,
+            ),
+            (
+                keymap.vim_normal.jump_top.as_ref(),
+                &mut vim_normal.jump_top,
+            ),
+            (
+                keymap.vim_normal.jump_bottom.as_ref(),
+                &mut vim_normal.jump_bottom,
+            ),
+        ] {
+            if configured.is_none() {
+                bindings.retain(|binding| {
+                    !configured_vim_normal_bindings_to_preserve.contains(binding)
+                        && !chords.bindings.iter().any(|chord| {
+                            chord.action.context == KeymapContext::VimNormal
+                                && chord.chord.prefix.parts() == binding.parts()
+                        })
+                });
+            }
+        }
         let mut vim_operator = VimOperatorKeymap {
             delete_line: resolve_local!(keymap, defaults, vim_operator, delete_line),
             yank_line: resolve_local!(keymap, defaults, vim_operator, yank_line),
@@ -902,6 +987,32 @@ impl RuntimeKeymap {
             motion_word_end: resolve_local!(keymap, defaults, vim_operator, motion_word_end),
             motion_line_start: resolve_local!(keymap, defaults, vim_operator, motion_line_start),
             motion_line_end: resolve_local!(keymap, defaults, vim_operator, motion_line_end),
+            motion_find_forward: resolve_local!(
+                keymap,
+                defaults,
+                vim_operator,
+                motion_find_forward
+            ),
+            motion_find_backward: resolve_local!(
+                keymap,
+                defaults,
+                vim_operator,
+                motion_find_backward
+            ),
+            motion_till_forward: resolve_local!(
+                keymap,
+                defaults,
+                vim_operator,
+                motion_till_forward
+            ),
+            motion_till_backward: resolve_local!(
+                keymap,
+                defaults,
+                vim_operator,
+                motion_till_backward
+            ),
+            motion_jump_top: resolve_local!(keymap, defaults, vim_operator, motion_jump_top),
+            motion_jump_bottom: resolve_local!(keymap, defaults, vim_operator, motion_jump_bottom),
             select_inner_text_object: resolve_local!(
                 keymap,
                 defaults,
@@ -963,6 +1074,30 @@ impl RuntimeKeymap {
                 vim_operator.motion_line_end.as_slice(),
             ),
             (
+                keymap.vim_operator.motion_find_forward.as_ref(),
+                vim_operator.motion_find_forward.as_slice(),
+            ),
+            (
+                keymap.vim_operator.motion_find_backward.as_ref(),
+                vim_operator.motion_find_backward.as_slice(),
+            ),
+            (
+                keymap.vim_operator.motion_till_forward.as_ref(),
+                vim_operator.motion_till_forward.as_slice(),
+            ),
+            (
+                keymap.vim_operator.motion_till_backward.as_ref(),
+                vim_operator.motion_till_backward.as_slice(),
+            ),
+            (
+                keymap.vim_operator.motion_jump_top.as_ref(),
+                vim_operator.motion_jump_top.as_slice(),
+            ),
+            (
+                keymap.vim_operator.motion_jump_bottom.as_ref(),
+                vim_operator.motion_jump_bottom.as_slice(),
+            ),
+            (
                 keymap.vim_operator.cancel.as_ref(),
                 vim_operator.cancel.as_slice(),
             ),
@@ -977,6 +1112,42 @@ impl RuntimeKeymap {
             vim_operator
                 .select_around_text_object
                 .retain(|binding| !configured_vim_operator_bindings_to_preserve.contains(binding));
+        }
+        for (configured, bindings) in [
+            (
+                keymap.vim_operator.motion_find_forward.as_ref(),
+                &mut vim_operator.motion_find_forward,
+            ),
+            (
+                keymap.vim_operator.motion_find_backward.as_ref(),
+                &mut vim_operator.motion_find_backward,
+            ),
+            (
+                keymap.vim_operator.motion_till_forward.as_ref(),
+                &mut vim_operator.motion_till_forward,
+            ),
+            (
+                keymap.vim_operator.motion_till_backward.as_ref(),
+                &mut vim_operator.motion_till_backward,
+            ),
+            (
+                keymap.vim_operator.motion_jump_top.as_ref(),
+                &mut vim_operator.motion_jump_top,
+            ),
+            (
+                keymap.vim_operator.motion_jump_bottom.as_ref(),
+                &mut vim_operator.motion_jump_bottom,
+            ),
+        ] {
+            if configured.is_none() {
+                bindings.retain(|binding| {
+                    !configured_vim_operator_bindings_to_preserve.contains(binding)
+                        && !chords.bindings.iter().any(|chord| {
+                            chord.action.context == KeymapContext::VimOperator
+                                && chord.chord.prefix.parts() == binding.parts()
+                        })
+                });
+            }
         }
 
         let vim_text_object = VimTextObjectKeymap {
@@ -1184,6 +1355,12 @@ impl RuntimeKeymap {
             editor,
             vim_normal,
             vim_operator,
+            vim_search: VimSearchKeymap {
+                forward: resolve_local!(keymap, defaults, vim_search, forward),
+                backward: resolve_local!(keymap, defaults, vim_search, backward),
+                next: resolve_local!(keymap, defaults, vim_search, next),
+                previous: resolve_local!(keymap, defaults, vim_search, previous),
+            },
             vim_text_object,
             pager,
             list,
@@ -1191,6 +1368,35 @@ impl RuntimeKeymap {
             approval,
         };
 
+        let configured: Vec<_> = runtime_action_bindings(&resolved)
+            .filter(|action| {
+                action.id.context.overlaps(KeymapContext::VimNormal)
+                    && bindings::configured_binding_for_action(keymap, action.id)
+                        .is_some_and(Option::is_some)
+            })
+            .flat_map(|action| action.bindings.iter().copied())
+            .collect();
+        for (setting, bindings) in [
+            (
+                keymap.vim_normal.undo.as_ref(),
+                &mut resolved.vim_normal.undo,
+            ),
+            (
+                keymap.vim_normal.redo.as_ref(),
+                &mut resolved.vim_normal.redo,
+            ),
+        ] {
+            if setting.is_none() {
+                bindings.retain(|binding| {
+                    !configured.contains(binding)
+                        && !resolved.chords.bindings.iter().any(|chord| {
+                            chord.action.context.overlaps(KeymapContext::VimNormal)
+                                && chord.chord.prefix.parts() == binding.parts()
+                        })
+                });
+            }
+        }
+        resolved.configure_vim_search(keymap)?;
         resolved.validate_conflicts()?;
         chords::validate_chord_conflicts(&resolved)?;
         chords::install_dispatch_bindings(&mut resolved)?;
@@ -1216,7 +1422,7 @@ impl RuntimeKeymap {
     fn built_in_defaults() -> Self {
         Self {
             app: AppKeymap {
-                open_agents: default_bindings![alt(KeyCode::Char('a'))],
+                open_agents: default_bindings![],
                 open_transcript: default_bindings![ctrl(KeyCode::Char('t'))],
                 open_external_editor: default_bindings![ctrl(KeyCode::Char('g'))],
                 copy: default_bindings![ctrl(KeyCode::Char('o'))],
@@ -1340,6 +1546,15 @@ impl RuntimeKeymap {
                     plain(KeyCode::Char('$')),
                     shift(KeyCode::Char('$'))
                 ],
+                find_forward: default_bindings![plain(KeyCode::Char('f'))],
+                find_backward: default_bindings![shift(KeyCode::Char('f'))],
+                till_forward: default_bindings![plain(KeyCode::Char('t'))],
+                till_backward: default_bindings![shift(KeyCode::Char('t'))],
+                jump_top: default_bindings![],
+                jump_bottom: default_bindings![
+                    shift(KeyCode::Char('g')),
+                    plain(KeyCode::Char('G'))
+                ],
                 delete_char: default_bindings![plain(KeyCode::Char('x'))],
                 replace_char: default_bindings![plain(KeyCode::Char('r'))],
                 repeat_last_change: default_bindings![plain(KeyCode::Char('.'))],
@@ -1357,8 +1572,11 @@ impl RuntimeKeymap {
                 start_delete_operator: default_bindings![plain(KeyCode::Char('d'))],
                 start_yank_operator: default_bindings![plain(KeyCode::Char('y'))],
                 start_change_operator: default_bindings![plain(KeyCode::Char('c'))],
+                undo: default_bindings![plain(KeyCode::Char('u'))],
+                redo: default_bindings![ctrl(KeyCode::Char('r'))],
                 cancel_operator: default_bindings![plain(KeyCode::Esc)],
             },
+            vim_search: VimSearchKeymap::default(),
             vim_operator: VimOperatorKeymap {
                 delete_line: default_bindings![plain(KeyCode::Char('d'))],
                 yank_line: default_bindings![plain(KeyCode::Char('y'))],
@@ -1373,6 +1591,15 @@ impl RuntimeKeymap {
                 motion_line_end: default_bindings![
                     plain(KeyCode::Char('$')),
                     shift(KeyCode::Char('$'))
+                ],
+                motion_find_forward: default_bindings![plain(KeyCode::Char('f'))],
+                motion_find_backward: default_bindings![shift(KeyCode::Char('f'))],
+                motion_till_forward: default_bindings![plain(KeyCode::Char('t'))],
+                motion_till_backward: default_bindings![shift(KeyCode::Char('t'))],
+                motion_jump_top: default_bindings![],
+                motion_jump_bottom: default_bindings![
+                    shift(KeyCode::Char('g')),
+                    plain(KeyCode::Char('G'))
                 ],
                 select_inner_text_object: default_bindings![plain(KeyCode::Char('i'))],
                 select_around_text_object: default_bindings![plain(KeyCode::Char('a'))],
@@ -1532,110 +1759,60 @@ impl RuntimeKeymap {
             side_toggle_bindings.push(legacy_slash_binding);
         }
 
-        validate_unique(
-            "app",
-            [
-                ("open_agents", self.app.open_agents.as_slice()),
-                ("open_transcript", self.app.open_transcript.as_slice()),
-                (
-                    "open_external_editor",
-                    self.app.open_external_editor.as_slice(),
-                ),
-                ("copy", self.app.copy.as_slice()),
-                ("clear_terminal", self.app.clear_terminal.as_slice()),
-                ("toggle_vim_mode", self.app.toggle_vim_mode.as_slice()),
-                ("toggle_fast_mode", self.app.toggle_fast_mode.as_slice()),
-                ("toggle_raw_output", self.app.toggle_raw_output.as_slice()),
-                ("toggle_side_conversation", side_toggle_bindings.as_slice()),
-                ("chat.interrupt_turn", self.chat.interrupt_turn.as_slice()),
-                (
-                    "chat.decrease_reasoning_effort",
-                    self.chat.decrease_reasoning_effort.as_slice(),
-                ),
-                (
-                    "chat.increase_reasoning_effort",
-                    self.chat.increase_reasoning_effort.as_slice(),
-                ),
-                (
-                    "chat.previous_permission_mode",
-                    self.chat.previous_permission_mode.as_slice(),
-                ),
-                (
-                    "chat.next_permission_mode",
-                    self.chat.next_permission_mode.as_slice(),
-                ),
-                (
-                    "chat.edit_queued_message",
-                    self.chat.edit_queued_message.as_slice(),
-                ),
-                ("composer.submit", self.composer.submit.as_slice()),
-                ("composer.queue", self.composer.queue.as_slice()),
-                (
-                    "composer.toggle_shortcuts",
-                    self.composer.toggle_shortcuts.as_slice(),
-                ),
-                (
-                    "composer.history_search_previous",
-                    self.composer.history_search_previous.as_slice(),
-                ),
-                (
-                    "composer.history_search_next",
-                    self.composer.history_search_next.as_slice(),
-                ),
-            ],
-        )?;
+        let main_bindings = [
+            ("open_agents", self.app.open_agents.as_slice()),
+            ("open_transcript", self.app.open_transcript.as_slice()),
+            (
+                "open_external_editor",
+                self.app.open_external_editor.as_slice(),
+            ),
+            ("copy", self.app.copy.as_slice()),
+            ("clear_terminal", self.app.clear_terminal.as_slice()),
+            ("toggle_vim_mode", self.app.toggle_vim_mode.as_slice()),
+            ("toggle_fast_mode", self.app.toggle_fast_mode.as_slice()),
+            ("toggle_raw_output", self.app.toggle_raw_output.as_slice()),
+            ("toggle_side_conversation", side_toggle_bindings.as_slice()),
+            ("chat.interrupt_turn", self.chat.interrupt_turn.as_slice()),
+            (
+                "chat.decrease_reasoning_effort",
+                self.chat.decrease_reasoning_effort.as_slice(),
+            ),
+            (
+                "chat.increase_reasoning_effort",
+                self.chat.increase_reasoning_effort.as_slice(),
+            ),
+            (
+                "chat.previous_permission_mode",
+                self.chat.previous_permission_mode.as_slice(),
+            ),
+            (
+                "chat.next_permission_mode",
+                self.chat.next_permission_mode.as_slice(),
+            ),
+            (
+                "chat.edit_queued_message",
+                self.chat.edit_queued_message.as_slice(),
+            ),
+            ("composer.submit", self.composer.submit.as_slice()),
+            ("composer.queue", self.composer.queue.as_slice()),
+            (
+                "composer.toggle_shortcuts",
+                self.composer.toggle_shortcuts.as_slice(),
+            ),
+            (
+                "composer.history_search_previous",
+                self.composer.history_search_previous.as_slice(),
+            ),
+            (
+                "composer.history_search_next",
+                self.composer.history_search_next.as_slice(),
+            ),
+        ];
+        validate_unique("app", main_bindings)?;
 
         validate_no_reserved(
             "main",
-            [
-                ("open_agents", self.app.open_agents.as_slice()),
-                ("open_transcript", self.app.open_transcript.as_slice()),
-                (
-                    "open_external_editor",
-                    self.app.open_external_editor.as_slice(),
-                ),
-                ("copy", self.app.copy.as_slice()),
-                ("clear_terminal", self.app.clear_terminal.as_slice()),
-                ("toggle_vim_mode", self.app.toggle_vim_mode.as_slice()),
-                ("toggle_fast_mode", self.app.toggle_fast_mode.as_slice()),
-                ("toggle_raw_output", self.app.toggle_raw_output.as_slice()),
-                ("toggle_side_conversation", side_toggle_bindings.as_slice()),
-                ("chat.interrupt_turn", self.chat.interrupt_turn.as_slice()),
-                (
-                    "chat.decrease_reasoning_effort",
-                    self.chat.decrease_reasoning_effort.as_slice(),
-                ),
-                (
-                    "chat.increase_reasoning_effort",
-                    self.chat.increase_reasoning_effort.as_slice(),
-                ),
-                (
-                    "chat.previous_permission_mode",
-                    self.chat.previous_permission_mode.as_slice(),
-                ),
-                (
-                    "chat.next_permission_mode",
-                    self.chat.next_permission_mode.as_slice(),
-                ),
-                (
-                    "chat.edit_queued_message",
-                    self.chat.edit_queued_message.as_slice(),
-                ),
-                ("composer.submit", self.composer.submit.as_slice()),
-                ("composer.queue", self.composer.queue.as_slice()),
-                (
-                    "composer.toggle_shortcuts",
-                    self.composer.toggle_shortcuts.as_slice(),
-                ),
-                (
-                    "composer.history_search_previous",
-                    self.composer.history_search_previous.as_slice(),
-                ),
-                (
-                    "composer.history_search_next",
-                    self.composer.history_search_next.as_slice(),
-                ),
-            ],
+            main_bindings,
             MAIN_RESERVED_BINDINGS,
             [(
                 "chat.interrupt_turn",
@@ -1644,6 +1821,35 @@ impl RuntimeKeymap {
             )],
         )?;
 
+        let approval_overlay_bindings = [
+            ("list.move_up", self.list.move_up.as_slice()),
+            ("list.move_down", self.list.move_down.as_slice()),
+            ("list.move_left", self.list.move_left.as_slice()),
+            ("list.move_right", self.list.move_right.as_slice()),
+            ("list.page_up", self.list.page_up.as_slice()),
+            ("list.page_down", self.list.page_down.as_slice()),
+            ("list.jump_top", self.list.jump_top.as_slice()),
+            ("list.jump_bottom", self.list.jump_bottom.as_slice()),
+            ("list.accept", self.list.accept.as_slice()),
+            ("list.cancel", self.list.cancel.as_slice()),
+            (
+                "approval.open_fullscreen",
+                self.approval.open_fullscreen.as_slice(),
+            ),
+            ("approval.open_thread", self.approval.open_thread.as_slice()),
+            ("approval.approve", self.approval.approve.as_slice()),
+            (
+                "approval.approve_for_session",
+                self.approval.approve_for_session.as_slice(),
+            ),
+            (
+                "approval.approve_for_prefix",
+                self.approval.approve_for_prefix.as_slice(),
+            ),
+            ("approval.deny", self.approval.deny.as_slice()),
+            ("approval.decline", self.approval.decline.as_slice()),
+            ("approval.cancel", self.approval.cancel.as_slice()),
+        ];
         validate_no_shadow_with_allowed_overlaps(
             "app",
             [
@@ -1660,35 +1866,7 @@ impl RuntimeKeymap {
                 ("toggle_raw_output", self.app.toggle_raw_output.as_slice()),
                 ("toggle_side_conversation", side_toggle_bindings.as_slice()),
             ],
-            [
-                ("list.move_up", self.list.move_up.as_slice()),
-                ("list.move_down", self.list.move_down.as_slice()),
-                ("list.move_left", self.list.move_left.as_slice()),
-                ("list.move_right", self.list.move_right.as_slice()),
-                ("list.page_up", self.list.page_up.as_slice()),
-                ("list.page_down", self.list.page_down.as_slice()),
-                ("list.jump_top", self.list.jump_top.as_slice()),
-                ("list.jump_bottom", self.list.jump_bottom.as_slice()),
-                ("list.accept", self.list.accept.as_slice()),
-                ("list.cancel", self.list.cancel.as_slice()),
-                (
-                    "approval.open_fullscreen",
-                    self.approval.open_fullscreen.as_slice(),
-                ),
-                ("approval.open_thread", self.approval.open_thread.as_slice()),
-                ("approval.approve", self.approval.approve.as_slice()),
-                (
-                    "approval.approve_for_session",
-                    self.approval.approve_for_session.as_slice(),
-                ),
-                (
-                    "approval.approve_for_prefix",
-                    self.approval.approve_for_prefix.as_slice(),
-                ),
-                ("approval.deny", self.approval.deny.as_slice()),
-                ("approval.decline", self.approval.decline.as_slice()),
-                ("approval.cancel", self.approval.cancel.as_slice()),
-            ],
+            approval_overlay_bindings,
             [(
                 "clear_terminal",
                 "list.move_right",
@@ -1804,232 +1982,38 @@ impl RuntimeKeymap {
             )],
         )?;
 
-        validate_unique(
-            "editor",
-            [
-                ("insert_newline", self.editor.insert_newline.as_slice()),
-                ("move_left", self.editor.move_left.as_slice()),
-                ("move_right", self.editor.move_right.as_slice()),
-                ("move_up", self.editor.move_up.as_slice()),
-                ("move_down", self.editor.move_down.as_slice()),
-                ("move_word_left", self.editor.move_word_left.as_slice()),
-                ("move_word_right", self.editor.move_word_right.as_slice()),
-                ("move_line_start", self.editor.move_line_start.as_slice()),
-                ("move_line_end", self.editor.move_line_end.as_slice()),
-                ("delete_backward", self.editor.delete_backward.as_slice()),
-                ("delete_forward", self.editor.delete_forward.as_slice()),
-                (
-                    "delete_backward_word",
-                    self.editor.delete_backward_word.as_slice(),
-                ),
-                (
-                    "delete_forward_word",
-                    self.editor.delete_forward_word.as_slice(),
-                ),
-                ("kill_line_start", self.editor.kill_line_start.as_slice()),
-                ("kill_whole_line", self.editor.kill_whole_line.as_slice()),
-                ("kill_line_end", self.editor.kill_line_end.as_slice()),
-                ("yank", self.editor.yank.as_slice()),
-            ],
-        )?;
-
-        validate_unique(
-            "vim_normal",
-            [
-                ("enter_insert", self.vim_normal.enter_insert.as_slice()),
-                (
-                    "append_after_cursor",
-                    self.vim_normal.append_after_cursor.as_slice(),
-                ),
-                (
-                    "append_line_end",
-                    self.vim_normal.append_line_end.as_slice(),
-                ),
-                (
-                    "insert_line_start",
-                    self.vim_normal.insert_line_start.as_slice(),
-                ),
-                (
-                    "open_line_below",
-                    self.vim_normal.open_line_below.as_slice(),
-                ),
-                (
-                    "open_line_above",
-                    self.vim_normal.open_line_above.as_slice(),
-                ),
-                ("move_left", self.vim_normal.move_left.as_slice()),
-                ("move_right", self.vim_normal.move_right.as_slice()),
-                ("move_up", self.vim_normal.move_up.as_slice()),
-                ("move_down", self.vim_normal.move_down.as_slice()),
-                (
-                    "move_word_forward",
-                    self.vim_normal.move_word_forward.as_slice(),
-                ),
-                (
-                    "move_word_backward",
-                    self.vim_normal.move_word_backward.as_slice(),
-                ),
-                ("move_word_end", self.vim_normal.move_word_end.as_slice()),
-                (
-                    "move_line_start",
-                    self.vim_normal.move_line_start.as_slice(),
-                ),
-                ("move_line_end", self.vim_normal.move_line_end.as_slice()),
-                ("delete_char", self.vim_normal.delete_char.as_slice()),
-                ("replace_char", self.vim_normal.replace_char.as_slice()),
-                (
-                    "repeat_last_change",
-                    self.vim_normal.repeat_last_change.as_slice(),
-                ),
-                (
-                    "substitute_char",
-                    self.vim_normal.substitute_char.as_slice(),
-                ),
-                (
-                    "delete_to_line_end",
-                    self.vim_normal.delete_to_line_end.as_slice(),
-                ),
-                (
-                    "change_to_line_end",
-                    self.vim_normal.change_to_line_end.as_slice(),
-                ),
-                ("yank_line", self.vim_normal.yank_line.as_slice()),
-                ("paste_after", self.vim_normal.paste_after.as_slice()),
-                (
-                    "start_delete_operator",
-                    self.vim_normal.start_delete_operator.as_slice(),
-                ),
-                (
-                    "start_yank_operator",
-                    self.vim_normal.start_yank_operator.as_slice(),
-                ),
-                (
-                    "start_change_operator",
-                    self.vim_normal.start_change_operator.as_slice(),
-                ),
-                (
-                    "cancel_operator",
-                    self.vim_normal.cancel_operator.as_slice(),
-                ),
-            ],
-        )?;
-
-        validate_unique(
-            "vim_operator",
-            [
-                ("delete_line", self.vim_operator.delete_line.as_slice()),
-                ("yank_line", self.vim_operator.yank_line.as_slice()),
-                ("motion_left", self.vim_operator.motion_left.as_slice()),
-                ("motion_right", self.vim_operator.motion_right.as_slice()),
-                ("motion_up", self.vim_operator.motion_up.as_slice()),
-                ("motion_down", self.vim_operator.motion_down.as_slice()),
-                (
-                    "motion_word_forward",
-                    self.vim_operator.motion_word_forward.as_slice(),
-                ),
-                (
-                    "motion_word_backward",
-                    self.vim_operator.motion_word_backward.as_slice(),
-                ),
-                (
-                    "motion_word_end",
-                    self.vim_operator.motion_word_end.as_slice(),
-                ),
-                (
-                    "motion_line_start",
-                    self.vim_operator.motion_line_start.as_slice(),
-                ),
-                (
-                    "motion_line_end",
-                    self.vim_operator.motion_line_end.as_slice(),
-                ),
-                (
-                    "select_inner_text_object",
-                    self.vim_operator.select_inner_text_object.as_slice(),
-                ),
-                (
-                    "select_around_text_object",
-                    self.vim_operator.select_around_text_object.as_slice(),
-                ),
-                ("cancel", self.vim_operator.cancel.as_slice()),
-            ],
-        )?;
-
-        validate_unique(
-            "vim_text_object",
-            [
-                ("word", self.vim_text_object.word.as_slice()),
-                ("big_word", self.vim_text_object.big_word.as_slice()),
-                ("parentheses", self.vim_text_object.parentheses.as_slice()),
-                ("brackets", self.vim_text_object.brackets.as_slice()),
-                ("braces", self.vim_text_object.braces.as_slice()),
-                ("double_quote", self.vim_text_object.double_quote.as_slice()),
-                ("single_quote", self.vim_text_object.single_quote.as_slice()),
-                ("backtick", self.vim_text_object.backtick.as_slice()),
-                ("cancel", self.vim_text_object.cancel.as_slice()),
-            ],
-        )?;
-
-        validate_unique(
-            "pager",
-            [
-                ("scroll_up", self.pager.scroll_up.as_slice()),
-                ("scroll_down", self.pager.scroll_down.as_slice()),
-                ("page_up", self.pager.page_up.as_slice()),
-                ("page_down", self.pager.page_down.as_slice()),
-                ("half_page_up", self.pager.half_page_up.as_slice()),
-                ("half_page_down", self.pager.half_page_down.as_slice()),
-                ("jump_top", self.pager.jump_top.as_slice()),
-                ("jump_bottom", self.pager.jump_bottom.as_slice()),
-                ("close", self.pager.close.as_slice()),
-                ("close_transcript", self.pager.close_transcript.as_slice()),
-            ],
-        )?;
+        let context_bindings = |context| {
+            runtime_action_bindings(self)
+                .filter(move |binding| binding.id.context == context)
+                .map(|binding| (binding.id.action, binding.bindings))
+        };
+        for context in [
+            KeymapContext::Editor,
+            KeymapContext::VimNormal,
+            KeymapContext::VimOperator,
+            KeymapContext::VimTextObject,
+            KeymapContext::Pager,
+        ] {
+            validate_unique(context.config_name(), context_bindings(context))?;
+        }
 
         validate_no_reserved(
             "pager",
-            [
-                ("scroll_up", self.pager.scroll_up.as_slice()),
-                ("scroll_down", self.pager.scroll_down.as_slice()),
-                ("page_up", self.pager.page_up.as_slice()),
-                ("page_down", self.pager.page_down.as_slice()),
-                ("half_page_up", self.pager.half_page_up.as_slice()),
-                ("half_page_down", self.pager.half_page_down.as_slice()),
-                ("jump_top", self.pager.jump_top.as_slice()),
-                ("jump_bottom", self.pager.jump_bottom.as_slice()),
-                ("close", self.pager.close.as_slice()),
-                ("close_transcript", self.pager.close_transcript.as_slice()),
-            ],
+            context_bindings(KeymapContext::Pager),
             TRANSCRIPT_BACKTRACK_RESERVED_BINDINGS,
             [],
         )?;
 
-        validate_unique(
-            "list",
-            [
-                ("move_up", self.list.move_up.as_slice()),
-                ("move_down", self.list.move_down.as_slice()),
-                ("move_left", self.list.move_left.as_slice()),
-                ("move_right", self.list.move_right.as_slice()),
-                ("page_up", self.list.page_up.as_slice()),
-                ("page_down", self.list.page_down.as_slice()),
-                ("jump_top", self.list.jump_top.as_slice()),
-                ("jump_bottom", self.list.jump_bottom.as_slice()),
-                ("accept", self.list.accept.as_slice()),
-                ("cancel", self.list.cancel.as_slice()),
-            ],
-        )?;
+        validate_unique("list", context_bindings(KeymapContext::List))?;
 
-        let agents_bindings = [
-            ("search", self.agents.search.as_slice()),
-            ("new_task", self.agents.new_task.as_slice()),
-            ("rename", self.agents.rename.as_slice()),
-            ("stop", self.agents.stop.as_slice()),
-            ("toggle_grouping", self.agents.toggle_grouping.as_slice()),
-        ];
-        validate_unique("agents", agents_bindings)?;
-        validate_no_reserved("agents", agents_bindings, MAIN_RESERVED_BINDINGS, [])?;
-        for (action, bindings) in agents_bindings {
+        validate_unique("agents", context_bindings(KeymapContext::Agents))?;
+        validate_no_reserved(
+            "agents",
+            context_bindings(KeymapContext::Agents),
+            MAIN_RESERVED_BINDINGS,
+            [],
+        )?;
+        for (action, bindings) in context_bindings(KeymapContext::Agents) {
             #[cfg(unix)]
             if bindings.contains(&key_hint::ctrl(KeyCode::Char('z'))) {
                 return Err(format!(
@@ -2049,56 +2033,10 @@ impl RuntimeKeymap {
             }
         }
 
-        validate_unique(
-            "approval",
-            [
-                ("open_fullscreen", self.approval.open_fullscreen.as_slice()),
-                ("open_thread", self.approval.open_thread.as_slice()),
-                ("approve", self.approval.approve.as_slice()),
-                (
-                    "approve_for_session",
-                    self.approval.approve_for_session.as_slice(),
-                ),
-                (
-                    "approve_for_prefix",
-                    self.approval.approve_for_prefix.as_slice(),
-                ),
-                ("deny", self.approval.deny.as_slice()),
-                ("decline", self.approval.decline.as_slice()),
-                ("cancel", self.approval.cancel.as_slice()),
-            ],
-        )?;
+        validate_unique("approval", context_bindings(KeymapContext::Approval))?;
 
         let mut seen: HashMap<(KeyCode, KeyModifiers), &'static str> = HashMap::new();
-        for (action, bindings) in [
-            ("list.move_up", self.list.move_up.as_slice()),
-            ("list.move_down", self.list.move_down.as_slice()),
-            ("list.move_left", self.list.move_left.as_slice()),
-            ("list.move_right", self.list.move_right.as_slice()),
-            ("list.page_up", self.list.page_up.as_slice()),
-            ("list.page_down", self.list.page_down.as_slice()),
-            ("list.jump_top", self.list.jump_top.as_slice()),
-            ("list.jump_bottom", self.list.jump_bottom.as_slice()),
-            ("list.accept", self.list.accept.as_slice()),
-            ("list.cancel", self.list.cancel.as_slice()),
-            (
-                "approval.open_fullscreen",
-                self.approval.open_fullscreen.as_slice(),
-            ),
-            ("approval.open_thread", self.approval.open_thread.as_slice()),
-            ("approval.approve", self.approval.approve.as_slice()),
-            (
-                "approval.approve_for_session",
-                self.approval.approve_for_session.as_slice(),
-            ),
-            (
-                "approval.approve_for_prefix",
-                self.approval.approve_for_prefix.as_slice(),
-            ),
-            ("approval.deny", self.approval.deny.as_slice()),
-            ("approval.decline", self.approval.decline.as_slice()),
-            ("approval.cancel", self.approval.cancel.as_slice()),
-        ] {
+        for (action, bindings) in approval_overlay_bindings {
             for binding in bindings {
                 let key = binding.parts();
                 if let Some(previous) = seen.insert(key, action) {
@@ -2128,9 +2066,9 @@ See the Codex keymap documentation for supported actions and examples."
 ///
 /// This intentionally allows the same key across different contexts; handlers
 /// only evaluate one context at a time.
-fn validate_unique<const N: usize>(
+fn validate_unique<'a>(
     context: &str,
-    pairs: [(&'static str, &[KeyBinding]); N],
+    pairs: impl IntoIterator<Item = (&'static str, &'a [KeyBinding])>,
 ) -> Result<(), String> {
     let mut seen: HashMap<(KeyCode, KeyModifiers), &'static str> = HashMap::new();
     for (action, bindings) in pairs {
@@ -2184,9 +2122,9 @@ See the Codex keymap documentation for supported actions and examples."
     Ok(())
 }
 
-fn validate_no_reserved<const N: usize, const A: usize>(
+fn validate_no_reserved<'a, const A: usize>(
     context: &str,
-    pairs: [(&'static str, &[KeyBinding]); N],
+    pairs: impl IntoIterator<Item = (&'static str, &'a [KeyBinding])>,
     reserved: &[(&'static str, KeyBinding)],
     allowed_overlaps: [(&'static str, &'static str, KeyBinding); A],
 ) -> Result<(), String> {
@@ -2989,6 +2927,61 @@ mod tests {
     }
 
     #[test]
+    fn configured_legacy_vim_bindings_prune_new_navigation_defaults() {
+        let mut keymap = TuiKeymap::default();
+        keymap.vim_normal.move_left = Some(one("f"));
+        keymap.vim_operator.motion_left = Some(one("g"));
+        keymap.vim_normal.move_right = Some(one("t"));
+        keymap.vim_normal.move_up = Some(one("shift-f"));
+        keymap.vim_operator.motion_right = Some(one("shift-t"));
+
+        let runtime = RuntimeKeymap::from_config(&keymap).expect("config should parse");
+
+        assert_eq!(runtime.vim_normal.find_forward, Vec::new());
+        assert_eq!(runtime.vim_normal.find_backward, Vec::new());
+        assert_eq!(runtime.vim_operator.motion_jump_top, Vec::new());
+        assert_eq!(runtime.vim_normal.till_forward, Vec::new());
+        assert_eq!(runtime.vim_operator.motion_till_backward, Vec::new());
+    }
+
+    #[test]
+    fn explicit_vim_navigation_binding_still_conflicts_with_legacy_binding() {
+        for key in ["f", "t"] {
+            let mut keymap = TuiKeymap::default();
+            keymap.vim_normal.move_left = Some(one(key));
+            let action = if key == "f" {
+                keymap.vim_normal.find_forward = Some(one(key));
+                "find_forward"
+            } else {
+                keymap.vim_normal.till_forward = Some(one(key));
+                "till_forward"
+            };
+            expect_conflict(&keymap, "move_left", action);
+        }
+    }
+
+    #[test]
+    fn vim_search_preserves_custom_motion_bindings() {
+        for operator in [false, true] {
+            let mut config = TuiKeymap::default();
+            if operator {
+                config.vim_operator.motion_left = Some(one("n"));
+            } else {
+                config.vim_normal.move_left = Some(one("n"));
+            }
+            assert!(
+                RuntimeKeymap::from_config(&config)
+                    .unwrap()
+                    .vim_search
+                    .next
+                    .is_empty()
+            );
+            config.vim_search.next = Some(one("n"));
+            assert!(RuntimeKeymap::from_config(&config).is_err());
+        }
+    }
+
+    #[test]
     fn configured_vim_normal_chord_prefix_prunes_new_repeat_default() {
         let mut keymap = TuiKeymap::default();
         keymap.vim_normal.move_line_start = Some(one(". g"));
@@ -3000,6 +2993,65 @@ mod tests {
             binding.action.context == KeymapContext::VimNormal
                 && binding.chord.prefix == key_hint::plain(KeyCode::Char('.'))
         }));
+    }
+
+    #[test]
+    fn configured_legacy_bindings_prune_new_history_defaults() {
+        for key in ["u", "ctrl-r"] {
+            for (context, action, suffix) in [
+                ("vim_normal", "move_left", ""),
+                ("vim_normal", "move_left", " g"),
+                ("vim_search", "forward", ""),
+                ("vim_search", "forward", " g"),
+                ("composer", "submit", ""),
+                ("global", "submit", ""),
+                ("global", "queue", ""),
+                ("global", "toggle_shortcuts", ""),
+            ] {
+                let mut keymap: TuiKeymap = serde_json::from_value(serde_json::json!({
+                    (context): { (action): format!("{key}{suffix}") }
+                }))
+                .expect("config should deserialize");
+                if key == "ctrl-r"
+                    && (!suffix.is_empty() || matches!(context, "composer" | "global"))
+                {
+                    // Ctrl+R chords and main-surface actions must unbind the older history key.
+                    keymap.composer.history_search_previous = Some(KeybindingsSpec::Many(vec![]));
+                }
+                let runtime = RuntimeKeymap::from_config(&keymap).expect("config should parse");
+                let bindings = if key == "u" {
+                    runtime.vim_normal.undo
+                } else {
+                    runtime.vim_normal.redo
+                };
+                assert_eq!(bindings, Vec::new());
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_vim_history_bindings_still_conflict_with_legacy_bindings() {
+        let mut keymap = TuiKeymap::default();
+        keymap.vim_normal.move_left = Some(one("u"));
+        keymap.vim_normal.undo = Some(one("u"));
+        expect_conflict(&keymap, "move_left", "undo");
+
+        keymap.vim_normal.move_left = Some(one("ctrl-r"));
+        keymap.vim_normal.undo = None;
+        keymap.vim_normal.redo = Some(one("ctrl-r"));
+        expect_conflict(&keymap, "move_left", "redo");
+    }
+
+    #[test]
+    fn explicit_empty_arrays_unbind_vim_history_actions() {
+        let mut keymap = TuiKeymap::default();
+        keymap.vim_normal.undo = Some(KeybindingsSpec::Many(vec![]));
+        keymap.vim_normal.redo = Some(KeybindingsSpec::Many(vec![]));
+
+        let runtime = RuntimeKeymap::from_config(&keymap).expect("config should parse");
+
+        assert!(runtime.vim_normal.undo.is_empty());
+        assert!(runtime.vim_normal.redo.is_empty());
     }
 
     #[test]
@@ -3345,32 +3397,6 @@ mod tests {
             RuntimeKeymap::from_config(&keymap)
                 .expect_err("backspace is reserved for task input")
                 .contains("backspace")
-        );
-    }
-
-    #[test]
-    fn agents_overview_default_yields_to_existing_custom_shortcuts() {
-        let mut keymap = TuiKeymap::default();
-        keymap.global.open_transcript = Some(one("alt-a"));
-
-        let runtime = RuntimeKeymap::from_config(&keymap).expect("existing keymap remains valid");
-
-        assert_eq!(
-            runtime.app.open_transcript,
-            vec![key_hint::alt(KeyCode::Char('a'))]
-        );
-        assert!(runtime.app.open_agents.is_empty());
-
-        keymap.global.open_transcript = Some(one("alt-a ctrl-t"));
-        let runtime = RuntimeKeymap::from_config(&keymap).expect("existing chord remains valid");
-        assert!(runtime.app.open_agents.is_empty());
-
-        keymap.global.open_transcript = None;
-        keymap.pager.scroll_up = Some(one("alt-a page-up"));
-        let runtime = RuntimeKeymap::from_config(&keymap).expect("pager chord remains valid");
-        assert_eq!(
-            runtime.app.open_agents,
-            vec![key_hint::alt(KeyCode::Char('a'))]
         );
     }
 

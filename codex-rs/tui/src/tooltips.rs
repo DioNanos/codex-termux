@@ -20,7 +20,7 @@ const OTHER_TOOLTIP_NON_MAC: &str = "*New* Build faster with Codex.";
 const FREE_GO_TOOLTIP: &str =
     "*New* For a limited time, Codex is included in your plan for free – let’s build together.";
 
-const RAW_TOOLTIPS: &str = include_str!("../tooltips.txt");
+const RAW_TOOLTIPS: &str = include_str!("../assets/tooltips.txt");
 
 lazy_static! {
     static ref TOOLTIPS: Vec<&'static str> = RAW_TOOLTIPS

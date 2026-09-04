@@ -155,6 +155,19 @@ fn test_header_auth_uses_chatgpt_codex_base_url() {
 }
 
 #[test]
+fn codex_backend_routes_require_codex_base_url() {
+    for (base_url, expected) in [
+        (None, true),
+        (Some(CHATGPT_CODEX_BASE_URL), true),
+        (Some("https://chatgpt-staging.com/backend-api/codex/"), true),
+        (Some("https://proxy.example.com/v1"), false),
+    ] {
+        let provider = ModelProviderInfo::create_openai_provider(base_url.map(str::to_owned));
+        assert_eq!(provider.supports_codex_backend_routes(), expected);
+    }
+}
+
+#[test]
 fn test_uses_openai_actor_authorization() {
     let mut provider = ModelProviderInfo {
         http_headers: Some(maplit::hashmap! {

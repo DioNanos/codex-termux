@@ -120,7 +120,7 @@ impl OAuthHttpClientAdapter {
         })
     }
 
-    async fn execute_request(
+    pub(crate) async fn execute_request(
         &self,
         request: HttpRequest,
         redirect_policy: OAuthHttpRedirectPolicy,

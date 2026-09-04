@@ -69,7 +69,7 @@ impl ShadowSelectionExperiment {
 
     pub(crate) fn run(
         &self,
-        input: &TurnInputContext,
+        input: &TurnInputContext<'_>,
         catalog: &SkillCatalog,
         explicitly_selected: &[SkillCatalogEntry],
         host_snapshot: Option<&HostSkillsSnapshot>,

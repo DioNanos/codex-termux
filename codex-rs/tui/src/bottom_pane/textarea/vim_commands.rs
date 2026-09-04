@@ -1,4 +1,8 @@
-//! Semantic Vim editing transactions and complete-change replay.
+//! Semantic Vim editing transactions, character find/till motions, and complete-change replay.
+//!
+//! `f`/`F` land on a matching grapheme; `t`/`T` stop just before/after it. Forward operator
+//! motions include the destination, while backward motions exclude the original cursor.
+//! All four motions share these boundaries for navigation, `c`/`d`/`y`, and semantic `.` replay.
 
 use super::TextArea;
 use super::VimMode;
@@ -7,15 +11,26 @@ use super::VimOperator;
 use super::VimPending;
 use super::VimTextObject;
 use super::VimTextObjectScope;
+use super::vim::VimFindMotion;
 use crate::key_hint::KeyBindingListExt;
+use crate::vim_search::SearchQuery;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
+use unicode_segmentation::GraphemeCursor;
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Debug)]
 pub(crate) enum VimEdit {
     Editor(VimEditorEdit),
     Text(String),
+}
+
+/// Vim command recording and searches preserved across same-draft restoration.
+#[derive(Debug, Default)]
+pub(crate) struct VimPersistentState {
+    pub(crate) commands: VimCommandState,
+    search: crate::vim_search::SearchQuery,
 }
 
 #[derive(Clone, Debug)]
@@ -31,19 +46,27 @@ pub(super) enum VimInsertPosition {
     OpenBelow,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) enum VimEditTarget {
     Character,
     Line,
     LineEnd,
     Motion(VimMotion),
+    Search(SearchQuery),
     TextObject {
         scope: VimTextObjectScope,
         object: VimTextObject,
     },
+    Find {
+        motion: VimFindMotion,
+        target: char,
+    },
+    BufferJump {
+        last: bool,
+    },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) enum VimAction {
     Insert(VimInsertPosition),
     Delete(VimEditTarget),
@@ -68,14 +91,19 @@ pub(super) enum VimAction {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct VimCommandState {
-    pending_change: Vec<VimEdit>,
-    last_change: Vec<VimEdit>,
+pub(crate) struct VimCommandState {
+    pub(super) pending_change: Vec<VimEdit>,
+    pub(crate) last_change: Vec<VimEdit>,
     changed: bool,
-    replaying: bool,
+    pub(super) replaying: bool,
 }
 
 impl TextArea {
+    pub(crate) fn swap_vim_persistent_state(&mut self, state: &mut VimPersistentState) {
+        std::mem::swap(&mut self.vim_commands, &mut state.commands);
+        std::mem::swap(&mut self.vim_search.last, &mut state.search);
+    }
+
     pub(crate) fn vim_repeat_actions(&self) -> Option<Vec<VimEdit>> {
         (!self.vim_commands.last_change.is_empty()).then(|| self.vim_commands.last_change.clone())
     }
@@ -105,7 +133,7 @@ impl TextArea {
             && !self.vim_commands.replaying
             && !self.vim_commands.pending_change.is_empty();
         let prior_len = self.text.len();
-        self.apply_vim_editor_action(action);
+        self.apply_vim_editor_action(action.clone());
         let changed = self.text.len() != prior_len;
         let deletion = matches!(
             action,
@@ -127,9 +155,9 @@ impl TextArea {
 
     pub(super) fn start_vim_edit(&mut self, action: VimAction) -> bool {
         let prior_len = self.text.len();
-        self.vim_commands.pending_change = vec![VimEdit::Editor(VimEditorEdit(action))];
+        self.vim_commands.pending_change = vec![VimEdit::Editor(VimEditorEdit(action.clone()))];
         self.vim_commands.changed = false;
-        if !self.apply_vim_editor_action(action) {
+        if !self.apply_vim_editor_action(action.clone()) {
             self.vim_commands.pending_change.clear();
             return false;
         }
@@ -166,7 +194,7 @@ impl TextArea {
 
     pub(crate) fn apply_vim_edit(&mut self, edit: &VimEdit) -> bool {
         match edit {
-            VimEdit::Editor(VimEditorEdit(action)) => self.apply_vim_editor_action(*action),
+            VimEdit::Editor(VimEditorEdit(action)) => self.apply_vim_editor_action(action.clone()),
             VimEdit::Text(text) => {
                 if self.vim_mode != VimMode::Insert {
                     return false;
@@ -179,6 +207,7 @@ impl TextArea {
 
     fn apply_vim_editor_action(&mut self, action: VimAction) -> bool {
         let prior_len = self.text.len();
+        let is_change = matches!(action, VimAction::Change(_));
         match action {
             VimAction::Insert(position) => {
                 match position {
@@ -209,7 +238,7 @@ impl TextArea {
                 self.vim_mode = VimMode::Insert;
             }
             VimAction::Delete(target) | VimAction::Change(target) => {
-                let operator = if matches!(action, VimAction::Delete(_)) {
+                let operator = if !is_change {
                     VimOperator::Delete
                 } else {
                     VimOperator::Change
@@ -240,11 +269,24 @@ impl TextArea {
                         }
                     }
                     VimEditTarget::Motion(motion) => self.apply_vim_operator(operator, motion),
+                    VimEditTarget::Search(query) => {
+                        if !self.apply_vim_search(&query, Some(operator)) {
+                            return false;
+                        }
+                    }
                     VimEditTarget::TextObject { scope, object } => {
                         let Some(range) = self.text_object_range(object, scope) else {
                             return false;
                         };
                         self.apply_vim_operator_to_range(operator, range);
+                    }
+                    VimEditTarget::Find { motion, target } => {
+                        if !self.find_vim_character(motion, Some(operator), target) {
+                            return false;
+                        }
+                    }
+                    VimEditTarget::BufferJump { last } => {
+                        self.jump_to_vim_buffer_line(last, Some(operator));
                     }
                 }
                 if operator == VimOperator::Change {
@@ -306,7 +348,76 @@ impl TextArea {
             }
             return true;
         }
-        false
+        if self.vim_normal_keymap.find_forward.is_pressed(event) {
+            self.start_vim_find(VimFindMotion::Forward, /*operator*/ None);
+        } else if self.vim_normal_keymap.find_backward.is_pressed(event) {
+            self.start_vim_find(VimFindMotion::Backward, /*operator*/ None);
+        } else if self.vim_normal_keymap.till_forward.is_pressed(event) {
+            self.start_vim_find(VimFindMotion::TillForward, /*operator*/ None);
+        } else if self.vim_normal_keymap.till_backward.is_pressed(event) {
+            self.start_vim_find(VimFindMotion::TillBackward, /*operator*/ None);
+        } else if self.vim_normal_keymap.jump_top.is_pressed(event) {
+            self.jump_to_vim_buffer_line(/*last*/ false, /*operator*/ None);
+        } else if self.vim_normal_keymap.jump_bottom.is_pressed(event) {
+            self.jump_to_vim_buffer_line(/*last*/ true, /*operator*/ None);
+        } else {
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn handle_vim_operator_command(
+        &mut self,
+        operator: VimOperator,
+        event: KeyEvent,
+    ) -> bool {
+        if self
+            .vim_operator_keymap
+            .motion_find_forward
+            .is_pressed(event)
+        {
+            self.start_vim_find(VimFindMotion::Forward, Some(operator));
+        } else if self
+            .vim_operator_keymap
+            .motion_find_backward
+            .is_pressed(event)
+        {
+            self.start_vim_find(VimFindMotion::Backward, Some(operator));
+        } else if self
+            .vim_operator_keymap
+            .motion_till_forward
+            .is_pressed(event)
+        {
+            self.start_vim_find(VimFindMotion::TillForward, Some(operator));
+        } else if self
+            .vim_operator_keymap
+            .motion_till_backward
+            .is_pressed(event)
+        {
+            self.start_vim_find(VimFindMotion::TillBackward, Some(operator));
+        } else if self.vim_operator_keymap.motion_jump_top.is_pressed(event)
+            || self
+                .vim_operator_keymap
+                .motion_jump_bottom
+                .is_pressed(event)
+        {
+            let last = self
+                .vim_operator_keymap
+                .motion_jump_bottom
+                .is_pressed(event);
+            match operator {
+                VimOperator::Delete => {
+                    self.start_vim_edit(VimAction::Delete(VimEditTarget::BufferJump { last }));
+                }
+                VimOperator::Change => {
+                    self.start_vim_edit(VimAction::Change(VimEditTarget::BufferJump { last }));
+                }
+                VimOperator::Yank => self.jump_to_vim_buffer_line(last, Some(operator)),
+            }
+        } else {
+            return false;
+        }
+        true
     }
 
     pub(super) fn handle_vim_pending_command(&mut self, pending: VimPending, event: KeyEvent) {
@@ -316,8 +427,138 @@ impl TextArea {
                     self.start_vim_edit(VimAction::Replace(ch));
                 }
             }
+            VimPending::Find { motion, operator } => {
+                if let Some(ch) = vim_command_char(event) {
+                    match operator {
+                        Some(VimOperator::Delete) => {
+                            self.start_vim_edit(VimAction::Delete(VimEditTarget::Find {
+                                motion,
+                                target: ch,
+                            }));
+                        }
+                        Some(VimOperator::Change) => {
+                            self.start_vim_edit(VimAction::Change(VimEditTarget::Find {
+                                motion,
+                                target: ch,
+                            }));
+                        }
+                        Some(VimOperator::Yank) | None => {
+                            self.find_vim_character(motion, operator, ch);
+                        }
+                    }
+                }
+            }
             VimPending::None | VimPending::Operator(_) | VimPending::TextObject { .. } => {}
         }
+    }
+
+    fn start_vim_find(&mut self, motion: VimFindMotion, operator: Option<VimOperator>) {
+        self.vim_pending = VimPending::Find { motion, operator };
+    }
+
+    fn find_vim_character(
+        &mut self,
+        motion: VimFindMotion,
+        operator: Option<VimOperator>,
+        target: char,
+    ) -> bool {
+        let origin = self.cursor_pos;
+        let found = match motion {
+            VimFindMotion::Forward | VimFindMotion::TillForward => {
+                let line_end = self.end_of_current_line();
+                if origin >= line_end {
+                    return false;
+                }
+                let start = self.next_atomic_boundary(origin);
+                self.text[start..line_end]
+                    .grapheme_indices(/*is_extended*/ true)
+                    .find(|(offset, grapheme)| {
+                        grapheme.starts_with(target) && self.is_vim_command_target(start + offset)
+                    })
+                    .map(|(offset, grapheme)| start + offset..start + offset + grapheme.len())
+            }
+            VimFindMotion::Backward | VimFindMotion::TillBackward => {
+                let line_start = self.beginning_of_current_line();
+                self.text[line_start..origin]
+                    .grapheme_indices(/*is_extended*/ true)
+                    .rev()
+                    .find(|(offset, grapheme)| {
+                        grapheme.starts_with(target)
+                            && self.is_vim_command_target(line_start + offset)
+                    })
+                    .map(|(offset, grapheme)| {
+                        let start = line_start + offset;
+                        start..start + grapheme.len()
+                    })
+            }
+        };
+        let Some(position) = found else {
+            return false;
+        };
+        if let Some(operator) = operator {
+            let range = match motion {
+                VimFindMotion::Forward => origin..position.end,
+                VimFindMotion::Backward => position.start..origin,
+                VimFindMotion::TillForward => origin..position.start,
+                VimFindMotion::TillBackward => position.end..origin,
+            };
+            if operator == VimOperator::Yank {
+                self.set_cursor(range.start);
+            }
+            self.apply_vim_operator_to_range(operator, range);
+        } else {
+            let destination = match motion {
+                VimFindMotion::Forward | VimFindMotion::Backward => position.start,
+                VimFindMotion::TillForward => {
+                    let previous = self.text[..position.start]
+                        .grapheme_indices(/*is_extended*/ true)
+                        .next_back()
+                        .map_or(origin, |(offset, _)| offset);
+                    self.find_element_containing(previous)
+                        .map_or(previous, |idx| self.elements[idx].range.start)
+                }
+                VimFindMotion::TillBackward => position.end,
+            };
+            self.set_cursor(destination);
+        }
+        true
+    }
+
+    fn jump_to_vim_buffer_line(&mut self, last: bool, operator: Option<VimOperator>) {
+        if let Some(operator) = operator {
+            let current = self.current_line_range_with_newline();
+            let range = if last {
+                current.start..self.text.len()
+            } else {
+                0..current.end
+            };
+            match operator {
+                VimOperator::Delete => self.kill_line_range(range),
+                VimOperator::Yank => self.yank_line_range(range),
+                VimOperator::Change => {
+                    self.kill_line_range(range);
+                    self.vim_mode = VimMode::Insert;
+                }
+            }
+            return;
+        }
+        let start = if last {
+            self.beginning_of_line(self.text.len())
+        } else {
+            0
+        };
+        self.set_cursor(start);
+        self.set_cursor(self.first_non_blank_of_current_line());
+    }
+
+    pub(super) fn is_vim_command_target(&self, position: usize) -> bool {
+        !self
+            .elements
+            .iter()
+            .any(|element| element.range.contains(&position))
+            && GraphemeCursor::new(position, self.text.len(), /*is_extended*/ true)
+                .is_boundary(&self.text, /*chunk_start*/ 0)
+                .unwrap_or(false)
     }
 }
 

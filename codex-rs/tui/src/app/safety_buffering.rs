@@ -71,7 +71,7 @@ impl App {
             active_permission_profile.as_ref(),
             self.runtime_permission_profile_override
                 .as_ref()
-                .map(|profile| &profile.permission_profile),
+                .and_then(RuntimePermissionProfileOverride::turn_permission_profile),
         );
         if let Err(err) = turn_permissions_overrides(permissions_override, cwd.as_path()) {
             self.chat_widget

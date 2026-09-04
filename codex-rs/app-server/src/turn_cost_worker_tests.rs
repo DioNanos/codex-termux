@@ -11,7 +11,9 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TurnStartedEvent;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::time::timeout;
+use tracing::instrument::WithSubscriber;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
@@ -20,6 +22,9 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 const TURN_COST_PATH: &str = "/v1/analytics/codex/turn-costs";
+
+#[path = "turn_cost_worker_chatgpt_tests.rs"]
+mod chatgpt;
 
 #[tokio::test]
 async fn worker_starts_with_otlp_metrics_exporter_without_log_exporter() {
@@ -308,7 +313,9 @@ async fn priced_cost_uses_telemetry_captured_before_thread_removal() {
     runtime.record_observation(TurnCostObservation {
         thread_id,
         turn_id: turn_id.to_string(),
-        kind: TurnCostObservationKind::ResponseCompleted,
+        kind: TurnCostObservationKind::ResponseCompleted {
+            response_id: "resp-one".to_string(),
+        },
     });
     runtime.record_observation(TurnCostObservation {
         thread_id,
@@ -316,7 +323,7 @@ async fn priced_cost_uses_telemetry_captured_before_thread_removal() {
         kind: TurnCostObservationKind::Finished { interrupted: false },
     });
 
-    runtime.process_api_key_cost(
+    runtime.process_turn_cost(
         turn_id,
         &ApiKeyTurnCost {
             turn_id: turn_id.to_string(),
@@ -346,7 +353,7 @@ async fn priced_cost_waits_for_every_response_when_response_costs_are_available(
         TurnCostEntry {
             thread_id,
             session_telemetry: test_session_telemetry(thread_id),
-            expected_response_count: 2,
+            expected_response_ids: HashSet::from(["resp-one".to_string(), "resp-two".to_string()]),
             status: TurnCostStatus::Completed,
             next_poll_at: Instant::now(),
             attempt_count: 0,
@@ -366,7 +373,7 @@ async fn priced_cost_waits_for_every_response_when_response_costs_are_available(
         speed: Some("fast".to_string()),
         reasoning_effort: Some("high".to_string()),
     };
-    runtime.process_api_key_cost(turn_id, &cost);
+    runtime.process_turn_cost(turn_id, &cost);
 
     let entry = runtime.turns.get(turn_id).expect("turn remains tracked");
     assert_eq!(entry.attempt_count, 1);
@@ -379,7 +386,7 @@ async fn priced_cost_waits_for_every_response_when_response_costs_are_available(
             response_id: "resp-two".to_string(),
             total_usd: "0.50".to_string(),
         });
-    runtime.process_api_key_cost(turn_id, &cost);
+    runtime.process_turn_cost(turn_id, &cost);
 
     assert_eq!(runtime.turns.len(), 0);
 }
@@ -392,7 +399,7 @@ async fn test_runtime(server: &MockServer, auth_manager: Arc<AuthManager>) -> Wo
         .await
         .expect("test config");
     config.chatgpt_base_url = server.uri();
-    let backend = TurnCostBackend::OpenAiApiKey(Arc::clone(&auth_manager));
+    let backend = TurnCostBackend::OpenAi(Arc::clone(&auth_manager));
     WorkerRuntime {
         config: Arc::new(config),
         backend,
@@ -442,4 +449,44 @@ async fn wait_for_request_count(server: &MockServer, expected: usize) {
     })
     .await
     .expect("timed out waiting for turn-cost request");
+}
+
+#[test_case(500; "HTTP failure")]
+#[test_case(200; "decode failure")]
+#[tokio::test]
+async fn turn_cost_failures_do_not_log_response_bodies(status: u16) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TURN_COST_PATH))
+        .respond_with(
+            ResponseTemplate::new(status).set_body_string("private-workspace-response-marker"),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut runtime = test_runtime(
+        &server,
+        AuthManager::from_auth_for_testing(CodexAuth::from_api_key("sk-test")),
+    )
+    .await;
+    let capture = tempfile::NamedTempFile::new().expect("log capture");
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(Arc::new(capture.reopen().expect("log writer")))
+        .finish();
+    async {
+        assert_eq!(
+            runtime.probe_backend().await,
+            BackendAvailability::RetryProbe
+        );
+        runtime.poll_entries(&["turn-1".to_string()]).await;
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let logs = std::fs::read_to_string(capture.path()).expect("captured logs");
+    assert!(logs.contains("backend availability check failed temporarily"));
+    assert!(logs.contains("failed to query turn costs"));
+    assert!(!logs.contains("private-workspace-response-marker"));
+    server.verify().await;
 }

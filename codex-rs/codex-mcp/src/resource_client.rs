@@ -8,6 +8,7 @@ use anyhow::anyhow;
 use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceContent;
 use codex_rmcp_client::CancellableEventStreamRequest;
+use codex_rmcp_client::RmcpClient;
 use rmcp::model::GetMeta;
 use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ReadResourceRequestParams;
@@ -20,9 +21,9 @@ use serde_json::json;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
+use crate::McpEventStreamOpener;
 use crate::McpRuntime;
 use crate::connection_manager::McpConnectionSet;
-use crate::connection_manager::McpServerConnection;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 
 /// One page of resources returned by an MCP server.
@@ -69,11 +70,34 @@ pub struct McpEventNotification {
 pub struct McpEventStream {
     request: Option<CancellableEventStreamRequest>,
     runtime_handle: Handle,
-    connection: Option<Arc<McpServerConnection>>,
-    hosted_event_server_removals: watch::Receiver<()>,
+    client: Option<Arc<RmcpClient>>,
+    cancel_event_streams_on_server_removal: watch::Receiver<()>,
 }
 
 impl McpEventStream {
+    pub(crate) async fn open(
+        client: Arc<RmcpClient>,
+        cancel_event_streams_on_server_removal: watch::Receiver<()>,
+        event_name: &str,
+        arguments: &Value,
+        request_meta: Option<&Map<String, Value>>,
+    ) -> Result<Self> {
+        let mut params = json!({ "name": event_name, "arguments": arguments });
+        if let Some(request_meta) = request_meta {
+            params["_meta"] = Value::Object(request_meta.clone());
+        }
+        let request = client
+            .send_event_stream_request(Some(params))
+            .await
+            .context("events/stream request failed")?;
+        Ok(Self {
+            request: Some(request),
+            runtime_handle: Handle::current(),
+            client: Some(client),
+            cancel_event_streams_on_server_removal,
+        })
+    }
+
     /// Receives the next raw lifecycle notification for this subscription.
     pub async fn recv(&mut self) -> Result<Option<McpEventNotification>> {
         let Some(request) = self.request.as_mut() else {
@@ -83,7 +107,7 @@ impl McpEventStream {
         tokio::select! {
             biased;
 
-            Ok(()) = self.hosted_event_server_removals.changed() => {
+            Ok(()) = self.cancel_event_streams_on_server_removal.changed() => {
                 self.cancel();
                 Err(anyhow!("hosted MCP event server was removed"))
             }
@@ -100,7 +124,7 @@ impl McpEventStream {
             }
             response = &mut request.handle.rx => {
                 self.request = None;
-                self.connection = None;
+                self.client = None;
 
                 match response {
                     Ok(Ok(_))
@@ -120,14 +144,14 @@ impl McpEventStream {
         }) = self.request.take()
         {
             drop(notifications);
-            let connection = self.connection.take();
+            let client = self.client.take();
             self.runtime_handle.spawn(async move {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(30),
                     handle.cancel(Some("event subscription closed".to_string())),
                 )
                 .await;
-                drop(connection);
+                drop(client);
             });
         }
     }
@@ -229,7 +253,7 @@ impl McpResourceClient {
         Ok(McpResourceReadResult { contents })
     }
 
-    /// Lists the events advertised by the hosted Plugin Runtime.
+    /// Lists the events advertised by the MCP event server.
     pub async fn list_events(&self) -> Result<McpEventCatalogSnapshot> {
         let (connections, _) = self
             .runtime
@@ -242,7 +266,7 @@ impl McpResourceClient {
             .client
             .send_custom_request_with_timeout("events/list", /*params*/ None, request_timeout)
             .await
-            .context("events/list failed for hosted Plugin Runtime")?;
+            .context("events/list request failed")?;
         let ServerResult::CustomResult(result) = result else {
             return Err(anyhow!("events/list returned an unexpected MCP result"));
         };
@@ -263,32 +287,30 @@ impl McpResourceClient {
         arguments: &Value,
         request_meta: Option<&Map<String, Value>>,
     ) -> Result<McpEventStream> {
-        let mut params = json!({
-            "name": event_name,
-            "arguments": arguments,
-        });
-        if let Some(request_meta) = request_meta {
-            params["_meta"] = Value::Object(request_meta.clone());
-        }
-
-        let (connections, hosted_event_server_removals) = self
+        let (connections, cancel_event_streams_on_server_removal) = self
             .runtime
             .latest_connections_for_event_server(CODEX_APPS_MCP_SERVER_NAME)?;
-        let (managed, _, connection) = connections
-            .client_with_connection_by_name(CODEX_APPS_MCP_SERVER_NAME)
+        let (managed, _) = connections
+            .client_by_name(CODEX_APPS_MCP_SERVER_NAME)
             .await?;
-        let request = managed
-            .client
-            .send_event_stream_request(Some(params))
-            .await
-            .context("events/stream failed for hosted Plugin Runtime")?;
+        McpEventStream::open(
+            managed.client,
+            cancel_event_streams_on_server_removal,
+            event_name,
+            arguments,
+            request_meta,
+        )
+        .await
+    }
 
-        Ok(McpEventStream {
-            request: Some(request),
-            runtime_handle: Handle::current(),
-            connection: Some(connection),
-            hosted_event_server_removals,
-        })
+    /// Creates an event stream opener using the task's event server settings.
+    pub fn event_stream_opener(&self) -> Result<McpEventStreamOpener> {
+        self.runtime.event_stream_opener()
+    }
+
+    /// Forwards event server removal to the owner of the task's subscriptions.
+    pub fn forward_event_server_removals_to(&self, cancellation: watch::Sender<()>) {
+        self.runtime.forward_event_server_removals_to(cancellation);
     }
 }
 

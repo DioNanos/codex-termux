@@ -28,6 +28,7 @@ fn settings_item(
 ) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
         ThreadSettingsAppliedEvent {
+            thread_id: None,
             thread_settings: ThreadSettingsSnapshot {
                 model: "gpt-5".to_string(),
                 model_provider_id: "openai".to_string(),
@@ -61,6 +62,7 @@ fn turn_context_item(
 ) -> RolloutItem {
     RolloutItem::TurnContext(TurnContextItem {
         turn_id: Some(turn_id.to_string()),
+        root_turn_id: None,
         cwd: cwd(),
         workspace_roots: Some(vec![cwd()]),
         current_date: None,
@@ -79,6 +81,7 @@ fn turn_context_item(
         multi_agent_version: None,
         multi_agent_mode: None,
         realtime_active: None,
+        cyber_access_program: None,
         effort: None,
         summary: codex_protocol::config_types::ReasoningSummary::Auto,
     })

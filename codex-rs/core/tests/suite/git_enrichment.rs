@@ -92,11 +92,24 @@ fn expected_workspace(repo: &Path, head: &str, has_changes: bool) -> Value {
     })
 }
 
+enum GitMetadataAtStartup {
+    Present,
+    RestoredAfterPrewarm,
+}
+
+#[test_case(GitMetadataAtStartup::Present; "git present at startup")]
+#[test_case(GitMetadataAtStartup::RestoredAfterPrewarm; "git restored after prewarm")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn startup_prewarm_skips_git_enrichment_and_user_turn_observes_fresh_state() -> Result<()> {
+async fn startup_prewarm_skips_git_enrichment_and_user_turn_observes_fresh_state(
+    git_metadata: GitMetadataAtStartup,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let (repo, head) = create_git_repo()?;
+    let saved_git = TempDir::new()?;
+    if matches!(git_metadata, GitMetadataAtStartup::RestoredAfterPrewarm) {
+        std::fs::rename(repo.path().join(".git"), saved_git.path().join("git"))?;
+    }
     let server = start_websocket_server(vec![vec![
         vec![ev_response_created("warm-1"), ev_completed("warm-1")],
         vec![
@@ -104,7 +117,7 @@ async fn startup_prewarm_skips_git_enrichment_and_user_turn_observes_fresh_state
             ev_function_call(
                 "wait-for-git",
                 "test_sync_tool",
-                r#"{"sleep_after_ms":5000}"#,
+                r#"{"wait_for_git_enrichment":true}"#,
             ),
             ev_completed("resp-1"),
         ],
@@ -129,8 +142,12 @@ async fn startup_prewarm_skips_git_enrichment_and_user_turn_observes_fresh_state
     )
     .await?
     .body_json();
+    assert_eq!(prewarm["generate"], json!(false));
     assert!(turn_metadata(&prewarm)?.get("workspaces").is_none());
 
+    if matches!(git_metadata, GitMetadataAtStartup::RestoredAfterPrewarm) {
+        std::fs::rename(saved_git.path().join("git"), repo.path().join(".git"))?;
+    }
     std::fs::write(repo.path().join("untracked.txt"), "dirty\n")?;
     test.submit_turn("inspect the workspace").await?;
     let turn = server
@@ -141,6 +158,66 @@ async fn startup_prewarm_skips_git_enrichment_and_user_turn_observes_fresh_state
     assert_eq!(
         turn_metadata(&turn)?["workspaces"],
         expected_workspace(repo.path(), &head, /*has_changes*/ true)
+    );
+
+    test.codex.shutdown_and_wait().await?;
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Repository credentials must never cross the outbound model-request boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_turn_git_enrichment_redacts_remote_credentials() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let (repo, head) = create_git_repo()?;
+    run_git(
+        repo.path(),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://git-user:git-secret-token@example.invalid/cxa5426/repo.git",
+        ],
+    )?;
+    let server = start_websocket_server(vec![vec![
+        vec![ev_response_created("warm-1"), ev_completed("warm-1")],
+        vec![
+            ev_response_created("resp-1"),
+            ev_function_call(
+                "wait-for-git",
+                "test_sync_tool",
+                r#"{"wait_for_git_enrichment":true}"#,
+            ),
+            ev_completed("resp-1"),
+        ],
+        vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "done"),
+            ev_completed("resp-2"),
+        ],
+    ]])
+    .await;
+    let cwd = repo.path().to_path_buf();
+    let mut builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(move |config| {
+            config.cwd = cwd.abs();
+        });
+    let test = builder.build_with_websocket_server(&server).await?;
+
+    test.submit_turn("inspect the workspace").await?;
+    let turn = server
+        .single_connection()
+        .get(2)
+        .context("turn follow-up request")?
+        .body_json();
+    let serialized_turn = serde_json::to_string(&turn)?;
+    assert!(!serialized_turn.contains("git-user"));
+    assert!(!serialized_turn.contains("git-secret-token"));
+    assert_eq!(
+        turn_metadata(&turn)?["workspaces"],
+        expected_workspace(repo.path(), &head, /*has_changes*/ false)
     );
 
     test.codex.shutdown_and_wait().await?;

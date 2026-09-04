@@ -494,12 +494,21 @@ impl TestCodexBuilder {
         &mut self,
         server: &wiremock::MockServer,
     ) -> anyhow::Result<TestCodex> {
+        let test_env = test_env().await?;
+        self.build_with_environment(server, test_env).await
+    }
+
+    /// Builds a test runtime using an explicitly selected execution environment.
+    pub async fn build_with_environment(
+        &mut self,
+        server: &wiremock::MockServer,
+        test_env: TestEnv,
+    ) -> anyhow::Result<TestCodex> {
         let home = match self.home.clone() {
             Some(home) => home,
             None => Arc::new(TempDir::new()?),
         };
         let base_url = format!("{}/v1", server.uri());
-        let test_env = test_env().await?;
         Box::pin(self.build_with_home_and_base_url(
             base_url, home, /*resume_from*/ None, test_env,
             /*include_local_environment*/ false,
@@ -553,9 +562,7 @@ impl TestCodexBuilder {
             Some(home) => home,
             None => Arc::new(TempDir::new()?),
         };
-        let base_url_clone = base_url.clone();
         self.config_mutators.push(Box::new(move |config| {
-            config.model_provider.base_url = Some(base_url_clone);
             config.model_provider.supports_websockets = true;
             config.experimental_realtime_ws_model = Some("realtime-test-model".to_string());
             config.realtime.version = RealtimeWsVersion::V1;
@@ -1339,10 +1346,6 @@ pub fn test_codex() -> TestCodexBuilder {
                 .features
                 .disable(Feature::ShellSnapshot)
                 .expect("test config should allow ShellSnapshot override");
-            config
-                .features
-                .enable(Feature::ContentItemKinds)
-                .expect("test config should allow ContentItemKinds override");
         })],
         auth: CodexAuth::from_api_key("dummy"),
         pre_build_hooks: vec![],

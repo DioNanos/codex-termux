@@ -229,36 +229,39 @@ describe("Codex", () => {
     }
   });
 
-  it("passes modelReasoningEffort to exec", async () => {
-    const { url, close } = await startResponsesTestProxy({
-      statusCode: 200,
-      responseBodies: [
-        sse(
-          responseStarted("response_1"),
-          assistantMessage("Reasoning effort applied", "item_1"),
-          responseCompleted("response_1"),
-        ),
-      ],
-    });
-
-    const { args: spawnArgs, restore } = codexExecSpy();
-    const { client, cleanup } = createMockClient(url);
-
-    try {
-      const thread = client.startThread({
-        modelReasoningEffort: "high",
+  it.each(["high", "persistent"] as const)(
+    "passes %s modelReasoningEffort to exec",
+    async (effort) => {
+      const { url, close } = await startResponsesTestProxy({
+        statusCode: 200,
+        responseBodies: [
+          sse(
+            responseStarted("response_1"),
+            assistantMessage("Reasoning effort applied", "item_1"),
+            responseCompleted("response_1"),
+          ),
+        ],
       });
-      await thread.run("apply reasoning effort");
 
-      const commandArgs = spawnArgs[0];
-      expect(commandArgs).toBeDefined();
-      expectPair(commandArgs, ["--config", 'model_reasoning_effort="high"']);
-    } finally {
-      cleanup();
-      restore();
-      await close();
-    }
-  });
+      const { args: spawnArgs, restore } = codexExecSpy();
+      const { client, cleanup } = createMockClient(url);
+
+      try {
+        const thread = client.startThread({
+          modelReasoningEffort: effort,
+        });
+        await thread.run("apply reasoning effort");
+
+        const commandArgs = spawnArgs[0];
+        expect(commandArgs).toBeDefined();
+        expectPair(commandArgs, ["--config", `model_reasoning_effort="${effort}"`]);
+      } finally {
+        cleanup();
+        restore();
+        await close();
+      }
+    },
+  );
 
   it("passes networkAccessEnabled to exec", async () => {
     const { url, close } = await startResponsesTestProxy({

@@ -1143,7 +1143,7 @@ pub fn run_elevated_provisioning_setup(
     run_setup_exe(&payload, /*needs_elevation*/ false, codex_home)
 }
 
-fn build_payload_roots(
+pub(crate) fn build_payload_roots(
     request: &SandboxSetupRequest<'_>,
     overrides: &SetupRootOverrides,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
@@ -1202,7 +1202,7 @@ fn build_payload_roots(
     (read_roots, write_roots)
 }
 
-fn build_payload_deny_write_paths(
+pub(crate) fn build_payload_deny_write_paths(
     request: &SandboxSetupRequest<'_>,
     explicit_deny_write_paths: Option<Vec<PathBuf>>,
 ) -> Vec<PathBuf> {

@@ -23,12 +23,16 @@ pub enum McpServerConnectionStatus {
     Disabled,
 }
 
-/// Extension ID for OpenAI form elicitation.
+/// Extension ID for OpenAI elicitation modes.
+pub const OPENAI_ELICITATION_EXTENSION_ID: &str = "openai/elicitation";
+/// Extension ID for legacy OpenAI form elicitation.
 pub const OPENAI_FORM_EXTENSION_ID: &str = "openai/form";
 /// Extension ID for standard MCP form elicitations that require user-entered input.
 pub const OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID: &str = "openai/standard-form-input";
 /// Extension ID for MCP App UI rendering.
 pub const MCP_APP_UI_EXTENSION_ID: &str = "io.modelcontextprotocol/ui";
+/// Host-supplied confirmation-policy documents for Node REPL-backed actor calls.
+pub const CONFIRMATION_POLICIES_META_KEY: &str = "openai/confirmation_policies";
 
 /// Returns whether a raw MCP server name identifies a Node REPL-backed server.
 pub fn is_node_repl_backed_server(server: &str) -> bool {

@@ -12,6 +12,7 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxEntryMissingPathBehavior;
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSandboxPolicyContext;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::SandboxPolicy;
@@ -332,6 +333,12 @@ pub struct FileSystemSandboxContext {
     pub cwd: Option<PathUri>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspace_roots: Vec<PathUri>,
+    /// Executor-local user home used to resolve home-relative policy paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_home_dir: Option<PathUri>,
+    /// Executor-local default directories used to resolve `:tmpdir` policy entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporary_directories: Option<Vec<PathUri>>,
     pub windows_sandbox_level: WindowsSandboxLevel,
     #[serde(default)]
     pub windows_sandbox_private_desktop: bool,
@@ -376,6 +383,8 @@ impl FileSystemSandboxContext {
             permissions: permissions.into(),
             cwd,
             workspace_roots,
+            user_home_dir: None,
+            temporary_directories: None,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             windows_sandbox_private_desktop: false,
             windows_sandbox_proxy_settings_mode: None,
@@ -391,6 +400,18 @@ impl FileSystemSandboxContext {
         let file_system_policy = permissions.file_system_sandbox_policy();
         matches!(file_system_policy.kind, FileSystemSandboxKind::Restricted)
             && !file_system_policy.has_full_disk_write_access()
+    }
+
+    /// Borrows the executor-owned paths needed to interpret filesystem policy entries.
+    ///
+    /// Returns `None` after the cwd has been omitted from a transport context.
+    pub fn policy_context(&self) -> Option<FileSystemSandboxPolicyContext<'_>> {
+        Some(FileSystemSandboxPolicyContext {
+            cwd: self.cwd.as_ref()?,
+            workspace_roots: &self.workspace_roots,
+            user_home_dir: self.user_home_dir.as_ref(),
+            temporary_directories: self.temporary_directories.as_deref(),
+        })
     }
 
     pub fn has_cwd_dependent_permissions(&self) -> bool {

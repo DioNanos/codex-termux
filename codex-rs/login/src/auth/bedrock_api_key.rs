@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::Path;
 
 use codex_config::types::AuthCredentialsStoreMode;
@@ -10,10 +11,19 @@ use super::storage::AuthKeyringBackendKind;
 use codex_protocol::auth::AuthMode;
 
 /// Managed Amazon Bedrock API key persisted in `auth.json`.
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct BedrockApiKeyAuth {
     pub api_key: String,
     pub region: String,
+}
+
+impl fmt::Debug for BedrockApiKeyAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BedrockApiKeyAuth")
+            .field("api_key", &"<redacted>")
+            .field("region", &self.region)
+            .finish()
+    }
 }
 
 /// Writes an `auth.json` that contains only the Amazon Bedrock API key auth.

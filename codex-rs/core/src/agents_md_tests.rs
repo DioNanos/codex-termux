@@ -25,7 +25,7 @@ use codex_exec_server::RemoveOptions;
 use codex_exec_server::WalkOptions;
 use codex_exec_server::WalkOutcome;
 use codex_exec_server::WriteFileOptions;
-use codex_extension_api::UserInstructions;
+use codex_extension_api::Instructions;
 use codex_features::Feature;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
@@ -311,7 +311,7 @@ impl ExecutorFileSystem for FailingFileSystem {
 
 struct TestConfig {
     config: Config,
-    user_instructions: Option<UserInstructions>,
+    user_instructions: Option<Instructions>,
 }
 
 impl Deref for TestConfig {
@@ -368,6 +368,7 @@ fn resolved_local_environments<const N: usize>(
                         workspace_roots: Vec::new(),
                         config: EnvironmentConfigState::Ready(EnvironmentConfig {
                             allow_login_shell: true,
+                            workspace_roots: Vec::new(),
                             windows_sandbox_level: WindowsSandboxLevel::Disabled,
                             windows_sandbox_private_desktop: true,
                             use_legacy_landlock: false,
@@ -506,7 +507,7 @@ async fn make_config(root: &TempDir, limit: usize, instructions: Option<&str>) -
     config.cwd = root.abs();
     config.project_doc_max_bytes = limit;
 
-    let user_instructions = instructions.map(|text| UserInstructions {
+    let user_instructions = instructions.map(|text| Instructions {
         text: text.to_owned(),
         source: config.codex_home.join(DEFAULT_AGENTS_MD_FILENAME),
     });
@@ -555,7 +556,7 @@ async fn make_config_with_project_root_markers(
 
     config.cwd = root.abs();
     config.project_doc_max_bytes = limit;
-    let user_instructions = instructions.map(|text| UserInstructions {
+    let user_instructions = instructions.map(|text| Instructions {
         text: text.to_owned(),
         source: config.codex_home.join(DEFAULT_AGENTS_MD_FILENAME),
     });
@@ -1540,7 +1541,7 @@ async fn instruction_sources_include_global_before_agents_md_docs() {
     let project_agents = cfg.cwd.join("AGENTS.md");
 
     let expected = LoadedAgentsMd {
-        user_instructions: Some(UserInstructions {
+        user_instructions: Some(Instructions {
             text: "global doc".to_string(),
             source: global_agents.clone(),
         }),

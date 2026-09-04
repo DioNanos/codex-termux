@@ -17,7 +17,10 @@ impl ToolExecutor<ToolInvocation> for Handler {
         create_followup_task_tool()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             let mut analytics = ToolCallAnalytics::new(&invocation, CollabAgentTool::FollowupTask);
             let result = self.handle_call(invocation, &mut analytics).await;

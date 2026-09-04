@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::SortDirection;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredProjectRoot {
     pub path: String,
@@ -14,6 +16,7 @@ pub struct StoredProject {
     pub position: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    pub recency_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +29,8 @@ pub struct StoredProjectsPage {
 pub struct ListProjectsParams {
     pub cursor: Option<String>,
     pub limit: usize,
+    pub sort_key: codex_state::ProjectSortKey,
+    pub sort_direction: SortDirection,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

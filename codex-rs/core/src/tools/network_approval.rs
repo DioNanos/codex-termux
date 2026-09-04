@@ -621,7 +621,7 @@ impl NetworkApprovalService {
         let Some(environment_id) = active_environment_id.or_else(|| {
             active_turn
                 .as_ref()
-                .and_then(|(turn_context, _)| turn_context.environments.primary())
+                .and_then(|(turn_context, _, _)| turn_context.environments.primary())
                 .map(|environment| environment.selection.environment_id.clone())
         }) else {
             return NetworkDecision::deny(REASON_NOT_ALLOWED);
@@ -648,7 +648,7 @@ impl NetworkApprovalService {
             format!("Network access to \"{target}\" was blocked by policy.");
         let prompt_reason = format!("{} is not in the allowed_domains", request.host);
 
-        let Some((turn_context, strict_auto_review)) = active_turn else {
+        let Some((turn_context, step_settings, strict_auto_review)) = active_turn else {
             if let Some(owner_call) = owner_call.as_ref() {
                 self.record_call_outcome(&owner_call.registration_id, policy_denial_message);
             }
@@ -694,7 +694,11 @@ impl NetworkApprovalService {
             pending_owner.complete(PendingApprovalDecision::Deny);
             return NetworkDecision::deny(REASON_NOT_ALLOWED);
         }
-        if !allows_network_approval_flow(turn_context.approval_policy()) {
+        let review_context = GuardianReviewContext::from_resolved_settings(
+            Arc::clone(&turn_context),
+            &step_settings,
+        );
+        if !allows_network_approval_flow(review_context.approval_policy) {
             if let Some(owner_call) = owner_call.as_ref() {
                 self.record_call_outcome(&owner_call.registration_id, policy_denial_message);
             }
@@ -755,7 +759,7 @@ impl NetworkApprovalService {
             cwd,
         };
         let approval_context = ApprovalContext {
-            review_context: GuardianReviewContext::from(&turn_context),
+            review_context,
             cancellation_token: None,
             call_id: approval_call_id,
             tool_name: telemetry_tool_name.clone(),

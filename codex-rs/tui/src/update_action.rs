@@ -12,6 +12,8 @@ pub enum UpdateAction {
     NpmGlobalLatest,
     /// Update via `bun install -g @mmmbuto/codex-cli-termux@latest`.
     BunGlobalLatest,
+    /// Update via `vp install -g @mmmbuto/codex-cli-termux@latest`.
+    VitePlusGlobalLatest,
     /// Update via `pnpm add -g @mmmbuto/codex-cli-termux@latest`.
     PnpmGlobalLatest,
     /// Redirect a detected Homebrew install to the supported fork npm package.
@@ -28,6 +30,7 @@ impl UpdateAction {
         match &context.method {
             InstallMethod::Npm => Some(UpdateAction::NpmGlobalLatest),
             InstallMethod::Bun => Some(UpdateAction::BunGlobalLatest),
+            InstallMethod::VitePlus => Some(UpdateAction::VitePlusGlobalLatest),
             InstallMethod::Pnpm => Some(UpdateAction::PnpmGlobalLatest),
             InstallMethod::Brew => Some(UpdateAction::BrewUpgrade),
             InstallMethod::Standalone { platform, .. } => Some(match platform {
@@ -49,6 +52,9 @@ impl UpdateAction {
                 "bun",
                 &["install", "-g", "@mmmbuto/codex-cli-termux@latest"],
             ),
+            UpdateAction::VitePlusGlobalLatest => {
+                ("vp", &["install", "-g", "@mmmbuto/codex-cli-termux@latest"])
+            }
             UpdateAction::PnpmGlobalLatest => {
                 ("pnpm", &["add", "-g", "@mmmbuto/codex-cli-termux@latest"])
             }

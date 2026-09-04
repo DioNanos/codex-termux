@@ -6,6 +6,8 @@
 use super::*;
 
 const ULTRA_REASONING_CONCURRENCY_WARNING_THRESHOLD: usize = 8;
+pub(super) const MODEL_SELECTION_VIEW_ID: &str = "model-selection";
+pub(super) const ALL_MODELS_SELECTION_VIEW_ID: &str = "all-models-selection";
 
 impl ChatWidget {
     /// Open a popup to choose a quick auto model. Selecting "All models"
@@ -29,7 +31,11 @@ impl ChatWidget {
                 return;
             }
         };
+        let request_id = uuid::Uuid::new_v4();
+        self.model_popup_request_id = Some(request_id);
         self.open_model_popup_with_presets(presets);
+        // Show cached choices immediately and update any still-present picker when the reply arrives.
+        self.app_event_tx.send(AppEvent::FetchModels { request_id });
     }
 
     fn model_menu_header(&self, title: &str, subtitle: &str) -> Box<dyn Renderable> {
@@ -89,7 +95,7 @@ impl ChatWidget {
             .partition(|preset| Self::is_auto_model(&preset.model));
 
         if auto_presets.is_empty() {
-            self.open_all_models_popup(other_presets);
+            self.open_all_models_popup_with_view_id(other_presets, MODEL_SELECTION_VIEW_ID);
             return;
         }
 
@@ -139,11 +145,8 @@ impl ChatWidget {
             .collect();
 
         if !other_presets.is_empty() {
-            let all_models = other_presets;
-            let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-                tx.send(AppEvent::OpenAllModelsPopup {
-                    models: all_models.clone(),
-                });
+            let actions: Vec<SelectionAction> = vec![Box::new(|tx| {
+                tx.send(AppEvent::OpenAllModelsPopup);
             })];
 
             let is_current = !items.iter().any(|item| item.is_current);
@@ -165,7 +168,8 @@ impl ChatWidget {
             "Select Model",
             "Pick a quick auto mode or browse all models.",
         );
-        self.bottom_pane.show_selection_view(SelectionViewParams {
+        self.show_model_selection_view(SelectionViewParams {
+            view_id: Some(MODEL_SELECTION_VIEW_ID),
             footer_hint: Some(standard_popup_hint_line()),
             items,
             header,
@@ -173,7 +177,7 @@ impl ChatWidget {
         });
     }
 
-    fn is_auto_model(model: &str) -> bool {
+    pub(super) fn is_auto_model(model: &str) -> bool {
         model.starts_with("codex-auto-")
     }
 
@@ -186,8 +190,24 @@ impl ChatWidget {
         }
     }
 
-    pub(crate) fn open_all_models_popup(&mut self, presets: Vec<ModelPreset>) {
+    pub(crate) fn open_all_models_popup(&mut self) {
+        let presets = self
+            .model_catalog
+            .try_list_models()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|preset| preset.show_in_picker && !Self::is_auto_model(&preset.model))
+            .collect();
+        self.open_all_models_popup_with_view_id(presets, ALL_MODELS_SELECTION_VIEW_ID);
+    }
+
+    fn open_all_models_popup_with_view_id(
+        &mut self,
+        presets: Vec<ModelPreset>,
+        view_id: &'static str,
+    ) {
         if presets.is_empty() {
+            self.bottom_pane.dismiss_view_by_id(view_id);
             self.add_info_message(
                 "No additional models are available right now.".to_string(),
                 /*hint*/ None,
@@ -224,7 +244,8 @@ impl ChatWidget {
             "Select Model and Effort",
             "Access legacy models by running codex -m <model_name> or in your config.toml",
         );
-        self.bottom_pane.show_selection_view(SelectionViewParams {
+        self.show_model_selection_view(SelectionViewParams {
+            view_id: Some(view_id),
             footer_hint: Some(self.bottom_pane.standard_popup_hint_line()),
             items,
             header,
@@ -646,6 +667,7 @@ impl ChatWidget {
             ReasoningEffortConfig::XHigh => "Extra high".to_string(),
             ReasoningEffortConfig::Max => "Max".to_string(),
             ReasoningEffortConfig::Ultra => "Ultra".to_string(),
+            ReasoningEffortConfig::Persistent => "Persistent".to_string(),
             ReasoningEffortConfig::Custom(value) => value.clone(),
         }
     }

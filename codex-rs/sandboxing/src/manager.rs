@@ -301,6 +301,9 @@ impl SandboxManager {
         windows_sandbox_level: WindowsSandboxLevel,
         has_managed_network_requirements: bool,
     ) -> SandboxType {
+        #[cfg(windows)]
+        crate::windows_mxc::record_availability_once();
+
         if self.should_sandbox(permission_profile, pref, has_managed_network_requirements) {
             get_platform_sandbox(windows_sandbox_level != WindowsSandboxLevel::Disabled)
                 .unwrap_or(SandboxType::None)

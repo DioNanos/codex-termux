@@ -384,6 +384,7 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
             rejected_steer_history_records: VecDeque::new(),
             queued_user_messages,
             queued_user_message_history_records: VecDeque::new(),
+            recovered_queue: false,
             user_turn_pending_start: false,
             submit_pending_steers_after_interrupt: false,
             current_collaboration_mode: chat.current_collaboration_mode.clone(),

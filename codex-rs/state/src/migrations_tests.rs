@@ -843,7 +843,7 @@ async fn repair_recency_migration_succeeds_while_another_connection_holds_writer
         .await
         .expect("current migrations should apply");
     let read_pool = sqlite
-        .open_read_only_pool(&state_path)
+        .open_read_only_pool(&state_path, /*busy_timeout*/ None)
         .await
         .expect("read-only pool should open");
     let mut write_connection = pool.acquire().await.expect("write connection should open");

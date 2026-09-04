@@ -879,6 +879,51 @@ async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
 }
 
 #[tokio::test]
+async fn spawn_internal_guardian_session_preserves_windows_sandbox_proxy_settings() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let parent = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start parent thread");
+    let reviewer = manager
+        .spawn_internal_session(
+            parent.thread_id,
+            StartThreadOptions {
+                session_source: Some(SessionSource::Internal(InternalSessionSource::Guardian)),
+                ..StartThreadOptions::new(config)
+            },
+        )
+        .await
+        .expect("start internal reviewer");
+
+    assert_eq!(
+        (
+            parent.thread.session.windows_sandbox_proxy_settings_mode,
+            reviewer.thread.session.windows_sandbox_proxy_settings_mode,
+        ),
+        (
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve,
+        )
+    );
+
+    manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+}
+
+#[tokio::test]
 async fn spawn_internal_session_preserves_parent_lineage_without_forking_history() {
     struct ParentLifecycleContributor {
         observed_mcp_sources: Arc<std::sync::Mutex<Vec<SessionSource>>>,
@@ -908,7 +953,7 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
         }
     }
 
-    struct ParentInstructionsProvider(codex_extension_api::UserInstructions);
+    struct ParentInstructionsProvider(codex_extension_api::Instructions);
 
     impl codex_extension_api::UserInstructionsProvider for ParentInstructionsProvider {
         fn load_user_instructions(&self) -> codex_extension_api::LoadUserInstructionsFuture<'_> {
@@ -954,7 +999,7 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
     )
     .expect("managed requirements stack");
 
-    let parent_instructions = codex_extension_api::UserInstructions {
+    let parent_instructions = codex_extension_api::Instructions {
         text: "parent user instructions must not be inherited".to_string(),
         source: config.codex_home.join("AGENTS.md"),
     };
@@ -1017,6 +1062,7 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
     reviewer_environment.config =
         EnvironmentConfigState::Ready(codex_protocol::protocol::EnvironmentConfig {
             allow_login_shell: true,
+            workspace_roots: reviewer_environment.workspace_roots.clone(),
             permission_profile: config.permissions.permission_profile_state().snapshot(),
             shell_environment_policy: Default::default(),
             windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
@@ -1516,12 +1562,17 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
         )
         .await
         .expect("resume source thread");
-    let resumed_turn = resumed
+    let (prepared_turn, _) = resumed
         .thread
         .session
-        .new_turn_with_sub_id("resume-turn".to_string(), SessionSettingsUpdate::default())
+        .new_turn_with_sub_id(
+            "resume-turn".to_string(),
+            SessionSettingsUpdate::default(),
+            Default::default(),
+        )
         .await
         .expect("build resumed turn context");
+    let resumed_turn = prepared_turn;
     assert_eq!(resumed_turn.environments.turn_environments().count(), 1);
     assert_eq!(
         resumed_turn
@@ -1550,12 +1601,17 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
         )
         .await
         .expect("fork source thread");
-    let forked_turn = forked
+    let (prepared_turn, _) = forked
         .thread
         .session
-        .new_turn_with_sub_id("fork-turn".to_string(), SessionSettingsUpdate::default())
+        .new_turn_with_sub_id(
+            "fork-turn".to_string(),
+            SessionSettingsUpdate::default(),
+            Default::default(),
+        )
         .await
         .expect("build forked turn context");
+    let forked_turn = prepared_turn;
     assert_eq!(forked_turn.environments.turn_environments().count(), 1);
     assert_eq!(
         forked_turn
@@ -2386,6 +2442,7 @@ fn completed_legacy_event_history_is_not_mid_turn() {
             phase: None,
             memory_citation: None,
             delivery: None,
+            questions: None,
         })),
     ]);
 

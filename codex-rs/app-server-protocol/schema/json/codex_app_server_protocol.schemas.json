@@ -643,6 +643,30 @@
             },
             "method": {
               "enum": [
+                "thread/revert"
+              ],
+              "title": "Thread/revertRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadRevertParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/revertRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/list"
               ],
               "title": "Thread/listRequestMethod",
@@ -802,6 +826,54 @@
             "params"
           ],
           "title": "Thread/readRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/turns/list"
+              ],
+              "title": "Thread/turns/listRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadTurnsListParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/turns/listRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/items/list"
+              ],
+              "title": "Thread/items/listRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadItemsListParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/items/listRequest",
           "type": "object"
         },
         {
@@ -1019,6 +1091,30 @@
             "params"
           ],
           "title": "Plugin/installedRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "plugin/reconcile"
+              ],
+              "title": "Plugin/reconcileRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/PluginReconcileParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Plugin/reconcileRequest",
           "type": "object"
         },
         {
@@ -3930,6 +4026,27 @@
         {
           "properties": {
             "_meta": true,
+            "message": {
+              "type": "string"
+            },
+            "mode": {
+              "enum": [
+                "openaiForm"
+              ],
+              "type": "string"
+            },
+            "requestedSchema": true
+          },
+          "required": [
+            "message",
+            "mode",
+            "requestedSchema"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "_meta": true,
             "elicitationId": {
               "type": "string"
             },
@@ -5504,6 +5621,46 @@
           "properties": {
             "method": {
               "enum": [
+                "modelProvider/authRecoveryStarted"
+              ],
+              "title": "ModelProvider/authRecoveryStartedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/AuthRecoveryNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "ModelProvider/authRecoveryStartedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "modelProvider/authRecoveryCompleted"
+              ],
+              "title": "ModelProvider/authRecoveryCompletedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/AuthRecoveryNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "ModelProvider/authRecoveryCompletedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "turn/moderationMetadata"
               ],
               "title": "Turn/moderationMetadataNotificationMethod",
@@ -6842,6 +6999,17 @@
             "default": true,
             "type": "boolean"
           },
+          "links": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AppLinksConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-account approval settings keyed by link ID."
+          },
           "open_world_enabled": {
             "type": [
               "boolean",
@@ -6968,6 +7136,36 @@
           "id",
           "name"
         ],
+        "type": "object"
+      },
+      "AppLinkConfig": {
+        "description": "Approval settings for a connected account within an app.",
+        "properties": {
+          "approvals_reviewer": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ApprovalsReviewer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "default_tools_approval_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AppToolApproval"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "AppLinksConfig": {
+        "description": "Account settings for a single app.",
         "type": "object"
       },
       "AppListUpdatedNotification": {
@@ -7536,6 +7734,27 @@
           }
         ]
       },
+      "AsyncUserInputQuestion": {
+        "additionalProperties": false,
+        "properties": {
+          "options": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "type": "object"
+      },
       "AuthMode": {
         "description": "Authentication mode for OpenAI-backed providers.",
         "oneOf": [
@@ -7596,6 +7815,31 @@
             "type": "string"
           }
         ]
+      },
+      "AuthRecoveryNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "provider",
+          "threadId",
+          "turnId"
+        ],
+        "title": "AuthRecoveryNotification",
+        "type": "object"
       },
       "AutoCompactTokenLimitScope": {
         "description": "Selects which part of the active context is charged against `model_auto_compact_token_limit`.",
@@ -7941,6 +8185,7 @@
               "contextWindowExceeded",
               "sessionBudgetExceeded",
               "usageLimitExceeded",
+              "rateLimitExceeded",
               "serverOverloaded",
               "cyberPolicy",
               "misalignmentPolicyViolation",
@@ -10184,6 +10429,15 @@
         ],
         "type": "object"
       },
+      "CyberAccessProgram": {
+        "description": "Requested cyber treatment for a ChatGPT-authenticated Codex turn. Authorization and model-tier restrictions remain server-owned.",
+        "enum": [
+          "standard",
+          "daybreakBlue",
+          "daybreakRed"
+        ],
+        "type": "string"
+      },
       "DeprecationNoticeNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -11995,6 +12249,13 @@
       "GetAccountRateLimitsResponse": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
+          "accountId": {
+            "description": "Account associated with this usage snapshot, when supplied by the backend.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "rateLimitResetCredits": {
             "anyOf": [
               {
@@ -12004,6 +12265,9 @@
                 "type": "null"
               }
             ]
+          },
+          "rateLimitUpsell": {
+            "description": "Optional backend-owned banner from the same usage read. Its nested keys retain the backend's snake_case contract; an absent banner leaves the client's existing UI unchanged."
           },
           "rateLimits": {
             "allOf": [
@@ -14572,6 +14836,47 @@
         },
         "type": "object"
       },
+      "MisalignmentErrorDetails": {
+        "properties": {
+          "detailedExplanation": {
+            "description": "A substantive localized explanation is required before offering continuation.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "errorType": {
+            "description": "Open-ended classification; clients must accept categories added by Responses.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "steer": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/MisalignmentSteer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Instruction to submit as the next turn's user input if continuation is confirmed."
+          }
+        },
+        "type": "object"
+      },
+      "MisalignmentSteer": {
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "type": "object"
+      },
       "ModeKind": {
         "description": "Initial collaboration mode to use when the TUI starts.",
         "enum": [
@@ -15962,6 +16267,84 @@
         "title": "PluginReadResponse",
         "type": "object"
       },
+      "PluginReconcileChangedPlugin": {
+        "description": "Runtime categories affected by this change, not just capabilities currently present. Flags describe declarations before runtime policy filtering. Updates OR the old and new bundle flags; enablement changes and cached reinstalls use the cached bundle; removals retain the old bundle's flags.",
+        "properties": {
+          "hasApps": {
+            "type": "boolean"
+          },
+          "hasHooks": {
+            "type": "boolean"
+          },
+          "hasMcps": {
+            "type": "boolean"
+          },
+          "hasSkills": {
+            "description": "Whether either bundle declares skill roots; not a validated inventory of enabled skills.",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "Local plugin ID (`name@marketplace`), matching `PluginSummary.id`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hasApps",
+          "hasHooks",
+          "hasMcps",
+          "hasSkills",
+          "id"
+        ],
+        "type": "object"
+      },
+      "PluginReconcileParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "reason": {
+            "description": "Optional client-provided reason recorded with the reconciliation attempt.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "PluginReconcileParams",
+        "type": "object"
+      },
+      "PluginReconcileResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Bundle and installed-state changes observed by this pass, not a runtime-readiness acknowledgement or a cumulative diff since the client's last request. Other metadata-only changes are not listed.",
+        "properties": {
+          "changedPlugins": {
+            "description": "Plugins affected by bundle changes, enablement changes, or removals. Installed-state changes compare against the previous cached snapshot, including cached reinstalls. Removal hints survive cache cleanup failures; unchanged plugins are omitted.",
+            "items": {
+              "$ref": "#/definitions/v2/PluginReconcileChangedPlugin"
+            },
+            "type": "array"
+          },
+          "failedMaterializationRemotePluginIds": {
+            "description": "Subset of failures for which the requested bundle could not be materialized. A previously cached version may still be available.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "failedRemotePluginIds": {
+            "description": "Backend remote plugin IDs whose bundle or identity update failed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "changedPlugins",
+          "failedMaterializationRemotePluginIds",
+          "failedRemotePluginIds"
+        ],
+        "title": "PluginReconcileResponse",
+        "type": "object"
+      },
       "PluginSearchResult": {
         "properties": {
           "marketplaceName": {
@@ -16822,6 +17205,14 @@
             "format": "int64",
             "type": "integer"
           },
+          "recencyAt": {
+            "description": "Newest non-archived member thread's recency, in Unix seconds; null when none exist.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "roots": {
             "items": {
               "$ref": "#/definitions/v2/ProjectRoot"
@@ -16879,6 +17270,13 @@
           "path"
         ],
         "type": "object"
+      },
+      "ProjectSortKey": {
+        "enum": [
+          "position",
+          "recencyAt"
+        ],
+        "type": "string"
       },
       "QueuedSubmission": {
         "properties": {
@@ -17125,6 +17523,16 @@
             "anyOf": [
               {
                 "$ref": "#/definitions/v2/TokenUsageBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "usageMetadata": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ResponseUsageMetadata"
               },
               {
                 "type": "null"
@@ -18377,6 +18785,19 @@
             "type": "object"
           }
         ]
+      },
+      "ResponseUsageMetadata": {
+        "description": "Usage metadata reported for one upstream response.",
+        "properties": {
+          "amount": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": true
+        },
+        "type": "object"
       },
       "ResponsesApiWebSearchAction": {
         "oneOf": [
@@ -19773,9 +20194,25 @@
             ],
             "description": "Optional Git metadata captured when the thread was created."
           },
+          "historyMode": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/ThreadHistoryMode"
+              }
+            ],
+            "default": "legacy",
+            "description": "Persisted thread history contract selected when this thread was created."
+          },
           "id": {
             "description": "Identifier for this thread. Codex-generated thread IDs are UUIDv7.",
             "type": "string"
+          },
+          "model": {
+            "description": "Current configured model when loaded, otherwise the latest persisted model. Null when unavailable. This is not per-turn execution telemetry.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "modelProvider": {
             "description": "Model provider used for this thread (for example, 'openai').",
@@ -19812,6 +20249,17 @@
               "string",
               "null"
             ]
+          },
+          "reasoningEffort": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ReasoningEffort"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Current configured reasoning effort when loaded, otherwise the latest persisted effort. Null when unset or unavailable. This is not per-turn execution telemetry."
           },
           "recencyAt": {
             "description": "Unix timestamp (in seconds) used for thread recency ordering.",
@@ -20080,6 +20528,10 @@
             ]
           },
           "ephemeral": {
+            "type": "boolean"
+          },
+          "excludeTurns": {
+            "description": "When true, return only thread metadata and live fork state without populating `thread.turns`. This is useful when the client plans to call `thread/turns/list` immediately after forking. Full-history hydration is deprecated for paginated threads; use this with `thread/turns/list` and `thread/items/list` instead.",
             "type": "boolean"
           },
           "lastTurnId": {
@@ -20542,6 +20994,16 @@
                 ],
                 "default": null
               },
+              "questions": {
+                "default": null,
+                "items": {
+                  "$ref": "#/definitions/v2/AsyncUserInputQuestion"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
               "text": {
                 "type": "string"
               },
@@ -20559,6 +21021,40 @@
               "type"
             ],
             "title": "AgentMessageThreadItem",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "namespace": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "output": {
+                "$ref": "#/definitions/v2/FunctionCallOutputBody"
+              },
+              "type": {
+                "enum": [
+                  "functionCallOutput"
+                ],
+                "title": "FunctionCallOutputThreadItemType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "output",
+              "type"
+            ],
+            "title": "FunctionCallOutputThreadItem",
             "type": "object"
           },
           {
@@ -21260,6 +21756,83 @@
         ],
         "type": "object"
       },
+      "ThreadItemsListParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "cursor": {
+            "description": "Opaque cursor to pass to the next call to continue after the last item.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "description": "Optional item page size.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sortDirection": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/SortDirection"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional item pagination direction; defaults to ascending."
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "turnId": {
+            "description": "Optional turn id to filter by. When omitted, returns items across the thread.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "threadId"
+        ],
+        "title": "ThreadItemsListParams",
+        "type": "object"
+      },
+      "ThreadItemsListResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "backwardsCursor": {
+            "description": "Opaque cursor to pass as `cursor` when reversing `sortDirection`. This is only populated when the page contains at least one item.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "items": {
+              "$ref": "#/definitions/v2/ThreadItemEntry"
+            },
+            "type": "array"
+          },
+          "nextCursor": {
+            "description": "Opaque cursor to pass to the next call to continue after the last item. if None, there are no more items to return.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ThreadItemsListResponse",
+        "type": "object"
+      },
       "ThreadListCwdFilter": {
         "anyOf": [
           {
@@ -21577,7 +22150,7 @@
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "includeTurns": {
-            "description": "When true, include turns and their items from rollout history.",
+            "description": "When true, include turns and their items from rollout history. Full-history hydration is deprecated for paginated threads; prefer a metadata-only read and page with `thread/turns/list` and `thread/items/list`.",
             "type": "boolean"
           },
           "threadId": {
@@ -22203,6 +22776,10 @@
               "null"
             ]
           },
+          "excludeTurns": {
+            "description": "When true, return only thread metadata and live-resume state without populating `thread.turns`. This is useful when the client plans to call `thread/turns/list` immediately after resuming. Full-history hydration is deprecated for paginated threads; use this with `thread/turns/list` and `thread/items/list` instead.",
+            "type": "boolean"
+          },
           "model": {
             "description": "Configuration overrides for the resumed thread, if any.",
             "type": [
@@ -22277,6 +22854,14 @@
             },
             "type": "array"
           },
+          "itemsBackwardsCursor": {
+            "default": null,
+            "description": "Opaque cursor for hydrating paginated items backwards.\n\nPass this as `cursor` to `thread/items/list` with `sortDirection: \"desc\"`. The first page includes the item identified by the cursor.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "model": {
             "type": "string"
           },
@@ -22309,6 +22894,14 @@
           },
           "thread": {
             "$ref": "#/definitions/v2/Thread"
+          },
+          "turnsBackwardsCursor": {
+            "default": null,
+            "description": "Opaque cursor for hydrating paginated turns backwards.\n\nPass this as `cursor` to `thread/turns/list` with `sortDirection: \"desc\"`. The first page includes the turn identified by the cursor.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -22321,6 +22914,57 @@
           "thread"
         ],
         "title": "ThreadResumeResponse",
+        "type": "object"
+      },
+      "ThreadRevertParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Replace a paginated thread's durable history with the prefix before one turn.\n\nThis only changes persisted conversation history. It does not revert local file changes.",
+        "properties": {
+          "beforeTurnId": {
+            "description": "Turn excluded from the replacement history, together with every later turn.",
+            "type": "string"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "beforeTurnId",
+          "threadId"
+        ],
+        "title": "ThreadRevertParams",
+        "type": "object"
+      },
+      "ThreadRevertResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "itemsBackwardsCursor": {
+            "description": "Opaque cursor for hydrating paginated items backwards.\n\nPass this as `cursor` to `thread/items/list` with `sortDirection: \"desc\"`. The first page includes the item identified by the cursor.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thread": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/Thread"
+              }
+            ],
+            "description": "Updated loaded thread metadata. `turns` is always empty; hydrate retained history through `thread/turns/list`."
+          },
+          "turnsBackwardsCursor": {
+            "description": "Opaque cursor for hydrating paginated turns backwards.\n\nPass this as `cursor` to `thread/turns/list` with `sortDirection: \"desc\"`. The first page includes the turn identified by the cursor.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "thread"
+        ],
+        "title": "ThreadRevertResponse",
         "type": "object"
       },
       "ThreadRevertedNotification": {
@@ -22764,6 +23408,14 @@
           },
           "threadId": {
             "type": "string"
+          },
+          "timeoutMs": {
+            "description": "Maximum execution time in milliseconds. Defaults to one hour when omitted or null. Must be non-negative; zero requests an immediate timeout, not unlimited execution. Does not affect the immediate RPC acknowledgement.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -23310,6 +23962,87 @@
         "title": "ThreadTokenUsageUpdatedNotification",
         "type": "object"
       },
+      "ThreadTurnsListParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "cursor": {
+            "description": "Opaque cursor to pass to the next call to continue after the last turn.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "itemsView": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/TurnItemsView"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How much item detail to include for each returned turn; defaults to summary."
+          },
+          "limit": {
+            "description": "Optional turn page size.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sortDirection": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/SortDirection"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional turn pagination direction; defaults to descending."
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "threadId"
+        ],
+        "title": "ThreadTurnsListParams",
+        "type": "object"
+      },
+      "ThreadTurnsListResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "backwardsCursor": {
+            "description": "Opaque cursor to pass as `cursor` when reversing `sortDirection`. This is only populated when the page contains at least one turn. Use it with the opposite `sortDirection` to include the anchor turn again and catch updates to that turn.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "items": {
+              "$ref": "#/definitions/v2/Turn"
+            },
+            "type": "array"
+          },
+          "nextCursor": {
+            "description": "Opaque cursor to pass to the next call to continue after the last turn. if None, there are no more turns to return.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ThreadTurnsListResponse",
+        "type": "object"
+      },
       "ThreadUnarchiveParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -23719,6 +24452,18 @@
           },
           "message": {
             "type": "string"
+          },
+          "misalignment": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/MisalignmentErrorDetails"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional public explanation and continuation instruction for a misalignment block."
           }
         },
         "required": [
@@ -23939,6 +24684,13 @@
               "null"
             ]
           },
+          "serviceTierForTurn": {
+            "description": "Override the service tier only when this request starts a new turn. Use \"default\" for standard speed. Omitted or null inherits the thread's tier. Does not change the thread's tier or a turn being steered.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "summary": {
             "anyOf": [
               {
@@ -23952,6 +24704,23 @@
           },
           "threadId": {
             "type": "string"
+          },
+          "toolOutput": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/TurnToolOutput"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "turnTrigger": {
+            "description": "Optional source classification for the caller that starts this turn. Ignored when this request steers an already-active turn.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -24042,6 +24811,27 @@
           "turnId"
         ],
         "title": "TurnSteerResponse",
+        "type": "object"
+      },
+      "TurnToolOutput": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "output": {
+            "$ref": "#/definitions/v2/FunctionCallOutputBody"
+          }
+        },
+        "required": [
+          "name",
+          "output"
+        ],
         "type": "object"
       },
       "TurnsPage": {

@@ -351,7 +351,11 @@ impl Inner {
         self.notify_connection_changed();
         let inner = Arc::clone(self);
         tokio::spawn(async move {
-            inner.recover(disconnect_message).await;
+            tokio::select! {
+                biased;
+                _ = inner.retired.cancelled() => {},
+                _ = inner.recover(disconnect_message) => {},
+            }
         });
     }
 

@@ -2,6 +2,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use chrono::Utc;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::SessionSource;
@@ -708,7 +709,7 @@ async fn apply_thread_git_info_patch(
             git_info
                 .origin_url
                 .as_ref()
-                .map(|origin_url| origin_url.as_deref()),
+                .map(|origin_url| origin_url.as_ref()),
         )
         .await
         .map_err(|err| ThreadStoreError::Internal {
@@ -728,7 +729,7 @@ async fn apply_thread_git_info(
     thread_id: ThreadId,
     sha: &Option<String>,
     branch: &Option<String>,
-    origin_url: &Option<String>,
+    origin_url: &Option<SanitizedGitUrl>,
 ) -> ThreadStoreResult<()> {
     let Some(state_db) = store.state_db().await else {
         return Err(ThreadStoreError::Internal {
@@ -740,7 +741,7 @@ async fn apply_thread_git_info(
             thread_id,
             Some(sha.as_deref()),
             Some(branch.as_deref()),
-            Some(origin_url.as_deref()),
+            Some(origin_url.as_ref()),
         )
         .await
         .map_err(|err| ThreadStoreError::Internal {
@@ -758,7 +759,7 @@ async fn apply_thread_git_info(
 fn resolve_git_info_patch(
     existing: Option<GitInfo>,
     git_info: GitInfoPatch,
-) -> (Option<String>, Option<String>, Option<String>) {
+) -> (Option<String>, Option<String>, Option<SanitizedGitUrl>) {
     let (existing_sha, existing_branch, existing_origin_url) = match existing {
         Some(info) => (
             info.commit_hash.map(|sha| sha.0),
@@ -778,7 +779,7 @@ async fn apply_thread_git_info_to_rollout(
     thread_id: ThreadId,
     sha: &Option<String>,
     branch: &Option<String>,
-    origin_url: &Option<String>,
+    origin_url: &Option<SanitizedGitUrl>,
     memory_mode: Option<&str>,
 ) -> ThreadStoreResult<()> {
     let mut session_meta =
@@ -1435,7 +1436,10 @@ mod tests {
                     git_info: Some(GitInfoPatch {
                         sha: Some(Some("abc123".to_string())),
                         branch: Some(Some("main".to_string())),
-                        origin_url: Some(Some("https://github.com/openai/codex".to_string())),
+                        origin_url: Some(Some(
+                            SanitizedGitUrl::try_from("https://github.com/openai/codex")
+                                .expect("valid git remote URL"),
+                        )),
                     }),
                     ..Default::default()
                 },
@@ -1536,7 +1540,10 @@ mod tests {
                     git_info: Some(GitInfoPatch {
                         sha: Some(Some("abc123".to_string())),
                         branch: Some(Some("main".to_string())),
-                        origin_url: Some(Some("https://github.com/openai/codex".to_string())),
+                        origin_url: Some(Some(
+                            SanitizedGitUrl::try_from("https://github.com/openai/codex")
+                                .expect("valid git remote URL"),
+                        )),
                     }),
                     ..Default::default()
                 },
@@ -1596,7 +1603,10 @@ mod tests {
                     git_info: Some(GitInfoPatch {
                         sha: Some(Some("abc123".to_string())),
                         branch: Some(Some("main".to_string())),
-                        origin_url: Some(Some("https://github.com/openai/codex".to_string())),
+                        origin_url: Some(Some(
+                            SanitizedGitUrl::try_from("https://github.com/openai/codex")
+                                .expect("valid git remote URL"),
+                        )),
                     }),
                     ..Default::default()
                 },

@@ -14,6 +14,7 @@ use codex_app_server_protocol::ActivePermissionProfile;
 use codex_app_server_protocol::ApprovalsReviewer;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::DeprecationNoticeNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -1441,6 +1442,19 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
         .find(|request| request.url.path().ends_with("/responses"))
         .expect("forked turn response request");
     let request_body = response_request.body_json::<Value>()?;
+    let turn_metadata: Value = serde_json::from_str(
+        request_body["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("forked turn metadata"),
+    )?;
+    assert_eq!(
+        turn_metadata["forked_from_thread_id"].as_str(),
+        Some(conversation_id.as_str())
+    );
+    assert_eq!(
+        turn_metadata["forked_from_ordinal_exclusive"].as_u64(),
+        Some(history_base.end_ordinal_exclusive)
+    );
     let model_input = request_body["input"]
         .as_array()
         .expect("response input array");
@@ -1491,6 +1505,132 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
             .thread_id,
         ThreadId::from_string(forked_thread_id.as_str())?
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn thread_fork_accepts_resumed_rollout_under_symlinked_sessions_root() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let external = TempDir::new()?;
+    let external_sessions = external.path().join("sessions");
+    std::fs::create_dir_all(external_sessions.as_path())?;
+    std::os::unix::fs::symlink(
+        external_sessions.as_path(),
+        codex_home.path().join("sessions"),
+    )?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let conversation_id = create_fake_paginated_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let source_path = rollout_path(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        conversation_id.as_str(),
+    );
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            path: Some(source_path),
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadForkResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+
+    assert_eq!(thread.forked_from_id, Some(conversation_id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_fork_warns_for_paginated_full_history_hydration() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let conversation_id = create_fake_paginated_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let _: DeprecationNoticeNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("deprecationNotice"),
+    )
+    .await??;
+    let _: ThreadForkResponse = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+
+    mcp.clear_message_buffer();
+    let metadata_fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id.clone(),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadForkResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(metadata_fork_id)).await??;
+    assert!(
+        !mcp.pending_notification_methods()
+            .contains(&"deprecationNotice".to_string())
+    );
+
+    mcp.clear_message_buffer();
+    let invalid_fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id,
+            last_turn_id: Some("turn-1".to_string()),
+            before_turn_id: Some("turn-1".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let _: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(invalid_fork_id)),
+    )
+    .await??;
+    assert!(
+        !mcp.pending_notification_methods()
+            .contains(&"deprecationNotice".to_string())
+    );
+
     Ok(())
 }
 
@@ -1631,6 +1771,11 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
         .await?;
     let forked_thread_id = forked_thread.id.clone();
     let forked_path = forked_thread.path.expect("forked rollout path");
+    let history_base = read_session_meta_line(forked_path.as_path())
+        .await?
+        .meta
+        .history_base
+        .expect("fork history base");
     let child_rollout = std::fs::read_to_string(forked_path.as_path())?
         .lines()
         .map(serde_json::from_str::<RolloutLine>)
@@ -1862,6 +2007,19 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
         .find(|request| request.url.path().ends_with("/responses"))
         .expect("cold-resumed model request")
         .body_json::<Value>()?;
+    let turn_metadata: Value = serde_json::from_str(
+        request_body["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("cold-resumed turn metadata"),
+    )?;
+    assert_eq!(
+        turn_metadata["forked_from_thread_id"].as_str(),
+        Some(source_thread_id.as_str())
+    );
+    assert_eq!(
+        turn_metadata["forked_from_ordinal_exclusive"].as_u64(),
+        Some(history_base.end_ordinal_exclusive)
+    );
     let model_input = request_body["input"].as_array().expect("model input");
     assert!(model_input.iter().any(|item| {
         item["role"] == expected_marker_role

@@ -303,8 +303,7 @@ fn write_permissions_for_paths_keep_dirs_outside_workspace_root() {
     );
 
     let permissions = write_permissions_for_paths(&[file_path], &sandbox_policy, &cwd_abs);
-    let expected_outside =
-        dunce::simplified(&outside.canonicalize().expect("canonicalize outside dir")).abs();
+    let expected_outside = outside.abs();
 
     assert_eq!(
         permissions

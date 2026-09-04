@@ -160,6 +160,7 @@ fn agent_message(text: &str) -> RolloutItem {
         phase: None,
         memory_citation: None,
         delivery: None,
+        questions: None,
     }))
 }
 
@@ -230,11 +231,14 @@ fn compacted(replacement_history: Vec<ResponseItem>) -> RolloutItem {
     RolloutItem::Compacted(CompactedItem {
         message: "checkpoint".to_string(),
         replacement_history: Some(replacement_history.into_iter().map(Into::into).collect()),
+        guardian_history: None,
         mcp_resource_origins: None,
         window_number: Some(1),
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     })
 }
 
@@ -441,6 +445,7 @@ async fn migration_preserves_image_generation_failure_metadata() {
             resets_at: Some(1_786_150_800),
         }),
         saved_path: None,
+        imagegen_request_id: None,
     };
     let image_completion =
         RolloutItem::EventMsg(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
@@ -1405,11 +1410,14 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
             RolloutItem::Compacted(CompactedItem {
                 message: "superseded checkpoint".repeat(1024),
                 replacement_history: Some(Vec::new()),
+                guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: Some(1),
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             RolloutItem::Compacted(CompactedItem {
                 message: "latest checkpoint".to_string(),
@@ -1425,15 +1433,19 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                     }
                     .into(),
                 ]),
+                guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: Some(2),
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             started("child-turn"),
             RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("child-turn".to_string()),
+                root_turn_id: None,
                 cwd: serde_json::from_value(json!(home.path())).expect("absolute cwd"),
                 workspace_roots: None,
                 current_date: None,
@@ -1452,6 +1464,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: None,
                 summary: ReasoningSummary::Auto,
             }),

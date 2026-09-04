@@ -801,6 +801,57 @@ fn join_normalizes_relative_uri_segments() {
 }
 
 #[test]
+fn join_descendant_uses_the_base_path_convention() {
+    for (base, relative, expected) in [
+        (
+            "file:///workspace",
+            "docs/../public",
+            "file:///workspace/public",
+        ),
+        (
+            "file:///C:/workspace",
+            r"docs\..\public",
+            "file:///C:/workspace/public",
+        ),
+        (
+            "file://server/share/workspace",
+            r"docs\..\public",
+            "file://server/share/workspace/public",
+        ),
+    ] {
+        let base = PathUri::parse(base).expect("valid base URI");
+        let expected = PathUri::parse(expected).expect("valid expected URI");
+        assert_eq!(
+            base.join_descendant(relative),
+            Ok(expected),
+            "joining {relative}"
+        );
+    }
+}
+
+#[test]
+fn join_descendant_rejects_non_descendant_paths() {
+    for (base, path) in [
+        ("file:///workspace", "/workspace/docs"),
+        ("file:///workspace", "../outside"),
+        ("file:///C:/workspace", r"\workspace\docs"),
+        ("file:///C:/workspace", r"C:\workspace\docs"),
+        ("file:///C:/workspace", r"C:docs"),
+        ("file:///C:/workspace", r"docs\file:stream"),
+        ("file://server/share/workspace", r"..\outside"),
+    ] {
+        let base = PathUri::parse(base).expect("valid base URI");
+        assert_eq!(
+            base.join_descendant(path),
+            Err(PathUriParseError::JoinPathMustBeDescendant(
+                path.to_string()
+            )),
+            "joining {path}"
+        );
+    }
+}
+
+#[test]
 fn join_replaces_posix_absolute_path() {
     let base = PathUri::parse("file:///workspace").expect("valid base URI");
 
@@ -1158,6 +1209,12 @@ fn starts_with_uses_uri_segment_boundaries() {
             false,
         ),
         (
+            "file:///workspace/pri%76ate/file",
+            "file:///workspace/%70rivate",
+            true,
+        ),
+        ("file:///workspace/%ff/file", "file:///workspace/%FF", true),
+        (
             "file:///workspace/plugin/%5C..%5Coutside",
             "file:///workspace/plugin",
             true,
@@ -1172,6 +1229,54 @@ fn starts_with_uses_uri_segment_boundaries() {
         let base = PathUri::parse(base).expect("valid base URI");
         assert_eq!(path.starts_with(&base), expected);
     }
+}
+
+#[test]
+fn overlaps_uses_lexical_containment() {
+    for (left, right, expected) in [
+        ("file:///workspace", "file:///workspace/src", Some(true)),
+        (
+            "file:///C:/WORKSPACE",
+            "file:///c:/workspace/src",
+            Some(true),
+        ),
+        (
+            "file:///workspace/src",
+            "file:///workspace/tests",
+            Some(false),
+        ),
+        ("file:///WORKSPACE", "file:///workspace/src", Some(false)),
+    ] {
+        let left = PathUri::parse(left).expect("valid left URI");
+        let right = PathUri::parse(right).expect("valid right URI");
+
+        assert_eq!(left.overlaps(&right), expected, "{left} and {right}");
+        assert_eq!(right.overlaps(&left), expected, "{right} and {left}");
+    }
+
+    let opaque = PathUri::from_opaque_path_bytes(b"/workspace/private");
+    let lexical = PathUri::parse("file:///workspace").expect("valid lexical URI");
+    assert_eq!(opaque.overlaps(&opaque), Some(true));
+    assert_eq!(opaque.overlaps(&lexical), None);
+    assert_eq!(lexical.overlaps(&opaque), None);
+}
+
+#[test]
+fn lexical_depth_counts_validated_nonempty_segments() {
+    for (path, expected) in [
+        ("file:///", Some(0)),
+        ("file:///workspace////", Some(1)),
+        ("file:///workspace/%70rivate", Some(2)),
+        ("file:///workspace/private%2Fsecret", None),
+    ] {
+        let path = PathUri::parse(path).expect("valid path URI");
+        assert_eq!(path.lexical_depth(), expected, "lexical depth for {path}");
+    }
+
+    assert_eq!(
+        PathUri::from_opaque_path_bytes(b"/workspace").lexical_depth(),
+        None
+    );
 }
 
 #[test]

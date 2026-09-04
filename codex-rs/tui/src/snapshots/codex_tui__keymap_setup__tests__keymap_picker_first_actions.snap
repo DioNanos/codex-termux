@@ -2,19 +2,19 @@
 source: tui/src/keymap_setup.rs
 expression: snapshot
 ---
-tab: All (119 selectable)
+tab: All (137 selectable)
 tab: Common (20 selectable)
 tab: Customized (0) (0 selectable)
-tab: Unbound (4) (4 selectable)
+tab: Unbound (5) (5 selectable)
 tab: App (14 selectable)
 tab: Composer (5 selectable)
 tab: Editor (17 selectable)
-tab: Vim (50 selectable)
+tab: Vim (68 selectable)
 tab: Navigation (20 selectable)
 tab: Agents (5 selectable)
 tab: Approval (8 selectable)
 tab: Debug (1 selectable)
-Open Agents | alt-a | Global open_agents Open Agents Open the shared agent-session overview. alt-a Default
+Open Agents | unbound | Global open_agents Open Agents Open the shared agent-session overview. unbound Default
 Open Transcript | ctrl-t | Global open_transcript Open Transcript Open the transcript overlay. ctrl-t Default
 Open External Editor | ctrl-g | Global open_external_editor Open External Editor Open the current draft in an external editor. ctrl-g Default
 Copy | ctrl-o | Global copy Copy Copy the last agent response to the clipboard. ctrl-o Default

@@ -564,6 +564,14 @@ async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<(
         "resume --last --all should pick newest session"
     );
 
+    // Selection must still use the latest turn's cwd when only the compressed rollout exists.
+    zstd::stream::copy_encode(
+        std::fs::File::open(&path_b)?,
+        std::fs::File::create(path_b.with_extension("jsonl.zst"))?,
+        /*level*/ 3,
+    )?;
+    std::fs::remove_file(&path_b)?;
+
     let marker_a2 = format!("resume-cwd-a-2-{}", Uuid::new_v4());
     let prompt_a2 = format!("echo {marker_a2}");
     test.cmd_with_server(&server)

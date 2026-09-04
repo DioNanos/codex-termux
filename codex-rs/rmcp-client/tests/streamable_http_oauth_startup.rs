@@ -64,6 +64,7 @@ const REFRESHABLE_SERVER_URL: &str = "https://refreshable.example/mcp";
 enum OAuthStartupScenario {
     DirectAuthorizationMetadata,
     GatewayHeadersHelper,
+    SameOriginGatewayHeadersHelper,
     ProtectedResourceMetadata,
 }
 
@@ -84,6 +85,11 @@ async fn refreshes_oauth_with_gateway_headers_helper() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn refreshes_oauth_after_gateway_rejects_token_request() -> anyhow::Result<()> {
+    assert_expired_token_refresh(OAuthStartupScenario::SameOriginGatewayHeadersHelper).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn refresh_uses_discovered_protected_resource_audience() -> anyhow::Result<()> {
     assert_expired_token_refresh(OAuthStartupScenario::ProtectedResourceMetadata).await
 }
@@ -91,10 +97,20 @@ async fn refresh_uses_discovered_protected_resource_audience() -> anyhow::Result
 async fn assert_expired_token_refresh(scenario: OAuthStartupScenario) -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let authorization_server = MockServer::start().await;
+    let same_origin_gateway = matches!(
+        scenario,
+        OAuthStartupScenario::SameOriginGatewayHeadersHelper
+    );
+    let token_server = if same_origin_gateway {
+        &server
+    } else {
+        &authorization_server
+    };
     let resource_url = format!("{}/mcp", server.uri());
     let (server_url, mcp_path, authorization_metadata_path) = match scenario {
         OAuthStartupScenario::DirectAuthorizationMetadata
-        | OAuthStartupScenario::GatewayHeadersHelper => (
+        | OAuthStartupScenario::GatewayHeadersHelper
+        | OAuthStartupScenario::SameOriginGatewayHeadersHelper => (
             resource_url.clone(),
             "/mcp",
             "/.well-known/oauth-authorization-server/mcp",
@@ -130,8 +146,8 @@ async fn assert_expired_token_refresh(scenario: OAuthStartupScenario) -> anyhow:
 
     let mut authorization_metadata = json!({
         "issuer": server_url.clone(),
-        "authorization_endpoint": format!("{}/oauth/authorize", authorization_server.uri()),
-        "token_endpoint": format!("{}/oauth/token", authorization_server.uri()),
+        "authorization_endpoint": format!("{}/oauth/authorize", token_server.uri()),
+        "token_endpoint": format!("{}/oauth/token", token_server.uri()),
         "scopes_supported": [""],
     });
     if matches!(scenario, OAuthStartupScenario::ProtectedResourceMetadata) {
@@ -142,6 +158,8 @@ async fn assert_expired_token_refresh(scenario: OAuthStartupScenario) -> anyhow:
         .ok_or_else(|| anyhow::anyhow!("authorization metadata should include issuer"))?
         .to_string();
 
+    let helper_directory = TempDir::new()?;
+    let helper_invocations = helper_directory.path().join("helper-invocations");
     Mock::given(method("GET"))
         .and(path(authorization_metadata_path))
         .and(header("user-agent", RESOURCE_USER_AGENT))
@@ -152,7 +170,14 @@ async fn assert_expired_token_refresh(scenario: OAuthStartupScenario) -> anyhow:
         .await;
     Mock::given(method("POST"))
         .and(path("/oauth/token"))
-        .and(header("user-agent", MCP_USER_AGENT))
+        .and(header(
+            "user-agent",
+            if same_origin_gateway {
+                RESOURCE_USER_AGENT
+            } else {
+                MCP_USER_AGENT
+            },
+        ))
         .and(body_string_contains("grant_type=refresh_token"))
         .and(body_string_contains(format!(
             "refresh_token={REFRESH_TOKEN}"
@@ -164,14 +189,25 @@ async fn assert_expired_token_refresh(scenario: OAuthStartupScenario) -> anyhow:
                     .any(|(name, value)| name == "resource" && value == expected_resource)
             }
         })
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token": REFRESHED_ACCESS_TOKEN,
-            "token_type": "Bearer",
-            "expires_in": 7200,
-            "refresh_token": REFRESH_TOKEN,
-        })))
-        .expect(1)
-        .mount(&authorization_server)
+        .respond_with(move |request: &Request| {
+            if same_origin_gateway
+                && request
+                    .headers
+                    .get("x-helper-generation")
+                    .is_some_and(|generation| generation == "1")
+            {
+                ResponseTemplate::new(/*s*/ 401)
+            } else {
+                ResponseTemplate::new(/*s*/ 200).set_body_json(json!({
+                    "access_token": REFRESHED_ACCESS_TOKEN,
+                    "token_type": "Bearer",
+                    "expires_in": 7200,
+                    "refresh_token": REFRESH_TOKEN,
+                }))
+            }
+        })
+        .expect(if same_origin_gateway { 2 } else { 1 })
+        .mount(token_server)
         .await;
     Mock::given(method("POST"))
         .and(path(mcp_path))
@@ -214,7 +250,11 @@ async fn assert_expired_token_refresh(scenario: OAuthStartupScenario) -> anyhow:
         .await;
 
     let codex_home = TempDir::new()?;
-    let with_headers_helper = matches!(scenario, OAuthStartupScenario::GatewayHeadersHelper);
+    let with_headers_helper = matches!(
+        scenario,
+        OAuthStartupScenario::GatewayHeadersHelper
+            | OAuthStartupScenario::SameOriginGatewayHeadersHelper
+    );
 
     // Credential storage resolves CODEX_HOME from the process environment.
     // Run the client half of the test in an ignored helper test so it can use
@@ -231,14 +271,19 @@ async fn assert_expired_token_refresh(scenario: OAuthStartupScenario) -> anyhow:
         command.env(
             CHILD_HELPER_COMMAND_ENV,
             format!(
-                "\"{}\" --http-headers-helper",
+                "\"{}\" --http-headers-helper \"{}\"",
                 cargo_bin("test_streamable_http_server")?.display(),
+                helper_invocations.display(),
             ),
         );
     }
     let status = command.status().await?;
     assert!(status.success(), "OAuth startup child failed: {status}");
     if with_headers_helper {
+        assert_eq!(
+            std::fs::read_to_string(helper_invocations)?,
+            if same_origin_gateway { "xx" } else { "x" }
+        );
         let requests = server.received_requests().await.unwrap_or_default();
         assert!(requests.iter().all(|request| {
             request
@@ -251,6 +296,12 @@ async fn assert_expired_token_refresh(scenario: OAuthStartupScenario) -> anyhow:
         .received_requests()
         .await
         .ok_or_else(|| anyhow::anyhow!("authorization server should record requests"))?;
+    server.verify().await;
+    authorization_server.verify().await;
+    if same_origin_gateway {
+        assert!(authorization_requests.is_empty());
+        return Ok(());
+    }
     assert_eq!(authorization_requests.len(), 1);
     assert_eq!(authorization_requests[0].headers.get("x-api-key"), None);
     assert_eq!(
@@ -264,8 +315,7 @@ async fn assert_expired_token_refresh(scenario: OAuthStartupScenario) -> anyhow:
             .map(http::HeaderValue::as_bytes),
         Some(MCP_USER_AGENT.as_bytes())
     );
-    server.verify().await;
-    authorization_server.verify().await;
+
     Ok(())
 }
 

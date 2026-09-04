@@ -902,6 +902,47 @@ impl Environment {
         }
     }
 
+    /// Refresh the connection to the executor currently registered for this environment.
+    ///
+    /// # Caller contract
+    ///
+    /// Call after a planned replacement has registered and become available under the
+    /// same environment ID. This method does not provision or destroy executors, or
+    /// wait for the registry to identify a particular replacement. It requires a remote
+    /// Noise registry-backed environment; other environment types return an error.
+    ///
+    /// # Session behavior
+    ///
+    /// A fresh registry lookup determines whether the current session can be reused.
+    /// A changed executor key, or a failed or missing session, causes a fresh connection
+    /// without resuming the old session. Retirement cancels old recovery, fails its
+    /// outstanding work and process handles, and never replays commands. The environment
+    /// object and filesystem handle remain usable through the new connection.
+    /// A matching executor key preserves a session that has not failed, including one
+    /// that is recovering; the live readiness check rejects a recovering connection.
+    ///
+    /// # Completion and errors
+    ///
+    /// Success means the selected connection answered a live status RPC, not merely that
+    /// metadata was cached. Refresh bypasses the old session's recovery deadline, but
+    /// registry lookup, connection, and status RPC timeouts still apply. If the initial
+    /// registry lookup fails, refresh leaves the old session untouched; errors after
+    /// retirement do not restore it. Ordinary disconnect recovery is unchanged unless
+    /// refresh retires the session.
+    #[tracing::instrument(
+        name = "exec_server.environment.refresh_connection",
+        skip_all,
+        fields(remote = self.is_remote())
+    )]
+    pub async fn refresh_connection(&self) -> Result<(), ExecServerError> {
+        let client = self.remote_client.as_ref().ok_or_else(|| {
+            ExecServerError::Protocol(
+                "connection refresh requires a remote environment".to_string(),
+            )
+        })?;
+        client.refresh_connection().await
+    }
+
     /// Fetches uncached metadata, connecting or waiting for recovery as needed.
     // TODO: Remove after app-server migrates off of force_environment_info.
     #[tracing::instrument(
@@ -1023,7 +1064,7 @@ impl Environment {
         }
     }
 
-    /// Returns whether the initial startup attempt has completed.
+    /// Returns whether startup has completed, including a first connection made by refresh.
     pub fn startup_finished(&self) -> bool {
         self.remote_client
             .as_ref()

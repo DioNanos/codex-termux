@@ -62,6 +62,17 @@
           "default": true,
           "type": "boolean"
         },
+        "links": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AppLinksConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Per-account approval settings keyed by link ID."
+        },
         "open_world_enabled": {
           "type": [
             "boolean",
@@ -79,6 +90,36 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "AppLinkConfig": {
+      "description": "Approval settings for a connected account within an app.",
+      "properties": {
+        "approvals_reviewer": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ApprovalsReviewer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "default_tools_approval_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AppToolApproval"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AppLinksConfig": {
+      "description": "Account settings for a single app.",
       "type": "object"
     },
     "AppToolApproval": {

@@ -42,6 +42,7 @@ pub use crate::tui_keymap::TuiListKeymap;
 pub use crate::tui_keymap::TuiPagerKeymap;
 pub use crate::tui_keymap::TuiVimNormalKeymap;
 pub use crate::tui_keymap::TuiVimOperatorKeymap;
+pub use crate::tui_keymap::TuiVimSearchKeymap;
 
 pub const DEFAULT_OTEL_ENVIRONMENT: &str = "dev";
 pub const DEFAULT_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize = 2;
@@ -454,6 +455,28 @@ pub struct AppToolsConfig {
     pub tools: HashMap<String, AppToolConfig>,
 }
 
+/// Approval settings for a connected account within an app.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct AppLinkConfig {
+    /// Reviewer for approval prompts from this account, overriding the app default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<ApprovalsReviewer>,
+
+    /// Approval mode for this account unless a tool override exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tools_approval_mode: Option<AppToolApproval>,
+}
+
+/// Account settings for a single app.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct AppLinksConfig {
+    /// Per-account approval settings keyed by link ID.
+    #[serde(default, flatten)]
+    pub links: HashMap<String, AppLinkConfig>,
+}
+
 /// Config values for a single app/connector.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -485,6 +508,10 @@ pub struct AppConfig {
     /// Per-tool settings for this app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<AppToolsConfig>,
+
+    /// Per-account approval settings keyed by link ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<AppLinksConfig>,
 }
 
 /// App/connector settings loaded from `config.toml`.
@@ -709,6 +736,17 @@ pub struct Tui {
     #[serde(default = "default_true")]
     pub show_tooltips: bool,
 
+    /// Generate automatic conversation recaps when the terminal is unfocused.
+    /// Defaults to `true`. Disabling this leaves `/recap` available on demand.
+    #[serde(default = "default_true")]
+    pub auto_recap: bool,
+
+    /// When true, disables burst-paste detection for typed input entirely.
+    /// All characters are inserted as they are received, and no buffering
+    /// or placeholder replacement will occur for fast keypress bursts.
+    /// Overrides the legacy top-level `disable_paste_burst` setting. Defaults to `false`.
+    pub disable_paste_burst: Option<bool>,
+
     /// Start the composer in Vim mode (`Normal`) by default.
     /// Defaults to `false`.
     #[serde(default)]
@@ -879,7 +917,7 @@ pub struct PluginMcpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_tools: Option<Vec<String>>,
 
-    /// Per-tool approval settings keyed by tool name.
+    /// Per-tool policy settings keyed by tool name.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tools: HashMap<String, McpServerToolConfig>,
 }

@@ -80,6 +80,7 @@ pub(crate) fn running_summary(handler: &ConfiguredHandler) -> HookRunSummary {
         unreachable!("executor-scoped hooks do not produce public hook summaries");
     };
     HookRunSummary {
+        builtin: handler.builtin,
         id: handler.run_id(),
         event_name: handler.event_name,
         handler_type: handler.handler_type(),
@@ -234,6 +235,7 @@ pub(crate) fn completed_summary(
         unreachable!("executor-scoped hooks do not produce public hook summaries");
     };
     HookRunSummary {
+        builtin: handler.builtin,
         id: handler.run_id(),
         event_name: handler.event_name,
         handler_type: handler.handler_type(),
@@ -348,6 +350,7 @@ mod tests {
         display_order: i64,
     ) -> ConfiguredHandler {
         ConfiguredHandler {
+            builtin: false,
             event_name,
             matcher: matcher.map(str::to_owned),
             timeout_sec: 5,

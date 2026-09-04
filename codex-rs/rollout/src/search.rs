@@ -294,6 +294,7 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         | RolloutItem::Compacted(_)
         | RolloutItem::RealtimeItem(_)
         | RolloutItem::SecurityRiskScore(_)
+        | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::WorldState(_) => None,
     }
 }

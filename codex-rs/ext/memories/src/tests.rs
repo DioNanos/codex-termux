@@ -580,7 +580,10 @@ async fn search_tool_rejects_legacy_single_query() {
     assert!(err.to_string().contains("query"));
 }
 
-fn memory_tool(memory_root: &Path, tool_name: &str) -> Arc<dyn ToolExecutor<ToolCall>> {
+fn memory_tool(
+    memory_root: &Path,
+    tool_name: &str,
+) -> Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>> {
     let expected_tool_name = memory_tool_name(tool_name);
     crate::tools::memory_tools(
         LocalMemoriesBackend::from_memory_root(memory_root),

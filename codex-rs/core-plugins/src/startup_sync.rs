@@ -27,7 +27,7 @@ const CURATED_PLUGINS_BACKUP_ARCHIVE_API_URL: &str =
     "https://chatgpt.com/backend-api/plugins/export/curated";
 const OPENAI_PLUGINS_OWNER: &str = "openai";
 const OPENAI_PLUGINS_REPO: &str = "plugins";
-const OPENAI_PLUGINS_GIT_URL: &str = "https://github.com/openai/plugins.git";
+pub(crate) const OPENAI_PLUGINS_GIT_URL: &str = "https://github.com/openai/plugins.git";
 const CURATED_PLUGINS_FETCH_REF: &str = "refs/codex/curated-sync";
 const CURATED_PLUGINS_RELATIVE_DIR: &str = ".tmp/plugins";
 const CURATED_PLUGINS_SHA_FILE: &str = ".tmp/plugins.sha";

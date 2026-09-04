@@ -29,9 +29,9 @@ pub(super) async fn materialize_to_sqlite(
         .as_ref()
         .map_or(0, |state| state.next_byte_offset);
     if projection_state.is_none()
-        && !tokio::fs::try_exists(rollout_path)
+        && codex_rollout::existing_rollout_path(rollout_path)
             .await
-            .map_err(thread_store_io_error)?
+            .is_none()
     {
         return Ok(());
     }
@@ -76,13 +76,21 @@ async fn read_projection_steps(
     thread_id: ThreadId,
     subagent_history_start_ordinal: Option<u64>,
 ) -> ThreadStoreResult<(Vec<RolloutProjectionStep>, u64)> {
-    let file_end_offset = match tokio::fs::metadata(rollout_path).await {
-        Ok(metadata) => metadata.len(),
+    let path = rollout_path.to_path_buf();
+    let file =
+        tokio::task::spawn_blocking(move || codex_rollout::open_rollout_seekable_reader(&path))
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to join rollout projection read: {err}"),
+            })?;
+    let mut file = match file {
+        Ok(file) => tokio::fs::File::from_std(file),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound && start_offset == 0 => {
             return Ok((Vec::new(), 0));
         }
         Err(err) => return Err(thread_store_io_error(err)),
     };
+    let file_end_offset = file.metadata().await.map_err(thread_store_io_error)?.len();
     let byte_count =
         file_end_offset
             .checked_sub(start_offset)
@@ -93,9 +101,6 @@ async fn read_projection_steps(
         message: "durable rollout append exceeds addressable memory".to_string(),
     })?;
     let mut bytes = vec![0; byte_count];
-    let mut file = tokio::fs::File::open(rollout_path)
-        .await
-        .map_err(thread_store_io_error)?;
     file.seek(SeekFrom::Start(start_offset))
         .await
         .map_err(thread_store_io_error)?;

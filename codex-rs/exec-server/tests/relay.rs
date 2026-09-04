@@ -1,11 +1,10 @@
 mod common;
 
-#[cfg(unix)]
-#[path = "relay/version_skew.rs"]
-mod version_skew;
-
 #[path = "common/relay.rs"]
 mod relay_support;
+
+#[path = "relay/registration_retry_tests.rs"]
+mod registration_retry;
 
 use std::collections::HashMap;
 use std::sync::Arc;

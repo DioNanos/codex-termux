@@ -173,6 +173,8 @@ pub(crate) enum RateLimitRefreshOrigin {
     ResetPicker { request_id: u64 },
     /// Refresh requested after a reset credit was successfully consumed.
     ResetConsume { request_id: u64 },
+    /// Refresh backend recovery after an inference limit error.
+    Recovery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,15 +206,28 @@ pub(crate) enum ThreadTitleDestination {
     RenameSuggestion { request_id: Uuid },
 }
 
+/// Identifies the policy that initiated a recap request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecapTrigger {
+    Automatic,
+    Manual,
+}
+
+#[derive(Debug)]
+pub(crate) struct AgentsOverviewThreadRefresh {
+    pub(crate) threads: std::collections::HashMap<ThreadId, Option<Thread>>,
+    pub(crate) recent_seed_complete: bool,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, IntoStaticStr)]
 pub(crate) enum AppEvent {
-    /// Open the daemon-wide overview of loaded root sessions.
+    /// Open the daemon-wide overview of recent and locally retained root sessions.
     OpenAgentsOverview,
     /// Update the daemon-wide overview after a background thread listing finishes.
     AgentsOverviewThreadsLoaded {
         request_id: Uuid,
-        result: Result<Vec<Thread>, String>,
+        result: Result<AgentsOverviewThreadRefresh, String>,
     },
     /// Switch to a root session selected from the shared dashboard.
     SelectAgentsOverviewThread {
@@ -364,7 +379,7 @@ pub(crate) enum AppEvent {
 
     /// Result of the fresh startup thread that is attached after the input UI is live.
     StartupThreadStarted {
-        result: Result<AppServerStartedThread, String>,
+        result: color_eyre::Result<AppServerStartedThread>,
     },
 
     /// Register a dynamically created background thread before its first turn starts.
@@ -517,6 +532,7 @@ pub(crate) enum AppEvent {
 
     /// Result of refreshing rate limits.
     RateLimitsLoaded {
+        request_id: u64,
         origin: RateLimitRefreshOrigin,
         hard_stop_generation: u64,
         result: Result<GetAccountRateLimitsResponse, String>,
@@ -594,6 +610,7 @@ pub(crate) enum AppEvent {
 
     /// Result of notifying the workspace owner.
     AddCreditsNudgeEmailFinished {
+        request_id: Uuid,
         result: Result<AddCreditsNudgeEmailStatus, String>,
     },
 
@@ -941,7 +958,6 @@ pub(crate) enum AppEvent {
 
     StartCommitAnimation,
     StopCommitAnimation,
-    CommitTick,
 
     /// Update the current reasoning effort in the running app and widget.
     UpdateReasoningEffort(Option<ReasoningEffort>),
@@ -976,6 +992,15 @@ pub(crate) enum AppEvent {
         service_tier: Option<String>,
     },
 
+    /// Fetch the current catalog even when cached models produce no picker.
+    FetchModels {
+        request_id: uuid::Uuid,
+    },
+    ModelsLoaded {
+        request_id: uuid::Uuid,
+        result: Result<Vec<ModelPreset>, String>,
+    },
+
     /// Open the reasoning selection popup after picking a model.
     OpenReasoningPopup {
         model: ModelPreset,
@@ -999,9 +1024,7 @@ pub(crate) enum AppEvent {
     },
 
     /// Open the full model picker (non-auto models).
-    OpenAllModelsPopup {
-        models: Vec<ModelPreset>,
-    },
+    OpenAllModelsPopup,
 
     /// Open the confirmation prompt before enabling full access mode.
     OpenFullAccessConfirmation {
@@ -1031,6 +1054,10 @@ pub(crate) enum AppEvent {
         /// True when the scan failed (e.g. ACL query error) and protections could not be verified.
         failed_scan: bool,
     },
+
+    /// The startup world-writable scan finished and queued any protected warning it requires.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    StartupWorldWritableScanCompleted,
 
     /// Prompt to enable the Windows sandbox feature before using Agent mode.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -1322,6 +1349,38 @@ pub(crate) enum AppEvent {
         context: String,
         action: String,
     },
+
+    /// Generate a recap for the displayed idle thread at the user's request.
+    GenerateRecap {
+        thread_id: ThreadId,
+    },
+
+    /// Recheck whether an unfocused thread is ready for an automatic recap.
+    CheckRecap {
+        thread_id: ThreadId,
+    },
+
+    /// Deliver the result of starting a recap's temporary thread.
+    RecapStarted {
+        thread_id: ThreadId,
+        request_id: Uuid,
+        trigger: RecapTrigger,
+        completed_turn_count: usize,
+        turn_revision: usize,
+        history: String,
+        result: Result<String, String>,
+    },
+
+    /// Deliver the generated recap from a temporary structured turn.
+    RecapGenerated {
+        thread_id: ThreadId,
+        request_id: Uuid,
+        trigger: RecapTrigger,
+        temporary_thread_id: ThreadId,
+        completed_turn_count: usize,
+        turn_revision: usize,
+        result: Result<String, String>,
+    },
 }
 
 /// Named profile selection to apply after any required UI guardrails complete.
@@ -1342,6 +1401,8 @@ pub(crate) struct PermissionProfileSelection {
 pub(crate) enum ExitMode {
     /// Shutdown core and exit after completion.
     ShutdownFirst,
+    /// Unsubscribe and exit after the current turn was successfully interrupted.
+    ShutdownAfterInterrupt,
     /// Exit the UI loop immediately without waiting for shutdown.
     ///
     /// This skips `Op::Shutdown`, so any in-flight work may be dropped and

@@ -286,6 +286,7 @@ impl ResourceOrigin {
         if !AppToolPolicyEvaluator::new(&binding.config().config_layer_stack)
             .policy(AppToolPolicyInput {
                 connector_id: Some(&self.connector_id),
+                link_id: None,
                 tool_name: tool_info.tool.name.as_ref(),
                 tool_title: tool_info.tool.title.as_deref(),
                 destructive_hint: annotations.and_then(|value| value.destructive_hint),

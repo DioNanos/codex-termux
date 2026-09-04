@@ -1,3 +1,4 @@
+mod audio;
 mod callbacks;
 mod globals;
 mod module_loader;

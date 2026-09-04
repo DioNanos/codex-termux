@@ -1,27 +1,55 @@
 use anyhow::Result;
 use codex_core::TurnInputRequest;
 #[cfg(unix)]
+use codex_core::config::Constrained;
+#[cfg(unix)]
+use codex_core::config::NetworkProxySpec;
+#[cfg(unix)]
 use codex_core::shell::get_shell_by_model_provided_path;
+#[cfg(unix)]
+use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_features::Feature;
+#[cfg(unix)]
+use codex_network_proxy::NetworkProxyConfig;
+#[cfg(unix)]
+use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+#[cfg(unix)]
+use codex_protocol::config_types::TrustLevel;
+#[cfg(unix)]
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
+#[cfg(unix)]
+use codex_protocol::models::PermissionProfileSnapshot;
+#[cfg(unix)]
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
+#[cfg(unix)]
+use codex_protocol::protocol::EnvironmentConfig;
+#[cfg(unix)]
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+#[cfg(unix)]
+use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
+#[cfg(unix)]
+use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 #[cfg(unix)]
 use core_test_support::skip_if_remote;
+#[cfg(unix)]
+use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -84,11 +112,12 @@ async fn wait_for_snapshot(codex_home: &Path) -> Result<PathBuf> {
     }
 }
 
-async fn wait_for_file_contents(path: &Path) -> Result<String> {
+async fn wait_for_file_contents(path: &Path, expected: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match fs::read_to_string(path).await {
-            Ok(contents) => return Ok(contents),
+            Ok(contents) if contents == expected => return Ok(()),
+            Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
         }
@@ -293,6 +322,437 @@ fn assert_posix_snapshot_sections(snapshot: &str) {
 }
 
 #[cfg(unix)]
+fn shell_snapshot_v2_prewarm_builder(profile_home: &Path) -> TestCodexBuilder {
+    let configured_home = profile_home.to_string_lossy().into_owned();
+    let shell = get_shell_by_model_provided_path(&PathBuf::from("/bin/bash"));
+    test_codex()
+        .with_user_shell(shell)
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::UnifiedExec)
+                .expect("test config should enable unified exec");
+            config
+                .features
+                .enable(Feature::ShellSnapshotV2)
+                .expect("test config should enable in-memory snapshots");
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::Disabled)
+                .expect("test config should allow unrestricted permissions");
+            config
+                .permissions
+                .shell_environment_policy
+                .ignore_default_excludes = false;
+            config.permissions.shell_environment_policy.r#set =
+                HashMap::from([("HOME".to_string(), configured_home)]);
+        })
+}
+
+#[cfg(unix)]
+async fn run_no_shell_turn(harness: &TestCodexHarness) -> Result<()> {
+    let response = mount_sse_once(
+        harness.server(),
+        sse(vec![
+            ev_response_created("no-shell"),
+            ev_assistant_message("done", "done"),
+            ev_completed("no-shell"),
+        ]),
+    )
+    .await;
+    let codex = &harness.test().codex;
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(codex, |event| {
+        assert!(
+            !matches!(event, EventMsg::ExecApprovalRequest(_) | EventMsg::Error(_)),
+            "unexpected event: {event:?}"
+        );
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    response.single_request();
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_snapshot_v2_warms_after_hooks_without_blocking_the_model() -> Result<()> {
+    skip_if_remote!(Ok(()), "profile fixture uses a host-local HOME directory");
+    let profile_home = tempfile::tempdir()?;
+    fs::write(
+        profile_home.path().join(".bashrc"),
+        ". \"$HOME/prepared\"\nprintf x >> \"$HOME/captures\"\nwhile [ ! -f \"$HOME/ready\" ]; do /bin/sleep 0.01; done\nexport PROFILE_SECRET=secret\n",
+    )
+    .await?;
+    let prepared = profile_home.path().join("prepared");
+    let builder = shell_snapshot_v2_prewarm_builder(profile_home.path())
+        .with_pre_build_hook(move |home| {
+            std::fs::write(home.join("hooks.json"), json!({
+                "hooks": { "SessionStart": [{ "hooks": [{
+                    "type": "command",
+                    "command": format!("printf 'profile_helper() {{ printf helper; }}\\n' > {}", shlex::try_quote(prepared.to_str().unwrap()).unwrap()),
+                }] }] }
+            }).to_string()).expect("write startup hook");
+        })
+        .with_config(trust_discovered_hooks);
+    let harness = TestCodexHarness::with_auto_env_builder(builder).await?;
+
+    // The model can finish a text-only turn while the profile is still blocked.
+    run_no_shell_turn(&harness).await?;
+    wait_for_file_contents(&profile_home.path().join("captures"), "x").await?;
+    fs::write(profile_home.path().join("ready"), "").await?;
+
+    let end = run_tool_turn_on_harness(
+        &harness,
+        "use the prewarmed in-memory shell snapshot",
+        "shell-snapshot-v2-prewarm",
+        "exec_command",
+        json!({
+            "cmd": "profile_helper; printf '|%s' \"${PROFILE_SECRET-missing}\"",
+            "yield_time_ms": 1_000,
+        }),
+    )
+    .await?;
+
+    assert_eq!(end.exit_code, 0);
+    assert!(
+        harness
+            .function_call_stdout("shell-snapshot-v2-prewarm")
+            .await
+            .trim()
+            .ends_with("helper|missing")
+    );
+    assert_eq!(
+        fs::read_to_string(profile_home.path().join("captures")).await?,
+        "x"
+    );
+    assert!(!harness.test().home.path().join("shell_snapshots").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_snapshot_v2_recovers_after_failed_prewarm() -> Result<()> {
+    skip_if_remote!(Ok(()), "prewarming is local-only");
+    let profile_home = tempfile::tempdir()?;
+    let profile = profile_home.path().join(".bashrc");
+    fs::write(&profile, "printf x > \"$HOME/failed\"\nexit 7\n").await?;
+    let bash_env = profile.to_string_lossy().into_owned();
+    let builder =
+        shell_snapshot_v2_prewarm_builder(profile_home.path()).with_config(move |config| {
+            // Ordinary login-shell fallback must read the same profile, so the output
+            // distinguishes a recovered, filtered snapshot from an unfiltered fallback.
+            let policy = &mut config.permissions.shell_environment_policy;
+            policy.r#set.insert("BASH_ENV".to_string(), bash_env);
+        });
+    let harness = TestCodexHarness::with_auto_env_builder(builder).await?;
+    run_no_shell_turn(&harness).await?;
+    wait_for_file_contents(&profile_home.path().join("failed"), "x").await?;
+
+    // Replace the file rather than modifying the failed capture's open script.
+    let repaired = profile_home.path().join("repaired");
+    fs::write(
+        &repaired,
+        "printf x >> \"$HOME/captures\"\nprofile_helper() { printf recovered; }\nexport PROFILE_SECRET=secret\n",
+    ).await?;
+    fs::rename(repaired, profile).await?;
+    for call_id in ["after-failed-prewarm", "reuse-recovered-snapshot"] {
+        let end = run_tool_turn_on_harness(
+            &harness,
+            "use the recovered snapshot",
+            call_id,
+            "exec_command",
+            json!({"cmd": "profile_helper; printf '|%s' \"${PROFILE_SECRET-missing}\""}),
+        )
+        .await?;
+        assert_eq!(end.exit_code, 0);
+        let output = harness.function_call_stdout(call_id).await;
+        assert!(output.trim().ends_with("recovered|missing"));
+    }
+    assert_eq!(
+        fs::read_to_string(profile_home.path().join("captures")).await?,
+        "x"
+    );
+    harness.test().codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_snapshot_v2_prewarm_preserves_the_sandbox() -> Result<()> {
+    skip_if_remote!(Ok(()), "profile fixture uses a host-local HOME directory");
+    let profile_home = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+    let forbidden = outside.path().join("profile-write");
+    let writable_home = profile_home.path().to_path_buf().try_into()?;
+    let forbidden_path = forbidden.to_string_lossy().into_owned();
+    fs::write(
+        profile_home.path().join(".bashrc"),
+        "(printf escaped > \"$OUTSIDE\") 2>/dev/null\nprintf done > \"$HOME/captures\"\n",
+    )
+    .await?;
+    let builder =
+        shell_snapshot_v2_prewarm_builder(profile_home.path()).with_config(move |config| {
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::workspace_write_with(
+                    std::slice::from_ref(&writable_home),
+                    NetworkSandboxPolicy::Restricted,
+                    /*exclude_tmpdir_env_var*/ true,
+                    /*exclude_slash_tmp*/ true,
+                ))
+                .expect("set sandboxed permissions");
+            config
+                .permissions
+                .shell_environment_policy
+                .r#set
+                .insert("OUTSIDE".to_string(), forbidden_path);
+            let rules = config.codex_home.join("rules");
+            std::fs::create_dir_all(&rules).expect("create rules directory");
+            std::fs::write(
+                rules.join("default.rules"),
+                "prefix_rule(pattern=[\"true\"], decision=\"allow\")\n",
+            )
+            .expect("allow the former warm-up sentinel");
+        });
+    let harness = TestCodexHarness::with_auto_env_builder(builder).await?;
+    run_no_shell_turn(&harness).await?;
+    wait_for_file_contents(&profile_home.path().join("captures"), "done").await?;
+    harness.test().codex.shutdown_and_wait().await?;
+    assert!(
+        !forbidden.exists(),
+        "profile startup must stay sandboxed even when true is allowed"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_snapshot_v2_prewarm_stops_on_shutdown() -> Result<()> {
+    skip_if_remote!(Ok(()), "profile fixture uses a host-local HOME directory");
+    let profile_home = tempfile::tempdir()?;
+    fs::write(
+        profile_home.path().join(".bashrc"),
+        "printf '%s' \"$$\" > \"$HOME/pid\"\nprintf x > \"$HOME/captures\"\nwhile :; do /bin/sleep 0.01; done\n",
+    ).await?;
+    let harness = TestCodexHarness::with_auto_env_builder(shell_snapshot_v2_prewarm_builder(
+        profile_home.path(),
+    ))
+    .await?;
+    run_no_shell_turn(&harness).await?;
+    wait_for_file_contents(&profile_home.path().join("captures"), "x").await?;
+    let pid = fs::read_to_string(profile_home.path().join("pid")).await?;
+
+    let codex = &harness.test().codex;
+    codex.submit(Op::Shutdown {}).await?;
+    wait_for_event(codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while tokio::process::Command::new("/bin/kill")
+            .args(["-0", &pid])
+            .output()
+            .await?
+            .status
+            .success()
+        {
+            sleep(Duration::from_millis(25)).await;
+        }
+        anyhow::Ok(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test_case::test_case(|config| {
+    config.active_project.trust_level = Some(TrustLevel::Untrusted);
+    config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
+}; "untrusted")]
+#[test_case::test_case(|config| {
+    config.permissions.network = Some(NetworkProxySpec::from_config_and_constraints(
+        NetworkProxyConfig { enabled: true, allow_local_binding: true, ..Default::default() },
+        /*requirements*/ None,
+        config.permissions.permission_profile(),
+    ).expect("configure managed network"));
+}; "managed network")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_snapshot_v2_prewarm_skips_ineligible_sessions(
+    configure: fn(&mut codex_core::config::Config),
+) -> Result<()> {
+    skip_if_remote!(Ok(()), "profile fixture uses a host-local HOME directory");
+    let profile_home = tempfile::tempdir()?;
+    fs::write(
+        profile_home.path().join(".bashrc"),
+        "printf x > \"$HOME/captures\"\n",
+    )
+    .await?;
+    let builder = shell_snapshot_v2_prewarm_builder(profile_home.path()).with_config(configure);
+    let harness = TestCodexHarness::with_auto_env_builder(builder).await?;
+    run_no_shell_turn(&harness).await?;
+    harness.test().codex.shutdown_and_wait().await?;
+    assert!(!profile_home.path().join("captures").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test_case::test_case("SessionStart")]
+#[test_case::test_case("UserPromptSubmit")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_snapshot_v2_does_not_warm_a_hook_stopped_turn(hook_event: &str) -> Result<()> {
+    skip_if_remote!(Ok(()), "profile fixture uses a host-local HOME directory");
+    let profile_home = tempfile::tempdir()?;
+    fs::write(
+        profile_home.path().join(".bashrc"),
+        "printf x > \"$HOME/captures\"\n",
+    )
+    .await?;
+    let hook_event = hook_event.to_string();
+    let builder =
+        shell_snapshot_v2_prewarm_builder(profile_home.path())
+            .with_pre_build_hook(move |home| {
+                std::fs::write(home.join("hooks.json"), json!({
+                "hooks": { (hook_event): [{ "hooks": [{
+                    "type": "command",
+                    "command": "printf '%s' '{\"continue\":false,\"stopReason\":\"blocked\"}'",
+                }] }] }
+            }).to_string()).expect("write stopping hook");
+            })
+            .with_config(trust_discovered_hooks);
+    let harness = TestCodexHarness::with_auto_env_builder(builder).await?;
+    harness.submit("do not start the model or shell").await?;
+    harness.test().codex.shutdown_and_wait().await?;
+    assert!(harness.request_bodies().await.is_empty());
+    assert!(!profile_home.path().join("captures").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test_case::test_case(PermissionProfile::workspace_write(); "read only reviewer")]
+#[test_case::test_case(PermissionProfile::External { network: NetworkSandboxPolicy::Enabled }; "reviewer without shell tools")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_snapshot_v2_guardian_uses_its_resolved_permissions_and_tools(
+    parent_permissions: PermissionProfile,
+) -> Result<()> {
+    skip_if_remote!(Ok(()), "profile fixture uses a host-local HOME directory");
+    let profile_home = tempfile::tempdir()?;
+    fs::write(
+        profile_home.path().join(".bashrc"),
+        "printf capture > \"$HOME/$CODEX_THREAD_ID\"\n",
+    )
+    .await?;
+    let builder =
+        shell_snapshot_v2_prewarm_builder(profile_home.path()).with_config(move |config| {
+            config
+                .permissions
+                .set_permission_profile(parent_permissions)
+                .expect("set parent permissions");
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+            let rules = config.codex_home.join("rules");
+            std::fs::create_dir_all(&rules).expect("create rules directory");
+            std::fs::write(
+                rules.join("default.rules"),
+                "prefix_rule(pattern=[\"printf\", \"parent\"], decision=\"prompt\")\n",
+            )
+            .expect("require review even for an unrestricted owner environment");
+        });
+    let harness = TestCodexHarness::with_auto_env_builder(builder).await?;
+    let test = harness.test();
+    let responses = mount_sse_sequence(
+        harness.server(),
+        vec![
+            sse(vec![
+                ev_function_call(
+                    "parent",
+                    "exec_command",
+                    &json!({
+                        "cmd": "printf parent",
+                        "sandbox_permissions": "require_escalated",
+                        "justification": "Exercise Guardian review",
+                    })
+                    .to_string(),
+                ),
+                ev_completed("parent"),
+            ]),
+            sse(vec![
+                ev_function_call("reviewer", "exec_command", r#"{"cmd":"printf reviewed"}"#),
+                ev_completed("reviewer"),
+            ]),
+            sse(vec![
+                ev_assistant_message(
+                    "assessment",
+                    r#"{"risk_level":"low","user_authorization":"high","outcome":"allow","rationale":"Harmless output."}"#,
+                ),
+                ev_completed("assessment"),
+            ]),
+            sse(vec![ev_completed("done")]),
+        ],
+    )
+    .await;
+    let mut environments = local_selections(test.config.cwd.clone());
+    environments.environments[0].config = EnvironmentConfigState::Ready(EnvironmentConfig {
+        allow_login_shell: true,
+        workspace_roots: environments.environments[0].workspace_roots.clone(),
+        permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
+        shell_environment_policy: test.config.permissions.shell_environment_policy.clone(),
+        windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
+        windows_sandbox_private_desktop: test.config.permissions.windows_sandbox_private_desktop,
+        use_legacy_landlock: test.config.features.use_legacy_landlock(),
+        exec_policy: None,
+        mcp_policy: None,
+        network_policy: None,
+        selected_capability_roots: Vec::new(),
+    });
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "run the reviewed command".to_string(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(environments),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        assert!(
+            !matches!(event, EventMsg::ExecApprovalRequest(_) | EventMsg::Error(_)),
+            "unexpected event: {event:?}"
+        );
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    test.codex.shutdown_and_wait().await?;
+    let requests = responses.requests();
+    let guardian_requests = requests
+        .iter()
+        .filter(|request| request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian")
+        .collect::<Vec<_>>();
+    assert_eq!(guardian_requests.len(), 2);
+    let guardian_id = guardian_requests[0].body_json()["client_metadata"]["thread_id"]
+        .as_str()
+        .expect("Guardian thread ID")
+        .to_string();
+    assert_ne!(guardian_id, test.session_configured.thread_id.to_string());
+    assert!(
+        profile_home
+            .path()
+            .join(test.session_configured.thread_id.to_string())
+            .exists()
+    );
+    assert!(
+        !profile_home.path().join(guardian_id).exists(),
+        "Guardian profile must not inherit writable owner permissions"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_snapshot_v2_filters_profile_secrets_without_creating_files() -> Result<()> {
     skip_if_remote!(Ok(()), "profile fixture uses a host-local HOME directory");
@@ -385,6 +845,7 @@ async fn shell_snapshot_v2_preserves_legacy_snapshots_for_user_shell() -> Result
     codex
         .submit(Op::RunUserShellCommand {
             command: "printf legacy".to_string(),
+            timeout_ms: None,
         })
         .await?;
     let end = wait_for_event_match(codex, |event| match event {
@@ -566,10 +1027,7 @@ async fn unified_exec_snapshot_still_intercepts_apply_patch() -> Result<()> {
         patch_end.stdout, patch_end.stderr,
     );
 
-    assert_eq!(
-        wait_for_file_contents(&target).await?,
-        "hello from snapshot\n"
-    );
+    wait_for_file_contents(&target, "hello from snapshot\n").await?;
 
     Ok(())
 }

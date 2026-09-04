@@ -169,6 +169,25 @@ async fn thread_section_operations_without_sqlite_return_method_not_found() -> R
 }
 
 #[tokio::test]
+async fn thread_start_defaults_to_legacy_without_history_list_support() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let store_id = Uuid::new_v4().to_string();
+    create_config_toml_with_thread_store(codex_home.path(), &server.uri(), &store_id)?;
+
+    let _in_memory_store = InMemoryThreadStoreId { store_id };
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    let ThreadStartResponse { thread, .. } = mcp.start_thread(ThreadStartParams::default()).await?;
+
+    assert_eq!(thread.history_mode, ThreadHistoryMode::Legacy);
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_start_rejects_paginated_history_without_list_support() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;

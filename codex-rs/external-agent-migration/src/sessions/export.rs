@@ -136,6 +136,7 @@ pub(super) fn rollout_items_from_messages(messages: Vec<ConversationMessage>) ->
                         phase: None,
                         memory_citation: None,
                         delivery: None,
+                        questions: None,
                     },
                 )));
                 items.push(RolloutItem::ResponseItem(response_item(message).into()));
@@ -158,6 +159,7 @@ fn external_session_imported_marker_item() -> RolloutItem {
         phase: None,
         memory_citation: None,
         delivery: None,
+        questions: None,
     }))
 }
 
@@ -254,6 +256,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }
         );
     }
@@ -287,6 +290,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             })
         );
         let last_turn_complete = imported

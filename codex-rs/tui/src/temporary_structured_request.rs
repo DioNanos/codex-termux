@@ -4,6 +4,8 @@ use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::ConfigReadParams;
+use codex_app_server_protocol::ConfigReadResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxMode;
 use codex_app_server_protocol::SandboxPolicy;
@@ -37,7 +39,10 @@ pub(crate) struct TemporaryStructuredThreadOptions {
     pub(crate) mcp_server_names: Vec<String>,
 }
 
-/// Start an ephemeral, non-interactive thread without widening its parent's permissions.
+/// Start an ephemeral thread without widening permissions or exposing tools and environment access.
+///
+/// Structured prompts can contain untrusted transcript text, so the effective app-server config is
+/// read first and every MCP server is explicitly disabled alongside built-in and extension tools.
 pub(crate) async fn start_temporary_thread(
     request_handle: &AppServerRequestHandle,
     options: TemporaryStructuredThreadOptions,
@@ -55,6 +60,7 @@ pub(crate) async fn start_temporary_thread(
         ("features.apps".to_string(), false.into()),
         ("features.code_mode".to_string(), false.into()),
         ("features.code_mode_only".to_string(), false.into()),
+        ("features.context_management".to_string(), false.into()),
         ("features.current_time_reminder".to_string(), false.into()),
         ("features.deferred_executor".to_string(), false.into()),
         ("features.enable_fanout".to_string(), false.into()),
@@ -72,9 +78,16 @@ pub(crate) async fn start_temporary_thread(
         ("features.shell_snapshot".to_string(), false.into()),
         ("features.shell_tool".to_string(), false.into()),
         ("features.standalone_web_search".to_string(), false.into()),
+        ("features.token_budget".to_string(), false.into()),
         ("features.tool_suggest".to_string(), false.into()),
         ("features.unified_exec".to_string(), false.into()),
         ("features.view_image".to_string(), false.into()),
+        ("orchestrator.skills.enabled".to_string(), false.into()),
+        ("skills.include_instructions".to_string(), false.into()),
+        (
+            "token_budget.use_history_notes_extension".to_string(),
+            false.into(),
+        ),
         (
             "tools.experimental_request_user_input.enabled".to_string(),
             false.into(),
@@ -82,34 +95,62 @@ pub(crate) async fn start_temporary_thread(
         ("tools.update_plan.enabled".to_string(), false.into()),
         ("web_search".to_string(), "disabled".into()),
     ]);
-    for server_name in mcp_server_names {
-        config.insert(format!("mcp_servers.{server_name}.enabled"), false.into());
-    }
+    let response: ThreadStartResponse = tokio::time::timeout(STRUCTURED_TURN_TIMEOUT, async {
+        // Fail closed if the remote-effective MCP configuration cannot be read.
+        let effective_config: ConfigReadResponse = request_handle
+            .request_typed(ClientRequest::ConfigRead {
+                request_id: RequestId::String(format!("temporary-config-{}", Uuid::new_v4())),
+                params: ConfigReadParams {
+                    include_layers: false,
+                    cwd: Some(cwd.clone()),
+                },
+            })
+            .await?;
+        let mut mcp_server_names = mcp_server_names
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Some(effective_mcp_servers) = effective_config
+            .config
+            .additional
+            .get("mcp_servers")
+            .and_then(Value::as_object)
+        {
+            mcp_server_names.extend(effective_mcp_servers.keys().cloned());
+        }
+        config.insert(
+            "mcp_servers".to_string(),
+            Value::Object(
+                mcp_server_names
+                    .into_iter()
+                    .map(|name| (name, serde_json::json!({ "enabled": false })))
+                    .collect(),
+            ),
+        );
 
-    let response: ThreadStartResponse = tokio::time::timeout(
-        STRUCTURED_TURN_TIMEOUT,
-        request_handle.request_typed(ClientRequest::ThreadStart {
-            request_id: RequestId::String(format!("temporary-structured-{}", Uuid::new_v4())),
-            params: ThreadStartParams {
-                model: Some(model),
-                model_provider: Some(model_provider),
-                cwd: Some(cwd),
-                approval_policy: Some(AskForApproval::Never),
-                sandbox: custom_permission_profile
-                    .is_none()
-                    .then_some(SandboxMode::ReadOnly),
-                permissions: custom_permission_profile.clone(),
-                runtime_workspace_roots: Some(Vec::new()),
-                ephemeral: Some(true),
-                thread_source: Some(ThreadSource::Feature("system".to_string())),
-                environments: Some(Vec::new()),
-                dynamic_tools: Some(Vec::new()),
-                selected_capability_roots: Some(Vec::new()),
-                config: Some(config),
-                ..ThreadStartParams::default()
-            },
-        }),
-    )
+        request_handle
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::String(format!("temporary-structured-{}", Uuid::new_v4())),
+                params: ThreadStartParams {
+                    model: Some(model),
+                    model_provider: Some(model_provider),
+                    cwd: Some(cwd),
+                    approval_policy: Some(AskForApproval::Never),
+                    sandbox: custom_permission_profile
+                        .is_none()
+                        .then_some(SandboxMode::ReadOnly),
+                    permissions: custom_permission_profile.clone(),
+                    runtime_workspace_roots: Some(Vec::new()),
+                    ephemeral: Some(true),
+                    thread_source: Some(ThreadSource::Feature("system".to_string())),
+                    environments: Some(Vec::new()),
+                    dynamic_tools: Some(Vec::new()),
+                    selected_capability_roots: Some(Vec::new()),
+                    config: Some(config),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+    })
     .await
     .map_err(|_| eyre!("temporary structured thread start timed out"))??;
 
@@ -197,6 +238,35 @@ pub(crate) async fn collect_structured_response(
     ))
 }
 
+/// Make a bounded best-effort attempt to detach an ephemeral thread.
+pub(crate) async fn unsubscribe_temporary_thread(
+    request_handle: &AppServerRequestHandle,
+    thread_id: String,
+) {
+    match tokio::time::timeout(
+        STRUCTURED_TURN_TIMEOUT,
+        request_handle.request_typed::<ThreadUnsubscribeResponse>(
+            ClientRequest::ThreadUnsubscribe {
+                request_id: RequestId::String(format!(
+                    "temporary-structured-unsubscribe-{}",
+                    Uuid::new_v4()
+                )),
+                params: ThreadUnsubscribeParams { thread_id },
+            },
+        ),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "failed to unsubscribe from temporary structured thread");
+        }
+        Err(_) => {
+            tracing::debug!("temporary structured thread unsubscribe timed out");
+        }
+    }
+}
+
 /// Run a bounded structured turn and make a bounded temporary-thread cleanup attempt.
 pub(crate) async fn run_temporary_structured_turn(
     request_handle: AppServerRequestHandle,
@@ -221,28 +291,7 @@ pub(crate) async fn run_temporary_structured_turn(
     .await
     .unwrap_or_else(|_| Err(eyre!("temporary structured turn timed out")));
 
-    match tokio::time::timeout(
-        STRUCTURED_TURN_TIMEOUT,
-        request_handle.request_typed::<ThreadUnsubscribeResponse>(
-            ClientRequest::ThreadUnsubscribe {
-                request_id: RequestId::String(format!(
-                    "temporary-structured-unsubscribe-{}",
-                    Uuid::new_v4()
-                )),
-                params: ThreadUnsubscribeParams { thread_id },
-            },
-        ),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            tracing::debug!(%error, "failed to unsubscribe from temporary structured thread");
-        }
-        Err(_) => {
-            tracing::debug!("temporary structured thread unsubscribe timed out");
-        }
-    }
+    unsubscribe_temporary_thread(&request_handle, thread_id).await;
 
     result
 }

@@ -20,14 +20,21 @@ use crate::session::session::SessionSettingsUpdate;
 
 pub(super) fn validate_environment_selections(
     selections: &[TurnEnvironmentSelection],
-) -> CodexResult<()> {
+) -> ConstraintResult<()> {
     for selection in selections {
         match &selection.config {
             EnvironmentConfigState::FromThread
             | EnvironmentConfigState::Pending
             | EnvironmentConfigState::Failed(_) => {}
             EnvironmentConfigState::Ready(config) => {
-                validate_environment_config(selection, config)?;
+                validate_environment_config(selection, config).map_err(|error| {
+                    ConstraintError::InvalidValue {
+                        field_name: "environments",
+                        candidate: "environment configuration".to_string(),
+                        allowed: format!("valid environment configuration ({error})"),
+                        requirement_source: codex_config::RequirementSource::Unknown,
+                    }
+                })?;
             }
         }
     }

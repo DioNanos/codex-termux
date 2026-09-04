@@ -95,3 +95,33 @@ async fn marketplace_remove_rejects_unknown_marketplace() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn marketplace_remove_preserves_marketplace_referenced_by_session_config() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    record_user_marketplace(codex_home.path(), "debug", &configured_marketplace_update())?;
+    write_installed_marketplace(codex_home.path(), "debug")?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+
+    codex_command(codex_home.path())?
+        .args([
+            "plugin", "marketplace",
+            "-c", "marketplaces.debug.source_type=\"git\"",
+            "remove", "debug",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "marketplace `debug` is configured in session-flags; remove it from that configuration source instead",
+        ));
+
+    assert_eq!(std::fs::read_to_string(config_path)?, config);
+    assert_eq!(
+        std::fs::read_to_string(
+            marketplace_install_root(codex_home.path()).join("debug/marker.txt")
+        )?,
+        "installed",
+    );
+    Ok(())
+}

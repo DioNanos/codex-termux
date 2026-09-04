@@ -34,6 +34,8 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
+use core_test_support::startup::STARTUP_TIMEOUT;
+use core_test_support::startup::expect_startup;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use futures::SinkExt;
@@ -64,6 +66,7 @@ enum PushedExecScenario {
     Complete,
     DirectDenied,
     ElevatedPowerShell,
+    RejectedLongWindowsDangerousCommand,
     SandboxedInterceptedPatch,
     SandboxedDirectPatch,
     SandboxedDirectPatchDenied,
@@ -87,9 +90,12 @@ struct PushedExecServerResult {
     process_start: Value,
 }
 
-async fn read_exec_server_json(websocket: &mut WebSocketStream<TcpStream>) -> Value {
+async fn read_exec_server_json(
+    websocket: &mut WebSocketStream<TcpStream>,
+    wait: Duration,
+) -> Value {
     loop {
-        match timeout(Duration::from_secs(5), websocket.next())
+        match timeout(wait, websocket.next())
             .await
             .expect("websocket read should not time out")
             .expect("websocket should stay open")
@@ -118,7 +124,7 @@ async fn accept_initialized_exec_server(listener: TcpListener) -> WebSocketStrea
     let (stream, _) = listener.accept().await.expect("connection");
     let mut websocket = accept_async(stream).await.expect("websocket handshake");
 
-    let initialize = read_exec_server_json(&mut websocket).await;
+    let initialize = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)).await;
     assert_eq!(initialize["method"], "initialize");
     send_exec_server_json(
         &mut websocket,
@@ -128,7 +134,7 @@ async fn accept_initialized_exec_server(listener: TcpListener) -> WebSocketStrea
         }),
     )
     .await;
-    let initialized = read_exec_server_json(&mut websocket).await;
+    let initialized = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)).await;
     assert_eq!(initialized["method"], "initialized");
 
     websocket
@@ -138,7 +144,7 @@ async fn send_environment_info(
     websocket: &mut WebSocketStream<TcpStream>,
     scenario: PushedExecScenario,
 ) {
-    let info = read_exec_server_json(websocket).await;
+    let info = read_exec_server_json(websocket, STARTUP_TIMEOUT).await;
     assert_eq!(info["method"], "environment/info");
     respond_environment_info(websocket, &info["id"], scenario).await;
 }
@@ -148,17 +154,27 @@ async fn respond_environment_info(
     id: &Value,
     scenario: PushedExecScenario,
 ) {
-    let shell = if matches!(scenario, PushedExecScenario::ElevatedPowerShell) {
+    let shell = if matches!(
+        scenario,
+        PushedExecScenario::ElevatedPowerShell
+            | PushedExecScenario::RejectedLongWindowsDangerousCommand
+    ) {
         json!({ "name": "powershell", "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" })
     } else {
         json!({ "name": "zsh", "path": "/bin/zsh" })
     };
+    let platform_os = matches!(
+        scenario,
+        PushedExecScenario::RejectedLongWindowsDangerousCommand
+    )
+    .then_some("windows");
     send_exec_server_json(
         websocket,
         json!({
             "id": id,
             "result": {
                 "shell": shell,
+                "platformOs": platform_os,
                 "capabilities": { "networkProxyLaunch": true }
             }
         }),
@@ -179,7 +195,8 @@ async fn serve_exec_with_pushed_events(
     send_environment_info(&mut websocket, scenario).await;
 
     let process_start = loop {
-        let request = read_exec_server_json(&mut websocket).await;
+        // The runtime may still be finishing local setup before its first tool call.
+        let request = read_exec_server_json(&mut websocket, STARTUP_TIMEOUT).await;
         match request["method"].as_str() {
             Some("process/start") => break request,
             Some("environment/info") => {
@@ -384,6 +401,9 @@ async fn serve_exec_with_pushed_events(
                 send_exec_server_json(&mut websocket, message).await;
             }
         }
+        PushedExecScenario::RejectedLongWindowsDangerousCommand => {
+            panic!("dangerous command must not reach the executor")
+        }
         PushedExecScenario::DirectDenied => {
             send_exec_server_json(
                 &mut websocket,
@@ -428,7 +448,7 @@ async fn serve_exec_with_pushed_events(
 
     let mut process_read_requests = 0;
     loop {
-        let request = read_exec_server_json(&mut websocket).await;
+        let request = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)).await;
         match request["method"].as_str() {
             Some("process/read") => {
                 process_read_requests += 1;
@@ -457,6 +477,9 @@ async fn serve_exec_with_pushed_events(
                     }),
                     PushedExecScenario::ElevatedPowerShell => {
                         panic!("elevated remote PowerShell must not read a remote process")
+                    }
+                    PushedExecScenario::RejectedLongWindowsDangerousCommand => {
+                        panic!("dangerous command must not read a remote process")
                     }
                     PushedExecScenario::SandboxedInterceptedPatch
                     | PushedExecScenario::SandboxedDirectPatch
@@ -549,6 +572,7 @@ async fn serve_exec_with_pushed_events(
 #[cfg_attr(not(windows), test_case(PushedExecScenario::Complete, ManagedNetworkScenario::Enabled { policy_callbacks: true }, true ; "foreign_windows_managed_network_preserves_approval_registration"))]
 #[cfg_attr(not(windows), test_case(PushedExecScenario::Complete, ManagedNetworkScenario::None, true ; "foreign_windows_workspace_sandbox"))]
 #[test_case(PushedExecScenario::ElevatedPowerShell, ManagedNetworkScenario::None, true ; "windows_elevated_powershell_disables_profile")]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::RejectedLongWindowsDangerousCommand, ManagedNetworkScenario::None, true ; "remote_windows_dangerous_command_rejection_is_bounded"))]
 #[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedInterceptedPatch, ManagedNetworkScenario::None, true ; "foreign_windows_intercepted_patch_is_sandboxed"))]
 #[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatch, ManagedNetworkScenario::None, true ; "foreign_windows_direct_patch_is_sandboxed"))]
 #[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatchDenied, ManagedNetworkScenario::None, true ; "foreign_windows_direct_patch_denial_requests_approval"))]
@@ -584,13 +608,17 @@ async fn exec_command_consumes_pushed_remote_process_events(
             &json!({
                 "cmd": match scenario {
                     PushedExecScenario::SandboxedInterceptedPatch => {
-                        "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: secret.txt\n@@\n-old\n+new\n*** End Patch\nPATCH"
+                        "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: secret.txt\n@@\n-old\n+new\n*** End Patch\nPATCH".to_string()
                     }
                     PushedExecScenario::UnsandboxedInterceptedPatch
                     | PushedExecScenario::FullDiskInterceptedPatch => {
-                        "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: allowed.txt\n+allowed\n*** End Patch\nPATCH"
+                        "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: allowed.txt\n+allowed\n*** End Patch\nPATCH".to_string()
                     }
-                    _ => "pwd",
+                    PushedExecScenario::RejectedLongWindowsDangerousCommand => format!(
+                        "Remove-Item test -Force; {}",
+                        "Write-Output filler; ".repeat(2_000)
+                    ),
+                    _ => "pwd".to_string(),
                 },
                 "yield_time_ms": 1_000,
             })
@@ -687,9 +715,7 @@ timeout = 900
             config.bypass_hook_trust = true;
         }
     });
-    let test = timeout(Duration::from_secs(5), builder.build(&server))
-        .await
-        .context("thread startup should connect to the fake exec-server")??;
+    let test = expect_startup(builder.build(&server)).await;
 
     let turn_permission_profile = if managed_network_configured {
         test.session_configured.permission_profile.clone()
@@ -800,6 +826,23 @@ timeout = 900
                 _ => {}
             }
         }
+    }
+    if matches!(
+        scenario,
+        PushedExecScenario::RejectedLongWindowsDangerousCommand
+    ) {
+        let request = response_mock
+            .last_request()
+            .context("model should receive the dangerous-command rejection")?;
+        let (output, success) = request
+            .function_call_output_content_and_success(CALL_ID)
+            .context("dangerous-command rejection should be model visible")?;
+        assert_ne!(success, Some(true));
+        let output = output.context("dangerous-command rejection should contain text")?;
+        assert!(output.len() < 1_000);
+        assert!(output.contains("chars truncated"));
+        exec_server.abort();
+        return Ok(());
     }
     if matches!(
         scenario,
@@ -990,6 +1033,9 @@ timeout = 900
             assert!(output.contains("Process exited with code 0"));
             assert!(output.contains(COMPLETE_OUTPUT));
             assert_eq!(process_read_requests, 0, "unexpected compatibility read");
+        }
+        PushedExecScenario::RejectedLongWindowsDangerousCommand => {
+            unreachable!("dangerous command returned early")
         }
         PushedExecScenario::DirectDenied => {
             assert!(!saw_exec_command_begin);

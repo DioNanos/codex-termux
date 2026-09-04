@@ -5,8 +5,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
+use codex_config::LoaderOverrides;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
+use codex_core::config::ConfigBuilder;
+use codex_core::config::set_project_trust_level;
 use codex_core_plugins::store::PluginStore;
 use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::ExtensionRegistryBuilder;
@@ -20,6 +23,7 @@ use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::config_types::TrustLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -59,7 +63,11 @@ use core_test_support::zsh_fork::zsh_fork_test_builder;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use test_case::test_case;
+use wiremock::Mock;
 use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 const SAMPLE_PLUGIN_CONFIG_NAME: &str = "sample@test";
 const SAMPLE_REMOTE_PLUGIN_CONFIG_NAME: &str = "sample@openai-curated-remote";
@@ -625,10 +633,8 @@ async fn plugin_skill_product_policy_and_migrated_command_precedence_reach_agent
     })
     .await;
 
-    let developer_text = response
-        .single_request()
-        .message_input_texts("developer")
-        .join("\n");
+    let requests = response.requests();
+    let developer_text = requests[0].message_input_texts("developer").join("\n");
     assert_eq!(
         (
             developer_text.contains("sample:source-command-review: native review skill"),
@@ -681,6 +687,107 @@ async fn legacy_plugin_skill_prompt_remains_complete() -> Result<()> {
         .message_input_texts("user")
         .join("\n");
     assert!(user_text.contains(&skill_contents));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sites_migration_agent_turn_prefers_loadable_remote_sites() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "plugins": [{
+                "id": "plugins~plugin_connector_1p_689987207de08191979cf68eca2941c6",
+                "name": "sites",
+                "scope": "GLOBAL",
+                "status": "ENABLED",
+                "installation_policy": "AVAILABLE",
+                "authentication_policy": "ON_USE",
+                "release": {
+                    "version": "local",
+                    "display_name": "Sites",
+                    "description": "Sites",
+                    "interface": {},
+                },
+                "enabled": true,
+            }],
+            "pagination": {"next_page_token": null},
+        })))
+        .mount(&server)
+        .await;
+
+    let codex_home = Arc::new(TempDir::new()?);
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"[features]
+plugins = true
+remote_plugin = true
+
+[plugins."sites@openai-bundled"]
+enabled = true
+"#,
+    )?;
+    for (marketplace, skill) in [
+        ("openai-bundled", "bundled-sites"),
+        ("openai-curated-remote", "remote-sites"),
+    ] {
+        let root = codex_home
+            .path()
+            .join(format!("plugins/cache/{marketplace}/sites/local"));
+        std::fs::create_dir_all(root.join(".codex-plugin"))?;
+        std::fs::write(
+            root.join(".codex-plugin/plugin.json"),
+            r#"{"name":"sites"}"#,
+        )?;
+        let skill_dir = root.join("skills").join(skill);
+        std::fs::create_dir_all(&skill_dir)?;
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {skill}\ndescription: test skill\n---\n\n# body\n"),
+        )?;
+    }
+
+    let chatgpt_base_url = server.uri();
+    let mut builder = test_codex()
+        .with_home(codex_home)
+        .with_extensions(skills_extensions())
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| config.chatgpt_base_url = chatgpt_base_url);
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let auth = test.thread_manager.auth_manager().auth().await;
+    test.thread_manager
+        .plugins_manager()
+        .reconcile_remote_installed_plugins(&test.config.plugins_config_input(), auth.as_ref())
+        .await?;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Inspect the available Sites skills.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = response.requests();
+    let developer_text = requests[0].message_input_texts("developer").join("\n");
+    assert_eq!(
+        (
+            developer_text.contains("sites:remote-sites"),
+            developer_text.contains("sites:bundled-sites"),
+        ),
+        (true, false),
+        "unexpected Sites skills in developer prompt: {developer_text:?}"
+    );
     Ok(())
 }
 
@@ -1241,6 +1348,121 @@ async fn explicit_plugin_mentions_keep_non_conflicting_mcp_for_chatgpt_auth() ->
     let echo_tool = echo_tool.expect("plugin MCP tool should remain searchable");
     assert_plugin_provenance(&echo_tool);
 
+    Ok(())
+}
+
+#[test_case(TrustLevel::Trusted, true, true, false, &[]; "trusted project disables the plugin")]
+#[test_case(TrustLevel::Untrusted, true, true, false, &["echo_tool"]; "untrusted project cannot disable the plugin")]
+#[test_case(TrustLevel::Trusted, false, true, true, &["echo"]; "trusted project enables system-disabled server and overrides user tool policy")]
+#[test_case(TrustLevel::Untrusted, false, true, true, &[]; "untrusted project cannot enable system-disabled server")]
+#[test_case(TrustLevel::Trusted, true, false, true, &[]; "trusted project disables system-enabled server")]
+#[test_case(TrustLevel::Untrusted, true, false, true, &["echo_tool"]; "untrusted project preserves system startup and user tool policy")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn system_marketplace_plugin_honors_layered_activation_and_mcp_policy(
+    trust_level: TrustLevel,
+    system_enabled: bool,
+    project_enabled: bool,
+    plugin_enabled: bool,
+    expected_tools: &[&str],
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let mock = mount_plugin_tool_search_turn(&server).await;
+    let codex_home = Arc::new(TempDir::new()?);
+    let project = TempDir::new()?;
+    write_plugin_mcp_plugin(codex_home.as_ref(), &stdio_server_bin()?);
+    let user_config_path = codex_home.path().join("config.toml");
+    let user_config = std::fs::read_to_string(&user_config_path)?;
+    std::fs::write(
+        &user_config_path,
+        format!(
+            "{user_config}\n[plugins.\"{SAMPLE_PLUGIN_CONFIG_NAME}\".mcp_servers.sample]\ndisabled_tools = [\"echo\"]\n"
+        ),
+    )?;
+    let system_config_path = codex_home.path().join("system.toml");
+    let marketplace = TempDir::new()?;
+    std::fs::create_dir_all(marketplace.path().join(".agents/plugins"))?;
+    std::fs::write(
+        marketplace.path().join(".agents/plugins/marketplace.json"),
+        r#"{"name":"test","plugins":[{"name":"sample","source":{"source":"local","path":"./sample"}}]}"#,
+    )?;
+    let marketplace_source = toml::Value::String(marketplace.path().to_string_lossy().into_owned());
+    std::fs::write(
+        &system_config_path,
+        format!(
+            "[marketplaces.test]\nsource_type = \"local\"\nsource = {marketplace_source}\n[plugins.\"{SAMPLE_PLUGIN_CONFIG_NAME}\".mcp_servers.sample]\nenabled = {system_enabled}\nenabled_tools = [\"echo\", \"echo-tool\"]\n"
+        ),
+    )?;
+    // The cached plugin may activate only through this system-defined marketplace.
+    // Without the definition, source restrictions exclude it from the real turn.
+    let requirements_path = codex_home.path().join("requirements.toml");
+    std::fs::write(
+        &requirements_path,
+        format!(
+            "[marketplaces]\nrestrict_to_allowed_sources = true\n[marketplaces.allowed_sources.test]\nsource = \"local\"\npath = {marketplace_source}\n"
+        ),
+    )?;
+    std::fs::create_dir_all(project.path().join(".git"))?;
+    std::fs::create_dir_all(project.path().join(".codex"))?;
+    std::fs::write(
+        project.path().join(".codex/config.toml"),
+        format!(
+            "[plugins.\"{SAMPLE_PLUGIN_CONFIG_NAME}\"]\nenabled = {plugin_enabled}\n[plugins.\"{SAMPLE_PLUGIN_CONFIG_NAME}\".mcp_servers.sample]\nenabled = {project_enabled}\ndisabled_tools = [\"echo-tool\"]\n"
+        ),
+    )?;
+    set_project_trust_level(codex_home.path(), project.path(), trust_level)?;
+    // Exercise the real layer loader and trust checks while keeping the test harness's
+    // mock model provider and automatically selected executor environment.
+    let layered_config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(project.path().to_path_buf()))
+        .loader_overrides(LoaderOverrides {
+            system_config_path: Some(system_config_path),
+            system_requirements_path: Some(requirements_path),
+            ..LoaderOverrides::without_managed_config_for_tests()
+        })
+        .build()
+        .await?;
+    let mut builder = test_codex()
+        .with_home(codex_home)
+        .with_config(move |config| config.config_layer_stack = layered_config.config_layer_stack);
+    let test = builder.build_with_remote_and_local_env(&server).await?;
+    let startup = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::McpStartupComplete(summary) => Some(summary.clone()),
+        _ => None,
+    })
+    .await;
+    let expected_ready = if expected_tools.is_empty() {
+        vec![]
+    } else {
+        vec!["sample"]
+    };
+    assert_eq!(
+        serde_json::to_value(startup)?,
+        serde_json::json!({"ready": expected_ready, "failed": [], "cancelled": []}),
+    );
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Mention {
+            name: "sample".into(),
+            path: format!("plugin://{SAMPLE_PLUGIN_CONFIG_NAME}"),
+        }]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let requests = mock.requests();
+    let output = requests[1].tool_search_output(PLUGIN_MCP_SEARCH_CALL_ID);
+    let mut visible_tools = output["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|namespace| namespace["name"] == SAMPLE_PLUGIN_MCP_NAMESPACE)
+        .flat_map(|namespace| namespace["tools"].as_array().into_iter().flatten())
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect::<Vec<_>>();
+    visible_tools.sort_unstable();
+    assert_eq!(visible_tools, expected_tools);
     Ok(())
 }
 

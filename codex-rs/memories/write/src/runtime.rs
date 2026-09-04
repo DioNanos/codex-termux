@@ -269,6 +269,7 @@ impl MemoryStartupContext {
         let mut client_session = model_client.new_session();
         let window_id = format!("{}:0", self.thread_id);
         let responses_metadata = detached_memory_responses_metadata(
+            &self.thread_manager,
             installation_id,
             session_id_string,
             self.thread_id.to_string(),

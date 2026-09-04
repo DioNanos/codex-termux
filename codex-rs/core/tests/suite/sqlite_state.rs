@@ -417,6 +417,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                     session_id: thread_id.into(),
                     id: thread_id,
                     forked_from_id: None,
+                    forked_from_ordinal_exclusive: None,
                     parent_thread_id: None,
                     timestamp: "2026-01-27T12:00:00Z".to_string(),
                     cwd: codex_home.to_path_buf(),

@@ -158,6 +158,61 @@ async fn selected_plugin_package_is_contributed_without_servers_or_connectors() 
 }
 
 #[tokio::test]
+async fn managed_plugins_requirement_disables_selected_executor_plugin_capabilities() -> TestResult
+{
+    let codex_home = tempfile::tempdir()?;
+    let plugin_root = tempfile::tempdir()?;
+    std::fs::create_dir_all(plugin_root.path().join(".codex-plugin"))?;
+    std::fs::write(
+        plugin_root.path().join(".codex-plugin/plugin.json"),
+        r#"{"name":"selected-root","interface":{"displayName":"Selected Root"}}"#,
+    )?;
+    std::fs::write(
+        plugin_root.path().join(".mcp.json"),
+        r#"{"mcpServers":{"probe":{"command":"probe-command"}}}"#,
+    )?;
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                r#"
+[features]
+plugins = false
+"#,
+            ),
+        )
+        .build()
+        .await?;
+    assert!(!config.features.enabled(Feature::Plugins));
+
+    let direct = raw_selected_plugin_contributions(&config, plugin_root.path()).await?;
+    assert!(
+        matches!(
+            direct.as_slice(),
+            [McpServerContribution::SelectedPluginPackage { selected_root_id, .. }]
+                if selected_root_id == "selected-root"
+        ),
+        "managed Plugins disable should preserve only the direct selected-root identity"
+    );
+
+    config
+        .features
+        .enable(Feature::ExecutorCapabilityDiscovery)
+        .expect("test config should allow feature update");
+    let discovered = raw_selected_plugin_contributions(&config, plugin_root.path()).await?;
+    assert!(
+        matches!(
+            discovered.as_slice(),
+            [McpServerContribution::SelectedPluginPackage { selected_root_id, .. }]
+                if selected_root_id == "selected-root"
+        ),
+        "managed Plugins disable should preserve only the discovered selected-root identity"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn high_level_discovery_matches_the_existing_plugin_provider() -> TestResult {
     let codex_home = tempfile::tempdir()?;
     let plugin_root = tempfile::tempdir()?;
@@ -176,8 +231,8 @@ async fn high_level_discovery_matches_the_existing_plugin_provider() -> TestResu
       "enabled_tools": ["read", "deploy", "trusted", "package-only"],
       "disabled_tools": ["package-denied"],
       "tools": {
-        "read": {"approval_mode": "prompt"},
-        "deploy": {"approval_mode": "approve"},
+        "read": {"approval_mode": "prompt", "output_token_limit": 12000},
+        "deploy": {"approval_mode": "approve", "output_token_limit": 4000},
         "trusted": {"approval_mode": "approve"}
       }
     },
@@ -200,6 +255,10 @@ disabled_tools = ["write"]
 
 [plugins."selected-root".mcp_servers.first.tools.read]
 approval_mode = "approve"
+output_token_limit = 8000
+
+[plugins."selected-root".mcp_servers.first.tools.deploy]
+output_token_limit = 9000
 
 [plugins."selected-root".mcp_servers.first.tools.trusted]
 approval_mode = "approve"
@@ -253,18 +312,21 @@ default_tools_approval_mode = "auto"
                     "read".to_string(),
                     McpServerToolConfig {
                         approval_mode: Some(AppToolApproval::Prompt),
+                        output_token_limit: std::num::NonZeroUsize::new(8_000),
                     },
                 ),
                 (
                     "deploy".to_string(),
                     McpServerToolConfig {
                         approval_mode: Some(AppToolApproval::Prompt),
+                        output_token_limit: std::num::NonZeroUsize::new(4_000),
                     },
                 ),
                 (
                     "trusted".to_string(),
                     McpServerToolConfig {
                         approval_mode: Some(AppToolApproval::Approve),
+                        ..Default::default()
                     },
                 ),
             ]),

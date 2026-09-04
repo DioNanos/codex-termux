@@ -1,0 +1,149 @@
+name: termux-gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git ref or SHA to validate; empty uses github.ref
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - name: Checkout source ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read Rust toolchain
+        id: rust_toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  shear:
+    name: shear
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - name: Checkout source ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read Rust toolchain
+        id: rust_toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: cargo-shear@1.11.2
+      - name: Run cargo shear
+        run: cargo shear
+      - name: Check Cargo.lock is unchanged
+        run: git diff --exit-code Cargo.lock
+
+  deny:
+    name: deny
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - name: Checkout source ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read Rust toolchain
+        id: rust_toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Run cargo-deny
+        run: cargo deny check
+      - name: Check Cargo.lock is unchanged
+        run: git diff --exit-code Cargo.lock
+
+  tests:
+    name: targeted tests
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - name: Checkout source ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read Rust toolchain
+        id: rust_toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
+      - name: Test TUI exec flow
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p codex-tui -- exec_flow 2>&1 | tee termux-gate-tui-exec-flow.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-tui-exec-flow.out
+          grep -F 'replayed_command_completion_preserves_tracking_without_duplicate_starts ... ok' termux-gate-tui-exec-flow.out
+      - name: Test app-server attachment path mapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p codex-app-server -- attachment_path_mapper turn_start_maps_local_image_to_the_termux_attachment_directory turn_steer_maps_local_image_to_the_termux_attachment_directory 2>&1 | tee termux-gate-app-server-attachments.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-app-server-attachments.out
+          grep -F 'termux_maps_only_the_attachments_directory_by_path_component ... ok' termux-gate-app-server-attachments.out
+          grep -F 'turn_start_maps_local_image_to_the_termux_attachment_directory ... ok' termux-gate-app-server-attachments.out
+          grep -F 'turn_steer_maps_local_image_to_the_termux_attachment_directory ... ok' termux-gate-app-server-attachments.out

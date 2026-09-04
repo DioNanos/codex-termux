@@ -53,6 +53,7 @@ use codex_utils_plugins::SkillDiscoveryMode;
 use codex_utils_plugins::find_plugin_manifest_path;
 use codex_utils_plugins::migrated_command_skills_root;
 use serde_json::Value as JsonValue;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
@@ -128,6 +129,8 @@ pub(crate) fn log_plugin_load_errors(plugins: &[LoadedPlugin<McpServerConfig>]) 
 }
 
 /// Load configured plugins without applying auth-dependent runtime policies.
+// TODO(sites-migration): Remove the exclusion parameter and lint allowance when bundled Sites is retired.
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace", skip_all)]
 pub(crate) async fn load_plugins_from_layer_stack(
     config_layer_stack: &ConfigLayerStack,
@@ -137,6 +140,7 @@ pub(crate) async fn load_plugins_from_layer_stack(
     restriction_product: Option<Product>,
     remote_global_catalog_active: bool,
     skill_root_loader: &dyn SkillRootLoader<PluginSkillRoot>,
+    excluded_plugin_ids: &BTreeSet<String>,
 ) -> Vec<LoadedPlugin<McpServerConfig>> {
     let skill_config_rules = skill_config_rules_from_stack(config_layer_stack);
     let RemoteInstalledPluginsSnapshot {
@@ -146,6 +150,7 @@ pub(crate) async fn load_plugins_from_layer_stack(
     load_plugins_from_layer_stack_with_scope(
         config_layer_stack,
         extra_plugins,
+        excluded_plugin_ids,
         store,
         remote_global_catalog_active,
         PluginLoadScope::AllCapabilities {
@@ -162,16 +167,18 @@ pub(crate) async fn load_plugins_from_layer_stack(
 async fn load_plugins_from_layer_stack_with_scope(
     config_layer_stack: &ConfigLayerStack,
     extra_plugins: HashMap<String, PluginConfig>,
+    excluded_plugin_ids: &BTreeSet<String>,
     store: &PluginStore,
     remote_global_catalog_active: bool,
     scope: PluginLoadScope<'_>,
 ) -> Vec<LoadedPlugin<McpServerConfig>> {
-    let configured_plugins = merge_configured_plugins_with_remote_installed(
+    let mut configured_plugins = merge_configured_plugins_with_remote_installed(
         configured_plugins_from_stack(config_layer_stack, store.codex_home().as_path()),
         extra_plugins,
         store,
         remote_global_catalog_active,
     );
+    configured_plugins.retain(|id, _| !excluded_plugin_ids.contains(id));
     let mut configured_plugins: Vec<_> = configured_plugins.into_iter().collect();
     configured_plugins.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
@@ -201,6 +208,7 @@ async fn load_plugins_from_layer_stack_with_scope(
 pub async fn load_plugin_hooks_from_layer_stack(
     config_layer_stack: &ConfigLayerStack,
     extra_plugins: HashMap<String, PluginConfig>,
+    excluded_plugin_ids: &BTreeSet<String>,
     store: &PluginStore,
     target_curated_marketplace: TargetCuratedMarketplace,
     remote_global_catalog_active: bool,
@@ -208,6 +216,7 @@ pub async fn load_plugin_hooks_from_layer_stack(
     let mut plugins = load_plugins_from_layer_stack_with_scope(
         config_layer_stack,
         extra_plugins,
+        excluded_plugin_ids,
         store,
         remote_global_catalog_active,
         PluginLoadScope::HooksOnly,
@@ -723,7 +732,7 @@ fn is_full_git_sha(value: &str) -> bool {
     value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
-fn configured_plugins_from_user_config_value(
+fn configured_plugins_from_config_value(
     user_config: &toml::Value,
 ) -> HashMap<String, PluginConfig> {
     let Some(plugins_value) = user_config.get("plugins") else {
@@ -769,7 +778,7 @@ fn configured_plugins_from_codex_home(
         }
     };
 
-    configured_plugins_from_user_config_value(&user_config)
+    configured_plugins_from_config_value(&user_config)
 }
 
 fn configured_plugin_ids(
@@ -974,6 +983,7 @@ fn apply_plugin_mcp_server_policy(config: &mut McpServerConfig, policy: &PluginM
         if let Some(approval_mode) = tool_policy.approval_mode {
             tool_config.approval_mode = Some(approval_mode);
         }
+        tool_config.restrict_output_token_limit(tool_policy.output_token_limit);
     }
 }
 
@@ -1067,7 +1077,7 @@ pub(crate) async fn load_plugin_skill_inventory(
     }
 }
 
-fn plugin_skill_roots(
+pub(crate) fn plugin_skill_roots(
     plugin_root: &AbsolutePathBuf,
     manifest_paths: &PluginManifestPaths,
     manifest_format: PluginManifestFormat,
@@ -1391,7 +1401,7 @@ pub async fn load_plugin_mcp_servers(
     load_plugin_mcp_servers_with_policy(plugin_root, auth_mode, /*plugin_policy*/ None).await
 }
 
-/// Loads plugin MCP servers with the effective user policy for an installed plugin.
+/// Loads plugin MCP servers with the effective configuration policy for an installed plugin.
 pub async fn load_configured_plugin_mcp_servers(
     plugin_root: &Path,
     auth_mode: Option<AuthMode>,
@@ -1412,10 +1422,7 @@ pub async fn load_configured_plugin_mcp_servers(
 pub fn configured_plugin_mcp_server_policies(
     config_layer_stack: &ConfigLayerStack,
 ) -> HashMap<String, HashMap<String, PluginMcpServerConfig>> {
-    config_layer_stack
-        .effective_user_config()
-        .map(|config| configured_plugins_from_user_config_value(&config))
-        .unwrap_or_default()
+    configured_plugins_from_config_value(&config_layer_stack.effective_config())
         .into_iter()
         .map(|(plugin_id, plugin)| (plugin_id, plugin.mcp_servers))
         .collect()
@@ -1452,7 +1459,7 @@ pub fn apply_configured_plugin_mcp_server_policies(
                 }
             }
             for (tool_name, tool_policy) in &policy.tools {
-                if tool_policy.approval_mode.is_some() {
+                if tool_policy.approval_mode.is_some() || tool_policy.output_token_limit.is_some() {
                     server.tools.entry(tool_name.clone()).or_default();
                 }
             }
@@ -1470,6 +1477,12 @@ pub fn apply_configured_plugin_mcp_server_policies(
                             .restrict_to(approval_mode),
                     );
                 }
+                tool_config.restrict_output_token_limit(
+                    policy
+                        .tools
+                        .get(tool_name)
+                        .and_then(|tool_policy| tool_policy.output_token_limit),
+                );
             }
         }
     }

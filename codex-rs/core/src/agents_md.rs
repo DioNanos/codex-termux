@@ -25,7 +25,7 @@ use codex_config::project_root_markers_from_config;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::GetMetadataOptions;
 use codex_exec_server::ReadFileOptions;
-use codex_extension_api::UserInstructions;
+use codex_extension_api::Instructions;
 use codex_file_system::FileSystemSandboxContext;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
@@ -54,7 +54,7 @@ const MAX_CONCURRENT_ANCESTOR_PROBES: usize = 256;
 /// instructions.
 pub(crate) async fn load_project_instructions(
     config: &Config,
-    user_instructions: Option<UserInstructions>,
+    user_instructions: Option<Instructions>,
     environments: &TurnEnvironmentSnapshot,
 ) -> io::Result<Option<LoadedAgentsMd>> {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
@@ -285,7 +285,7 @@ fn candidate_filenames(config: &Config) -> Vec<&str> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoadedAgentsMd {
     /// Host-provided user instructions.
-    user_instructions: Option<UserInstructions>,
+    user_instructions: Option<Instructions>,
 
     /// Ordered instructions and their provenance.
     entries: Vec<InstructionEntry>,
@@ -298,7 +298,7 @@ impl LoadedAgentsMd {
             return Self::default();
         }
         Self {
-            user_instructions: Some(UserInstructions {
+            user_instructions: Some(Instructions {
                 text: contents,
                 source: path,
             }),
@@ -306,7 +306,7 @@ impl LoadedAgentsMd {
         }
     }
 
-    fn from_user_instructions(user_instructions: Option<UserInstructions>) -> Self {
+    fn from_user_instructions(user_instructions: Option<Instructions>) -> Self {
         Self {
             user_instructions: user_instructions
                 .filter(|instructions| !instructions.text.trim().is_empty()),

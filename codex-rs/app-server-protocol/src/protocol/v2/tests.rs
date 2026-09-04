@@ -38,6 +38,7 @@ use codex_protocol::permissions::FileSystemSandboxEntry as CoreFileSystemSandbox
 use codex_protocol::permissions::FileSystemSpecialPath as CoreFileSystemSpecialPath;
 use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
 use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
+use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::ExecCommandSource as CoreExecCommandSource;
 use codex_protocol::protocol::GranularApprovalConfig as CoreGranularApprovalConfig;
@@ -287,6 +288,8 @@ fn thread_resume_response_round_trips_initial_turns_page() {
             project_id: None,
             history_mode: Default::default(),
             model_provider: "openai".to_string(),
+            model: None,
+            reasoning_effort: None,
             created_at: 1,
             updated_at: 1,
             recency_at: Some(1),
@@ -1305,23 +1308,44 @@ fn fs_copy_params_round_trip_with_recursive_directory_copy() {
 
 #[test]
 fn thread_shell_command_params_round_trip() {
-    let params = ThreadShellCommandParams {
-        thread_id: "thr_123".to_string(),
-        command: "printf 'hello world\\n'".to_string(),
-    };
+    for timeout_ms in [None, Some(0), Some(28_800_000)] {
+        let params = ThreadShellCommandParams {
+            thread_id: "thr_123".to_string(),
+            command: "printf 'hello world\\n'".to_string(),
+            timeout_ms,
+        };
 
-    let value = serde_json::to_value(&params).expect("serialize thread/shellCommand params");
+        let value = serde_json::to_value(&params).expect("serialize thread/shellCommand params");
+        assert_eq!(
+            value,
+            json!({
+                "threadId": "thr_123",
+                "command": "printf 'hello world\\n'",
+                "timeoutMs": timeout_ms,
+            })
+        );
+
+        let decoded = serde_json::from_value::<ThreadShellCommandParams>(value)
+            .expect("deserialize thread/shellCommand params");
+        assert_eq!(decoded, params);
+    }
+}
+
+#[test]
+fn thread_shell_command_params_without_timeout_remain_valid() {
+    let decoded = serde_json::from_value::<ThreadShellCommandParams>(json!({
+        "threadId": "thr_123",
+        "command": "echo hello",
+    }))
+    .expect("deserialize thread/shellCommand params without timeoutMs");
     assert_eq!(
-        value,
-        json!({
-            "threadId": "thr_123",
-            "command": "printf 'hello world\\n'",
-        })
+        decoded,
+        ThreadShellCommandParams {
+            thread_id: "thr_123".to_string(),
+            command: "echo hello".to_string(),
+            timeout_ms: None,
+        }
     );
-
-    let decoded = serde_json::from_value::<ThreadShellCommandParams>(value)
-        .expect("deserialize thread/shellCommand params");
-    assert_eq!(decoded, params);
 }
 
 #[test]
@@ -3047,6 +3071,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         phase: None,
         memory_citation: None,
         delivery: None,
+        questions: None,
     });
 
     assert_eq!(
@@ -3057,6 +3082,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             phase: None,
             memory_citation: None,
             delivery: None,
+            questions: None,
         }
     );
 
@@ -3076,6 +3102,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             rollout_ids: vec!["rollout-1".to_string()],
         }),
         delivery: None,
+        questions: None,
     });
 
     assert_eq!(
@@ -3094,8 +3121,41 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
                 thread_ids: vec!["rollout-1".to_string()],
             }),
             delivery: None,
+            questions: None,
         }
     );
+
+    let async_item = ThreadItem::from(TurnItem::AgentMessage(AgentMessageItem {
+        id: "async-1".to_string(),
+        content: vec![AgentMessageContent::Text {
+            text: "Which?".to_string(),
+        }],
+        phase: Some(MessagePhase::FinalAnswer),
+        memory_citation: None,
+        delivery: Some(AgentMessageDelivery::Async),
+        questions: Some(vec![AsyncUserInputQuestion {
+            title: "Which?".to_string(),
+            options: None,
+        }]),
+    }));
+    assert_eq!(
+        serde_json::to_value(&async_item).unwrap(),
+        json!({
+            "type": "agentMessage", "id": "async-1", "text": "Which?", "phase": "final_answer",
+            "memoryCitation": null, "delivery": "async", "questions": [{"title": "Which?", "options": null}]
+        })
+    );
+    let old_item: ThreadItem = serde_json::from_value(json!({
+        "type": "agentMessage", "id": "old-1", "text": "An old message"
+    }))
+    .unwrap();
+    assert!(matches!(
+        old_item,
+        ThreadItem::AgentMessage {
+            questions: None,
+            ..
+        }
+    ));
 
     let reasoning_item = TurnItem::Reasoning(ReasoningItem {
         id: "reasoning-1".to_string(),
@@ -4488,11 +4548,19 @@ fn codex_error_info_serializes_http_status_code_in_camel_case() {
 }
 
 #[test]
-fn codex_error_info_serializes_cyber_policy_in_camel_case() {
-    assert_eq!(
-        serde_json::to_value(CodexErrorInfo::CyberPolicy).unwrap(),
-        json!("cyberPolicy")
-    );
+fn core_error_info_converts_to_camel_case() {
+    for (core, expected) in [
+        (CoreCodexErrorInfo::CyberPolicy, json!("cyberPolicy")),
+        (
+            CoreCodexErrorInfo::RateLimitExceeded,
+            json!("rateLimitExceeded"),
+        ),
+    ] {
+        assert_eq!(
+            serde_json::to_value(CodexErrorInfo::from(core)).unwrap(),
+            expected
+        );
+    }
 }
 
 #[test]
@@ -4714,6 +4782,8 @@ fn turn_start_params_preserve_explicit_null_service_tier() {
         thread_id: "thread_123".to_string(),
         client_user_message_id: None,
         input: vec![],
+        turn_trigger: None,
+        tool_output: None,
         responsesapi_client_metadata: None,
         additional_context: None,
         environments: None,
@@ -4725,16 +4795,47 @@ fn turn_start_params_preserve_explicit_null_service_tier() {
         permissions: None,
         model: None,
         service_tier: None,
+        service_tier_for_turn: None,
         effort: None,
         summary: None,
         output_schema: None,
         collaboration_mode: None,
         multi_agent_mode: None,
         personality: None,
+        cyber_access_program: None,
     };
     let serialized_without_override =
         serde_json::to_value(&without_override).expect("params should serialize");
     assert_eq!(serialized_without_override.get("serviceTier"), None);
+}
+
+#[test]
+fn turn_start_cyber_access_program_uses_separate_wire_formats() {
+    for (app_server_value, core_value) in [
+        ("standard", "standard"),
+        ("daybreakBlue", "daybreak_blue"),
+        ("daybreakRed", "daybreak_red"),
+    ] {
+        let params: TurnStartParams = serde_json::from_value(json!({
+            "threadId": "thread_123",
+            "input": [],
+            "cyberAccessProgram": app_server_value,
+        }))
+        .expect("params should deserialize");
+        let core_program: codex_protocol::turn_input::CyberAccessProgram = params
+            .cyber_access_program
+            .expect("explicit program")
+            .into();
+
+        assert_eq!(
+            serde_json::to_value(params).expect("params should serialize")["cyberAccessProgram"],
+            app_server_value,
+        );
+        assert_eq!(
+            serde_json::to_value(core_program).expect("core program should serialize"),
+            json!(core_value),
+        );
+    }
 }
 
 #[test]

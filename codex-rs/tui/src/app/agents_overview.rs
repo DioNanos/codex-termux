@@ -1,9 +1,10 @@
-//! Daemon-wide overview of loaded root sessions and their subagents.
+//! Daemon-wide overview of recent and locally retained sessions and their subagents.
 
 use super::agents_overview_view::AgentsOverviewGroup;
 use super::agents_overview_view::AgentsOverviewRow;
 use super::agents_overview_view::AgentsOverviewView;
 use super::*;
+use crate::app_event::AgentsOverviewThreadRefresh;
 use crate::bottom_pane::SelectionDescriptionLayout;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
@@ -12,14 +13,7 @@ use crate::chatwidget::ThreadInputStateRestoreMode;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::Thread;
-use codex_app_server_protocol::ThreadItem;
-use codex_app_server_protocol::ThreadLoadedListParams;
-use codex_app_server_protocol::ThreadLoadedListResponse;
-use codex_app_server_protocol::ThreadReadParams;
-use codex_app_server_protocol::ThreadReadResponse;
-use codex_app_server_protocol::ThreadStatus;
-use codex_app_server_protocol::ThreadTurnsListParams;
-use codex_app_server_protocol::ThreadTurnsListResponse;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
@@ -29,14 +23,28 @@ pub(crate) const AGENTS_OVERVIEW_VIEW_ID: &str = "agents-overview";
 
 #[derive(Default)]
 pub(super) struct AgentsOverviewState {
+    /// Missing metadata records a local resume until the next metadata refresh.
+    pub(super) threads: HashMap<ThreadId, Option<Thread>>,
+    pub(super) initialized: bool,
     pub(super) request_id: Option<Uuid>,
     pub(super) refresh_pending: bool,
+    pub(super) refresh_thread_ids: HashSet<ThreadId>,
+    pub(super) refresh_task: Option<tokio::task::AbortHandle>,
+    pub(super) refresh_notifications: HashMap<ThreadId, Vec<ServerNotification>>,
     pub(super) rendered_full_screen: bool,
     pub(super) visible_thread_ids: Vec<ThreadId>,
     pub(super) view_state:
         Arc<std::sync::Mutex<super::agents_overview_view::AgentsOverviewViewState>>,
     pub(super) input_states: HashMap<ThreadId, ThreadInputState>,
     pub(super) dispatched_requests: HashMap<ThreadId, Vec<ServerRequest>>,
+}
+
+impl Drop for AgentsOverviewState {
+    fn drop(&mut self) {
+        if let Some(task) = self.refresh_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl App {
@@ -90,137 +98,76 @@ impl App {
             return;
         }
 
-        self.agents_overview.request_id = None;
-        self.agents_overview.refresh_pending = false;
-        let view = self.agents_overview_view(Vec::new(), /*selected_thread_id*/ None);
+        let threads = self
+            .agents_overview
+            .threads
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+        let view = self.agents_overview_view(threads, /*selected_thread_id*/ None);
         self.agents_overview.visible_thread_ids = view.thread_ids();
         self.chat_widget.show_bottom_pane_view(Box::new(view));
         self.refresh_agents_overview_threads(app_server);
-    }
-
-    pub(super) fn refresh_agents_overview_threads(&mut self, app_server: &AppServerSession) {
-        if self
-            .chat_widget
-            .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID)
-            .is_none()
-        {
-            return;
-        }
-        if self.agents_overview.request_id.is_some() {
-            self.agents_overview.refresh_pending = true;
-            return;
-        }
-
-        let request_id = Uuid::new_v4();
-        self.agents_overview.request_id = Some(request_id);
-        let request_handle = app_server.request_handle();
-        let app_event_tx = self.app_event_tx.clone();
-        let refresh_task = tokio::spawn(async move {
-            let result = async {
-                let mut threads = Vec::new();
-                let mut cursor = None;
-                while threads.len() < 1_000 {
-                    let page = request_handle
-                        .request_typed::<ThreadLoadedListResponse>(ClientRequest::ThreadLoadedList {
-                            request_id: RequestId::String(Uuid::new_v4().to_string()),
-                            params: ThreadLoadedListParams {
-                                cursor,
-                                limit: Some(100),
-                            },
-                        })
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    let mut loaded_threads = tokio::task::JoinSet::new();
-                    for thread_id in page.data.into_iter().take(1_000 - threads.len()) {
-                        let request_handle = request_handle.clone();
-                        loaded_threads.spawn(async move {
-                            match request_handle
-                                .request_typed::<ThreadReadResponse>(ClientRequest::ThreadRead {
-                                    request_id: RequestId::String(Uuid::new_v4().to_string()),
-                                    params: ThreadReadParams {
-                                        thread_id: thread_id.clone(),
-                                        include_turns: false,
-                                    },
-                                })
-                                .await
-                            {
-                                Ok(mut response) => {
-                                    if let Ok(turns) = request_handle
-                                        .request_typed::<ThreadTurnsListResponse>(
-                                            ClientRequest::ThreadTurnsList {
-                                                request_id: RequestId::String(
-                                                    Uuid::new_v4().to_string(),
-                                                ),
-                                                params: ThreadTurnsListParams {
-                                                    thread_id,
-                                                    cursor: None,
-                                                    limit: Some(1),
-                                                    sort_direction: None,
-                                                    items_view: None,
-                                                },
-                                            },
-                                        )
-                                        .await
-                                        && let Some(ThreadItem::UserMessage { content, .. }) = turns
-                                            .data
-                                            .first()
-                                            .and_then(|turn| turn.items.first())
-                                    {
-                                        response.thread.preview =
-                                            ChatWidget::user_message_display_from_inputs(content)
-                                                .message;
-                                    }
-                                    Some(response.thread)
-                                }
-                                Err(error) => {
-                                    tracing::warn!(thread_id, %error, "failed to read loaded agent thread");
-                                    None
-                                }
-                            }
-                        });
-                        if loaded_threads.len() >= 16
-                            && let Some(Ok(Some(thread))) = loaded_threads.join_next().await
-                        {
-                            threads.push(thread);
-                        }
-                    }
-                    while let Some(result) = loaded_threads.join_next().await {
-                        if let Ok(Some(thread)) = result {
-                            threads.push(thread);
-                        }
-                    }
-                    let Some(next_cursor) = page.next_cursor else {
-                        break;
-                    };
-                    cursor = Some(next_cursor);
-                }
-                threads.sort_by_key(|thread| std::cmp::Reverse(thread.updated_at));
-                Ok(threads)
-            }
-            .await;
-
-            app_event_tx.send(AppEvent::AgentsOverviewThreadsLoaded { request_id, result });
-        });
-        if let Ok(mut state) = self.agents_overview.view_state.lock() {
-            state.refresh_task = Some(refresh_task.abort_handle());
-        }
     }
 
     pub(super) fn apply_agents_overview_thread_refresh(
         &mut self,
         app_server: &AppServerSession,
         request_id: Uuid,
-        result: Result<Vec<Thread>, String>,
+        result: Result<AgentsOverviewThreadRefresh, String>,
     ) {
         if self.agents_overview.request_id != Some(request_id) {
             return;
         }
         self.agents_overview.request_id = None;
+        self.agents_overview.refresh_task = None;
+        match result {
+            Ok(refresh) => {
+                self.agents_overview.initialized = refresh.recent_seed_complete;
+                for (thread_id, thread) in refresh.threads {
+                    if let Some(mut thread) = thread {
+                        if thread.ephemeral {
+                            self.agents_overview.threads.remove(&thread_id);
+                            continue;
+                        }
+                        thread.turns.clear();
+                        self.agents_overview.threads.insert(thread_id, Some(thread));
+                    } else {
+                        self.agents_overview.threads.entry(thread_id).or_default();
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to refresh shared agents");
+                if self
+                    .chat_widget
+                    .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID)
+                    .is_some()
+                {
+                    self.chat_widget
+                        .add_error_message(format!("Failed to load shared agents: {error}"));
+                }
+            }
+        }
+        for notifications in
+            std::mem::take(&mut self.agents_overview.refresh_notifications).into_values()
+        {
+            for notification in notifications {
+                self.track_agents_overview_notification(&notification);
+            }
+        }
+        if std::mem::take(&mut self.agents_overview.refresh_pending) {
+            self.refresh_changed_agents_overview_threads(app_server);
+        }
+        self.repaint_agents_overview();
+    }
+
+    pub(super) fn repaint_agents_overview(&mut self) {
         let Some(selected) = self
             .chat_widget
             .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID)
         else {
-            self.agents_overview.refresh_pending = false;
             return;
         };
         let selected_thread_id = self
@@ -228,17 +175,13 @@ impl App {
             .visible_thread_ids
             .get(selected)
             .copied();
-        let threads = match result {
-            Ok(threads) => threads,
-            Err(error) => {
-                self.chat_widget
-                    .add_error_message(format!("Failed to load shared agents: {error}"));
-                if std::mem::take(&mut self.agents_overview.refresh_pending) {
-                    self.refresh_agents_overview_threads(app_server);
-                }
-                return;
-            }
-        };
+        let threads = self
+            .agents_overview
+            .threads
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
         let view = self.agents_overview_view(threads, selected_thread_id);
         self.agents_overview.visible_thread_ids = view.thread_ids();
         if selected_thread_id
@@ -246,17 +189,21 @@ impl App {
             && let Ok(mut state) = self.agents_overview.view_state.lock()
             && state.renaming
         {
+            self.chat_widget.add_info_message(
+                format!(
+                    "The rename target disappeared. Unsubmitted title: {}",
+                    state.input
+                ),
+                /*hint*/ None,
+            );
             state.renaming = false;
             state.input.clear();
         }
         self.chat_widget
             .replace_bottom_pane_view_if_present(AGENTS_OVERVIEW_VIEW_ID, Box::new(view));
-        if std::mem::take(&mut self.agents_overview.refresh_pending) {
-            self.refresh_agents_overview_threads(app_server);
-        }
     }
 
-    fn agents_overview_view(
+    pub(super) fn agents_overview_view(
         &self,
         mut threads: Vec<Thread>,
         selected_thread_id: Option<ThreadId>,
@@ -283,13 +230,15 @@ impl App {
 
         let mut roots = threads
             .iter()
-            .filter(|thread| {
-                thread.parent_thread_id.is_none()
-                    && !matches!(thread.status, ThreadStatus::NotLoaded)
-            })
+            .filter(|thread| thread.parent_thread_id.is_none())
             .map(|root| (root, agents_overview_group(root, &children)))
             .collect::<Vec<_>>();
-        roots.sort_by_key(|(root, group)| (*group, std::cmp::Reverse(root.updated_at)));
+        roots.sort_by(|(left, left_group), (right, right_group)| {
+            left_group
+                .cmp(right_group)
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
         let mut rows = Vec::new();
         for (root, group) in roots {
             let Ok(thread_id) = ThreadId::from_string(&root.id) else {
@@ -319,7 +268,9 @@ impl App {
         app_server: &mut AppServerSession,
         root_thread_id: ThreadId,
     ) -> color_eyre::Result<AppRunControl> {
-        if self.current_displayed_thread_id() == Some(root_thread_id) {
+        if self.current_displayed_thread_id() == Some(root_thread_id)
+            && !self.thread_unavailable(root_thread_id)
+        {
             return Ok(AppRunControl::Continue);
         }
 
@@ -381,32 +332,79 @@ impl App {
                     return Ok(AppRunControl::Continue);
                 }
             };
-            let config_cwd = if self.app_server_target.uses_remote_workspace() {
-                self.config.cwd.to_path_buf()
+            let unloaded = matches!(
+                target_thread.status,
+                codex_app_server_protocol::ThreadStatus::NotLoaded
+            );
+            let mut resume_config = if unloaded {
+                let target_session = SessionTarget {
+                    path: target_thread.path.clone(),
+                    thread_id: root_thread_id,
+                    history_mode: Some(target_thread.history_mode),
+                };
+                match self
+                    .resume_config_for_target(tui, app_server, &target_session)
+                    .await
+                {
+                    Ok(config) => config,
+                    Err(control) => return Ok(control),
+                }
             } else {
-                target_thread.cwd.to_path_buf()
-            };
-            let current_cwd = self.config.cwd.to_path_buf();
-            let resume_config = match self
-                .rebuild_config_for_resume_or_fallback(&current_cwd, config_cwd)
-                .await
-            {
-                Ok(config) => config,
-                Err(error) => {
-                    self.chat_widget
-                        .add_error_message(format!("Failed to load task settings: {error}"));
-                    return Ok(AppRunControl::Continue);
+                let config_cwd = if self.app_server_target.uses_remote_workspace() {
+                    self.config.cwd.to_path_buf()
+                } else {
+                    target_thread.cwd.to_path_buf()
+                };
+                let current_cwd = self.config.cwd.to_path_buf();
+                match self
+                    .rebuild_config_for_resume_or_fallback(&current_cwd, config_cwd)
+                    .await
+                {
+                    Ok(config) => config,
+                    Err(error) => {
+                        self.chat_widget
+                            .add_error_message(format!("Failed to load task settings: {error}"));
+                        return Ok(AppRunControl::Continue);
+                    }
                 }
             };
             let baseline_approval = resume_config.permissions.approval_policy.value();
             let baseline_permissions =
                 RuntimePermissionProfileOverride::from_config(&resume_config);
+            let resume_model_settings = match target_thread.status {
+                codex_app_server_protocol::ThreadStatus::NotLoaded => {
+                    self.apply_runtime_policy_overrides(
+                        &mut resume_config,
+                        RuntimePolicyOverrideScope::ExplicitOnly,
+                    );
+                    if matches!(self.runtime_approval_policy_override,
+                        Some(RuntimeApprovalPolicyOverride::Explicit(policy))
+                            if policy.to_core() != resume_config.permissions.approval_policy.value())
+                        || self
+                            .runtime_permission_profile_override
+                            .as_ref()
+                            .is_some_and(|profile| {
+                                profile.turn_override
+                                    == RuntimePermissionProfileTurnOverride::LegacySandbox
+                                    && !profile.matches_config(&resume_config)
+                            })
+                    {
+                        self.chat_widget.add_error_message(
+                            "Cannot resume task without preserving the selected permissions."
+                                .to_string(),
+                        );
+                        return Ok(AppRunControl::Continue);
+                    }
+                    self.resume_model_settings()
+                }
+                codex_app_server_protocol::ThreadStatus::Idle
+                | codex_app_server_protocol::ThreadStatus::Active { .. }
+                | codex_app_server_protocol::ThreadStatus::SystemError => {
+                    crate::app_server_session::ResumeModelSettings::PreserveExistingThread
+                }
+            };
             let resumed = match app_server
-                .resume_thread(
-                    resume_config.clone(),
-                    root_thread_id,
-                    crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
-                )
+                .resume_thread(resume_config.clone(), root_thread_id, resume_model_settings)
                 .await
             {
                 Ok(resumed) => resumed,
@@ -444,8 +442,19 @@ impl App {
             if previous_running_thread_ids.is_empty() {
                 self.shutdown_current_thread(app_server).await;
             }
-            self.runtime_approval_policy_override = None;
-            self.runtime_permission_profile_override = None;
+            // Explicit user choices carry across cold resumes; inherited task settings do not.
+            self.runtime_approval_policy_override =
+                self.runtime_approval_policy_override.filter(|policy| {
+                    unloaded && matches!(policy, RuntimeApprovalPolicyOverride::Explicit(_))
+                });
+            self.runtime_permission_profile_override = self
+                .runtime_permission_profile_override
+                .take()
+                .filter(|profile| {
+                    unloaded
+                        && profile.turn_override
+                            == RuntimePermissionProfileTurnOverride::LegacySandbox
+                });
             self.config = resume_config;
             tui.set_notification_settings(
                 self.config.tui_notifications.method,
@@ -477,14 +486,22 @@ impl App {
                     .set_workspace_roots(self.config.permissions.workspace_roots().to_vec());
             }
             self.config = destination_config;
-            if self.config.permissions.approval_policy.value() != baseline_approval {
-                self.runtime_approval_policy_override =
-                    Some(self.config.permissions.approval_policy.value().into());
+            let approval = self.config.permissions.approval_policy.value();
+            if self
+                .runtime_approval_policy_override
+                .is_none_or(|policy| policy.policy().to_core() != approval)
+            {
+                self.runtime_approval_policy_override = (approval != baseline_approval)
+                    .then_some(RuntimeApprovalPolicyOverride::Restored(approval.into()));
             }
-            let destination_permissions =
-                RuntimePermissionProfileOverride::from_config(&self.config);
-            if destination_permissions != baseline_permissions {
-                self.runtime_permission_profile_override = Some(destination_permissions);
+            if self
+                .runtime_permission_profile_override
+                .as_ref()
+                .is_none_or(|profile| !profile.matches_config(&self.config))
+            {
+                self.runtime_permission_profile_override = (!baseline_permissions
+                    .matches_config(&self.config))
+                .then(|| RuntimePermissionProfileOverride::from_restored_config(&self.config));
             }
             if !self
                 .backfill_loaded_subagent_threads(app_server)
@@ -504,7 +521,9 @@ impl App {
             }
         }
 
-        if self.current_displayed_thread_id() != Some(root_thread_id) {
+        if self.current_displayed_thread_id() != Some(root_thread_id)
+            || self.thread_unavailable(root_thread_id)
+        {
             self.select_agent_thread_and_discard_side(tui, app_server, root_thread_id)
                 .await?;
         }
@@ -586,7 +605,7 @@ impl App {
         };
         if let Some(profile) = self.runtime_permission_profile_override.as_ref()
             && profile.active_permission_profile.is_some()
-            && (RuntimePermissionProfileOverride::from_config(&config) != *profile
+            && (!profile.matches_config(&config)
                 || config.permissions.profile_workspace_roots()
                     != self.config.permissions.profile_workspace_roots())
         {
@@ -597,7 +616,7 @@ impl App {
                 .chat_widget
                 .add_error_message("Permission profile has different settings.".to_string());
         }
-        self.apply_runtime_policy_overrides(&mut config);
+        self.apply_runtime_policy_overrides(&mut config, RuntimePolicyOverrideScope::All);
         apply_managed_new_thread_defaults(
             &mut config,
             app_server.managed_new_thread_defaults(),
@@ -666,15 +685,34 @@ impl App {
     ) {
         let active_turn_id = match self.active_turn_id_for_thread(thread_id).await {
             Some(turn_id) => Some(turn_id),
-            None => match app_server
-                .thread_read(thread_id, /*include_turns*/ true)
-                .await
+            None => match async {
+                let thread = app_server
+                    .thread_read(thread_id, /*include_turns*/ false)
+                    .await?;
+                let turns = match thread.history_mode {
+                    ThreadHistoryMode::Paginated if app_server.supports_paginated_history() => {
+                        app_server
+                            .thread_turns_page(thread_id, /*cursor*/ None)
+                            .await?
+                            .data
+                    }
+                    ThreadHistoryMode::Legacy | ThreadHistoryMode::Paginated => {
+                        app_server
+                            .thread_read(thread_id, /*include_turns*/ true)
+                            .await?
+                            .turns
+                    }
+                };
+                Ok::<_, color_eyre::Report>(
+                    turns
+                        .into_iter()
+                        .find(|turn| turn.status == TurnStatus::InProgress)
+                        .map(|turn| turn.id),
+                )
+            }
+            .await
             {
-                Ok(thread) => thread
-                    .turns
-                    .into_iter()
-                    .find(|turn| turn.status == TurnStatus::InProgress)
-                    .map(|turn| turn.id),
+                Ok(turn_id) => turn_id,
                 Err(error) => {
                     self.chat_widget
                         .add_error_message(format!("Failed to stop background task: {error}"));

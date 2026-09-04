@@ -186,6 +186,13 @@ impl PathUri {
         self.0.path()
     }
 
+    /// Returns the percent-decoded URI path without requiring valid UTF-8.
+    ///
+    /// The URL authority is not included.
+    pub fn decoded_path_bytes(&self) -> Cow<'_, [u8]> {
+        urlencoding::decode_binary(self.encoded_path().as_bytes())
+    }
+
     fn windows_identity_path_bytes(&self) -> Option<Cow<'_, [u8]>> {
         if self.infer_path_convention() != Some(PathConvention::Windows)
             || self.opaque_fallback_bytes().is_some()
@@ -347,6 +354,37 @@ impl PathUri {
         native_path_segments_start_with(&path_segments, &base_segments, convention)
     }
 
+    /// Returns whether the lexical subtrees rooted at these URIs overlap.
+    ///
+    /// Returns `None` when either URI does not expose unambiguous lexical
+    /// components. Equal URIs are known to overlap even when they are opaque.
+    pub fn overlaps(&self, other: &Self) -> Option<bool> {
+        if self == other {
+            return Some(true);
+        }
+        self.lexical_depth()?;
+        other.lexical_depth()?;
+        Some(self.starts_with(other) || other.starts_with(self))
+    }
+
+    /// Returns true for a fallback URI that losslessly stores native path bytes.
+    pub fn is_opaque(&self) -> bool {
+        self.opaque_fallback_bytes().is_some()
+    }
+
+    /// Returns the number of non-empty path segments when this URI is safe for
+    /// lexical containment.
+    ///
+    /// Opaque fallback URIs and segments containing encoded native separators
+    /// return `None` because they do not expose unambiguous component boundaries.
+    pub fn lexical_depth(&self) -> Option<usize> {
+        if decode_bad_path_uri(&self.0).is_some() {
+            return None;
+        }
+        let convention = self.infer_path_convention()?;
+        containment_path_segments(&self.0, convention).map(|segments| segments.len())
+    }
+
     /// Returns the decoded relative path from `base` to this URI.
     ///
     /// The result uses the separators of the inferred path convention,
@@ -491,6 +529,27 @@ impl PathUri {
             }
         }
         Self::try_from(url)
+    }
+
+    /// Lexically resolves a relative native path that remains at or below this URI.
+    ///
+    /// Absolute, Windows root- or drive-relative, and escaping paths are rejected.
+    pub fn join_descendant(&self, path: &str) -> Result<Self, PathUriParseError> {
+        let descendant = self.join(path)?;
+        let windows = self.infer_path_convention() == Some(PathConvention::Windows);
+        if path.starts_with('/')
+            || windows
+                && (path.starts_with('\\')
+                    || PathConvention::Windows
+                        .path_segments(path)
+                        .any(|segment| segment.contains(':')))
+            || !descendant.starts_with(self)
+        {
+            return Err(PathUriParseError::JoinPathMustBeDescendant(
+                path.to_string(),
+            ));
+        }
+        Ok(descendant)
     }
 
     /// Converts this file URI to a path using the current host's path rules.
@@ -730,7 +789,13 @@ fn native_path_segments_start_with(
     convention: PathConvention,
 ) -> bool {
     match convention {
-        PathConvention::Posix => path_segments.starts_with(base_segments),
+        PathConvention::Posix => {
+            path_segments.len() >= base_segments.len()
+                && path_segments.iter().zip(base_segments).all(|(path, base)| {
+                    urlencoding::decode_binary(path.as_bytes())
+                        == urlencoding::decode_binary(base.as_bytes())
+                })
+        }
         PathConvention::Windows => {
             path_segments.len() >= base_segments.len()
                 && path_segments.iter().zip(base_segments).all(|(path, base)| {
@@ -901,8 +966,8 @@ pub enum PathUriParseError {
     QueryNotAllowed,
     #[error("fragments are not allowed in path URIs")]
     FragmentNotAllowed,
-    #[error("path `{0}` must be relative when joining a path URI")]
-    JoinPathMustBeRelative(String),
+    #[error("path `{0}` must resolve to a relative descendant when joining a path URI")]
+    JoinPathMustBeDescendant(String),
 }
 
 /// Path syntax used to render a [`PathUri`] as an operating-system path.

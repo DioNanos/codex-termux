@@ -187,6 +187,7 @@ async fn root_turn_suspension_preserves_unfinished_turn_history() {
                 turn_id: turn_id.clone(),
                 thread_settings: Default::default(),
                 trace: None,
+                cyber_access_program: None,
             })
             .await
             .expect("recover the unfinished turn"),

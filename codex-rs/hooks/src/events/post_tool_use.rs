@@ -589,6 +589,7 @@ mod tests {
 
     fn handler_with_async(r#async: bool) -> ConfiguredHandler {
         ConfiguredHandler {
+            builtin: false,
             event_name: HookEventName::PostToolUse,
             matcher: Some("^Bash$".to_string()),
             timeout_sec: 5,

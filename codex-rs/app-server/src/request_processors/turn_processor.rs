@@ -5,9 +5,13 @@ use codex_agent_extension::AgentRun;
 use codex_agent_extension::AgentRunner;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
+use codex_protocol::protocol::TurnSettingsUpdate;
+use codex_protocol::protocol::TurnSettingsUpdateOutcome;
 use codex_skills::system_cache_root_dir;
 
 use crate::attachment_path_mapper::to_host_path;
@@ -213,6 +217,48 @@ impl TurnRequestProcessor {
         self.thread_settings_update_inner(request_id, params)
             .await
             .map(|response| Some(response.into()))
+    }
+
+    pub(crate) async fn turn_settings_update(
+        &self,
+        request_id: &ConnectionRequestId,
+        params: TurnSettingsUpdateParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let (_, thread) = self.load_thread(&params.thread_id).await?;
+        self.ensure_direct_input_allowed(request_id, thread.as_ref())
+            .await?;
+        let (reply, outcome) = oneshot::channel();
+        self.submit_core_op(
+            request_id,
+            &thread,
+            Op::TurnSettings {
+                turn_id: params.turn_id,
+                update: TurnSettingsUpdate {
+                    approvals_reviewer: params
+                        .approvals_reviewer
+                        .map(codex_app_server_protocol::ApprovalsReviewer::to_core),
+                    model: params.model,
+                    // Match thread/settings/update: public null does not clear effort.
+                    effort: params.effort.map(Some),
+                    summary: params.summary,
+                    service_tier: params.service_tier,
+                },
+                reply,
+            },
+        )
+        .await
+        .map_err(|err| internal_error(format!("failed to submit turn settings: {err}")))?;
+        let outcome = outcome
+            .await
+            .map_err(|_| internal_error("turn settings operation ended before replying"))?;
+        let status = match outcome {
+            TurnSettingsUpdateOutcome::Applied => TurnSettingsUpdateStatus::Applied,
+            TurnSettingsUpdateOutcome::TargetUnavailable => {
+                TurnSettingsUpdateStatus::TargetUnavailable
+            }
+            TurnSettingsUpdateOutcome::Rejected { reason } => return Err(invalid_request(reason)),
+        };
+        Ok(Some(TurnSettingsUpdateResponse { status }.into()))
     }
 
     pub(crate) async fn turn_steer(
@@ -486,7 +532,38 @@ impl TurnRequestProcessor {
                 })?;
         self.ensure_direct_input_allowed(&request_id, thread.as_ref())
             .await?;
-        if let Err(error) = Self::validate_v2_input_limit(&params.input) {
+        if let Some(tool_output) = &params.tool_output {
+            if !params.input.is_empty() {
+                return Err(invalid_request(
+                    "`toolOutput` cannot be combined with nonempty `input`",
+                ));
+            }
+            if tool_output.name.is_empty() {
+                return Err(invalid_request("`toolOutput.name` must not be empty"));
+            }
+        }
+        let actual_chars = params
+            .input
+            .iter()
+            .map(V2UserInput::text_char_count)
+            .sum::<usize>()
+            + params
+                .tool_output
+                .as_ref()
+                .map_or(0, |output| match &output.output {
+                    FunctionCallOutputBody::Text(text) => text.chars().count(),
+                    FunctionCallOutputBody::ContentItems(items) => items
+                        .iter()
+                        .map(|item| match item {
+                            FunctionCallOutputContentItem::InputText { text } => {
+                                text.chars().count()
+                            }
+                            _ => 0,
+                        })
+                        .sum(),
+                });
+        if actual_chars > MAX_USER_INPUT_TEXT_CHARS {
+            let error = Self::input_too_large_error(actual_chars);
             self.track_error_response(
                 &request_id,
                 &error,
@@ -509,16 +586,33 @@ impl TurnRequestProcessor {
         let environment_selections =
             resolve_turn_environment_selections(self.thread_manager.as_ref(), params.environments)?;
 
-        // Map v2 input items to core input items.
-        let mapped_items: Vec<CoreInputItem> = params
-            .input
-            .into_iter()
-            .map(map_local_image_attachment_path)
-            .map(V2UserInput::into_core)
-            .collect();
-        let client_user_message_id = params.client_user_message_id;
         let additional_context = map_additional_context(params.additional_context);
-        let turn_has_input = !mapped_items.is_empty();
+        let turn_has_input = !params.input.is_empty();
+        let input = if let Some(tool_output) = params.tool_output {
+            let item = ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: None,
+                name: Some(tool_output.name),
+                namespace: tool_output.namespace,
+                output: FunctionCallOutputPayload {
+                    body: tool_output.output,
+                    success: None,
+                },
+                internal_chat_message_metadata_passthrough: None,
+            };
+            validate_response_item_image_urls(std::slice::from_ref(&item))?;
+            TurnInput::ResponseItem(item)
+        } else {
+            TurnInput::UserInput {
+                content: params
+                    .input
+                    .into_iter()
+                    .map(map_local_image_attachment_path)
+                    .map(V2UserInput::into_core)
+                    .collect(),
+                client_id: params.client_user_message_id,
+            }
+        };
         let cwd = resolve_request_cwd(params.cwd)?;
         let environments = self
             .build_environment_override(
@@ -547,23 +641,21 @@ impl TurnRequestProcessor {
                 },
             )
             .await?;
-        self.seal_realtime_transcript_before_user_input(thread_id, &mapped_items)
-            .await?;
 
         let submission = thread
             .start_or_steer_turn(
-                TurnInputRequest::new(TurnInput::UserInput {
-                    content: mapped_items,
-                    client_id: client_user_message_id,
-                })
-                .with_thread_settings(thread_settings)
-                .on_start(TurnStartOptions {
-                    final_output_json_schema: params.output_schema,
-                    ..Default::default()
-                })
-                .with_additional_context(additional_context)
-                .with_responses_metadata(params.responsesapi_client_metadata)
-                .with_trace(self.request_trace_context(&request_id).await),
+                TurnInputRequest::new(input)
+                    .with_thread_settings(thread_settings)
+                    .on_start(TurnStartOptions {
+                        turn_trigger: params.turn_trigger,
+                        final_output_json_schema: params.output_schema,
+                        service_tier: params.service_tier_for_turn,
+                        cyber_access_program: params.cyber_access_program.map(Into::into),
+                        ..Default::default()
+                    })
+                    .with_additional_context(additional_context)
+                    .with_responses_metadata(params.responsesapi_client_metadata)
+                    .with_trace(self.request_trace_context(&request_id).await),
             )
             .await
             .map_err(|err| {
@@ -923,12 +1015,12 @@ impl TurnRequestProcessor {
         request_id: &ConnectionRequestId,
         params: TurnSteerParams,
     ) -> Result<TurnSteerResponse, JSONRPCErrorError> {
-        let (thread_id, thread) =
-            self.load_thread(&params.thread_id)
-                .await
-                .inspect_err(|error| {
-                    self.track_error_response(request_id, error, /*error_type*/ None);
-                })?;
+        let (_, thread) = self
+            .load_thread(&params.thread_id)
+            .await
+            .inspect_err(|error| {
+                self.track_error_response(request_id, error, /*error_type*/ None);
+            })?;
         self.ensure_direct_input_allowed(request_id, thread.as_ref())
             .await?;
 
@@ -954,9 +1046,6 @@ impl TurnRequestProcessor {
             .map(V2UserInput::into_core)
             .collect();
         let additional_context = map_additional_context(params.additional_context);
-
-        self.seal_realtime_transcript_before_user_input(thread_id, &mapped_items)
-            .await?;
 
         let submission = thread
             .steer_turn(
@@ -1004,6 +1093,7 @@ impl TurnRequestProcessor {
                             ),
                         };
                         let error = TurnError {
+                            misalignment: None,
                             message: message.clone(),
                             codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
                                 turn_kind: turn_kind.into(),
@@ -1051,37 +1141,6 @@ impl TurnRequestProcessor {
             }
         };
         Ok(TurnSteerResponse { turn_id })
-    }
-
-    async fn seal_realtime_transcript_before_user_input(
-        &self,
-        thread_id: ThreadId,
-        input: &[CoreInputItem],
-    ) -> Result<(), JSONRPCErrorError> {
-        let thread_state = self.thread_state_manager.thread_state(thread_id).await;
-        if !thread_state
-            .lock()
-            .await
-            .realtime_history
-            .should_seal_user_input(input)
-        {
-            return Ok(());
-        }
-        let listener = self
-            .thread_state_manager
-            .current_listener_command_tx(thread_id)
-            .ok_or_else(|| internal_error("thread listener is not running"))?;
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        listener
-            .send(ThreadListenerCommand::SealRealtimeUserInput {
-                input: input.to_vec(),
-                completion_tx,
-            })
-            .map_err(|_| internal_error("thread listener is not running"))?;
-        completion_rx
-            .await
-            .map_err(|_| internal_error("thread listener stopped before sealing realtime input"))?
-            .map_err(internal_error)
     }
 
     async fn prepare_realtime_conversation_thread(
@@ -1198,7 +1257,10 @@ impl TurnRequestProcessor {
                         ConversationStartTransport::Webrtc { sdp }
                     }
                     ThreadRealtimeStartTransport::ExistingCall { call_id } => {
-                        ConversationStartTransport::ExistingCall { call_id }
+                        ConversationStartTransport::ExistingCall {
+                            call_id,
+                            sideband_base_url: None,
+                        }
                     }
                 }),
                 version: params.version,
@@ -1431,6 +1493,8 @@ impl TurnRequestProcessor {
         };
 
         if let Some(mut thread) = stored_thread {
+            let config_snapshot = review_thread.config_snapshot().await;
+            apply_live_model_settings(&mut thread, &config_snapshot);
             thread.session_id = review_thread.session_configured().session_id.to_string();
             self.thread_watch_manager
                 .upsert_thread_silently(&thread.id)

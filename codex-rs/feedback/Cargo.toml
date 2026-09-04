@@ -9,11 +9,16 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+bytes = { workspace = true }
 codex-http-client = { workspace = true }
 codex-login = { workspace = true }
 codex-protocol = { workspace = true }
+flate2 = { workspace = true }
+http = { workspace = true }
+httpdate = { workspace = true }
 mime_guess = { workspace = true }
 sentry = { version = "0.46" }
+tokio = { workspace = true, features = ["time"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

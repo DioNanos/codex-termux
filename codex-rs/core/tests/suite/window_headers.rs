@@ -129,6 +129,13 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
         metadata[2]["context_window_id"],
         metadata[3]["context_window_id"]
     );
+    assert_eq!(
+        metadata
+            .iter()
+            .map(|metadata| metadata["window_number"].as_u64())
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(0), Some(1), Some(1), Some(0)]
+    );
 
     Ok(())
 }

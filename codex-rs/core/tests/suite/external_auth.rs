@@ -1,3 +1,4 @@
+use codex_core::TurnInputRequest;
 use codex_login::AuthHeaders;
 use codex_login::CodexAuth;
 use codex_login::ExternalAuth;
@@ -9,6 +10,9 @@ use codex_model_provider_info::ModelProviderAwsAuthInfo;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
+use codex_protocol::protocol::AuthRecoveryEvent;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::user_input::UserInput;
 use codex_utils_redacted_string::RedactedString;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -317,7 +321,42 @@ async fn amazon_bedrock_aws_auth_refresh_resigns() -> anyhow::Result<()> {
             config.model_provider = provider;
         });
     let test = builder.build_with_auto_env(&server).await?;
-    test.submit_turn("hello").await?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let mut recovery_events = Vec::new();
+    loop {
+        match core_test_support::wait_for_event(&test.codex, |_| true).await {
+            EventMsg::AuthRecoveryStarted(event) => recovery_events.push(("started", event)),
+            EventMsg::AuthRecoveryCompleted(event) => recovery_events.push(("completed", event)),
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        recovery_events,
+        vec![
+            (
+                "started",
+                AuthRecoveryEvent {
+                    provider: "Amazon Bedrock".to_string(),
+                    message: "AWS session has expired. Reauthenticating...".to_string(),
+                },
+            ),
+            (
+                "completed",
+                AuthRecoveryEvent {
+                    provider: "Amazon Bedrock".to_string(),
+                    message: "Signed in with AWS.".to_string(),
+                },
+            ),
+        ]
+    );
     server.verify().await;
     Ok(())
 }

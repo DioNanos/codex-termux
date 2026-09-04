@@ -96,10 +96,36 @@ impl TokenUsageContributor for AllContributors {}
 
 impl SkillInvocationContributor for AllContributors {}
 
+struct ExecutorOnlySkillContributor;
+
+impl SkillInvocationContributor for ExecutorOnlySkillContributor {
+    fn requires_host_skill_discovery(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn host_skill_discovery_preserves_legacy_and_host_contributor_behavior() {
+    assert!(
+        ExtensionRegistryBuilder::<()>::new()
+            .build()
+            .requires_host_skill_discovery()
+    );
+
+    let mut executor_only = ExtensionRegistryBuilder::<()>::new();
+    executor_only.skill_invocation_contributor(Arc::new(ExecutorOnlySkillContributor));
+    assert!(!executor_only.build().requires_host_skill_discovery());
+
+    let mut mixed = ExtensionRegistryBuilder::<()>::new();
+    mixed.skill_invocation_contributor(Arc::new(ExecutorOnlySkillContributor));
+    mixed.skill_invocation_contributor(Arc::new(AllContributors));
+    assert!(mixed.build().requires_host_skill_discovery());
+}
+
 impl TurnInputContributor for AllContributors {
     fn contribute<'a>(
         &'a self,
-        input: TurnInputContext,
+        input: TurnInputContext<'a>,
         _extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
         _session_store: &'a ExtensionData,
         _thread_store: &'a ExtensionData,
@@ -118,7 +144,7 @@ impl ToolContributor for AllContributors {
         &self,
         _session_store: &ExtensionData,
         _thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
         Vec::new()
     }
 }
@@ -212,6 +238,10 @@ async fn build_round_trips_every_contributor_category() {
 
 impl ConversationHistorySnapshot for AllContributors {
     fn history_version(&self) -> u64 {
+        0
+    }
+
+    fn user_message_revision(&self) -> u64 {
         0
     }
 

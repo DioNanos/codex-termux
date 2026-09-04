@@ -365,7 +365,19 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
         .with_codex_home(codex_home.path())
         .build_initialized()
         .await?;
-    let thread_id = start_default_thread(&mut mcp).await?;
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            history_mode: Some(ThreadHistoryMode::Legacy),
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/started"),
+    )
+    .await??;
+    let thread_id = thread.id;
     materialize_thread_rollout(&mut mcp, &thread_id).await?;
     let ReviewStartResponse {
         turn,

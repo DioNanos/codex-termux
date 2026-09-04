@@ -23,6 +23,7 @@ pub use memories::Stage1StartupClaimParams;
 pub use project::CreatedProject;
 pub use project::Project;
 pub use project::ProjectRoot;
+pub use project::ProjectSortKey;
 pub use project::ProjectsPage;
 pub use queued_item::QueuedUserSubmissionRecord;
 pub use rollout_migration_state::RolloutMigrationCursor;

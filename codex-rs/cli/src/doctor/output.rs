@@ -1282,7 +1282,7 @@ Environment
       LESS                     -FRX
   ✓ runtime      running local build on darwin-arm64
   ✓ install      consistent
-      managed by               npm: no · bun: no · pnpm: no · package root —
+      managed by               npm: no · bun: no · pnpm: no · Vite+: no · package root —
   ✓ search       search is OK (bundled)
   ✓ git          git version 2.54.0
       selected git             /usr/bin/git

@@ -9,6 +9,7 @@ use codex_config::McpServerToolConfig;
 use codex_config::McpServerTransportConfig;
 use codex_protocol::mcp_policy::EnvironmentMcpPolicy;
 use codex_protocol::mcp_policy::PluginMcpRequirements;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 
 use crate::CODEX_APPS_MCP_SERVER_NAME;
@@ -20,6 +21,7 @@ use super::McpServerConflictAction;
 use super::McpServerRegistration;
 use super::McpServerSource;
 use super::ResolvedMcpCatalog;
+use super::ResolvedMcpServer;
 
 fn server(url: &str) -> McpServerConfig {
     McpServerConfig {
@@ -49,6 +51,7 @@ fn server(url: &str) -> McpServerConfig {
             "read".to_string(),
             McpServerToolConfig {
                 approval_mode: Some(AppToolApproval::Approve),
+                ..Default::default()
             },
         )]),
     }
@@ -83,6 +86,33 @@ fn register(source: McpServerSource) -> McpServerConflictAction {
 
 fn remove(source: McpServerSource) -> McpServerConflictAction {
     McpServerConflictAction::Remove(source)
+}
+
+#[test]
+fn plugin_host_root_is_retained_in_catalog_identity() {
+    let original_root = PathUri::parse("file:///plugins/original").expect("valid plugin root URI");
+    let replacement_root =
+        PathUri::parse("file:///plugins/replacement").expect("valid plugin root URI");
+    let catalog_for_root = |root| {
+        let mut builder = ResolvedMcpCatalog::builder();
+        builder.register(McpServerRegistration::from_plugin(
+            "docs".to_string(),
+            plugin("plugin@test").with_host_root(root),
+            /*plugin_order*/ 0,
+            server("https://plugin.example/mcp"),
+        ));
+        builder.build()
+    };
+    let original = catalog_for_root(original_root.clone());
+    let replacement = catalog_for_root(replacement_root);
+
+    let Some(McpServerSource::Plugin(attribution)) =
+        original.server("docs").map(ResolvedMcpServer::source)
+    else {
+        panic!("expected host-discovered plugin registration");
+    };
+    assert_eq!(attribution.host_root(), Some(&original_root));
+    assert!(!original.has_same_servers(&replacement));
 }
 
 #[test]

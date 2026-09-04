@@ -498,7 +498,9 @@ pub(crate) fn init() -> Result<InitializedTerminal> {
         !keyboard_modes::keyboard_enhancement_disabled() && detect_keyboard_enhancement_supported();
 
     #[cfg(windows)]
-    probe_windows_default_colors();
+    // OSC replies can arrive after their deadline. Do not issue terminal queries before directory
+    // trust and other protected startup screens have finished accepting their security decisions.
+    crate::terminal_palette::set_default_colors_from_startup_probe(/*colors*/ None);
 
     let tui = CustomTerminal::with_options_and_cursor_position(backend, cursor_pos)?;
     let stderr_guard = terminal_stderr::TerminalStderrGuard::install()?;
@@ -574,6 +576,10 @@ pub enum TuiEvent {
     /// The app refreshes terminal geometry for this draw because resize events are not delivered
     /// while the process is suspended.
     Resume,
+    /// A terminal focus notification indicating that the terminal or tab became active.
+    FocusGained,
+    /// A terminal focus notification indicating that the terminal or tab became inactive.
+    FocusLost,
 }
 
 pub struct Tui {
@@ -670,6 +676,10 @@ impl Tui {
         self.notification_condition = condition;
     }
 
+    pub(crate) fn is_terminal_focused(&self) -> bool {
+        self.terminal_focused.load(Ordering::Relaxed)
+    }
+
     pub fn frame_requester(&self) -> FrameRequester {
         self.frame_requester.clone()
     }
@@ -691,6 +701,15 @@ impl Tui {
     // Inverse of `pause_events`.
     pub fn resume_events(&mut self) {
         self.event_broker.resume_events();
+    }
+
+    /// Discover the visible Windows theme only after protected startup decisions have completed.
+    #[cfg(windows)]
+    pub(crate) fn probe_default_colors_after_protected_startup(&mut self) {
+        self.pause_events();
+        probe_windows_default_colors();
+        self.resume_events();
+        self.frame_requester.schedule_frame();
     }
 
     /// Reclaim terminal modes and stderr after a panic hook ran inside a recovery boundary.
@@ -764,7 +783,7 @@ impl Tui {
     /// Emit a desktop notification now if the terminal is unfocused.
     /// Returns true if a notification was posted.
     pub fn notify(&mut self, message: impl AsRef<str>) -> bool {
-        let terminal_focused = self.terminal_focused.load(Ordering::Relaxed);
+        let terminal_focused = self.is_terminal_focused();
         if !should_emit_notification(self.notification_condition, terminal_focused) {
             return false;
         }

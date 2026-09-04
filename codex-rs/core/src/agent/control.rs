@@ -25,6 +25,7 @@ use crate::thread_manager::ThreadManagerState;
 use crate::thread_manager::default_thread_id_generator;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
 use crate::turn_timing::now_unix_timestamp_ms;
+use arc_swap::ArcSwapOption;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
@@ -52,6 +53,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol::turn_input::CyberAccessProgram;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::ReadThreadParams;
@@ -71,6 +73,7 @@ use self::residency::V2Residency;
 mod execution;
 mod legacy;
 mod residency;
+mod service_tier;
 mod spawn;
 mod user_authorization;
 
@@ -89,6 +92,7 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) root_turn_id: Option<String>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
     pub(crate) multi_agent_v2_usage_hints: Option<ResolvedMultiAgentV2UsageHints>,
+    pub(crate) cyber_access_program: Option<CyberAccessProgram>,
 }
 
 #[derive(Clone, Debug)]
@@ -112,8 +116,7 @@ pub(crate) struct ListedAgent {
 /// which keeps the registry scoped to that root thread rather than the entire `ThreadManager`.
 #[derive(Clone)]
 pub(crate) struct AgentControl {
-    /// ID shared by the whole agent control session. This means every sub-agents from a common
-    /// root share the same session ID.
+    /// session_id is equal to the root thread's ID.
     session_id: SessionId,
     /// Weak handle back to the global thread registry/state.
     /// This is `Weak` to avoid reference cycles and shadow persistence of the form
@@ -126,6 +129,8 @@ pub(crate) struct AgentControl {
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Session-scoped state shared by the root thread and every cloned sub-agent control handle.
     rollout_budget: Arc<RolloutBudget>,
+    /// The user-selected root routing tier, shared by the entire agent tree.
+    root_service_tier: Arc<ArcSwapOption<String>>,
 }
 
 impl Default for AgentControl {
@@ -153,6 +158,7 @@ impl AgentControl {
             v2_residency: Arc::default(),
             agent_execution_limiter: Arc::default(),
             rollout_budget: Arc::default(),
+            root_service_tier: Arc::new(ArcSwapOption::from(None)),
         };
         if let Some(rollout_budget) = rollout_budget {
             control.rollout_budget.configure(rollout_budget);
@@ -183,19 +189,12 @@ impl AgentControl {
         &self,
         agent_id: ThreadId,
         input: Vec<UserInput>,
-        parent_turn_id: Option<String>,
-        root_turn_id: Option<String>,
+        start_options: TurnStartOptions,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
         let result = match thread
-            .start_or_steer_turn(
-                TurnInputRequest::user_input(input).on_start(TurnStartOptions {
-                    parent_turn_id,
-                    root_turn_id,
-                    ..Default::default()
-                }),
-            )
+            .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
             .await
         {
             Ok(TurnInputSubmission::Started { turn_id }) => Ok(turn_id),
@@ -220,8 +219,7 @@ impl AgentControl {
         agent_id: ThreadId,
         communication: InterAgentCommunication,
         agent_communication_context: AgentCommunicationContext,
-        parent_turn_id: Option<String>,
-        root_turn_id: Option<String>,
+        start_options: TurnStartOptions,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
         if communication.trigger_turn {
@@ -234,8 +232,7 @@ impl AgentControl {
             &state,
             communication,
             agent_communication_context,
-            parent_turn_id,
-            root_turn_id,
+            start_options,
         )
         .await
     }
@@ -295,16 +292,14 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
-        parent_turn_id: Option<String>,
-        root_turn_id: Option<String>,
+        start_options: TurnStartOptions,
     ) -> CodexResult<String> {
         self.submit_inter_agent_communication(
             agent_id,
             state,
             communication,
             context,
-            parent_turn_id,
-            root_turn_id,
+            start_options,
         )
         .await
     }
@@ -315,13 +310,18 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
-        parent_turn_id: Option<String>,
-        root_turn_id: Option<String>,
+        start_options: TurnStartOptions,
     ) -> CodexResult<String> {
         let communication_for_log =
             crate::agent_communication::logging_enabled().then(|| communication.clone());
-        let parent_turn_id = parent_turn_id.filter(|_| communication.trigger_turn);
-        let root_turn_id = root_turn_id.filter(|_| communication.trigger_turn);
+        let (parent_turn_id, root_turn_id) = if communication.trigger_turn {
+            (
+                start_options.parent_turn_id.clone(),
+                start_options.root_turn_id.clone(),
+            )
+        } else {
+            (None, None)
+        };
         let result = self
             .handle_thread_request_result(
                 agent_id,
@@ -329,7 +329,10 @@ impl AgentControl {
                 state
                     .send_op(
                         agent_id,
-                        Op::InterAgentCommunication { communication },
+                        Op::InterAgentCommunication {
+                            communication,
+                            start_options,
+                        },
                         parent_turn_id,
                         root_turn_id,
                     )
@@ -642,8 +645,7 @@ impl AgentControl {
                         parent_thread_id,
                         communication,
                         context,
-                        /*parent_turn_id*/ None,
-                        /*root_turn_id*/ None,
+                        TurnStartOptions::default(),
                     )
                     .await;
                 return;

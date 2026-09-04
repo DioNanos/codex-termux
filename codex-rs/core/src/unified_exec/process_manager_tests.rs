@@ -37,6 +37,16 @@ fn unified_exec_env_overrides_existing_values() {
     assert_eq!(env.get("PATH"), Some(&"/usr/bin".to_string()));
 }
 
+#[tokio::test]
+async fn deterministic_process_ids_are_not_reused_after_release() {
+    let manager = UnifiedExecProcessManager::default();
+    let first = manager.allocate_process_id().await;
+    manager.release_process_id(first).await;
+    let second = manager.allocate_process_id().await;
+
+    assert_eq!((first, second), (1000, 1001));
+}
+
 #[test]
 fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
     let local_policy_env = HashMap::from([
@@ -545,6 +555,7 @@ fn pruning_protects_recent_processes_even_if_exited() {
 #[cfg(unix)]
 #[tokio::test]
 async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing() {
+    let (_, turn) = crate::session::tests::make_session_and_context().await;
     let exited_process = Arc::new(
         crate::unified_exec::process_tests::remote_process(
             codex_exec_server::WriteStatus::Accepted,
@@ -589,6 +600,15 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
                 initial_exec_command_active: Arc::new(AtomicBool::new(false)),
                 hook_command: format!("command-{process_id}"),
                 tty: false,
+                environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+                permissions: super::super::TerminalPermissions::for_launch(
+                    turn.environments.primary().expect("turn environment"),
+                    &turn,
+                    super::super::TerminalSandboxSource::Native,
+                    crate::sandboxing::SandboxPermissions::UseDefault,
+                    /*additional_permissions*/ None,
+                    /*internal_permissions*/ None,
+                ),
                 network_approval: None,
                 session: std::sync::Weak::new(),
                 last_used: if is_exited {

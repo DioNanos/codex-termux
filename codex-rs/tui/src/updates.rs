@@ -89,6 +89,7 @@ async fn check_for_update(
         // published version instead of upstream's two-step release/npm check.
         Some(UpdateAction::NpmGlobalLatest)
         | Some(UpdateAction::BunGlobalLatest)
+        | Some(UpdateAction::VitePlusGlobalLatest)
         | Some(UpdateAction::PnpmGlobalLatest)
         | Some(UpdateAction::BrewUpgrade) => {
             let NpmLatestInfo { version } = client_pool
@@ -129,6 +130,7 @@ fn current_update_source(action: Option<UpdateAction>) -> &'static str {
     match action {
         Some(UpdateAction::NpmGlobalLatest) => "npm",
         Some(UpdateAction::BunGlobalLatest) => "bun",
+        Some(UpdateAction::VitePlusGlobalLatest) => "npm",
         Some(UpdateAction::PnpmGlobalLatest) => "pnpm",
         Some(UpdateAction::BrewUpgrade) => "npm",
         Some(UpdateAction::StandaloneUnix) | Some(UpdateAction::StandaloneWindows) | None => {

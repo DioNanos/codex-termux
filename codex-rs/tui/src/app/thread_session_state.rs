@@ -422,6 +422,8 @@ mod tests {
             project_id: None,
             history_mode: Default::default(),
             model_provider: "read-provider".to_string(),
+            model: None,
+            reasoning_effort: None,
             created_at: 1,
             updated_at: 2,
             recency_at: Some(2),

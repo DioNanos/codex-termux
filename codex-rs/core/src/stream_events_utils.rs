@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use codex_extension_api::ExtensionData;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::items::TurnItem;
@@ -100,7 +101,7 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
         || {
             completed_item_defers_mailbox_delivery_to_next_turn(
                 item,
-                turn_context.mode == ModeKind::Plan,
+                turn_context.mode() == ModeKind::Plan,
             )
         },
         |facts| facts.defers_mailbox_delivery_to_next_turn,
@@ -191,7 +192,7 @@ async fn record_stage1_output_usage_for_memory_citation(
 /// queuing any tool execution futures. This records items immediately so
 /// history and rollout stay in sync even if the turn is later cancelled.
 pub(crate) type InFlightFuture<'f> =
-    Pin<Box<dyn Future<Output = Result<ResponseInputItem>> + Send + 'f>>;
+    Pin<Box<dyn Future<Output = Result<ResponseItemEnvelope>> + Send + 'f>>;
 
 #[derive(Default)]
 pub(crate) struct OutputItemResult {
@@ -292,7 +293,7 @@ pub(crate) async fn handle_output_item_done(
     previously_active_item: Option<TurnItem>,
 ) -> Result<OutputItemResult> {
     let mut output = OutputItemResult::default();
-    let plan_mode = ctx.turn_context.mode == ModeKind::Plan;
+    let plan_mode = ctx.turn_context.mode() == ModeKind::Plan;
 
     match ToolRouter::build_tool_call(item.clone()) {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.

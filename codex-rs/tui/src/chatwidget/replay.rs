@@ -95,6 +95,7 @@ impl ChatWidget {
                 phase,
                 memory_citation,
                 delivery,
+                questions,
                 ..
             } => {
                 self.on_agent_message_item_completed(
@@ -120,6 +121,7 @@ impl ChatWidget {
                             }
                         }),
                         delivery,
+                        questions,
                     },
                     &turn_id,
                     from_replay,
@@ -156,26 +158,7 @@ impl ChatWidget {
                     codex_app_server_protocol::CommandExecutionStatus::Completed
                     | codex_app_server_protocol::CommandExecutionStatus::Failed,
                 ..
-            } if from_replay => {
-                if matches!(
-                    &item,
-                    ThreadItem::CommandExecution {
-                        status: codex_app_server_protocol::CommandExecutionStatus::Failed,
-                        ..
-                    }
-                ) {
-                    self.flush_completed_command_activity();
-                }
-                if !self.transcript.active_cell.as_ref().is_some_and(|cell| {
-                    cell.as_any()
-                        .downcast_ref::<ExecCell>()
-                        .is_some_and(ExecCell::is_active)
-                        || cell.as_any().is::<McpToolCallCell>()
-                }) {
-                    self.handle_command_execution_started_now(item.clone());
-                }
-                self.handle_command_execution_completed_now(item);
-            }
+            } if from_replay => self.handle_command_execution_completed_now(item),
             item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_completed(item),
             ThreadItem::FileChange {
                 status: codex_app_server_protocol::PatchApplyStatus::InProgress,
@@ -217,6 +200,26 @@ impl ChatWidget {
             }
             ThreadItem::ContextCompaction { .. } => {
                 self.add_info_message("Context compacted".to_string(), /*hint*/ None);
+            }
+            ThreadItem::FunctionCallOutput {
+                name,
+                namespace,
+                output,
+                ..
+            } => {
+                if let Some((source_thread_id, prompt)) =
+                    crate::dynamic_tools::parse_delegated_tool_output(
+                        &name,
+                        namespace.as_deref(),
+                        &output,
+                    )
+                {
+                    self.add_to_history(history_cell::PrefixedWrappedHistoryCell::new(
+                        format!("Sent by Codex from task {source_thread_id}\n{prompt}"),
+                        "• ".dim(),
+                        "  ",
+                    ));
+                }
             }
             ThreadItem::HookPrompt { .. } => {}
             ThreadItem::CollabAgentToolCall {

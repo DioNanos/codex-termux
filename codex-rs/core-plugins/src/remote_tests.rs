@@ -162,8 +162,116 @@ async fn remote_installed_plugins_paginate_across_all_scopes_without_download_ur
     );
 }
 
+#[tokio::test]
+async fn remote_catalog_cache_modes_control_refresh_and_persist_fetched_results() {
+    let server = MockServer::start().await;
+    let plugin = directory_plugin("plugin-gmail", "gmail");
+    Mock::given(method("GET"))
+        .and(path("/backend-api/ps/plugins/list"))
+        .and(query_param("scope", "GLOBAL"))
+        .and(query_param_is_missing("collection"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "plugins": [plugin],
+            "pagination": {"next_page_token": null},
+        })))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let (config, selected_urls) =
+        recording_remote_plugin_service_config(format!("{}/backend-api", server.uri()));
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+
+    for (mode, expire_cache, expected_refresh_needed, expected_cache_used) in [
+        (
+            RemotePluginCatalogCacheMode::PreferFreshCache,
+            false,
+            false,
+            false,
+        ),
+        (
+            RemotePluginCatalogCacheMode::PreferFreshCache,
+            false,
+            false,
+            true,
+        ),
+        (RemotePluginCatalogCacheMode::PreferCache, true, true, true),
+        (
+            RemotePluginCatalogCacheMode::PreferFreshCache,
+            false,
+            false,
+            false,
+        ),
+        (
+            RemotePluginCatalogCacheMode::ForceRefetch,
+            false,
+            false,
+            false,
+        ),
+    ] {
+        if expire_cache {
+            let cache_path =
+                std::fs::read_dir(codex_home.path().join("cache/remote_plugin_catalog"))
+                    .expect("read catalog cache directory")
+                    .next()
+                    .expect("catalog cache exists")
+                    .expect("read cache entry")
+                    .path();
+            let mut cached: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&cache_path).expect("read cache"))
+                    .expect("decode cache");
+            cached["fetched_at"] = serde_json::json!("2000-01-01T00:00:00Z");
+            std::fs::write(
+                cache_path,
+                serde_json::to_vec(&cached).expect("encode cache"),
+            )
+            .expect("expire catalog cache");
+        }
+
+        let outcome = fetch_directory_plugins_for_scope_with_cache(
+            Some(codex_home.path()),
+            &config,
+            &auth,
+            RemotePluginScope::Global,
+            /*collection*/ None,
+            mode,
+        )
+        .await
+        .expect("fetch directory plugins");
+        assert_eq!(
+            (
+                outcome.plugins,
+                outcome.cache_refresh_needed,
+                outcome.catalog_cache_used,
+            ),
+            (
+                vec![plugin.clone()],
+                expected_refresh_needed,
+                expected_cache_used,
+            ),
+        );
+    }
+
+    assert_eq!(
+        recorded_http_client_urls(&selected_urls),
+        vec![
+            format!(
+                "{}/backend-api/ps/plugins/list?scope=GLOBAL&limit=200",
+                server.uri()
+            );
+            3
+        ],
+    );
+    assert!(has_fresh_cached_remote_plugin_catalog(
+        codex_home.path(),
+        &config,
+        Some(&auth),
+        RemotePluginScope::Global,
+    ));
+}
+
 #[test]
-fn cached_remote_plugin_catalog_scopes_returns_existing_scopes() {
+fn catalog_cache_invalidation_clears_global_collections_and_preserves_other_scopes() {
     let codex_home = tempfile::tempdir().expect("create codex home");
     let config = RemotePluginServiceConfig::new(
         "https://chatgpt.com/backend-api".to_string(),
@@ -176,6 +284,7 @@ fn cached_remote_plugin_catalog_scopes_returns_existing_scopes() {
             &config,
             &auth,
             scope,
+            /*collection*/ None,
             &[],
         );
     }
@@ -183,6 +292,36 @@ fn cached_remote_plugin_catalog_scopes_returns_existing_scopes() {
     assert_eq!(
         cached_remote_plugin_catalog_scopes(codex_home.path(), &config, Some(&auth)),
         BTreeSet::from([RemotePluginScope::Global, RemotePluginScope::Workspace])
+    );
+    catalog_cache::write_cached_directory_plugins(
+        codex_home.path(),
+        &config,
+        &auth,
+        RemotePluginScope::Global,
+        Some(OPENAI_CURATED_REMOTE_COLLECTION_KEY),
+        &[],
+    );
+
+    invalidate_cached_remote_plugin_catalog_scopes(
+        codex_home.path(),
+        &config,
+        Some(&auth),
+        &[RemotePluginScope::Global],
+    );
+
+    assert_eq!(
+        cached_remote_plugin_catalog_scopes(codex_home.path(), &config, Some(&auth)),
+        BTreeSet::from([RemotePluginScope::Workspace]),
+    );
+    assert!(
+        catalog_cache::load_cached_directory_plugins(
+            codex_home.path(),
+            &config,
+            &auth,
+            RemotePluginScope::Global,
+            Some(OPENAI_CURATED_REMOTE_COLLECTION_KEY),
+        )
+        .is_none()
     );
 }
 

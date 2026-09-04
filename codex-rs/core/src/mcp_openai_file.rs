@@ -286,6 +286,7 @@ mod tests {
         };
         primary.selection.cwd = PathUri::from_abs_path(&cwd);
         primary.selection.workspace_roots.clear();
+        primary.config_mut().workspace_roots.clear();
     }
 
     #[tokio::test]

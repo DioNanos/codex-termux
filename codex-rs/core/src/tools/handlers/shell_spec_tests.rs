@@ -107,6 +107,7 @@ fn exec_command_tool_can_hide_shell_parameter() {
         },
         /*include_environment_id*/ false,
         /*include_shell_parameter*/ false,
+        /*include_windows_shell_guidance*/ cfg!(windows),
     );
 
     assert!(!has_parameter(&tool, "shell"));

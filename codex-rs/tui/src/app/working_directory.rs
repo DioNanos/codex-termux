@@ -29,13 +29,25 @@ impl App {
             return self.working_directory_error("MCP inventory is still loading.");
         }
         let agents = self.agent_navigation.ordered_threads();
+        let closed_agents: HashSet<_> = agents
+            .iter()
+            .filter_map(|(id, agent)| agent.is_closed.then_some(*id))
+            .collect();
         let active = self.thread_event_channels.iter().any(|(id, channel)| {
-            let store = channel.store.try_lock();
-            *id != thread_id && !store.is_ok_and(|store| store.active_turn_id().is_none())
+            *id != thread_id
+                && !closed_agents.contains(id)
+                && !channel
+                    .store
+                    .try_lock()
+                    .is_ok_and(|store| store.active_turn_id().is_none())
         });
         if active || agents.iter().any(|(t, a)| *t != thread_id && a.is_running) {
             return self.working_directory_error("Cannot change: another agent is running.");
         }
+        let open_agents: Vec<_> = agents
+            .iter()
+            .filter_map(|(id, agent)| (!agent.is_closed).then_some(*id))
+            .collect();
         let mut config = match self.rebuild_config_for_cwd(cwd.to_path_buf()).await {
             Ok(config) => config,
             Err(err) => return self.working_directory_error(format!("Cannot load {cwd:?}: {err}")),
@@ -45,13 +57,23 @@ impl App {
         }
         if let Some(profile) = self.runtime_permission_profile_override.as_ref()
             && profile.active_permission_profile.is_some()
-            && (RuntimePermissionProfileOverride::from_config(&config) != *profile
+            && (!profile.matches_config(&config)
                 || config.permissions.profile_workspace_roots()
                     != self.config.permissions.profile_workspace_roots())
         {
             return self.working_directory_error("Permission profile has different settings.");
         }
-        self.apply_runtime_policy_overrides(&mut config);
+        if let Some(profile) = self.runtime_permission_profile_override.as_ref()
+            && profile.turn_override == RuntimePermissionProfileTurnOverride::Preserve
+            && profile.active_permission_profile.is_none()
+            && !crate::app_server_session::permission_profile_is_safely_represented_by_sandbox_mode(
+                &profile.permission_profile,
+                cwd.as_path(),
+            )
+        {
+            return self.working_directory_error("Permission profile cannot be preserved by /cd.");
+        }
+        self.apply_runtime_policy_overrides(&mut config, RuntimePolicyOverrideScope::All);
         if self.runtime_permission_profile_override.is_some() {
             let reviewer = self.config.approvals_reviewer;
             let reviewers = &config.config_layer_stack.requirements().approvals_reviewer;
@@ -61,11 +83,12 @@ impl App {
             config.approvals_reviewer = reviewer;
         }
         let actual = config.permissions.approval_policy.value();
-        let snapshot = RuntimePermissionProfileOverride::from_config(&config);
-        let approval = self.runtime_approval_policy_override;
+        let approval = self
+            .runtime_approval_policy_override
+            .map(RuntimeApprovalPolicyOverride::policy);
         let profile = self.runtime_permission_profile_override.as_ref();
         if approval.is_some_and(|p| actual != p.to_core())
-            || profile.is_some_and(|p| snapshot != *p)
+            || profile.is_some_and(|profile| !profile.matches_config(&config))
         {
             return;
         }
@@ -96,10 +119,12 @@ impl App {
         {
             return self.working_directory_error("Conversation history is not saved.");
         }
-        let mut ids: HashSet<_> = channels.keys().copied().collect();
-        for (id, agent) in self.agent_navigation.ordered_threads() {
-            ids.extend((!agent.is_closed).then_some(id));
-        }
+        let mut ids: HashSet<_> = channels
+            .keys()
+            .copied()
+            .filter(|id| !closed_agents.contains(id))
+            .collect();
+        ids.extend(open_agents);
         let descendants = ids.iter().copied().filter(|id| *id != thread_id);
         for tracked_id in std::iter::once(thread_id).chain(descendants) {
             let request = ClientRequest::ThreadBackgroundTerminalsList {

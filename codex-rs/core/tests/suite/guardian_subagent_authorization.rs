@@ -323,5 +323,39 @@ async fn guardian_subagent_review_preserves_late_root_user_authorization() -> Re
     assert!(guardian_transcript.contains("assistant: Agent message from /root"));
     assert!(guardian_transcript.contains(FORWARDED_AGENT_MESSAGE));
 
+    let feedback_thread_ids = test
+        .thread_manager
+        .list_agent_subtree_thread_ids(root_thread_id)
+        .await?;
+    let failures = codex_feedback::guardian_review_failures(&feedback_thread_ids);
+    assert_eq!(failures.thread_ids, vec![worker_thread_id]);
+    let feedback = failures.attachment.expect("failed worker review");
+    let record: Value = serde_json::from_slice(&feedback.buffer)?;
+    assert_eq!(
+        json!({
+            "reviewed_thread_id": record["reviewed_thread_id"],
+            "reviewed_turn_id": record["reviewed_turn_id"],
+            "target_item_id": record["target_item_id"],
+            "reviewer_thread_id": record["reviewer_thread_id"],
+            "status": record["status"],
+            "decision": serde_json::from_str::<Value>(
+                record["decision"].as_str().expect("raw Guardian decision"),
+            )?,
+        }),
+        json!({
+            "reviewed_thread_id": worker_thread_id,
+            "reviewed_turn_id": worker_request.body_json()["client_metadata"]["turn_id"],
+            "target_item_id": WORKER_CALL_ID,
+            "reviewer_thread_id": guardian_review.single_request().body_json()["client_metadata"]["thread_id"],
+            "status": "denied",
+            "decision": {
+                "risk_level": "high",
+                "user_authorization": "high",
+                "outcome": "deny",
+                "rationale": "The agent message requests a different action.",
+            },
+        })
+    );
+
     Ok(())
 }

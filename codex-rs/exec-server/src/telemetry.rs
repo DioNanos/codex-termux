@@ -99,6 +99,7 @@ pub(crate) struct ConnectionMetricGuard {
 
 pub(crate) struct ProcessMetricGuard {
     telemetry: ExecServerTelemetry,
+    span: tracing::Span,
     started_at: Instant,
     result: &'static str,
 }
@@ -159,6 +160,31 @@ impl ExecServerTelemetry {
         });
     }
 
+    #[cfg(unix)]
+    pub(crate) fn shell_snapshot_captured(
+        &self,
+        duration: Duration,
+        result: Result<(), &'static str>,
+    ) {
+        // Local execution has no exec-server telemetry owner. Use the host's
+        // configured metrics client while preserving an explicit server client.
+        let Some(metrics) = self
+            .inner
+            .as_ref()
+            .map(|inner| inner.metrics.clone())
+            .or_else(codex_otel::global)
+        else {
+            return;
+        };
+        let success = if result.is_ok() { "true" } else { "false" };
+        let mut tags = vec![("version", "v2"), ("success", success)];
+        let _ = metrics.record_duration("codex.shell_snapshot.duration_ms", duration, &tags);
+        if let Err(failure_reason) = result {
+            tags.push(("failure_reason", failure_reason));
+        }
+        let _ = metrics.counter("codex.shell_snapshot", /*inc*/ 1, &tags);
+    }
+
     pub(crate) fn remote_registration_completed(&self, result: &'static str, duration: Duration) {
         self.record_operation(REMOTE_REGISTRATION_METRICS, result, duration);
     }
@@ -177,12 +203,28 @@ impl ExecServerTelemetry {
         });
     }
 
-    pub(crate) fn process_started(&self) -> ProcessMetricGuard {
+    pub(crate) fn process_started(&self, process_id: &str) -> ProcessMetricGuard {
         self.with_inner(|inner| {
             inner.adjust_process_count(/*delta*/ 1);
         });
+        let parent = codex_otel::current_span_w3c_trace_context();
+        // `parent:` accepts a local tracing span/ID, not a W3C context. A local
+        // parent would keep the request span alive until process exit and delay
+        // its export. Use `parent: None`, then set the W3C parent below to link
+        // the spans without retaining the request span.
+        let span = tracing::info_span!(
+            parent: None,
+            "codex.exec_server.process",
+            otel.kind = "internal",
+            process.id = process_id,
+            result = tracing::field::Empty,
+        );
+        if let Some(parent) = parent {
+            codex_otel::set_parent_from_w3c_trace_context(&span, &parent);
+        }
         ProcessMetricGuard {
             telemetry: self.clone(),
+            span,
             started_at: Instant::now(),
             result: "unknown",
         }
@@ -250,6 +292,7 @@ impl ProcessMetricGuard {
 
 impl Drop for ProcessMetricGuard {
     fn drop(&mut self) {
+        self.span.record("result", self.result);
         self.telemetry
             .process_finished(self.result, self.started_at.elapsed());
     }

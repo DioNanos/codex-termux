@@ -9,6 +9,7 @@ use codex_extension_api::ExtensionFuture;
 use codex_extension_api::McpServerContribution;
 use codex_extension_api::McpServerContributionContext;
 use codex_extension_api::McpServerContributor;
+use codex_features::Feature;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -215,7 +216,11 @@ fn project_metadata(
     selected_root_id: &str,
     plugin: SelectedPluginMetadata,
 ) -> Vec<McpServerContribution> {
-    let mut servers = plugin.servers.iter().cloned().collect::<HashMap<_, _>>();
+    let mut servers = if config.features.enabled(Feature::Plugins) {
+        plugin.servers.iter().cloned().collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
     if let Some(plugin_policy) = plugin_policy {
         apply_configured_plugin_mcp_server_policies(plugin_policy, &mut servers);
     }

@@ -2449,7 +2449,7 @@ async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
 #[derive(Clone)]
 struct StaticSkillProvider {
     catalog: SkillCatalog,
-    read_requests: Arc<Mutex<Vec<SkillReadRequest>>>,
+    read_requests: Arc<Mutex<Vec<(SkillAuthority, SkillPackageId, SkillResourceId)>>>,
     list_calls: Option<Arc<AtomicUsize>>,
     fail_first_list: bool,
 }
@@ -2565,13 +2565,20 @@ impl SkillProvider for StaticSkillProvider {
         })
     }
 
-    fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
+    fn read<'a>(
+        &'a self,
+        request: SkillReadRequest<'a>,
+    ) -> SkillProviderFuture<'a, SkillReadResult> {
         let read_requests = Arc::clone(&self.read_requests);
         Box::pin(async move {
             read_requests
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(request.clone());
+                .push((
+                    request.authority.clone(),
+                    request.package.clone(),
+                    request.resource.clone(),
+                ));
             Ok(SkillReadResult {
                 resource: request.resource,
                 contents: "# Lint Fix\n\nRun the formatter.".to_string(),
@@ -2637,18 +2644,10 @@ fn test_codex_home() -> PathBuf {
 }
 
 fn read_request_keys(
-    requests: &Arc<Mutex<Vec<SkillReadRequest>>>,
+    requests: &Mutex<Vec<(SkillAuthority, SkillPackageId, SkillResourceId)>>,
 ) -> Vec<(SkillAuthority, SkillPackageId, SkillResourceId)> {
     requests
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .map(|request| {
-            (
-                request.authority.clone(),
-                request.package.clone(),
-                request.resource.clone(),
-            )
-        })
-        .collect()
+        .clone()
 }

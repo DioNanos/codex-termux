@@ -11,7 +11,10 @@ impl SkillProvider for FailedReads {
         self.0.list(query)
     }
 
-    fn read(&self, _request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
+    fn read<'a>(
+        &'a self,
+        _request: SkillReadRequest<'a>,
+    ) -> SkillProviderFuture<'a, SkillReadResult> {
         Box::pin(async { Err(SkillProviderError::new("read unavailable")) })
     }
 

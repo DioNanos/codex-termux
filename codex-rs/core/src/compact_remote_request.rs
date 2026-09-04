@@ -30,7 +30,7 @@ pub(super) async fn run_remote_compact_attempt(
 ) -> CodexResult<RemoteCompactAttempt> {
     let turn_context = &step_context.turn;
     let mut history = sess.clone_history().await;
-    let base_instructions = sess.get_base_instructions().await;
+    let base_instructions = sess.get_prompt_base_instructions().await;
     let (rewritten_outputs, estimated_deleted_tokens) =
         trim_function_call_history_to_fit_context_window(
             &mut history,
@@ -58,7 +58,7 @@ pub(super) async fn run_remote_compact_attempt(
     let trace_input_history = compaction_trace
         .is_enabled()
         .then(|| history.raw_items().cloned().collect());
-    let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
+    let prompt_input = history.for_prompt(&turn_context.model_info().input_modalities);
     let tool_router = &step_context.tool_router;
     let prompt = Prompt {
         input: prompt_input,
@@ -67,6 +67,7 @@ pub(super) async fn run_remote_compact_attempt(
         base_instructions,
         output_schema: None,
         output_schema_strict: true,
+        cyber_access_program: turn_context.cyber_access_program,
     };
     let responses_metadata = sess
         .responses_metadata(
@@ -79,15 +80,15 @@ pub(super) async fn run_remote_compact_attempt(
         .model_client
         .compact_conversation_history(
             &prompt,
-            &turn_context.model_info,
+            turn_context.model_info(),
             turn_state,
             CompactConversationRequestSettings {
-                effort: turn_context.reasoning_effort.clone(),
-                summary: turn_context.reasoning_summary,
+                effort: turn_context.reasoning_effort().cloned(),
+                summary: turn_context.reasoning_summary(),
                 service_tier: if sess.services.auth_manager.auth_mode() == Some(AuthMode::ApiKey) {
                     None
                 } else {
-                    turn_context.config.service_tier.clone()
+                    step_context.settings.service_tier.clone()
                 },
             },
             &turn_context.session_telemetry,

@@ -525,6 +525,102 @@ async fn windows_sandbox_required_enable_prompt_reopens_on_cancel_when_unelevate
 }
 
 #[tokio::test]
+async fn fragmented_terminal_response_cannot_select_non_admin_windows_sandbox() {
+    for use_fallback_prompt in [false, true] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        let preset = builtin_approval_presets()
+            .into_iter()
+            .find(|preset| preset.id == "auto")
+            .expect("auto preset");
+
+        if use_fallback_prompt {
+            chat.open_windows_sandbox_fallback_prompt(preset, /*profile_selection*/ None);
+        } else {
+            chat.open_windows_sandbox_enable_prompt(preset, /*profile_selection*/ None);
+        }
+
+        for character in "20;rgb:2222/ffff/ffff".chars() {
+            chat.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+            assert!(
+                !matches!(
+                    rx.try_recv(),
+                    Ok(AppEvent::BeginWindowsSandboxLegacySetup { .. })
+                ),
+                "a fragmented terminal response must not choose the non-admin sandbox"
+            );
+        }
+
+        assert!(chat.has_active_view());
+        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppEvent::BeginWindowsSandboxLegacySetup { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn fragmented_terminal_response_cannot_acknowledge_world_writable_warning() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.open_world_writable_warning_confirmation(
+        /*preset*/ None,
+        /*profile_selection*/ None,
+        Vec::new(),
+        /*extra_count*/ 0,
+        /*failed_scan*/ true,
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    assert!(chat.has_active_view());
+    assert!(rx.try_recv().is_err());
+
+    for character in "20;rgb:2222/ffff/ffff".chars() {
+        chat.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        assert!(
+            !matches!(
+                rx.try_recv(),
+                Ok(AppEvent::UpdateWorldWritableWarningAcknowledged(_)
+                    | AppEvent::PersistWorldWritableWarningAcknowledged)
+            ),
+            "a fragmented terminal response must not acknowledge the world-writable warning"
+        );
+    }
+
+    assert!(chat.has_active_view());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AppEvent::UpdateWorldWritableWarningAcknowledged(true))
+    ));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AppEvent::PersistWorldWritableWarningAcknowledged)
+    ));
+}
+
+#[tokio::test]
+async fn windows_sandbox_setup_starts_a_fresh_status_clock() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.bottom_pane
+        .reset_status_timer(Duration::from_secs(/*secs*/ 125));
+
+    chat.show_windows_sandbox_setup_status();
+    let setup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(setup.contains("Setting up sandbox"));
+    assert!(setup.contains("(0s"));
+    assert_chatwidget_snapshot!(
+        "windows_sandbox_setup_fresh_clock",
+        setup.replace(&chat.config.cwd.display().to_string(), "[CWD]")
+    );
+
+    chat.clear_windows_sandbox_setup_status();
+    chat.bottom_pane.set_task_running(/*running*/ true);
+    let working = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(working.contains("Working"));
+    assert!(!working.contains("Setting up sandbox"));
+}
+
+#[tokio::test]
 async fn required_windows_sandbox_setup_defers_configured_initial_prompt() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let initial_prompt = "fix required sandbox startup".to_string();
@@ -760,21 +856,17 @@ async fn permissions_selection_emits_history_cell_when_selection_changes() {
         chat.set_windows_sandbox_mode(Some(WindowsSandboxModeToml::Unelevated));
     }
     chat.set_feature_enabled(Feature::GuardianApproval, /*enabled*/ true);
-    chat.on_task_started();
-    chat.dispatch_command(SlashCommand::Permissions);
-    let command = begin_exec(&mut chat, "call-permissions", "printf before");
-    end_exec(&mut chat, command, "before\n", "", /*exit_code*/ 0);
+    chat.open_permissions_popup();
     chat.handle_key_event(KeyEvent::from(KeyCode::Down));
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
     let cells = drain_insert_history(&mut rx);
     assert_eq!(
         cells.len(),
-        2,
-        "expected command and permissions selection history cells"
+        1,
+        "expected one permissions selection history cell"
     );
-    assert!(lines_to_single_string(&cells[0]).contains("Ran printf before"));
-    let rendered = lines_to_single_string(&cells[1]);
+    let rendered = lines_to_single_string(&cells[0]);
     assert!(
         rendered.contains("Permissions updated to"),
         "expected permissions selection history message, got: {rendered}"

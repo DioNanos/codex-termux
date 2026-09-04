@@ -217,7 +217,7 @@ async fn run_codex_tool_session_inner(
                         } = ev;
                         handle_exec_approval_request(
                             command,
-                            cwd.to_path_buf(),
+                            std::path::PathBuf::from(cwd.into_string()),
                             outgoing.clone(),
                             thread.clone(),
                             request_id.clone(),
@@ -247,6 +247,8 @@ async fn run_codex_tool_session_inner(
                         break;
                     }
                     EventMsg::Warning(_)
+                    | EventMsg::AuthRecoveryStarted(_)
+                    | EventMsg::AuthRecoveryCompleted(_)
                     | EventMsg::GuardianWarning(_)
                     | EventMsg::ModelVerification(_)
                     | EventMsg::SafetyBuffering(_)

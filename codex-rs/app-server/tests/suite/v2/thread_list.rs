@@ -37,6 +37,7 @@ use codex_app_server_protocol::UserInput;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_features::Feature;
 use codex_git_utils::GitSha;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::GitInfo as CoreGitInfo;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -50,7 +51,9 @@ use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_utils_absolute_path::test_support::PathExt;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::fs;
 use std::fs::FileTimes;
 use std::fs::OpenOptions;
@@ -1388,19 +1391,28 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
     }
 
     let mut mcp = init_mcp(codex_home.path()).await?;
+    let mut loaded_settings = HashMap::new();
     for (thread_id, source, capability) in threads_to_resume {
+        let (model, effort) = if thread_id == cli_id {
+            ("gpt-5.2", "high")
+        } else {
+            ("gpt-5.4", "low")
+        };
         let request_id = mcp
             .send_thread_resume_request(ThreadResumeParams {
                 thread_id: thread_id.clone(),
+                model: Some(model.to_string()),
+                config: Some([("model_reasoning_effort".to_string(), json!(effort))].into()),
                 ..Default::default()
             })
             .await?;
         let ThreadResumeResponse { thread, .. } =
             timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
         assert_eq!(
-            (thread.id, thread.source, thread.can_accept_direct_input),
-            (thread_id, source, capability)
+            (&thread.id, &thread.source, thread.can_accept_direct_input),
+            (&thread_id, &source, capability)
         );
+        loaded_settings.insert(thread_id, (thread.model, thread.reasoning_effort));
     }
 
     let response = list_threads(
@@ -1415,6 +1427,16 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
         /*archived*/ None,
     )
     .await?;
+    for thread in &response.data {
+        let expected_settings = loaded_settings
+            .get(&thread.id)
+            .map(|(model, effort)| (model.as_deref(), effort.clone()))
+            .unwrap_or((None, None));
+        assert_eq!(
+            (thread.model.as_deref(), thread.reasoning_effort.clone()),
+            expected_settings
+        );
+    }
     expected.reverse();
     assert_eq!(
         response
@@ -1886,7 +1908,10 @@ async fn thread_list_includes_git_info() -> Result<()> {
     let git_info = CoreGitInfo {
         commit_hash: Some(GitSha::new("abc123")),
         branch: Some("main".to_string()),
-        repository_url: Some("https://example.com/repo.git".to_string()),
+        repository_url: Some(
+            SanitizedGitUrl::try_from("https://example.com/repo.git")
+                .expect("repository URL should be valid"),
+        ),
     };
     let conversation_id = create_fake_rollout(
         codex_home.path(),
@@ -1922,6 +1947,65 @@ async fn thread_list_includes_git_info() -> Result<()> {
     assert_eq!(thread.source, SessionSource::Cli);
     assert_eq!(thread.cwd, test_absolute_path("/"));
     assert_eq!(thread.cli_version, "0.0.0");
+
+    Ok(())
+}
+
+/// Legacy rollout credentials must be sanitized before thread/list returns Git metadata.
+#[tokio::test]
+async fn thread_list_sanitizes_git_info_from_existing_rollouts() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    create_minimal_config(codex_home.path())?;
+
+    let git_info = CoreGitInfo {
+        commit_hash: Some(GitSha::new("abc123")),
+        branch: Some("main".to_string()),
+        repository_url: Some(
+            SanitizedGitUrl::try_from("https://example.com/repo.git")
+                .expect("repository URL should be valid"),
+        ),
+    };
+    let conversation_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-02-01T09-00-00",
+        "2025-02-01T09:00:00Z",
+        "Git info preview",
+        Some("mock_provider"),
+        Some(git_info),
+    )?;
+    let path = rollout_path(codex_home.path(), "2025-02-01T09-00-00", &conversation_id);
+    let rollout = fs::read_to_string(&path)?;
+    fs::write(
+        path,
+        rollout.replace(
+            "https://example.com/repo.git",
+            "https://alice:synthetic-rollout-secret@example.com/repo.git",
+        ),
+    )?;
+
+    let mut mcp = init_mcp(codex_home.path()).await?;
+    let ThreadListResponse { data, .. } = list_threads(
+        &mut mcp,
+        /*cursor*/ None,
+        Some(10),
+        Some(vec!["mock_provider".to_string()]),
+        /*source_kinds*/ None,
+        /*archived*/ None,
+    )
+    .await?;
+    let thread = data
+        .iter()
+        .find(|thread| thread.id == conversation_id)
+        .expect("expected thread for created rollout");
+
+    assert_eq!(
+        thread.git_info,
+        Some(ApiGitInfo {
+            sha: Some("abc123".to_string()),
+            branch: Some("main".to_string()),
+            origin_url: Some("https://example.com/repo.git".to_string()),
+        })
+    );
 
     Ok(())
 }

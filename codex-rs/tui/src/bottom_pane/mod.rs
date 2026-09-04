@@ -13,6 +13,8 @@
 //!
 //! Some UI is time-based rather than input-based, such as the transient "press again to quit"
 //! hint. The pane schedules redraws so those hints can expire even when the UI is otherwise idle.
+//! Inline banners sit above the composer. Number shortcuts apply only to an empty, idle composer;
+//! drafts, paste bursts, and active dialogs keep their normal input routing.
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
@@ -55,9 +57,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 mod action_required_title;
+mod actionable_banner;
 mod app_link_view;
 mod apply_patch_header;
 mod approval_overlay;
+mod hook_status;
 mod mcp_server_elicitation;
 mod multi_select_picker;
 mod request_user_input;
@@ -67,6 +71,8 @@ mod status_surface_preview;
 mod title_setup;
 pub(crate) use action_required_title::ACTION_REQUIRED_PREVIEW_PREFIX;
 pub(crate) use action_required_title::build_action_required_title_text;
+pub(crate) use actionable_banner::ActionableBanner;
+pub(crate) use actionable_banner::BannerDismissal;
 pub(crate) use app_link_view::AppLinkElicitationTarget;
 pub(crate) use app_link_view::AppLinkSuggestionType;
 pub(crate) use app_link_view::AppLinkView;
@@ -243,6 +249,11 @@ pub(crate) struct BottomPane {
 
     /// Inline status indicator shown above the composer while a task is running.
     status: Option<StatusIndicatorWidget>,
+    /// Running-hook summary supplied by the lifecycle owner after its reveal delay.
+    hook_status_message: Option<String>,
+    inline_banner: Option<actionable_banner::InlineBanner>,
+    /// Streaming may drop the row without losing its elapsed time or modal pause.
+    status_timer: crate::status_indicator_widget::StatusTimer,
     /// Unified exec session summary source.
     ///
     /// When a status row exists, this summary is mirrored inline in that row;
@@ -313,6 +324,9 @@ impl BottomPane {
             disable_paste_burst,
             is_task_running: false,
             status: None,
+            hook_status_message: None,
+            inline_banner: None,
+            status_timer: crate::status_indicator_widget::StatusTimer::default(),
             unified_exec_footer: UnifiedExecFooter::new(),
             pending_input_preview: PendingInputPreview::new(),
             pending_thread_approvals: PendingThreadApprovals::new(),
@@ -367,6 +381,11 @@ impl BottomPane {
 
     pub fn set_plugin_mentions(&mut self, plugins: Option<Vec<PluginCapabilitySummary>>) {
         self.composer.set_plugin_mentions(plugins);
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_agents_navigation_enabled(&mut self, enabled: bool) {
+        self.composer.set_agents_navigation_enabled(enabled);
         self.request_redraw();
     }
 
@@ -539,6 +558,15 @@ impl BottomPane {
         self.status.as_ref()
     }
 
+    pub(crate) fn status_elapsed(&self) -> Option<Duration> {
+        self.is_task_running
+            .then(|| self.status_timer.elapsed_at(Instant::now()))
+    }
+
+    pub(crate) fn reset_status_timer(&mut self, elapsed: Duration) {
+        self.status_timer.reset(elapsed);
+    }
+
     pub fn skills(&self) -> Option<&Vec<SkillMetadata>> {
         self.composer.skills()
     }
@@ -643,6 +671,16 @@ impl BottomPane {
         self.push_view(Box::new(modal));
     }
 
+    /// Edit the draft without invoking popups, submissions, or remote actions.
+    pub(crate) fn handle_disconnected_key(&mut self, key: KeyEvent) {
+        self.view_stack.clear();
+        self.delayed_approval_requests.clear();
+        self.composer
+            .set_input_enabled(/*enabled*/ true, /*placeholder*/ None);
+        self.composer.handle_disconnected_key(key);
+        self.request_redraw();
+    }
+
     /// Forward a key event to the active view or the composer.
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> InputResult {
         // If a modal/view is active, handle it here; otherwise forward to composer.
@@ -691,6 +729,9 @@ impl BottomPane {
             self.request_redraw();
             InputResult::None
         } else {
+            if self.handle_inline_banner_key(key_event) {
+                return InputResult::None;
+            }
             // If a task is running and a status line is visible, allow the
             // configured action to interrupt even while the composer has focus.
             // When a popup is active, prefer dismissing it over interrupting the task.
@@ -758,7 +799,7 @@ impl BottomPane {
                 self.request_redraw();
             }
             event
-        } else if self.composer.cancel_history_search() {
+        } else if self.composer.cancel_vim_search() || self.composer.cancel_history_search() {
             self.request_redraw();
             CancellationEvent::Handled
         } else if self.composer_is_empty() {
@@ -1034,7 +1075,7 @@ impl BottomPane {
 
     #[cfg(test)]
     pub(crate) fn status_indicator_visible(&self) -> bool {
-        self.status.is_some()
+        self.status_widget().is_some()
     }
 
     #[cfg(test)]
@@ -1065,6 +1106,7 @@ impl BottomPane {
 
         if running {
             if !was_running {
+                self.status_timer.reset(Duration::ZERO);
                 if self.status.is_none() {
                     self.status = Some(StatusIndicatorWidget::new(
                         self.app_event_tx.clone(),
@@ -1101,11 +1143,13 @@ impl BottomPane {
 
     pub(crate) fn ensure_status_indicator(&mut self) {
         if self.status.is_none() {
-            self.status = Some(StatusIndicatorWidget::new(
-                self.app_event_tx.clone(),
-                self.frame_requester.clone(),
-                self.animations_enabled,
-            ));
+            self.status.get_or_insert_with(|| {
+                StatusIndicatorWidget::new(
+                    self.app_event_tx.clone(),
+                    self.frame_requester.clone(),
+                    self.animations_enabled,
+                )
+            });
             if let Some(status) = self.status.as_mut() {
                 status.set_interrupt_binding(
                     self.keymap
@@ -1198,6 +1242,7 @@ impl BottomPane {
     }
 
     /// Replace the newest matching selection view without disturbing views stacked above it.
+    /// Preserve pending parent cleanup when an already-open child is accepted.
     pub(crate) fn replace_selection_view_if_present(
         &mut self,
         view_id: &'static str,
@@ -1213,11 +1258,13 @@ impl BottomPane {
 
         let replaces_active_view = index + 1 == self.view_stack.len();
         self.apply_standard_popup_hint(&mut params);
-        self.view_stack[index] = Box::new(list_selection_view::ListSelectionView::new(
+        let mut view = list_selection_view::ListSelectionView::new(
             params,
             self.app_event_tx.clone(),
             self.keymap.list.clone(),
-        ));
+        );
+        view.dismiss_after_child_accept = self.view_stack[index].dismiss_after_child_accept();
+        self.view_stack[index] = Box::new(view);
         if replaces_active_view {
             self.schedule_active_view_frame();
         }
@@ -1391,13 +1438,29 @@ impl BottomPane {
         }
     }
 
-    /// Copy unified-exec summary text into the active status row, if any.
+    /// Update hook activity after the lifecycle reveal delay, even outside a turn.
+    pub(crate) fn set_hook_status_message(&mut self, message: Option<String>) {
+        if self.hook_status_message == message {
+            return;
+        }
+
+        self.hook_status_message = message;
+        if self.hook_status_message.is_some() && self.status.is_none() && self.is_task_running() {
+            self.ensure_status_indicator();
+        } else {
+            self.sync_status_inline_message();
+            self.request_redraw();
+        }
+    }
+
+    /// Copy background activity and hook text into the active status row, if any.
     ///
     /// This keeps status-line inline text synchronized without forcing the
     /// standalone unified-exec footer row to be visible.
     fn sync_status_inline_message(&mut self) {
         if let Some(status) = self.status.as_mut() {
             status.update_inline_message(self.unified_exec_footer.summary_text());
+            status.update_hook_status_message(self.hook_status_message.clone());
         }
     }
 
@@ -1430,7 +1493,7 @@ impl BottomPane {
             && !(is_agent_command && key_event.code == KeyCode::Esc)
             && self.no_modal_or_popup_active()
             && !self.composer_should_handle_vim_insert_escape(key_event)
-            && self.status.is_some()
+            && self.status_widget().is_some()
     }
 
     pub(crate) fn terminal_title_requires_action(&self) -> bool {
@@ -1458,7 +1521,10 @@ impl BottomPane {
     /// overlays or popups and not running a task. This is the safe context to
     /// use Esc-Esc for backtracking from the main view.
     pub(crate) fn is_normal_backtrack_mode(&self) -> bool {
-        !self.is_task_running && self.view_stack.is_empty() && !self.composer.popup_active()
+        !self.is_task_running
+            && self.view_stack.is_empty()
+            && !self.composer.popup_active()
+            && !self.inline_banner_accepts_dismissal()
     }
 
     /// Return true when no popups or modal views are active, regardless of task state.
@@ -1688,15 +1754,12 @@ impl BottomPane {
     }
 
     fn pause_status_timer_for_modal(&mut self) {
-        if let Some(status) = self.status.as_mut() {
-            status.pause_timer();
-        }
+        self.status_timer.pause_at(Instant::now());
     }
 
     fn resume_status_timer_after_modal(&mut self) {
-        if let Some(status) = self.status.as_mut() {
-            status.resume_timer();
-        }
+        self.status_timer.resume_at(Instant::now());
+        self.request_redraw();
     }
 
     /// Height (terminal rows) required by the current bottom pane.
@@ -1812,16 +1875,42 @@ impl BottomPane {
         &'_ self,
         composer_right_reserve: u16,
     ) -> RenderableItem<'_> {
+        if (self.is_task_running || !self.view_stack.is_empty())
+            && let Some(banner) = &self.inline_banner
+        {
+            banner.visible.set(false);
+        }
         if let Some(view) = self.active_view() {
             RenderableItem::Borrowed(view)
         } else {
             let mut flex = FlexRenderable::new();
-            if let Some(status) = &self.status {
-                flex.push(/*flex*/ 0, RenderableItem::Borrowed(status));
+            if let Some(banner) = self
+                .inline_banner
+                .as_ref()
+                .filter(|_| !self.is_task_running)
+            {
+                flex.push(/*flex*/ 0, RenderableItem::Borrowed(banner));
+            }
+            if let Some(status) = self.status_widget() {
+                flex.push(
+                    /*flex*/ 0,
+                    RenderableItem::Owned(Box::new(status.with_timer(&self.status_timer))),
+                );
+            }
+            if self.status.is_none()
+                && let Some(message) = &self.hook_status_message
+            {
+                flex.push(
+                    /*flex*/ 0,
+                    RenderableItem::Owned(Box::new(hook_status::HookStatus {
+                        message,
+                        animations_enabled: self.animations_enabled,
+                    })),
+                );
             }
             // Avoid double-surfacing the same summary and avoid adding an extra
             // row while the status line is already visible.
-            if self.status.is_none() && !self.unified_exec_footer.is_empty() {
+            if self.status_widget().is_none() && !self.unified_exec_footer.is_empty() {
                 flex.push(
                     /*flex*/ 0,
                     RenderableItem::Borrowed(&self.unified_exec_footer),
@@ -1831,8 +1920,9 @@ impl BottomPane {
             let has_pending_input = !self.pending_input_preview.queued_messages.is_empty()
                 || !self.pending_input_preview.pending_steers.is_empty()
                 || !self.pending_input_preview.rejected_steers.is_empty();
-            let has_status_or_footer =
-                self.status.is_some() || !self.unified_exec_footer.is_empty();
+            let has_status_or_footer = self.status_widget().is_some()
+                || self.hook_status_message.is_some()
+                || !self.unified_exec_footer.is_empty();
             let has_inline_previews = has_pending_thread_approvals || has_pending_input;
             if has_inline_previews && has_status_or_footer {
                 flex.push(/*flex*/ 0, RenderableItem::Owned("".into()));
@@ -1949,6 +2039,9 @@ impl Renderable for BottomPane {
 
 #[cfg(test)]
 mod tests {
+    #[path = "actionable_banner_tests.rs"]
+    mod actionable_banner_tests;
+
     use super::*;
     use crate::app::app_server_requests::ResolvedAppServerRequest;
     use crate::app_command::AppCommand as Op;
@@ -2011,6 +2104,7 @@ mod tests {
 
     fn exec_request() -> ApprovalRequest {
         ApprovalRequest::Exec(ExecApprovalRequest {
+            kind: Default::default(),
             thread_id: codex_protocol::ThreadId::new(),
             thread_label: None,
             id: "1".to_string(),
@@ -2024,6 +2118,93 @@ mod tests {
             network_approval_context: None,
             additional_permissions: None,
         })
+    }
+
+    #[test]
+    fn inline_banner_snapshot() {
+        let (tx, _rx) = unbounded_channel();
+        let mut pane = test_pane(AppEventSender::new(tx));
+        pane.set_inline_banner(Some(ActionableBanner {
+            title: "Choose how to continue working".to_string(),
+            description: "A long description wraps to fit the available terminal width.\n"
+                .repeat(/*n*/ 8),
+            actions: vec![
+                SelectionItem {
+                    name: "Open usage settings".to_string(),
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Notify owner".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }));
+        let width = 44;
+        let area = Rect::new(
+            /*x*/ 0,
+            /*y*/ 0,
+            width,
+            pane.desired_height(width),
+        );
+        assert_snapshot!(
+            "inline_banner_wrapped_and_truncated",
+            render_snapshot(&pane, area)
+        );
+        assert!(!pane.is_normal_backtrack_mode());
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(pane.is_normal_backtrack_mode());
+    }
+
+    #[test]
+    fn backend_banner_snapshots_and_numbered_actions() {
+        for (kind, action, label) in [
+            ("personal_limit", "view_usage", "View usage"),
+            ("workspace_member_credits", "notify_owner", "Notify owner"),
+        ] {
+            let banner = crate::backend_banners::BackendBanner::parse(&serde_json::json!({
+                "banner_type": kind,
+                "presentation": "dismissible",
+                "title": "Usage limit\u{7} reached",
+                "description": "Your included usage is depleted.\nChoose an action to continue.",
+                "ctas": [
+                    {"action": "unsupported", "label": "Hidden action"},
+                    {"action": "view_usage", "label": "Open usage settings"},
+                    {"action": action, "label": label},
+                    {"action": "view_usage", "label": "Extra action"}
+                ]
+            }))
+            .expect("valid optional banner");
+            let (tx, mut rx) = unbounded_channel();
+            let mut pane = test_pane(AppEventSender::new(tx));
+            pane.set_inline_banner(Some(banner.actionable_banner()));
+            let width = 44;
+            let area = Rect::new(
+                /*x*/ 0,
+                /*y*/ 0,
+                width,
+                pane.desired_height(width),
+            );
+            assert_snapshot!(
+                format!("backend_banner_{kind}"),
+                render_snapshot(&pane, area)
+            );
+            pane.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+            let selected = match rx.try_recv().expect("numbered CTA dispatch") {
+                AppEvent::OpenUrlInBrowser { url } => url,
+                AppEvent::SendAddCreditsNudgeEmail { credit_type } => format!("{credit_type:?}"),
+                other => panic!("unexpected banner action: {other:?}"),
+            };
+            assert_eq!(
+                selected,
+                if action == "view_usage" {
+                    "https://chatgpt.com/codex/settings/usage"
+                } else {
+                    "Credits"
+                }
+            );
+            assert!(pane.inline_banner.is_some());
+        }
     }
 
     #[derive(Default)]
@@ -2137,6 +2318,11 @@ mod tests {
         assert_eq!(pane.composer_text(), "draft");
         assert!(!pane.composer.popup_active());
         assert!(!pane.quit_shortcut_hint_visible());
+        pane.composer.set_vim_enabled(/*enabled*/ true);
+        pane.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(CancellationEvent::Handled, pane.on_ctrl_c());
+        assert_eq!(pane.composer_text(), "draft");
+        assert!(!pane.composer.popup_active());
     }
 
     // live ring removed; related tests deleted.
@@ -2250,6 +2436,11 @@ mod tests {
         assert_eq!(pane.composer_text(), "ya");
         assert!(pane.view_stack.is_empty());
         assert_eq!(pane.delayed_approval_requests.len(), 1);
+        pane.handle_disconnected_key(KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
+        pane.pre_draw_tick_at(Instant::now() + APPROVAL_PROMPT_TYPING_IDLE_DELAY);
+        pane.handle_paste(" kept".into());
+        assert_eq!(pane.composer_text(), "ya kept");
+        assert!(pane.view_stack.is_empty());
         while let Ok(event) = rx.try_recv() {
             assert!(
                 !matches!(event, AppEvent::SubmitThreadOp { .. }),
@@ -2524,6 +2715,53 @@ mod tests {
 
         let bufs = snapshot_buffer(&buf);
         assert!(bufs.contains("• Working"), "expected Working header");
+
+        pane.reset_status_timer(Duration::from_secs(/*secs*/ 42));
+        pane.hide_status_indicator();
+        pane.pause_status_timer_for_modal();
+        let paused = pane.status_timer.elapsed_at(Instant::now());
+        pane.ensure_status_indicator();
+        assert_snapshot!(
+            "status_timer_survives_hidden_row",
+            render_snapshot(&pane, area)
+        );
+        assert_eq!(
+            pane.status_timer
+                .elapsed_at(Instant::now() + Duration::from_secs(/*secs*/ 10)),
+            paused
+        );
+        pane.resume_status_timer_after_modal();
+        assert!(
+            pane.status_timer
+                .elapsed_at(Instant::now() + Duration::from_secs(/*secs*/ 10))
+                >= paused + Duration::from_secs(/*secs*/ 10)
+        );
+        pane.set_task_running(/*running*/ false);
+        pane.set_task_running(/*running*/ true);
+        assert!(pane.status_timer.elapsed_at(Instant::now()) < paused);
+    }
+
+    #[test]
+    fn turn_start_keeps_an_outstanding_approval_paused() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let mut pane = test_pane(AppEventSender::new(tx));
+        // MCP startup can already own the running row when an agent turn starts.
+        pane.set_task_running(/*running*/ true);
+        pane.push_approval_request(exec_request(), &Features::default());
+        pane.hide_status_indicator();
+        pane.set_task_running(/*running*/ true);
+        pane.reset_status_timer(Duration::ZERO);
+        pane.ensure_status_indicator();
+        let later = Instant::now() + Duration::from_secs(/*secs*/ 120);
+        assert_eq!(pane.status_timer.elapsed_at(later), Duration::ZERO);
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(pane.no_modal_or_popup_active());
+        assert!(
+            pane.status_timer
+                .elapsed_at(Instant::now() + Duration::from_secs(/*secs*/ 10))
+                >= Duration::from_secs(/*secs*/ 10)
+        );
     }
 
     #[test]

@@ -284,6 +284,7 @@ async fn installed_agent_plugin_uses_isolated_data_root_for_stdio_mcp() {
         Some(Product::Codex),
         /*remote_global_catalog_active*/ false,
         test_skill_root_loader().as_ref(),
+        &BTreeSet::new(),
     )
     .await;
 
@@ -314,10 +315,16 @@ async fn installed_agent_plugin_uses_isolated_data_root_for_stdio_mcp() {
 }
 
 #[test]
-fn configured_plugins_from_stack_merges_user_layers() {
+fn configured_plugins_from_stack_merges_enabled_effective_layers() {
     let temp_dir = TempDir::new().expect("tempdir");
     let stack = ConfigLayerStack::new(
         vec![
+            ConfigLayerEntry::new(
+                ConfigLayerSource::System {
+                    file: user_config_path(&temp_dir, "system.toml"),
+                },
+                toml::from_str("[plugins.system]\nenabled = true\n").expect("system config toml"),
+            ),
             user_layer(
                 user_config_path(&temp_dir, "config.toml"),
                 "[plugins.base]\nenabled = true\n",
@@ -326,12 +333,36 @@ fn configured_plugins_from_stack_merges_user_layers() {
                 user_config_path(&temp_dir, "work.config.toml"),
                 "[plugins.profile]\nenabled = false\n",
             ),
+            ConfigLayerEntry::new(
+                ConfigLayerSource::Project {
+                    dot_codex_folder: user_config_path(&temp_dir, "project/.codex"),
+                },
+                toml::from_str(
+                    "[plugins.profile]\nenabled = true\n[plugins.profile.mcp_servers.example]\nenabled = false\n",
+                )
+                .expect("project config toml"),
+            ),
+            ConfigLayerEntry::new_disabled(
+                ConfigLayerSource::Project {
+                    dot_codex_folder: user_config_path(&temp_dir, "project/untrusted/.codex"),
+                },
+                toml::from_str("[plugins.untrusted]\nenabled = true\n")
+                    .expect("untrusted project config toml"),
+                "project is untrusted",
+            ),
         ],
         ConfigRequirements::default(),
         ConfigRequirementsToml::default(),
     )
     .expect("valid config layer stack");
 
+    let project_mcp_servers = HashMap::from([(
+        "example".to_string(),
+        PluginMcpServerConfig {
+            enabled: false,
+            ..PluginMcpServerConfig::default()
+        },
+    )]);
     let plugins = configured_plugins_from_stack(&stack, temp_dir.path());
 
     assert_eq!(
@@ -347,11 +378,22 @@ fn configured_plugins_from_stack_merges_user_layers() {
             (
                 "profile".to_string(),
                 PluginConfig {
-                    enabled: false,
+                    enabled: true,
+                    mcp_servers: project_mcp_servers.clone(),
+                },
+            ),
+            (
+                "system".to_string(),
+                PluginConfig {
+                    enabled: true,
                     mcp_servers: HashMap::new(),
                 },
             ),
         ])
+    );
+    assert_eq!(
+        configured_plugin_mcp_server_policies(&stack).get("profile"),
+        Some(&project_mcp_servers)
     );
 }
 
@@ -453,11 +495,13 @@ enabled = true
         Some(Product::Codex),
         /*remote_global_catalog_active*/ false,
         test_skill_root_loader().as_ref(),
+        &BTreeSet::new(),
     )
     .await;
     let hooks_only = load_plugins_from_layer_stack_with_scope(
         &stack,
         HashMap::new(),
+        &BTreeSet::new(),
         &store,
         /*remote_global_catalog_active*/ false,
         PluginLoadScope::HooksOnly,

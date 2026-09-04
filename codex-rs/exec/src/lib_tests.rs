@@ -1,4 +1,5 @@
 use super::*;
+use codex_app_server_protocol::AuthRecoveryNotification;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::ActivePermissionProfile;
@@ -289,6 +290,28 @@ fn runtime_warnings_are_filtered_to_the_primary_thread() {
     });
 
     assert_eq!(outcomes, [true, true, false]);
+
+    let recovery = AuthRecoveryNotification {
+        thread_id: primary_thread_id.to_string(),
+        turn_id: turn_id.to_string(),
+        provider: "example".to_string(),
+        message: "Refresh authentication".to_string(),
+    };
+    let outcomes = [
+        ServerNotification::AuthRecoveryStarted(recovery.clone()),
+        ServerNotification::AuthRecoveryCompleted(recovery.clone()),
+        ServerNotification::AuthRecoveryStarted(AuthRecoveryNotification {
+            thread_id: "thread-2".to_string(),
+            ..recovery.clone()
+        }),
+        ServerNotification::AuthRecoveryCompleted(AuthRecoveryNotification {
+            turn_id: "turn-2".to_string(),
+            ..recovery
+        }),
+    ]
+    .map(|notification| should_process_notification(&notification, primary_thread_id, turn_id));
+
+    assert_eq!(outcomes, [true, true, false, false]);
 }
 
 #[tokio::test]
@@ -340,6 +363,8 @@ fn turn_items_for_thread_returns_matching_turn_items() {
         project_id: None,
         history_mode: Default::default(),
         model_provider: "openai".to_string(),
+        model: None,
+        reasoning_effort: None,
         created_at: 0,
         updated_at: 0,
         recency_at: Some(0),
@@ -364,6 +389,7 @@ fn turn_items_for_thread_returns_matching_turn_items() {
                     phase: None,
                     memory_citation: None,
                     delivery: None,
+                    questions: None,
                 }],
                 status: codex_app_server_protocol::TurnStatus::Completed,
                 error: None,
@@ -395,6 +421,7 @@ fn turn_items_for_thread_returns_matching_turn_items() {
             phase: None,
             memory_citation: None,
             delivery: None,
+            questions: None,
         }])
     );
     assert_eq!(turn_items_for_thread(&thread, "missing-turn"), None);
@@ -826,6 +853,8 @@ fn sample_thread_start_response() -> ThreadStartResponse {
             project_id: None,
             history_mode: Default::default(),
             model_provider: "openai".to_string(),
+            model: None,
+            reasoning_effort: None,
             created_at: 0,
             updated_at: 0,
             recency_at: Some(0),

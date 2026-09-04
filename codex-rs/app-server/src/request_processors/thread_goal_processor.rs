@@ -176,7 +176,7 @@ impl ThreadGoalRequestProcessor {
                     // rollout. Once materialized, normal settings updates own this event.
                     let persisted_settings = thread.thread_settings_snapshot().await;
                     let items = [
-                        thread_settings_applied_item(persisted_settings.clone()),
+                        thread_settings_applied_item(thread_id, persisted_settings.clone()),
                         outcome.thread_goal_updated_item(),
                     ];
                     match thread.append_rollout_items(&items).await {
@@ -189,6 +189,7 @@ impl ThreadGoalRequestProcessor {
                             } else {
                                 thread
                                     .append_rollout_items(&[thread_settings_applied_item(
+                                        thread_id,
                                         current_settings,
                                     )])
                                     .await
@@ -480,9 +481,15 @@ impl ThreadGoalRequestProcessor {
     }
 }
 
-fn thread_settings_applied_item(thread_settings: ThreadSettingsSnapshot) -> RolloutItem {
+fn thread_settings_applied_item(
+    thread_id: ThreadId,
+    thread_settings: ThreadSettingsSnapshot,
+) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
-        ThreadSettingsAppliedEvent { thread_settings },
+        ThreadSettingsAppliedEvent {
+            thread_id: Some(thread_id),
+            thread_settings,
+        },
     ))
 }
 

@@ -779,6 +779,37 @@ foo = true"#;
     assert_eq!(config_error.range.start.column, 1);
 }
 
+#[tokio::test]
+async fn strict_config_accepts_removed_shared_compression_key_without_changing_compression() {
+    for enabled in [false, true] {
+        let tmp = tempdir().expect("tempdir");
+        let removed = !enabled;
+        std::fs::write(
+            tmp.path().join(CONFIG_TOML_FILE),
+            format!(
+                "[features]\nlocal_thread_store_compression = {enabled}\nlocal_thread_store_shared_compression = {removed}\n"
+            ),
+        )
+        .expect("write config");
+
+        let config = ConfigBuilder::default()
+            .codex_home(tmp.path().to_path_buf())
+            .fallback_cwd(Some(tmp.path().to_path_buf()))
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+            .strict_config(/*strict_config*/ true)
+            .build()
+            .await
+            .expect("removed feature remains accepted");
+
+        assert_eq!(
+            config
+                .features
+                .enabled(Feature::LocalThreadStoreCompression),
+            enabled
+        );
+    }
+}
+
 #[test]
 fn strict_config_points_to_unknown_nested_key() {
     let tmp = tempdir().expect("tempdir");

@@ -10,6 +10,7 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_config::AppToolApproval;
 use codex_protocol::mcp::CallToolResult;
+use codex_protocol::models::PermissionProfile;
 use rmcp::model::ListResourceTemplatesResult;
 use rmcp::model::ListResourcesResult;
 use rmcp::model::PaginatedRequestParams;
@@ -169,7 +170,7 @@ impl fmt::Debug for McpBinding {
 /// one [`McpBinding`].
 #[derive(Clone)]
 pub struct PreparedMcpCall {
-    _connections: Arc<McpConnectionSet>,
+    connections: Arc<McpConnectionSet>,
     client: Arc<ManagedClient>,
     config: Arc<McpConfig>,
     catalog_revision: u64,
@@ -196,10 +197,11 @@ impl PreparedMcpCall {
         server_metadata: McpServerMetadata,
         plugin_id: Option<String>,
         selected_plugin_server: bool,
-    ) -> Self {
+    ) -> Option<Self> {
         let server_name = tool_info.server_name.clone();
-        Self {
-            _connections: connections,
+        config.permission_profile_for_server(&server_name)?;
+        Some(Self {
+            connections,
             client,
             config,
             catalog_revision,
@@ -209,7 +211,7 @@ impl PreparedMcpCall {
             server_metadata,
             plugin_id,
             selected_plugin_server,
-        }
+        })
     }
 
     pub fn tool_info(&self) -> &ToolInfo {
@@ -221,8 +223,29 @@ impl PreparedMcpCall {
         &self.config
     }
 
+    /// Returns the owner permissions validated when this immutable call was prepared.
+    pub fn permission_profile(&self) -> &PermissionProfile {
+        let Some(permission_profile) = self.config.permission_profile_for_server(&self.server_name)
+        else {
+            unreachable!("prepared MCP calls retain their immutable permission authority");
+        };
+        permission_profile
+    }
+
     pub fn server_name(&self) -> &str {
         &self.server_name
+    }
+
+    /// Returns whether this call is bound to the host-owned Codex Apps server.
+    pub fn is_host_owned_apps(&self) -> bool {
+        self.config
+            .mcp_server_catalog
+            .server(&self.server_name)
+            .is_some_and(|registration| {
+                registration
+                    .source()
+                    .is_host_owned_apps(&self.server_name, registration.config())
+            })
     }
 
     pub fn server_origin(&self) -> Option<&str> {
@@ -243,6 +266,18 @@ impl PreparedMcpCall {
     pub fn tool_approval_mode(&self) -> AppToolApproval {
         self.server_metadata
             .tool_approval_mode(&self.tool_info.tool.name)
+    }
+
+    /// Returns the explicit output budget captured with this call's effective server config.
+    pub fn output_token_limit(&self) -> Option<usize> {
+        self.config
+            .mcp_server_catalog
+            .server(&self.server_name)?
+            .config()
+            .tools
+            .get(self.tool_info.tool.name.as_ref())?
+            .output_token_limit
+            .map(std::num::NonZeroUsize::get)
     }
 
     pub fn plugin_id(&self) -> Option<&str> {
@@ -298,10 +333,40 @@ impl PreparedMcpCall {
             ));
         }
         let (arguments, meta) = prepare().await?;
+        let timeout_deadline =
+            effective_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+        let add_trusted_access_context = self.connections.add_trusted_access_context(
+            &self.tool_info,
+            &self.server_metadata,
+            arguments.as_ref(),
+            meta,
+        );
+        let meta = match effective_timeout.zip(timeout_deadline) {
+            Some((timeout, deadline)) => {
+                tokio::time::timeout_at(deadline, add_trusted_access_context)
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("timed out awaiting tools/call after {timeout:.0?}")
+                    })?
+            }
+            None => add_trusted_access_context.await,
+        };
+        let remaining_timeout = match effective_timeout.zip(timeout_deadline) {
+            Some((timeout, deadline)) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(anyhow::anyhow!(
+                        "timed out awaiting tools/call after {timeout:.0?}"
+                    ));
+                }
+                Some(remaining)
+            }
+            None => None,
+        };
         let result = self
             .client
             .client
-            .call_tool(tool_name.clone(), arguments, meta, effective_timeout)
+            .call_tool(tool_name.clone(), arguments, meta, remaining_timeout)
             .await
             .with_context(|| format!("tool call failed for `{}/{tool_name}`", self.server_name))?;
         drop(current_revision);

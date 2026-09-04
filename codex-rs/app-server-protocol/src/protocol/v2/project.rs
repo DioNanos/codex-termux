@@ -7,6 +7,8 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 
+use super::SortDirection;
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -28,6 +30,17 @@ pub struct Project {
     pub created_at: i64,
     #[ts(type = "number")]
     pub updated_at: i64,
+    /// Newest non-archived member thread's recency, in Unix seconds; null when none exist.
+    #[ts(type = "number | null")]
+    pub recency_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum ProjectSortKey {
+    Position,
+    RecencyAt,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS, ExperimentalApi)]
@@ -38,6 +51,12 @@ pub struct ProjectListParams {
     pub cursor: Option<String>,
     #[ts(optional = nullable)]
     pub limit: Option<u32>,
+    /// Defaults to position. Recency sorting always places empty projects last.
+    #[ts(optional = nullable)]
+    pub sort_key: Option<ProjectSortKey>,
+    /// Requires sortKey. Defaults to asc for position and desc for recencyAt.
+    #[ts(optional = nullable)]
+    pub sort_direction: Option<SortDirection>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

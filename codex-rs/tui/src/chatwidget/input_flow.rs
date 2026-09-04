@@ -32,6 +32,7 @@ impl ChatWidget {
                 let should_submit_now = self.is_session_configured()
                     && !self.is_plan_streaming_in_tui()
                     && !self.input_queue.suppress_queue_autosend
+                    && !self.input_queue.rate_limit_recovery_pending
                     && (!self.input_queue.user_turn_pending_start
                         || self.turn_lifecycle.agent_turn_running);
                 if should_submit_now {
@@ -114,7 +115,8 @@ impl ChatWidget {
         }
         let should_run_now = self.is_session_configured()
             && !self.is_user_turn_pending_or_running()
-            && !self.input_queue.suppress_queue_autosend;
+            && !self.input_queue.suppress_queue_autosend
+            && !self.input_queue.rate_limit_recovery_pending;
         if !should_run_now || action != QueuedInputAction::Plain {
             self.input_queue
                 .queued_user_messages
@@ -140,6 +142,8 @@ impl ChatWidget {
         if !self.is_session_configured()
             || self.misalignment_policy_violation
             || self.input_queue.suppress_queue_autosend
+            || self.input_queue.rate_limit_recovery_pending
+            || self.input_queue.recovered_queue
         {
             return false;
         }

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
+use codex_async_utils::THREAD_STACK_SIZE_BYTES;
 #[cfg(unix)]
 use codex_exec_server::CODEX_ARG0_EXEC_HELPER_ARG1;
 use codex_exec_server::CODEX_FS_HELPER_ARG1;
@@ -23,7 +24,6 @@ const CODEX_SELF_EXE_ENV: &str = "CODEX_SELF_EXE";
 #[cfg(unix)]
 const EXECVE_WRAPPER_ARG0: &str = "codex-execve-wrapper";
 const LOCK_FILENAME: &str = ".lock";
-const TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Filesystems that do not support advisory file locking (observed on
 /// Termux storage backends under `/data/data/com.termux/files`) surface
@@ -270,7 +270,7 @@ where
     // top-level future on the caller's OS stack.
     let handle = std::thread::Builder::new()
         .name("codex-main".to_string())
-        .stack_size(TOKIO_WORKER_STACK_SIZE_BYTES)
+        .stack_size(THREAD_STACK_SIZE_BYTES)
         .spawn(move || {
             let runtime = build_runtime()?;
             runtime.block_on(run_main_with_arg0_guard(
@@ -345,7 +345,7 @@ fn linux_sandbox_exe_path(
 fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
-    builder.thread_stack_size(TOKIO_WORKER_STACK_SIZE_BYTES);
+    builder.thread_stack_size(THREAD_STACK_SIZE_BYTES);
     Ok(builder.build()?)
 }
 

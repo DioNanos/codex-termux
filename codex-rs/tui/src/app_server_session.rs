@@ -5,6 +5,7 @@
 
 mod fs;
 mod history;
+mod models;
 mod rollout_history;
 
 pub(crate) use history::HISTORY_ITEM_PAGE_LIMIT;
@@ -175,7 +176,8 @@ pub(crate) enum ThreadHistorySupport {
 }
 
 fn bootstrap_request_error(context: &'static str, err: TypedRequestError) -> color_eyre::Report {
-    color_eyre::eyre::eyre!("{context}: {err}")
+    let message = format!("{context}: {err}");
+    color_eyre::Report::new(err).wrap_err(message)
 }
 
 pub(crate) fn is_history_pagination_unsupported(source: &JSONRPCErrorError) -> bool {
@@ -462,6 +464,13 @@ impl AppServerSession {
         }
     }
 
+    pub(crate) fn with_thread_tool_transport(mut self, transport: ThreadToolTransport) -> Self {
+        if let ThreadToolTransport::Mcp(server) = transport {
+            self.dynamic_tool_mcp = Some(server);
+        }
+        self
+    }
+
     pub(crate) fn with_remote_cwd_override(mut self, remote_cwd_override: Option<PathBuf>) -> Self {
         self.remote_cwd_override = remote_cwd_override;
         self
@@ -477,6 +486,11 @@ impl AppServerSession {
 
     pub(crate) fn uses_embedded_app_server(&self) -> bool {
         matches!(&self.client, AppServerClient::InProcess(_))
+    }
+
+    /// Carry capabilities that may exist only in memory when the optional cache is unwritable.
+    pub(crate) fn inherit_task_tool_capabilities(&mut self, previous: &Self) {
+        self.task_tool_threads.extend(&previous.task_tool_threads);
     }
 
     pub(crate) fn task_tools_available(&self, thread_id: ThreadId) -> bool {
@@ -650,6 +664,10 @@ impl AppServerSession {
 
     pub(crate) fn managed_new_thread_defaults(&self) -> Option<&NewThreadModelDefaults> {
         self.managed_new_thread_defaults.as_ref()
+    }
+
+    pub(crate) fn supports_paginated_history(&self) -> bool {
+        self.history_support == ThreadHistorySupport::Paginated
     }
 
     /// Fetches the current account info without refreshing the auth token.
@@ -1201,8 +1219,10 @@ impl AppServerSession {
                 request_id,
                 params: TurnStartParams {
                     thread_id: thread_id.to_string(),
+                    turn_trigger: None,
                     client_user_message_id: None,
                     input: items,
+                    tool_output: None,
                     responsesapi_client_metadata: None,
                     additional_context: None,
                     environments: None,
@@ -1214,12 +1234,14 @@ impl AppServerSession {
                     permissions,
                     model: Some(model),
                     service_tier,
+                    service_tier_for_turn: None,
                     effort,
                     summary,
                     personality,
                     output_schema,
                     collaboration_mode,
                     multi_agent_mode: None,
+                    cyber_access_program: None,
                 },
             })
             .await
@@ -1437,6 +1459,7 @@ impl AppServerSession {
                 params: ThreadShellCommandParams {
                     thread_id: thread_id.to_string(),
                     command,
+                    timeout_ms: None,
                 },
             })
             .await
@@ -1779,6 +1802,29 @@ fn sandbox_mode_from_permission_profile(
             }
         }
     }
+}
+
+pub(crate) fn permission_profile_is_safely_represented_by_sandbox_mode(
+    permission_profile: &PermissionProfile,
+    cwd: &std::path::Path,
+) -> bool {
+    let Some(sandbox_mode) = sandbox_mode_from_permission_profile(permission_profile, cwd) else {
+        return false;
+    };
+    let projected_profile = match sandbox_mode {
+        codex_app_server_protocol::SandboxMode::ReadOnly => PermissionProfile::read_only(),
+        codex_app_server_protocol::SandboxMode::WorkspaceWrite => {
+            PermissionProfile::from_legacy_sandbox_policy_for_cwd(
+                &codex_protocol::protocol::SandboxPolicy::new_workspace_write_policy(),
+                cwd,
+            )
+        }
+        codex_app_server_protocol::SandboxMode::DangerFullAccess => PermissionProfile::Disabled,
+    };
+    permission_profile.network_sandbox_policy() == projected_profile.network_sandbox_policy()
+        && permission_profile
+            .file_system_sandbox_policy()
+            .is_semantically_equivalent_to(&projected_profile.file_system_sandbox_policy(), cwd)
 }
 
 fn permission_profile_id_from_active_profile(active: ActivePermissionProfile) -> String {
@@ -2428,6 +2474,8 @@ mod tests {
     #[test]
     fn app_server_rate_limit_snapshots_deduplicates_top_level_limit_from_map() {
         let response = GetAccountRateLimitsResponse {
+            account_id: None,
+            rate_limit_upsell: None,
             rate_limits: rate_limit_snapshot("codex"),
             rate_limits_by_limit_id: Some(HashMap::from([
                 ("codex".to_string(), rate_limit_snapshot("codex")),
@@ -2993,6 +3041,10 @@ mod tests {
             sandbox_mode_from_permission_profile(&permission_profile, cwd.as_path()),
             Some(codex_app_server_protocol::SandboxMode::ReadOnly)
         );
+        assert!(!permission_profile_is_safely_represented_by_sandbox_mode(
+            &permission_profile,
+            cwd.as_path(),
+        ));
     }
 
     #[test]
@@ -3588,6 +3640,8 @@ mod tests {
                 project_id: None,
                 history_mode: Default::default(),
                 model_provider: "openai".to_string(),
+                model: None,
+                reasoning_effort: None,
                 created_at: 1,
                 updated_at: 2,
                 recency_at: Some(2),
@@ -3620,6 +3674,7 @@ mod tests {
                             phase: None,
                             memory_citation: None,
                             delivery: None,
+                            questions: None,
                         },
                     ],
                     status: TurnStatus::Completed,

@@ -66,6 +66,7 @@ fn skills_to_info(
 fn hooks_to_info(hooks: &[codex_hooks::HookListEntry]) -> Vec<HookMetadata> {
     hooks
         .iter()
+        .filter(|hook| !hook.builtin)
         .map(|hook| {
             let handler = match &hook.handler {
                 HookListEntryHandler::Command { command, r#async } => {
@@ -479,19 +480,12 @@ impl CatalogRequestProcessor {
             cwds
         };
 
-        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
         let skills_service = self.thread_manager.skills_service();
         let plugins_manager = self.thread_manager.plugins_manager();
-        if force_reload && config.features.enabled(Feature::Plugins) {
+        if force_reload {
             plugins_manager.clear_cache();
             skills_service.clear_cache();
         }
-        // Plugin configuration is user-scoped; workspace skill rules are applied below.
-        let plugins_input = config.plugins_config_input();
-        let plugins = plugins_manager.plugins_for_config(&plugins_input).await;
-        let effective_skill_roots = plugins.effective_plugin_skill_roots();
-        let plugin_skill_snapshots =
-            plugins_manager.plugin_skill_snapshots_for_config(&plugins_input);
         let fs = self
             .thread_manager
             .environment_manager()
@@ -502,12 +496,11 @@ impl CatalogRequestProcessor {
             .map(|(index, cwd)| {
                 let fs = fs.clone();
                 let skills_request = &skills_request;
-                let effective_skill_roots = effective_skill_roots.clone();
-                let plugin_skill_snapshots = plugin_skill_snapshots.clone();
+                let plugins_manager = Arc::clone(&plugins_manager);
                 async move {
-                    let (cwd_abs, config_layer_stack) = match self.resolve_cwd_config(&cwd).await {
+                    let config = match self.load_latest_config(Some(cwd.clone())).await {
                         Ok(resolved) => resolved,
-                        Err(message) => {
+                        Err(error) => {
                             let error_path = cwd.clone();
                             return (
                                 index,
@@ -516,16 +509,20 @@ impl CatalogRequestProcessor {
                                     skills: Vec::new(),
                                     errors: vec![codex_app_server_protocol::SkillErrorInfo {
                                         path: error_path,
-                                        message,
+                                        message: error.message,
                                     }],
                                 },
                             );
                         }
                     };
+                    let plugins_input = config.plugins_config_input();
+                    let plugins = plugins_manager.plugins_for_config(&plugins_input).await;
+                    let plugin_skill_snapshots =
+                        plugins_manager.plugin_skill_snapshots_for_config(&plugins_input);
                     let skills_input = codex_skills_extension::HostSkillsLoadInput::new(
-                        cwd_abs.clone(),
-                        effective_skill_roots,
-                        config_layer_stack,
+                        config.cwd.clone(),
+                        plugins.effective_plugin_skill_roots(),
+                        config.config_layer_stack,
                     )
                     .with_plugin_skill_snapshots(plugin_skill_snapshots);
                     let snapshot = skills_request

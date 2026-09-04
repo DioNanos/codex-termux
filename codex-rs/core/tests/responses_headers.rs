@@ -686,3 +686,96 @@ async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() 
         Some(false)
     );
 }
+
+/// Credential-bearing Git remotes must be redacted from both metadata transports.
+#[tokio::test]
+async fn responses_stream_redacts_git_remote_credentials_from_turn_metadata() {
+    core_test_support::skip_if_no_network!();
+
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .build(&server)
+        .await
+        .expect("build test codex");
+    let cwd = test.cwd_path();
+    let remote_token = "test-git-secret-token";
+    let credential_bearing_origin =
+        "https://alice:test-git-secret-token@example.invalid/openai/codex.git";
+
+    for args in [
+        ["init"].as_slice(),
+        ["remote", "add", "origin", credential_bearing_origin].as_slice(),
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git command should run");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let first_response = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_function_call(
+            "wait-for-git",
+            "test_sync_tool",
+            r#"{"wait_for_git_enrichment":true}"#,
+        ),
+        responses::ev_completed("resp-1"),
+    ]);
+    let follow_up_response = responses::sse(vec![
+        responses::ev_response_created("resp-2"),
+        responses::ev_assistant_message("msg-1", "done"),
+        responses::ev_completed("resp-2"),
+    ]);
+    let request_log = responses::mount_response_sequence(
+        &server,
+        vec![
+            responses::sse_response(first_response),
+            responses::sse_response(follow_up_response),
+        ],
+    )
+    .await;
+
+    test.submit_turn("inspect the workspace")
+        .await
+        .expect("submit turn prompt");
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 2, "expected a follow-up model request");
+    let header_metadata = requests[1]
+        .header("x-codex-turn-metadata")
+        .expect("request header should include turn metadata");
+    let request_body = requests[1].body_json();
+    let body_metadata = request_body["client_metadata"]["x-codex-turn-metadata"]
+        .as_str()
+        .expect("request body should include turn metadata");
+
+    for (location, metadata) in [
+        ("request header", header_metadata.as_str()),
+        ("request body", body_metadata),
+    ] {
+        assert!(
+            !metadata.contains(remote_token),
+            "{location} should not expose git remote credentials"
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_str(metadata).expect("turn metadata should be valid JSON");
+        let remotes = metadata
+            .get("workspaces")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|workspaces| workspaces.values().next())
+            .and_then(|workspace| workspace.get("associated_remote_urls"))
+            .expect("turn metadata should include git remote URLs");
+        assert_eq!(
+            remotes,
+            &serde_json::json!({ "origin": "https://example.invalid/openai/codex.git" }),
+            "{location} should contain the sanitized remote"
+        );
+    }
+}

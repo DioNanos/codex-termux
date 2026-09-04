@@ -37,6 +37,10 @@ fn retryability_preserves_error_details_distinctions() {
     let errors = [
         (CodexErr::ServerOverloaded, false),
         (
+            CodexErr::new(CodexErrorDetails::RateLimitExceeded("retry later".into())),
+            true,
+        ),
+        (
             CodexErr::RetryLimit(RetryLimitReachedError {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 request_id: None,

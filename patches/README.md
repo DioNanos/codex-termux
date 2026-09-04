@@ -226,6 +226,7 @@ required to publish a working Android Termux package.
 - Files: `.github/workflows/repo-checks.yml`,
   `.github/workflows/rusty-v8-android-release.yml`,
   `.github/workflows/termux-npm-build-publish.yml`,
+  `.github/workflows/termux-gate.yml`,
   `.forgejo/workflows/termux-next-smoke.yml`
 - Upstream `repo-checks.yml` stages an npm package and uploads it as an artifact;
   these steps are gated with
@@ -241,7 +242,9 @@ required to publish a working Android Termux package.
   `.forgejo/workflows/termux-next-smoke.yml` is the Forge mirror used for
   develop-side smoke tests. Public candidates omit both `.forgejo/**` and the
   internal `test-report/**` device logs; `verify-patches.sh` enforces the full
-  versus sanitized-tree contract explicitly.
+  versus sanitized-tree contract explicitly. `termux-gate.yml` is the
+  fork-owned workflow-dispatch gate for formatting, Cargo lock cleanliness
+  under shear and deny, and targeted Termux regression tests.
 
 ### Patch #24 - Termux TLS roots (RETIRED at rust-v0.147.0)
 - **What it did**: reqwest 0.13 (pulled in by the rmcp 1.7.0 upgrade) routes TLS

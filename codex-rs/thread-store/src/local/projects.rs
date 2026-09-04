@@ -5,6 +5,7 @@ use crate::DeletedProject;
 use crate::ListProjectsParams;
 use crate::MoveProjectParams;
 use crate::ProjectMoveOutcome;
+use crate::SortDirection;
 use crate::StoredProject;
 use crate::StoredProjectRoot;
 use crate::StoredProjectsPage;
@@ -20,7 +21,15 @@ pub(super) async fn list_projects(
     let state = state(store)?;
     let has_cursor = params.cursor.is_some();
     let page = state
-        .list_projects(params.cursor.as_deref(), params.limit)
+        .list_projects(
+            params.cursor.as_deref(),
+            params.limit,
+            params.sort_key,
+            match params.sort_direction {
+                SortDirection::Asc => codex_state::SortDirection::Asc,
+                SortDirection::Desc => codex_state::SortDirection::Desc,
+            },
+        )
         .await
         .map_err(|error| {
             if has_cursor && error.to_string().starts_with("invalid project cursor:") {
@@ -178,5 +187,6 @@ fn stored_project(project: codex_state::Project) -> StoredProject {
         position: project.position,
         created_at_ms: project.created_at_ms,
         updated_at_ms: project.updated_at_ms,
+        recency_at_ms: project.recency_at_ms,
     }
 }

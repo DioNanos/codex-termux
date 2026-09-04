@@ -39,6 +39,7 @@ use core_test_support::skip_if_remote;
 use core_test_support::skip_if_wine_exec;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::time::timeout;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -794,8 +795,10 @@ async fn skills_list_accepts_relative_cwds() -> Result<()> {
     Ok(())
 }
 
+#[test_case(false; "plugins disabled by default")]
+#[test_case(true; "plugins enabled by default")]
 #[tokio::test]
-async fn skills_list_preserves_requested_cwd_order() -> Result<()> {
+async fn skills_list_preserves_requested_cwd_order(home_plugins_enabled: bool) -> Result<()> {
     skip_if_wine_exec!(
         Ok(()),
         "skills/list currently requires host-native cwd paths for workspace config"
@@ -803,25 +806,32 @@ async fn skills_list_preserves_requested_cwd_order() -> Result<()> {
     let codex_home = TempDir::new()?;
     let first_cwd = TempDir::new()?;
     let second_cwd = TempDir::new()?;
+    let third_cwd = TempDir::new()?;
     write_skill(&codex_home, "shared-skill")?;
     write_cached_local_curated_plugin_with_skill(codex_home.path(), "openai-api-curated")?;
     std::fs::write(
         codex_home.path().join("config.toml"),
-        r#"[features]
-plugins = true
+        format!(
+            r#"[features]
+plugins = {home_plugins_enabled}
 
 [plugins."google-calendar@openai-api-curated"]
-enabled = true
-"#,
+enabled = false
+"#
+        ),
     )?;
 
-    for (cwd, plugin_enabled) in [(first_cwd.path(), true), (second_cwd.path(), false)] {
+    for (cwd, plugins_enabled, plugin_enabled) in [
+        (first_cwd.path(), true, true),
+        (second_cwd.path(), false, true),
+        (third_cwd.path(), true, false),
+    ] {
         std::fs::create_dir_all(cwd.join(".git"))?;
         std::fs::create_dir_all(cwd.join(".codex"))?;
         std::fs::write(
             cwd.join(".codex/config.toml"),
             format!(
-                "[plugins.\"google-calendar@openai-api-curated\"]\nenabled = {plugin_enabled}\n"
+                "[features]\nplugins = {plugins_enabled}\n[plugins.\"google-calendar@openai-api-curated\"]\nenabled = {plugin_enabled}\n"
             ),
         )?;
         set_project_trust_level(codex_home.path(), cwd, TrustLevel::Trusted)?;
@@ -836,6 +846,7 @@ enabled = true
     for (cwd, name) in [
         (first_cwd.path(), "first-project-skill"),
         (second_cwd.path(), "second-project-skill"),
+        (third_cwd.path(), "third-project-skill"),
     ] {
         let cwd = AbsolutePathBuf::try_from(cwd)?;
         let git_dir = PathUri::from_abs_path(&cwd.join(".git"));
@@ -862,29 +873,30 @@ enabled = true
             .await?;
     }
 
-    for (request_index, force_reload) in [false, false, true].into_iter().enumerate() {
-        if request_index == 1 {
-            write_skill(&codex_home, "new-skill")?;
-        }
-
+    for force_reload in [false, false, true] {
         let request_id = mcp
             .send_skills_list_request(SkillsListParams {
                 cwds: vec![
                     first_cwd.path().to_path_buf(),
                     second_cwd.path().to_path_buf(),
+                    third_cwd.path().to_path_buf(),
                 ],
                 force_reload,
             })
             .await?;
         let SkillsListResponse { data } =
             timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
-        assert_eq!(data.len(), 2);
-        assert_eq!(data[0].cwd, first_cwd.path());
-        assert_eq!(data[1].cwd, second_cwd.path());
-        for (entry, project_skill) in data
-            .iter()
-            .zip(["first-project-skill", "second-project-skill"])
-        {
+        assert_eq!(
+            data.iter()
+                .map(|entry| entry.cwd.as_path())
+                .collect::<Vec<_>>(),
+            vec![first_cwd.path(), second_cwd.path(), third_cwd.path()],
+        );
+        for (entry, (project_skill, plugin_enabled)) in data.iter().zip([
+            ("first-project-skill", true),
+            ("second-project-skill", false),
+            ("third-project-skill", false),
+        ]) {
             assert_eq!(entry.errors, Vec::new());
             assert!(
                 entry
@@ -892,6 +904,10 @@ enabled = true
                     .iter()
                     .any(|skill| skill.name == "shared-skill")
             );
+            let mut expected_skills = vec![project_skill];
+            if plugin_enabled {
+                expected_skills.push("google-calendar:meeting-prep");
+            }
             assert_eq!(
                 entry
                     .skills
@@ -902,11 +918,7 @@ enabled = true
                     })
                     .map(|skill| skill.name.as_str())
                     .collect::<Vec<_>>(),
-                vec![project_skill, "google-calendar:meeting-prep"]
-            );
-            assert_eq!(
-                entry.skills.iter().any(|skill| skill.name == "new-skill"),
-                force_reload
+                expected_skills
             );
         }
     }

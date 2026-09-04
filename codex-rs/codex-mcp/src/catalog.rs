@@ -7,6 +7,7 @@ use codex_config::McpServerConfig;
 use codex_config::McpServerDisabledReason;
 use codex_config::RequirementSource;
 use codex_protocol::mcp_policy::EnvironmentMcpPolicy;
+use codex_utils_path_uri::PathUri;
 
 use crate::CODEX_APPS_MCP_SERVER_NAME;
 
@@ -16,6 +17,7 @@ pub struct McpPluginAttribution {
     plugin_id: String,
     display_name: String,
     agent_plugin: bool,
+    host_root: Option<PathUri>,
 }
 
 impl McpPluginAttribution {
@@ -24,6 +26,7 @@ impl McpPluginAttribution {
             plugin_id,
             display_name,
             agent_plugin: false,
+            host_root: None,
         }
     }
 
@@ -32,7 +35,14 @@ impl McpPluginAttribution {
             plugin_id,
             display_name,
             agent_plugin: true,
+            host_root: None,
         }
+    }
+
+    /// Records the exact host-discovered plugin root.
+    pub fn with_host_root(mut self, host_root: PathUri) -> Self {
+        self.host_root = Some(host_root);
+        self
     }
 
     pub fn plugin_id(&self) -> &str {
@@ -45,6 +55,11 @@ impl McpPluginAttribution {
 
     pub fn is_agent_plugin(&self) -> bool {
         self.agent_plugin
+    }
+
+    /// Returns the host-discovered root captured with this server registration.
+    pub fn host_root(&self) -> Option<&PathUri> {
+        self.host_root.as_ref()
     }
 }
 

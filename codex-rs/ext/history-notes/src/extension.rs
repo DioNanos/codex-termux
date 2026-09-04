@@ -17,6 +17,7 @@ use codex_extension_api::ToolExecutor;
 use codex_login::AuthManager;
 use codex_model_provider::create_model_provider;
 use codex_protocol::AgentPath;
+use codex_utils_output_truncation::TruncationPolicy;
 use serde_json::json;
 
 use crate::backend::HistoryNotesBackend;
@@ -110,6 +111,7 @@ impl ContextContributor for HistoryNotesExtension {
                     session_store.level_id(),
                     &identity.agent_name,
                     json!({}),
+                    TruncationPolicy::Bytes(MAX_THREAD_HINT_BYTES),
                 )
                 .await
             else {
@@ -135,7 +137,7 @@ impl ToolContributor for HistoryNotesExtension {
         &self,
         session_store: &ExtensionData,
         thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
         let Some(config) = thread_store.get::<HistoryNotesExtensionConfig>() else {
             return Vec::new();
         };
@@ -151,7 +153,7 @@ impl ToolContributor for HistoryNotesExtension {
                     config.backend.clone(),
                     session_store.level_id().to_string(),
                     identity.agent_name.clone(),
-                )) as Arc<dyn ToolExecutor<ToolCall>>
+                )) as Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>
             })
             .collect()
     }

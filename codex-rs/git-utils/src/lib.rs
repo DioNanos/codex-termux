@@ -27,6 +27,7 @@ pub use baseline::diff_since_latest_init;
 pub use baseline::ensure_git_baseline_repository;
 pub use baseline::reset_git_repository;
 pub use branch::merge_base_with_head;
+pub use codex_protocol::SanitizedGitUrl;
 pub use codex_protocol::protocol::GitSha;
 pub use errors::GitToolingError;
 pub use fsmonitor::FsmonitorOverride;

@@ -71,6 +71,8 @@ use crate::rpc::internal_error;
 use crate::rpc::invalid_params;
 use crate::rpc::invalid_request;
 use crate::rpc_server_requests::RpcServerRequestSender;
+#[cfg(unix)]
+use crate::shell_snapshot::CapturePurpose;
 use crate::telemetry::ExecServerTelemetry;
 use crate::telemetry::ProcessMetricGuard;
 
@@ -355,7 +357,12 @@ impl LocalProcess {
         #[cfg(unix)]
         self.inner
             .shell_snapshots
-            .prepare(&params, &mut prepared)
+            .prepare(
+                &params,
+                &mut prepared,
+                &self.inner.telemetry,
+                CapturePurpose::Execution,
+            )
             .await?;
         if prepared.command.is_empty() {
             return Err(invalid_params("argv must not be empty".to_string()));
@@ -406,6 +413,7 @@ impl LocalProcess {
                 return Err(internal_error(err.to_string()));
             }
         };
+        let metrics = self.inner.telemetry.process_started(&process_id);
 
         let output_notify = Arc::new(Notify::new());
         let (wake_tx, _wake_rx) = watch::channel(0);
@@ -421,6 +429,7 @@ impl LocalProcess {
             ) {
                 drop(process_map);
                 spawned.session.terminate();
+                metrics.finish("terminated");
                 return Err(invalid_request(format!(
                     "process {process_id} start was cancelled"
                 )));
@@ -443,7 +452,7 @@ impl LocalProcess {
                     output_notify: Arc::clone(&output_notify),
                     open_streams: 2,
                     closed: false,
-                    metrics: Some(self.inner.telemetry.process_started()),
+                    metrics: Some(metrics),
                     termination_requested: false,
                     sandbox: prepared.sandbox,
                     sandbox_denied: false,
@@ -750,6 +759,39 @@ impl LocalProcess {
 impl ExecBackend for LocalProcess {
     fn start(&self, params: ExecParams) -> ExecBackendFuture<'_> {
         Box::pin(LocalProcess::start(self, params))
+    }
+
+    #[cfg(unix)]
+    fn prewarm_shell_snapshot(&self, params: ExecParams) -> ExecProcessFuture<'_, ()> {
+        Box::pin(async move {
+            if params.enforce_managed_network
+                || params.managed_network.is_some()
+                || params.network_proxy.is_some()
+            {
+                return Err(ExecServerError::Protocol(
+                    "shell snapshot prewarming does not support managed networking".to_string(),
+                ));
+            }
+            let mut prepared = prepare_exec_request(
+                &params,
+                child_env(&params),
+                self.runtime_paths.as_ref(),
+                /*network_policy_decider*/ None,
+                /*network_policy_audit_observer*/ None,
+            )
+            .await
+            .map_err(map_handler_error)?;
+            self.inner
+                .shell_snapshots
+                .prepare(
+                    &params,
+                    &mut prepared,
+                    &self.inner.telemetry,
+                    CapturePurpose::Prewarm,
+                )
+                .await
+                .map_err(map_handler_error)
+        })
     }
 }
 
@@ -1893,7 +1935,7 @@ mod tests {
                 output_notify: Arc::clone(&output_notify),
                 open_streams: 2,
                 closed: false,
-                metrics: Some(backend.inner.telemetry.process_started()),
+                metrics: Some(backend.inner.telemetry.process_started(&process_id)),
                 termination_requested: false,
                 sandbox: SandboxType::None,
                 sandbox_denied: false,

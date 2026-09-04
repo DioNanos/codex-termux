@@ -10,6 +10,12 @@ use serde_json::Value;
 use crate::ConversationHistorySnapshot;
 use crate::ExtensionData;
 
+/// Thread-local state installed only after Guardian V2's async classifier initializes.
+pub struct GuardianV2Enabled {
+    /// Computer-use classification remains active for models requiring synchronous review.
+    pub computer_use_only: bool,
+}
+
 /// Classification returned by an approval reviewer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalAssessment {

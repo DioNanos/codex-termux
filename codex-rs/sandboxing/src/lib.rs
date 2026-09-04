@@ -7,8 +7,11 @@ pub mod policy_transforms;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
 mod spawn;
+mod terminal_queries;
 mod violation;
 mod windows;
+#[cfg(windows)]
+mod windows_mxc;
 
 #[cfg(target_os = "linux")]
 pub use bwrap::find_system_bwrap_in_path;

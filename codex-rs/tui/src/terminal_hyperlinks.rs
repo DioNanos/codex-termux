@@ -22,15 +22,18 @@ use ratatui::text::Text;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 use ratatui::widgets::Wrap;
+use unicode_segmentation::UnicodeSegmentation;
 use url::Url;
 
 use crate::line_truncation::line_width;
 use crate::render::line_utils::line_to_borrowed;
 use crate::render::line_utils::line_to_static;
-use crate::width::char_width;
 use crate::width::display_width;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_line;
+
+// Destinations are repeated in every linked buffer cell. Leave oversized URLs as plain text.
+const MAX_HYPERLINK_DESTINATION_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TerminalHyperlink {
@@ -235,10 +238,7 @@ pub(crate) fn remap_wrapped_line(
         if index > 0 {
             let trimmed = source_text[source_byte..].trim_start_matches(char::is_whitespace);
             let skipped = source_text[source_byte..].len() - trimmed.len();
-            source_column += source_text[source_byte..source_byte + skipped]
-                .chars()
-                .map(char_cell_width)
-                .sum::<usize>();
+            source_column += display_width(&source_text[source_byte..source_byte + skipped]);
             source_byte += skipped;
         }
 
@@ -249,8 +249,8 @@ pub(crate) fn remap_wrapped_line(
         };
         let mapped = &rendered[rendered_start..];
         let mut output_column = display_width(&rendered[..rendered_start]);
-        for ch in mapped.chars() {
-            let width = char_cell_width(ch);
+        for grapheme in mapped.graphemes(/*is_extended*/ true) {
+            let width = display_width(grapheme);
             while source
                 .hyperlinks
                 .get(link_index)
@@ -282,7 +282,7 @@ fn line_text(line: &Line<'_>) -> String {
 
 fn longest_suffix_matching_prefix(rendered: &str, source: &str) -> Option<usize> {
     rendered
-        .char_indices()
+        .grapheme_indices(/*is_extended*/ true)
         .map(|(index, _)| index)
         .chain(std::iter::once(rendered.len()))
         .find(|index| source.starts_with(&rendered[*index..]) && *index < rendered.len())
@@ -306,7 +306,9 @@ fn push_link_range(line: &mut HyperlinkLine, range: Range<usize>, link: &Termina
 pub(crate) fn web_links_in_text(text: &str) -> Vec<TerminalHyperlink> {
     let mut links = Vec::new();
     let mut search_from = 0usize;
-    for raw_token in text.split_ascii_whitespace() {
+    let mut source_byte = 0usize;
+    let mut source_column = 0usize;
+    for raw_token in text.split_whitespace() {
         let Some(relative_start) = text[search_from..].find(raw_token) else {
             continue;
         };
@@ -323,9 +325,12 @@ pub(crate) fn web_links_in_text(text: &str) -> Vec<TerminalHyperlink> {
         let Some(destination) = web_destination(candidate) else {
             continue;
         };
-        let start = display_width(&text[..raw_start + trimmed_start]);
-        let end = start + display_width(candidate);
-        links.push(TerminalHyperlink::web(start..end, destination));
+        let candidate_start = raw_start + trimmed_start;
+        // Measure disjoint prefixes so scanning a draft with many URLs stays linear.
+        source_column += display_width(&text[source_byte..candidate_start]);
+        source_byte = candidate_start;
+        let end = source_column + display_width(candidate);
+        links.push(TerminalHyperlink::web(source_column..end, destination));
     }
     links
 }
@@ -338,15 +343,41 @@ fn is_leading_punctuation(ch: char) -> bool {
 }
 
 fn trailing_url_end(candidate: &str) -> usize {
+    // Count delimiter balances once rather than rescanning for every trailing closer.
+    let mut balances = [0isize; 4];
+    for ch in candidate.chars() {
+        match ch {
+            '(' => balances[0] += 1,
+            ')' => balances[0] -= 1,
+            '[' => balances[1] += 1,
+            ']' => balances[1] -= 1,
+            '{' => balances[2] += 1,
+            '}' => balances[2] -= 1,
+            '<' => balances[3] += 1,
+            '>' => balances[3] -= 1,
+            _ => {}
+        }
+    }
     let mut end = candidate.len();
     while end > 0 {
         let remaining = &candidate[..end];
         let Some(ch) = remaining.chars().next_back() else {
             break;
         };
-        let trim = matches!(ch, ',' | '.' | ';' | '!' | '\'' | '"')
-            || matches!(ch, ')' | ']' | '}' | '>')
-                && has_unmatched_closing_delimiter(remaining, ch);
+        let balance = match ch {
+            ')' => Some(&mut balances[0]),
+            ']' => Some(&mut balances[1]),
+            '}' => Some(&mut balances[2]),
+            '>' => Some(&mut balances[3]),
+            _ => None,
+        };
+        let trim = if let Some(balance) = balance {
+            let unmatched = *balance < 0;
+            *balance += 1;
+            unmatched
+        } else {
+            matches!(ch, ',' | '.' | ';' | '!' | '\'' | '"')
+        };
         if !trim {
             break;
         }
@@ -355,20 +386,8 @@ fn trailing_url_end(candidate: &str) -> usize {
     end
 }
 
-fn has_unmatched_closing_delimiter(candidate: &str, closing: char) -> bool {
-    let opening = match closing {
-        ')' => '(',
-        ']' => '[',
-        '}' => '{',
-        '>' => '<',
-        _ => return false,
-    };
-    candidate.chars().filter(|ch| *ch == closing).count()
-        > candidate.chars().filter(|ch| *ch == opening).count()
-}
-
 pub(crate) fn web_destination(destination: &str) -> Option<String> {
-    let safe_destination = sanitized_destination(destination);
+    let safe_destination = sanitized_destination(destination)?;
     let parsed = Url::parse(&safe_destination).ok()?;
     matches!(parsed.scheme(), "http" | "https")
         .then(|| parsed.host_str())
@@ -377,13 +396,16 @@ pub(crate) fn web_destination(destination: &str) -> Option<String> {
 }
 
 fn trusted_file_destination(destination: &str) -> Option<String> {
-    let safe_destination = sanitized_destination(destination);
+    let safe_destination = sanitized_destination(destination)?;
     let parsed = Url::parse(&safe_destination).ok()?;
     (parsed.scheme() == "file" && parsed.to_file_path().is_ok()).then_some(safe_destination)
 }
 
-fn sanitized_destination(destination: &str) -> String {
-    destination.chars().filter(|ch| !ch.is_control()).collect()
+fn sanitized_destination(destination: &str) -> Option<String> {
+    if destination.len() > MAX_HYPERLINK_DESTINATION_BYTES {
+        return None;
+    }
+    Some(destination.chars().filter(|ch| !ch.is_control()).collect())
 }
 
 pub(crate) fn osc8_hyperlink(destination: &str, text: &str) -> String {
@@ -437,8 +459,8 @@ pub(crate) fn decorate_spans(line: &HyperlinkLine) -> Vec<Span<'static>> {
     let mut active_link_index = None;
     let mut active_destination: Option<String> = None;
     for span in &line.line.spans {
-        for ch in span.content.chars() {
-            let width = char_cell_width(ch);
+        for grapheme in span.content.graphemes(/*is_extended*/ true) {
+            let width = display_width(grapheme);
             while line
                 .hyperlinks
                 .get(link_index)
@@ -465,7 +487,7 @@ pub(crate) fn decorate_spans(line: &HyperlinkLine) -> Vec<Span<'static>> {
                 }
                 active_link_index = selected_link_index;
             }
-            push_styled_content(&mut out, ch.encode_utf8(&mut [0; 4]), span.style);
+            push_styled_content(&mut out, grapheme, span.style);
             column += width;
         }
     }
@@ -489,13 +511,6 @@ fn append_to_last_span(out: &mut [Span<'static>], content: &str) {
     if let Some(last) = out.last_mut() {
         last.content.to_mut().push_str(content);
     }
-}
-
-fn char_cell_width(ch: char) -> usize {
-    if ch.is_control() {
-        return 0;
-    }
-    char_width(ch)
 }
 
 pub(crate) fn mark_buffer_hyperlinks(
@@ -556,7 +571,9 @@ pub(crate) fn mark_buffer_hyperlinks(
                 continue;
             }
             for link in &rendered.hyperlinks {
-                let destination = link.terminal_destination();
+                let Some(destination) = link.terminal_destination() else {
+                    continue;
+                };
                 let mut trailing_columns = 0usize;
                 for column in link.columns.clone() {
                     if trailing_columns > 0 {
@@ -570,12 +587,7 @@ pub(crate) fn mark_buffer_hyperlinks(
                         continue;
                     }
                     trailing_columns = usize::from(cell.cell_width()).saturating_sub(1);
-                    let symbol = destination.as_ref().map_or_else(
-                        || cell.symbol().to_string(),
-                        |destination| {
-                            format!("\x1b]8;;{destination}\x07{}\x1b]8;;\x07", cell.symbol())
-                        },
-                    );
+                    let symbol = format!("\x1b]8;;{destination}\x07{}\x1b]8;;\x07", cell.symbol());
                     let width = NonZeroU16::new(cell.cell_width()).unwrap_or(NonZeroU16::MIN);
                     cell.set_symbol(&symbol)
                         .set_diff_option(CellDiffOption::ForcedWidth(width));
@@ -620,6 +632,10 @@ fn mark_matching_cells(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "terminal_hyperlinks_tests.rs"]
+mod regression_tests;
 
 #[cfg(test)]
 mod tests {

@@ -105,6 +105,9 @@ async fn test_step(
     } else {
         config.approvals_reviewer = ApprovalsReviewer::AutoReview;
     }
+    config
+        .server_permission_profiles
+        .insert(SERVER_NAME.to_string(), config.permission_profile.clone());
     let config = Arc::new(config);
     let prepared = PreparedMcpCall::new(
         Arc::clone(&connections),
@@ -125,7 +128,8 @@ async fn test_step(
         },
         Some(format!("{label}-plugin")),
         label == "old",
-    );
+    )
+    .expect("test call should retain its thread-owned permission profile");
     let calls = HashMap::from([((SERVER_NAME.to_string(), TOOL_NAME.to_string()), prepared)]);
 
     TestStep {
@@ -213,7 +217,7 @@ async fn prepared_call_keeps_captured_connection_and_authority_after_refresh() -
     assert_eq!(
         (
             old_call.config().approval_policy.value(),
-            &old_call.config().permission_profile,
+            old_call.permission_profile(),
             old_call.config().approvals_reviewer,
         ),
         (

@@ -1,5 +1,6 @@
 use super::*;
 use crate::SortDirection;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::protocol::SessionSource;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
@@ -847,7 +848,7 @@ impl StateRuntime {
         thread_id: ThreadId,
         git_sha: Option<Option<&str>>,
         git_branch: Option<Option<&str>>,
-        git_origin_url: Option<Option<&str>>,
+        git_origin_url: Option<Option<&SanitizedGitUrl>>,
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             r#"
@@ -864,7 +865,7 @@ WHERE id = ?
         .bind(git_branch.is_some())
         .bind(git_branch.flatten())
         .bind(git_origin_url.is_some())
-        .bind(git_origin_url.flatten())
+        .bind(git_origin_url.flatten().map(SanitizedGitUrl::as_str))
         .bind(thread_id.to_string())
         .execute(self.pool.as_ref())
         .await?;
@@ -1322,6 +1323,7 @@ pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
         | RolloutItem::WorldState(_)
         | RolloutItem::RealtimeItem(_)
         | RolloutItem::SecurityRiskScore(_)
+        | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::EventMsg(_) => None,
     })
 }
@@ -2567,6 +2569,7 @@ mod tests {
                 session_id: thread_id.into(),
                 id: thread_id,
                 forked_from_id: None,
+                forked_from_ordinal_exclusive: None,
                 parent_thread_id: None,
                 timestamp: metadata.created_at.to_rfc3339(),
                 cwd: PathBuf::new(),
@@ -2637,6 +2640,7 @@ mod tests {
                 session_id: thread_id.into(),
                 id: thread_id,
                 forked_from_id: None,
+                forked_from_ordinal_exclusive: None,
                 parent_thread_id: None,
                 timestamp: created_at,
                 cwd: PathBuf::new(),
@@ -2661,7 +2665,10 @@ mod tests {
             git: Some(GitInfo {
                 commit_hash: Some(codex_git_utils::GitSha::new("rollout-sha")),
                 branch: Some("rollout-branch".to_string()),
-                repository_url: Some("git@example.com:openai/codex.git".to_string()),
+                repository_url: Some(
+                    SanitizedGitUrl::try_from("git@example.com:openai/codex.git")
+                        .expect("valid git remote URL"),
+                ),
             }),
         })];
 
@@ -2700,7 +2707,10 @@ mod tests {
         let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
         metadata.git_sha = Some("sqlite-sha".to_string());
         metadata.git_branch = Some("sqlite-branch".to_string());
-        metadata.git_origin_url = Some("git@example.com:openai/codex.git".to_string());
+        metadata.git_origin_url = Some(
+            SanitizedGitUrl::try_from("git@example.com:openai/codex.git")
+                .expect("valid git remote URL"),
+        );
 
         runtime
             .upsert_thread(&metadata)
@@ -2710,7 +2720,10 @@ mod tests {
         let mut rollout_metadata = metadata.clone();
         rollout_metadata.git_sha = Some("rollout-sha".to_string());
         rollout_metadata.git_branch = Some("rollout-branch".to_string());
-        rollout_metadata.git_origin_url = Some("https://example.com/repo.git".to_string());
+        rollout_metadata.git_origin_url = Some(
+            SanitizedGitUrl::try_from("https://example.com/repo.git")
+                .expect("valid git remote URL"),
+        );
 
         runtime
             .upsert_thread(&rollout_metadata)
@@ -2849,7 +2862,10 @@ mod tests {
                 thread_id,
                 Some(Some("abc123")),
                 Some(Some("feature/branch")),
-                Some(Some("git@example.com:openai/codex.git")),
+                Some(Some(
+                    &SanitizedGitUrl::try_from("git@example.com:openai/codex.git")
+                        .expect("valid git remote URL"),
+                )),
             )
             .await
             .expect("git info update should succeed");
@@ -2940,7 +2956,10 @@ mod tests {
         let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
         metadata.git_sha = Some("abc123".to_string());
         metadata.git_branch = Some("feature/branch".to_string());
-        metadata.git_origin_url = Some("git@example.com:openai/codex.git".to_string());
+        metadata.git_origin_url = Some(
+            SanitizedGitUrl::try_from("git@example.com:openai/codex.git")
+                .expect("valid git remote URL"),
+        );
 
         runtime
             .upsert_thread(&metadata)

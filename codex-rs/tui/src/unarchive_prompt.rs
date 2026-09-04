@@ -41,8 +41,8 @@ pub(crate) async fn run_unarchive_prompt(
         .discard_pending_input_before_interactive_screen()?;
     let events = guard.tui.event_stream();
     tokio::pin!(events);
+    guard.draw(&screen)?;
     loop {
-        guard.draw(&screen)?;
         let Some(event) = events.next().await else {
             return Ok(UnarchiveChoice::Cancel);
         };
@@ -53,8 +53,14 @@ pub(crate) async fn run_unarchive_prompt(
                     return Ok(choice);
                 }
             }
-            TuiEvent::Paste(_) | TuiEvent::Draw | TuiEvent::Resize(_) | TuiEvent::Resume => {}
+            TuiEvent::Paste(_)
+            | TuiEvent::Draw
+            | TuiEvent::Resize(_)
+            | TuiEvent::Resume
+            | TuiEvent::FocusGained => {}
+            TuiEvent::FocusLost => continue,
         }
+        guard.draw(&screen)?;
     }
 }
 

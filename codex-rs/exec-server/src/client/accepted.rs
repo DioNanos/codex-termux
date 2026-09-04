@@ -243,9 +243,13 @@ impl LazyRemoteExecServerClient {
             transport_params: None,
             http_client_factory,
             recovery_policy: super::RecoveryPolicy::Wait,
-            startup: std::sync::Arc::new(OnceCell::new_with(Some(Ok(client)))),
-            current_client: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            startup: std::sync::Arc::new(super::ConnectionAttempt {
+                result: OnceCell::new_with(Some(Ok(client.clone()))),
+                ..Default::default()
+            }),
+            current_client: std::sync::Arc::new(std::sync::Mutex::new(Some(client))),
             reconnect: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             environment_connection_state_tx,
         }
     }

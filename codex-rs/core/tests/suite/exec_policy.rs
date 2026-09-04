@@ -716,6 +716,7 @@ async fn environment_command_restrictions_override_saved_prefix_approvals() -> R
             &selection,
             EnvironmentConfig {
                 allow_login_shell: true,
+                workspace_roots: selection.workspace_roots.clone(),
                 permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
                 shell_environment_policy: Default::default(),
                 windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
@@ -745,6 +746,7 @@ async fn environment_command_restrictions_override_saved_prefix_approvals() -> R
             &selection,
             EnvironmentConfig {
                 allow_login_shell: true,
+                workspace_roots: selection.workspace_roots.clone(),
                 permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
                 shell_environment_policy: Default::default(),
                 windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
@@ -853,6 +855,7 @@ async fn environment_command_policy_changes_invalidate_session_approvals() -> Re
                     &selection,
                     EnvironmentConfig {
                         allow_login_shell: true,
+                        workspace_roots: selection.workspace_roots.clone(),
                         permission_profile: PermissionProfileSnapshot::legacy(
                             PermissionProfile::Disabled,
                         ),

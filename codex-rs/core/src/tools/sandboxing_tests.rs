@@ -451,6 +451,7 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
     let request = attempt
         .env_for_exec_server(command(), options())
         .expect("prepare remote exec request");
+    assert!(!attempt.is_escalated());
 
     assert_eq!(
         request.command,
@@ -468,6 +469,8 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
             permissions: exec_server_permissions.clone().into(),
             cwd: Some(cwd_uri.clone()),
             workspace_roots: vec![cwd_uri.clone()],
+            user_home_dir: None,
+            temporary_directories: None,
             windows_sandbox_level: if cfg!(windows) {
                 codex_protocol::config_types::WindowsSandboxLevel::RestrictedToken
             } else {
@@ -488,10 +491,17 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
     let request = attempt
         .env_for_exec_server(command(), options())
         .expect("prepare unsandboxed remote exec request");
+    assert!(attempt.is_escalated());
 
     assert_eq!(request.exec_server_sandbox, None);
     assert!(!request.exec_server_enforce_managed_network);
     assert_eq!(request.exec_server_managed_network, Some(managed_network));
+
+    let full_access = codex_protocol::models::PermissionProfile::Disabled;
+    attempt.permissions = &full_access;
+    attempt.exec_server_permissions = &full_access;
+    attempt.enforce_managed_network = false;
+    assert!(!attempt.is_escalated(), "full access is not an escalation");
 }
 
 // --- Audit gate R1 (#22): the REAL default configuration, not a fixture ---

@@ -16,6 +16,7 @@
 //!
 //! If the keyring is not available or fails, we fall back to CODEX_HOME/.credentials.json which is consistent with other coding CLI agents.
 
+mod ema_identity;
 mod issuer_binding;
 mod refresh_lock;
 mod refresh_transaction;
@@ -71,8 +72,10 @@ use tokio::sync::Mutex;
 
 use codex_utils_home_dir::find_codex_home;
 
+pub(crate) use self::ema_identity::stored_oidc_identity;
 pub(crate) use self::issuer_binding::validate_authorization_server_endpoints;
 pub(crate) use self::issuer_binding::validate_refresh_token_issuer;
+pub(crate) use self::refresh_lock::RefreshCredentialLock;
 pub(crate) use self::refresh_transaction::install_tokens_in_manager;
 pub(crate) use self::resolved_store::ResolvedOAuthCredentialStore;
 pub(crate) use self::resolved_store::ResolvedOAuthTokens;
@@ -136,6 +139,18 @@ impl PartialEq for StoredOAuthCredentialSnapshot {
 }
 
 impl StoredOAuthCredentialSnapshot {
+    pub(crate) fn new(
+        mut credentials: StoredOAuthTokens,
+        store: ResolvedOAuthCredentialStore,
+    ) -> Self {
+        credentials.token_response.0.set_expires_in(None);
+        Self {
+            credentials,
+            store,
+            store_was_contended: false,
+        }
+    }
+
     /// Returns the normalized credentials originally read from the selected store.
     pub fn credentials(&self) -> &StoredOAuthTokens {
         &self.credentials
@@ -219,7 +234,7 @@ pub struct WrappedOAuthTokenResponse(pub OAuthTokenResponse);
 
 impl PartialEq for WrappedOAuthTokenResponse {
     fn eq(&self, other: &Self) -> bool {
-        match (serde_json::to_string(self), serde_json::to_string(other)) {
+        match (serde_json::to_value(self), serde_json::to_value(other)) {
             (Ok(s1), Ok(s2)) => s1 == s2,
             _ => false,
         }
@@ -283,13 +298,10 @@ pub fn stored_oauth_credential_snapshot(
     else {
         return Ok(None);
     };
-    let mut credentials = resolved.tokens;
-    credentials.token_response.0.set_expires_in(None);
-    Ok(Some(StoredOAuthCredentialSnapshot {
-        credentials,
-        store: resolved.store,
-        store_was_contended: false,
-    }))
+    Ok(Some(StoredOAuthCredentialSnapshot::new(
+        resolved.tokens,
+        resolved.store,
+    )))
 }
 
 fn oauth_store_is_contended(error: &Error) -> bool {
@@ -819,6 +831,9 @@ fn load_oauth_tokens_from_file_with_lock_held(
             false
         } else {
             entry.server_url == url
+                // Escaped names may also match another server's stored, escaped name.
+                // Only accept a legacy unescaped entry under this identity's own key.
+                && (!server_name.starts_with("local:") || stored_key == &key)
                 && (entry.server_name == local_server_name
                     || (stored_key == &key && entry.server_name == server_name))
         };
@@ -965,6 +980,7 @@ fn token_needs_refresh(expires_at: Option<u64>) -> bool {
 
 fn compute_store_key(server_name: &str, server_url: &str) -> Result<String> {
     let executor_owned = server_name.starts_with("executor:");
+    let enterprise_owned = server_name.starts_with("ema-idp:");
     let server_name = server_name.strip_prefix("local:").unwrap_or(server_name);
     let mut payload = JsonMap::new();
     payload.insert(
@@ -973,8 +989,21 @@ fn compute_store_key(server_name: &str, server_url: &str) -> Result<String> {
     );
     payload.insert("url".to_string(), Value::String(server_url.to_string()));
     payload.insert("headers".to_string(), Value::Object(JsonMap::new()));
-
-    let truncated = sha_256_prefix(&Value::Object(payload))?;
+    let payload = if enterprise_owned {
+        // The OS keyring is shared across homes. Keep enterprise sessions
+        // isolated by Codex profile as well as authenticated user and workspace.
+        let codex_home = find_codex_home()?;
+        fs::create_dir_all(&codex_home)?;
+        payload.insert(
+            "codex_home".to_string(),
+            serde_json::to_value(codex_home.as_path().canonicalize()?)?,
+        );
+        // Different binaries can enable different serde_json ordering features.
+        serde_json::to_value(payload.into_iter().collect::<BTreeMap<_, _>>())?
+    } else {
+        Value::Object(payload)
+    };
+    let truncated = sha_256_prefix(&payload)?;
     let separator = if executor_owned { ':' } else { '|' };
     Ok(format!("{server_name}{separator}{truncated}"))
 }

@@ -1,11 +1,13 @@
 use crate::agent::AgentStatus;
 use crate::config::ConstraintResult;
 use crate::context::ContextualUserFragment;
+use crate::context::GuardianReviewEvidence;
 use crate::elicitation::ElicitationRegistration;
 use crate::session::SessionIo;
 use crate::session::SessionSettingsUpdate;
 use crate::session::new_submission_id;
 use crate::session::session::Session;
+use crate::session::step_settings::StepSettingsUpdate;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
 use codex_exec_server::SelectedCapabilityRootsStatus;
@@ -54,6 +56,7 @@ use codex_protocol::turn_input::SuspendTurnOutcome;
 use codex_protocol::turn_input::TurnInputMode;
 use codex_protocol::turn_input::TurnInputRequest;
 use codex_protocol::turn_input::TurnInputSubmission;
+use codex_protocol::turn_input::TurnStartOptions;
 use codex_thread_store::PersistContext;
 use codex_thread_store::StoredThread;
 use codex_thread_store::StoredThreadHistory;
@@ -83,6 +86,8 @@ pub struct ThreadConfigSnapshot {
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
     pub permission_profile: PermissionProfile,
+    /// Resolved Full Access across the thread and every selected environment.
+    pub full_access: bool,
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub environments: TurnEnvironmentSelections,
     pub workspace_roots: Vec<AbsolutePathBuf>,
@@ -148,46 +153,23 @@ pub struct CodexThreadSettingsOverrides {
     pub personality: Option<Personality>,
 }
 
-/// One root conversation message exposed only to a worker's Guardian reviewers.
-#[derive(Debug, Eq, PartialEq)]
-pub enum GuardianRootMessage {
-    /// Genuine root-user input that can establish or revoke authorization.
-    User(String),
-    /// Root assistant final output that provides untrusted conversational context.
-    Assistant(String),
-}
+pub use codex_guardian_context::GuardianRootMessage;
 
-impl GuardianRootMessage {
-    /// Renders every line with its original role so message content cannot impersonate another role.
-    pub fn render(self) -> String {
-        let (role, text) = match self {
-            Self::User(text) => ("user", text),
-            Self::Assistant(text) => ("assistant", text),
-        };
-        text.lines()
-            .map(|line| format!("{role}: {line}\n"))
-            .collect()
-    }
-}
-
-/// Authorization state that changes on history rewrites or genuine user messages.
+/// Authorization state that changes on genuine user input or history resets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuardianAuthorizationVersion {
-    /// Conversation-history rewrite generation.
-    pub history_version: u64,
-    /// Number of genuine user messages in the conversation snapshot.
-    pub user_message_count: usize,
+    /// User-message/reset revision, preserved across compaction and internal context.
+    pub user_message_revision: u64,
+    /// Number of successful, host-produced answers to genuine user-input requests.
+    pub user_input_response_count: usize,
 }
 
 impl GuardianAuthorizationVersion {
     /// Captures history replacement and genuine user input from the same snapshot.
     pub fn from_history(history: &dyn ConversationHistorySnapshot) -> Self {
         Self {
-            history_version: history.history_version(),
-            user_message_count: history
-                .items()
-                .filter(|item| item.is_user_message())
-                .count(),
+            user_message_revision: history.user_message_revision(),
+            user_input_response_count: 0,
         }
     }
 }
@@ -197,6 +179,7 @@ impl GuardianAuthorizationVersion {
 pub struct GuardianRootSnapshot {
     pub authorization_version: GuardianAuthorizationVersion,
     pub messages: Vec<GuardianRootMessage>,
+    pub trusted_skill_paths: Vec<String>,
 }
 
 pub struct CodexThread {
@@ -333,8 +316,8 @@ impl CodexThread {
     /// Submits turn input without requiring the caller to inspect thread state.
     ///
     /// The result describes whether Core started a turn, steered an active
-    /// turn, or declined it without recording or enqueueing the input. Only
-    /// user input is accepted.
+    /// turn, or declined it without recording or enqueueing the input.
+    /// User input and named standalone function-call outputs are accepted.
     pub async fn start_or_steer_turn(
         &self,
         request: TurnInputRequest,
@@ -384,10 +367,22 @@ impl CodexThread {
             turn_id,
             thread_settings,
             trace,
+            cyber_access_program,
         } = request;
+        let root_turn_id = self
+            .session
+            .reference_context_item()
+            .await
+            .filter(|context| context.turn_id.as_deref() == Some(turn_id.as_str()))
+            .and_then(|context| context.root_turn_id);
+        let start_options = TurnStartOptions {
+            cyber_access_program,
+            root_turn_id,
+            ..Default::default()
+        };
         match self
             .io
-            .submit_recover_turn(thread_settings, trace, turn_id)
+            .submit_recover_turn(thread_settings, start_options, trace, turn_id)
             .await?
         {
             TurnInputSubmission::Started { turn_id } => {
@@ -495,6 +490,16 @@ impl CodexThread {
         self.session.inject_if_running(items).await
     }
 
+    /// Returns the trusted root when the expected turn is currently active.
+    pub async fn active_turn_root(&self, expected_turn_id: &str) -> Option<String> {
+        let active = self.session.active_turn.lock().await;
+        let task = active.as_ref()?.task.as_ref()?;
+        if task.turn_context.sub_id != expected_turn_id {
+            return None;
+        }
+        task.turn_context.turn_metadata_state.root_turn_id()
+    }
+
     pub async fn set_app_server_client_info(
         &self,
         app_server_client_name: Option<String>,
@@ -515,7 +520,7 @@ impl CodexThread {
         &self,
         overrides: CodexThreadSettingsOverrides,
     ) -> ConstraintResult<ThreadConfigSnapshot> {
-        let updates = self.thread_settings_update(overrides).await;
+        let updates = Self::thread_settings_update(overrides);
         self.session.preview_settings(&updates).await
     }
 
@@ -527,14 +532,11 @@ impl CodexThread {
         &self,
         settings: CodexThreadSettingsOverrides,
     ) -> ConstraintResult<()> {
-        let updates = self.thread_settings_update(settings).await;
-        self.session.update_settings(updates).await
+        let updates = Self::thread_settings_update(settings);
+        self.session.update_settings(updates).await.map(|_| ())
     }
 
-    async fn thread_settings_update(
-        &self,
-        overrides: CodexThreadSettingsOverrides,
-    ) -> SessionSettingsUpdate {
+    fn thread_settings_update(overrides: CodexThreadSettingsOverrides) -> SessionSettingsUpdate {
         let CodexThreadSettingsOverrides {
             environments,
             profile_workspace_roots,
@@ -551,28 +553,23 @@ impl CodexThread {
             collaboration_mode,
             personality,
         } = overrides;
-        let collaboration_mode = if let Some(collaboration_mode) = collaboration_mode {
-            collaboration_mode
-        } else {
-            self.session
-                .collaboration_mode()
-                .await
-                .with_updates(model, effort, /*developer_instructions*/ None)
-        };
-
         SessionSettingsUpdate {
+            step_settings: StepSettingsUpdate {
+                model,
+                effort,
+                collaboration_mode,
+                reasoning_summary: summary,
+                service_tier,
+                personality,
+                approval_policy,
+                approvals_reviewer,
+            },
             environments,
             profile_workspace_roots,
-            approval_policy,
-            approvals_reviewer,
             sandbox_policy,
             permission_profile,
             active_permission_profile,
             windows_sandbox_level,
-            collaboration_mode: Some(collaboration_mode),
-            reasoning_summary: summary,
-            service_tier,
-            personality,
             ..Default::default()
         }
     }
@@ -736,6 +733,20 @@ impl CodexThread {
         self.session.thread_config_snapshot().await
     }
 
+    /// Returns the active turn's reviewer, including live updates, or the thread default.
+    pub async fn approvals_reviewer_for_turn(&self, turn_id: &str) -> ApprovalsReviewer {
+        if let Some((turn, settings, _)) = self
+            .session
+            .active_turn_context_and_strict_auto_review()
+            .await
+            && turn.sub_id == turn_id
+        {
+            settings.approvals_reviewer()
+        } else {
+            self.config_snapshot().await.approvals_reviewer
+        }
+    }
+
     /// Returns thread-owned settings suitable for rollout persistence and resume.
     pub async fn thread_settings_snapshot(&self) -> ThreadSettingsSnapshot {
         self.session.thread_settings_snapshot().await
@@ -800,6 +811,17 @@ impl CodexThread {
 
     pub fn multi_agent_version(&self) -> Option<MultiAgentVersion> {
         self.session.multi_agent_version()
+    }
+
+    /// Returns the current user-authorization revision for Guardian.
+    pub async fn guardian_authorization_version(&self) -> GuardianAuthorizationVersion {
+        let history = self.session.conversation_history_snapshot().await;
+        self.thread_extension_data()
+            .get::<GuardianReviewEvidence>()
+            .map_or_else(
+                || GuardianAuthorizationVersion::from_history(history.as_ref()),
+                |evidence| evidence.authorization_version(history.as_ref()),
+            )
     }
 
     /// Returns bounded root conversation evidence and its authorization version atomically.

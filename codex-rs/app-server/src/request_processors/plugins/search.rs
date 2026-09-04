@@ -42,7 +42,9 @@ impl PluginRequestProcessor {
             return Ok(empty_response());
         }
 
-        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        let config = self
+            .load_catalog_config(cwds.as_deref().unwrap_or_default())
+            .await?;
         if !config.features.enabled(Feature::Plugins) {
             return Ok(empty_response());
         }

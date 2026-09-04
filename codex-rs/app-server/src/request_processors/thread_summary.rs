@@ -131,7 +131,7 @@ fn map_git_info(git_info: &CoreGitInfo) -> ConversationGitInfo {
     ConversationGitInfo {
         sha: git_info.commit_hash.as_ref().map(|sha| sha.0.clone()),
         branch: git_info.branch.clone(),
-        origin_url: git_info.repository_url.clone(),
+        origin_url: git_info.repository_url.clone().map(String::from),
     }
 }
 
@@ -272,6 +272,8 @@ pub(crate) fn summary_to_thread(
         history_mode: ThreadHistoryMode::Legacy,
         model_provider,
         created_at: created_at.map(|dt| dt.timestamp()).unwrap_or(0),
+        model: None,
+        reasoning_effort: None,
         updated_at: updated_at.map(|dt| dt.timestamp()).unwrap_or(0),
         recency_at: updated_at.map(|dt| dt.timestamp()),
         status: ThreadStatus::NotLoaded,

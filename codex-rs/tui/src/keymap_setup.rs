@@ -564,7 +564,8 @@ pub(crate) fn active_binding_specs(
     context: &str,
     action: &str,
 ) -> Result<Vec<String>, String> {
-    if let Some(action_id) = keymap_action_id(context, action)
+    let action_id = keymap_action_id(context, action);
+    if let Some(action_id) = action_id
         && let Some(specs) = runtime_keymap.chords.configured_specs(action_id)
     {
         return Ok(specs.to_vec());
@@ -573,6 +574,16 @@ pub(crate) fn active_binding_specs(
     let bindings = bindings_for_action(runtime_keymap, context, action).ok_or_else(|| {
         format!("Unknown keymap action `{context}.{action}`. Reopen /keymap and choose an action.")
     })?;
+    if let Some(action_id) = action_id
+        && let Some(crate::key_hint::ShortcutHint::Chord { prefix, completion }) =
+            runtime_keymap.chords.primary_hint(action_id, bindings)
+    {
+        return Ok(vec![format!(
+            "{} {}",
+            binding_to_config_key_spec(prefix)?,
+            binding_to_config_key_spec(completion)?
+        )]);
+    }
     bindings
         .iter()
         .map(|binding| binding_to_config_key_spec(*binding))
@@ -1037,6 +1048,15 @@ mod tests {
     #[test]
     fn picker_unbound_tab_lists_default_unbound_actions() {
         let runtime = RuntimeKeymap::defaults();
+        for (context, action) in [
+            ("vim_normal", "jump_top"),
+            ("vim_operator", "motion_jump_top"),
+        ] {
+            assert_eq!(
+                active_binding_specs(&runtime, context, action).expect("native Vim chord"),
+                ["g g"]
+            );
+        }
         let params = build_keymap_picker_params(&runtime, &TuiKeymap::default());
         let unbound_tab = selection_tab(&params, KEYMAP_UNBOUND_TAB_ID);
 
@@ -1051,6 +1071,7 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             vec![
+                ("Open Agents", Some("unbound"), false),
                 ("Toggle Vim Mode", Some("unbound"), false),
                 ("Previous Permission Mode", Some("unbound"), false),
                 ("Next Permission Mode", Some("unbound"), false),
@@ -1100,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn picker_repeat_last_change_render_snapshot() {
+    fn picker_repeat_and_redo_render_snapshots() {
         let runtime = RuntimeKeymap::defaults();
         let params = build_keymap_picker_params_for_selected_action(
             &runtime,
@@ -1115,6 +1136,20 @@ mod tests {
             .expect("repeat-last-change row should render");
 
         assert_snapshot!("keymap_picker_repeat_last_change", repeat_row);
+
+        let params = build_keymap_picker_params_for_selected_action(
+            &runtime,
+            &TuiKeymap::default(),
+            "vim_normal",
+            "redo",
+        );
+        let rendered = render_picker(params, /*width*/ 120);
+        let redo_row = rendered
+            .lines()
+            .find(|line| line.contains("Redo"))
+            .expect("redo row should render");
+
+        assert_snapshot!("keymap_picker_redo", redo_row);
     }
 
     #[test]

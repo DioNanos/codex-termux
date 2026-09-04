@@ -1,4 +1,4 @@
-//! Dashboard for inspecting and managing the daemon's active tasks.
+//! Dashboard for inspecting and managing the TUI's retained daemon tasks.
 
 use super::agents_overview::AGENTS_OVERVIEW_VIEW_ID;
 use crate::app_event::AppEvent;
@@ -85,10 +85,10 @@ pub(super) struct AgentsOverviewRow {
 #[derive(Clone, Default)]
 pub(super) struct AgentsOverviewViewState {
     pub(super) input: String,
+    pub(super) connection_notice: Option<&'static str>,
     search: String,
     searching: bool,
     pub(super) status_grouping: bool,
-    pub(super) refresh_task: Option<tokio::task::AbortHandle>,
     pub(super) renaming: bool,
 }
 
@@ -101,20 +101,6 @@ pub(super) struct AgentsOverviewView {
     app_event_tx: AppEventSender,
     keymap: ListKeymap,
     agents_keymap: AgentsKeymap,
-}
-
-impl Drop for AgentsOverviewView {
-    fn drop(&mut self) {
-        if let Some(task) = self
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .refresh_task
-            .take()
-        {
-            task.abort();
-        }
-    }
 }
 
 impl AgentsOverviewView {
@@ -461,12 +447,12 @@ impl BottomPaneView for AgentsOverviewView {
             return;
         }
 
-        if self.agents_keymap.toggle_grouping.is_pressed(key) {
-            let mut state = self.state();
-            state.status_grouping = !state.status_grouping;
-            return;
-        }
-        if self.agents_keymap.search.is_pressed(key) {
+        if self.agents_keymap.search.is_pressed(key) || {
+            let state = self.state();
+            state.connection_notice.is_some()
+                && state.searching
+                && self.keymap.action_for(key) == Some(ListAction::Cancel)
+        } {
             let mut state = self.state();
             if !state.renaming {
                 state.searching = !state.searching;
@@ -474,6 +460,21 @@ impl BottomPaneView for AgentsOverviewView {
                     state.search.clear();
                 }
             }
+            return;
+        }
+
+        if self.state().connection_notice.is_some() {
+            match self.keymap.action_for(key) {
+                Some(ListAction::MoveUp) => self.move_selection(/*forward*/ false),
+                Some(ListAction::MoveDown) => self.move_selection(/*forward*/ true),
+                _ => {}
+            }
+            return;
+        }
+
+        if self.agents_keymap.toggle_grouping.is_pressed(key) {
+            let mut state = self.state();
+            state.status_grouping = !state.status_grouping;
             return;
         }
         if self.agents_keymap.new_task.is_pressed(key) {
@@ -603,8 +604,12 @@ impl Renderable for AgentsOverviewView {
             }
         });
         let attention = format!("{needs_you} need input");
-        Line::from(format!("{attention}   {working} working   {ready} ready").dim())
-            .render(inset(summary), buf);
+        if let Some(notice) = self.state().connection_notice {
+            Line::from(notice.cyan()).render(inset(summary), buf);
+        } else {
+            Line::from(format!("{attention}   {working} working   {ready} ready").dim())
+                .render(inset(summary), buf);
+        }
         Line::from("─".repeat(usize::from(area.width.saturating_sub(4))).dim())
             .render(inset(divider), buf);
         let body = inset(body);
@@ -654,6 +659,11 @@ impl Renderable for AgentsOverviewView {
         let input = &input[visible_start..];
         Line::from(vec![label.cyan().bold(), input.into(), placeholder.dim()])
             .render(inset(prompt), buf);
+        if state.connection_notice.is_some() {
+            Line::from("ctrl+c quit · actions paused until the list is refreshed".dim())
+                .render(inset(footer), buf);
+            return;
+        }
         let list_hint = |action| {
             self.keymap.primary_hint(action).filter(|hint| {
                 !matches!(hint, ShortcutHint::Single(binding)

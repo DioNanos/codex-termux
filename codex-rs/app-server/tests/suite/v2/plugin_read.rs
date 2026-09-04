@@ -1425,6 +1425,14 @@ async fn plugin_read_agent_plugin_excludes_nested_skills() -> Result<()> {
 #[tokio::test]
 async fn plugin_read_returns_plugin_details_with_bundle_contents() -> Result<()> {
     let codex_home = TempDir::new()?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
     let repo_root = TempDir::new()?;
     let plugin_root = repo_root.path().join("plugins/demo-plugin");
     std::fs::create_dir_all(repo_root.path().join(".git"))?;

@@ -144,6 +144,14 @@ impl ConfigManager {
         .await
     }
 
+    /// Loads system, user, and runtime settings without discovering a project
+    /// from the app-server process's working directory.
+    pub(crate) async fn load_non_project_config(&self) -> std::io::Result<Config> {
+        let mut manager = self.clone();
+        manager.loader_overrides.ignore_project_config = true;
+        manager.load_latest_config(/*fallback_cwd*/ None).await
+    }
+
     pub(crate) async fn load_latest_config_for_thread(
         &self,
         thread_config: &Config,

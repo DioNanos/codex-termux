@@ -62,6 +62,8 @@ def load_manifest(manifest_path: Path) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError(f"{manifest_path} must contain a JSON object.")
     return payload
+
+
 def sanitize_cachebuster(value: str) -> str:
     sanitized = re.sub(r"[^a-z0-9-]+", "-", value.strip().lower())
     sanitized = re.sub(r"-{2,}", "-", sanitized).strip("-")

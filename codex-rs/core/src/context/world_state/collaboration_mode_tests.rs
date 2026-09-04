@@ -43,6 +43,8 @@ fn instruction_updates_are_applied_once_in_retained_history() {
         world_state.add_section(CollaborationModeState::from_collaboration_mode(
             &collaboration_mode(ModeKind::Default, instructions),
             /*catalog_messages*/ None,
+            /*update_plan_enabled*/ true,
+            /*custom_model_catalog*/ false,
         ));
         let expected: ResponseItem = ContextualUserFragment::into(CollaborationModeInstructions {
             instructions: instructions.unwrap_or_default().to_string(),
@@ -84,6 +86,8 @@ fn catalog_collaboration_messages_select_mode_variant() {
         let state = CollaborationModeState::from_collaboration_mode(
             &collaboration_mode(mode, Some("legacy instructions")),
             Some(&messages),
+            /*update_plan_enabled*/ true,
+            /*custom_model_catalog*/ false,
         );
 
         assert_eq!(state.instructions.as_deref(), Some(expected));
@@ -99,6 +103,8 @@ fn empty_catalog_collaboration_message_suppresses_legacy_instructions() {
     let state = CollaborationModeState::from_collaboration_mode(
         &collaboration_mode(ModeKind::Plan, Some("legacy plan instructions")),
         Some(&messages),
+        /*update_plan_enabled*/ true,
+        /*custom_model_catalog*/ false,
     );
 
     assert_eq!(
@@ -119,6 +125,8 @@ fn missing_catalog_collaboration_message_uses_legacy_instructions() {
     let state = CollaborationModeState::from_collaboration_mode(
         &collaboration_mode(ModeKind::Plan, Some("legacy plan instructions")),
         Some(&messages),
+        /*update_plan_enabled*/ true,
+        /*custom_model_catalog*/ false,
     );
 
     assert_eq!(
@@ -141,6 +149,8 @@ fn legacy_collaboration_mode_snapshots_refresh_catalog_messages_once() {
             let state = CollaborationModeState::from_collaboration_mode(
                 &collaboration_mode(ModeKind::Default, Some("stale legacy instructions")),
                 Some(&messages),
+                /*update_plan_enabled*/ true,
+                /*custom_model_catalog*/ false,
             );
 
             assert_eq!(
@@ -176,5 +186,7 @@ fn collaboration_mode_state(mode: ModeKind, instructions: &str) -> Collaboration
     CollaborationModeState::from_collaboration_mode(
         &collaboration_mode(mode, Some(instructions)),
         /*catalog_messages*/ None,
+        /*update_plan_enabled*/ true,
+        /*custom_model_catalog*/ false,
     )
 }

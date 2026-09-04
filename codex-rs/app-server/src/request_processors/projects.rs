@@ -19,14 +19,18 @@ use codex_app_server_protocol::ProjectMoveResponse;
 use codex_app_server_protocol::ProjectReadParams;
 use codex_app_server_protocol::ProjectReadResponse;
 use codex_app_server_protocol::ProjectRoot;
+use codex_app_server_protocol::ProjectSortKey;
 use codex_app_server_protocol::ProjectUpdateParams;
 use codex_app_server_protocol::ProjectUpdateResponse;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadProjectUpdatedNotification;
 use codex_thread_store::CreateProjectParams as StoreCreateProjectParams;
 use codex_thread_store::ListProjectsParams as StoreListProjectsParams;
 use codex_thread_store::MoveProjectParams as StoreMoveProjectParams;
 use codex_thread_store::ProjectMoveOutcome;
+use codex_thread_store::ProjectSortKey as StoreProjectSortKey;
+use codex_thread_store::SortDirection as StoreSortDirection;
 use codex_thread_store::StoredProject;
 use codex_thread_store::StoredProjectRoot;
 use codex_thread_store::ThreadStore;
@@ -66,10 +70,27 @@ impl ProjectRequestProcessor {
         &self,
         params: ProjectListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        if params.sort_key.is_none() && params.sort_direction.is_some() {
+            return Err(invalid_params("sortDirection requires sortKey"));
+        }
+        let sort_key = match params.sort_key.unwrap_or(ProjectSortKey::Position) {
+            ProjectSortKey::Position => StoreProjectSortKey::Position,
+            ProjectSortKey::RecencyAt => StoreProjectSortKey::RecencyAt,
+        };
+        let sort_direction = match params.sort_direction {
+            Some(SortDirection::Asc) => StoreSortDirection::Asc,
+            Some(SortDirection::Desc) => StoreSortDirection::Desc,
+            None => match sort_key {
+                StoreProjectSortKey::Position => StoreSortDirection::Asc,
+                StoreProjectSortKey::RecencyAt => StoreSortDirection::Desc,
+            },
+        };
         let page = self
             .thread_store
             .list_projects(StoreListProjectsParams {
                 cursor: params.cursor,
+                sort_key,
+                sort_direction,
                 limit: params
                     .limit
                     .map(|limit| limit as usize)
@@ -359,6 +380,9 @@ fn api_project(project: StoredProject) -> Result<Project, JSONRPCErrorError> {
         position: project.position,
         created_at: project.created_at_ms / 1000,
         updated_at: project.updated_at_ms / 1000,
+        recency_at: project
+            .recency_at_ms
+            .map(|timestamp| timestamp.div_euclid(/*rhs*/ 1000)),
     })
 }
 

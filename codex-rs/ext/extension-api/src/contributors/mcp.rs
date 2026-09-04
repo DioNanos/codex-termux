@@ -116,6 +116,8 @@ impl<'a, C> McpServerContributionContext<'a, C> {
 #[derive(Clone, Debug, Default)]
 pub struct SelectedPluginSnapshot {
     pub plugins: Vec<SelectedPluginIdentity>,
+    /// Selected plugin roots suppressed by the effective plugin feature policy.
+    pub disabled_plugin_roots: Vec<String>,
 }
 
 /// The configured identity of a plugin resolved from one selected root.

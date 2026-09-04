@@ -22,9 +22,16 @@ const MACOS_SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_base_policy.sbpl
 const MACOS_SEATBELT_NETWORK_POLICY: &str = include_str!("seatbelt_network_policy.sbpl");
 const MACOS_SEATBELT_PREFERENCES_POLICY: &str = include_str!("seatbelt_preferences_policy.sbpl");
 const MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS: &str =
-    include_str!("restricted_read_only_platform_defaults.sbpl");
-const MACOS_PROCESS_APPLICATIONS_READ_POLICY: &str =
-    r#"(allow file-read* (subpath "/Applications"))"#;
+    include_str!("seatbelt_read_only_platform_defaults.sbpl");
+// Ordinary processes need system scratch directories for compatibility, but filesystem helpers
+// must not inherit scratch access beyond the paths their permission profile explicitly grants.
+const MACOS_PROCESS_PLATFORM_DEFAULTS: &str = r#"
+(allow file-read* (subpath "/Applications"))
+(allow file-read* file-test-existence file-write* (subpath "/tmp"))
+(allow file-read* file-write* (subpath "/private/tmp"))
+(allow file-read* file-write* (subpath "/var/tmp"))
+(allow file-read* file-write* (subpath "/private/var/tmp"))
+"#;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum MacosSeatbeltProfile {
@@ -994,7 +1001,7 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
     if include_platform_defaults {
         policy_sections.push(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS.to_string());
         if profile == MacosSeatbeltProfile::Process {
-            policy_sections.push(MACOS_PROCESS_APPLICATIONS_READ_POLICY.to_string());
+            policy_sections.push(MACOS_PROCESS_PLATFORM_DEFAULTS.to_string());
         }
     }
     policy_sections.push(deny_read_policy);

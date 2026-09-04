@@ -47,6 +47,7 @@ use tracing::instrument;
 use url::Url;
 
 mod catalog_cache;
+mod plugin_capabilities;
 mod remote_installed_plugin_sync;
 mod search;
 mod share;
@@ -55,9 +56,11 @@ mod share;
 #[path = "remote_tests.rs"]
 mod tests;
 
+pub use plugin_capabilities::RemotePluginCapabilities;
 pub use remote_installed_plugin_sync::RemoteInstalledPluginBundleSyncError;
 pub use remote_installed_plugin_sync::RemoteInstalledPluginBundleSyncOutcome;
 pub use remote_installed_plugin_sync::RemotePluginCacheMutationGuard;
+pub use remote_installed_plugin_sync::RemotePluginChange;
 pub use remote_installed_plugin_sync::RemotePluginMaterialization;
 pub use remote_installed_plugin_sync::mark_remote_plugin_cache_mutation_in_flight;
 pub(crate) use remote_installed_plugin_sync::remote_installed_plugin_bundle_sync_gate;
@@ -201,6 +204,8 @@ pub enum RemoteMarketplaceSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemotePluginCatalogCacheMode {
     PreferCache,
+    /// Reuse fresh entries and synchronously refresh missing or stale entries.
+    PreferFreshCache,
     ForceRefetch,
 }
 
@@ -208,6 +213,15 @@ pub enum RemotePluginCatalogCacheMode {
 pub struct RemoteMarketplacesFetchOutcome {
     pub marketplaces: Vec<RemoteMarketplace>,
     pub catalog_cache_refresh_scopes: BTreeSet<RemotePluginScope>,
+    /// Whether any requested directory was served from disk cache, even if it was empty.
+    pub catalog_cache_used: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteMarketplaceFetchOutcome {
+    pub marketplace: Option<RemoteMarketplace>,
+    /// Whether the requested directory was served from disk cache, even if it was empty.
+    pub catalog_cache_used: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -788,6 +802,7 @@ pub async fn fetch_remote_marketplaces(
     let auth = ensure_chatgpt_auth(auth)?;
     let mut marketplaces = Vec::new();
     let mut catalog_cache_refresh_scopes = BTreeSet::new();
+    let mut catalog_cache_used = false;
     let needs_workspace_installed = sources.iter().any(|source| {
         matches!(
             source,
@@ -810,6 +825,7 @@ pub async fn fetch_remote_marketplaces(
                         config,
                         auth,
                         scope,
+                        /*collection*/ None,
                         catalog_cache_mode,
                     ),
                     fetch_installed_plugins_for_scope(config, auth, scope),
@@ -817,6 +833,7 @@ pub async fn fetch_remote_marketplaces(
                 if directory_plugins.cache_refresh_needed {
                     catalog_cache_refresh_scopes.insert(scope);
                 }
+                catalog_cache_used |= directory_plugins.catalog_cache_used;
                 if let Some(marketplace) = build_remote_marketplace(
                     scope.marketplace_name(),
                     scope.marketplace_display_name(),
@@ -835,6 +852,7 @@ pub async fn fetch_remote_marketplaces(
                         config,
                         auth,
                         scope,
+                        /*collection*/ None,
                         catalog_cache_mode,
                     ),
                     fetch_installed_plugins_for_scope(config, auth, scope),
@@ -842,6 +860,7 @@ pub async fn fetch_remote_marketplaces(
                 if directory_plugins.cache_refresh_needed {
                     catalog_cache_refresh_scopes.insert(scope);
                 }
+                catalog_cache_used |= directory_plugins.catalog_cache_used;
                 if let Some(marketplace) = build_remote_marketplace(
                     scope.marketplace_name(),
                     scope.marketplace_display_name(),
@@ -859,12 +878,14 @@ pub async fn fetch_remote_marketplaces(
                     config,
                     auth,
                     scope,
+                    /*collection*/ None,
                     catalog_cache_mode,
                 )
                 .await?;
                 if directory_plugins.cache_refresh_needed {
                     catalog_cache_refresh_scopes.insert(scope);
                 }
+                catalog_cache_used |= directory_plugins.catalog_cache_used;
                 if let Some(marketplace) = build_remote_marketplace(
                     scope.marketplace_name(),
                     scope.marketplace_display_name(),
@@ -939,6 +960,7 @@ pub async fn fetch_remote_marketplaces(
     Ok(RemoteMarketplacesFetchOutcome {
         marketplaces,
         catalog_cache_refresh_scopes,
+        catalog_cache_used,
     })
 }
 
@@ -950,7 +972,9 @@ pub(crate) async fn fetch_and_cache_remote_plugin_catalog(
 ) -> Result<(), RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
     let plugins = fetch_directory_plugins_for_scope(config, auth, scope).await?;
-    catalog_cache::write_cached_directory_plugins(codex_home, config, auth, scope, &plugins);
+    catalog_cache::write_cached_directory_plugins(
+        codex_home, config, auth, scope, /*collection*/ None, &plugins,
+    );
     Ok(())
 }
 
@@ -972,7 +996,18 @@ pub fn invalidate_cached_remote_plugin_catalog_scopes(
         return;
     };
     for scope in scopes {
-        catalog_cache::remove_cached_directory_plugins(codex_home, config, auth, *scope);
+        catalog_cache::remove_cached_directory_plugins(
+            codex_home, config, auth, *scope, /*collection*/ None,
+        );
+        if *scope == RemotePluginScope::Global {
+            catalog_cache::remove_cached_directory_plugins(
+                codex_home,
+                config,
+                auth,
+                *scope,
+                Some(OPENAI_CURATED_REMOTE_COLLECTION_KEY),
+            );
+        }
     }
 }
 
@@ -1091,14 +1126,15 @@ pub(crate) fn has_fresh_cached_remote_plugin_catalog(
     let Ok(auth) = ensure_chatgpt_auth(auth) else {
         return false;
     };
-    catalog_cache::load_cached_directory_plugins(codex_home, config, auth, scope).is_some_and(
-        |cached| {
-            matches!(
-                cached.freshness,
-                catalog_cache::RemotePluginCatalogCacheFreshness::Fresh
-            )
-        },
+    catalog_cache::load_cached_directory_plugins(
+        codex_home, config, auth, scope, /*collection*/ None,
     )
+    .is_some_and(|cached| {
+        matches!(
+            cached.freshness,
+            catalog_cache::RemotePluginCatalogCacheFreshness::Fresh
+        )
+    })
 }
 
 pub(crate) fn cached_remote_plugin_catalog_scopes(
@@ -1112,7 +1148,10 @@ pub(crate) fn cached_remote_plugin_catalog_scopes(
     RemotePluginScope::CATALOG_CACHE_SCOPES
         .into_iter()
         .filter(|scope| {
-            catalog_cache::load_cached_directory_plugins(codex_home, config, auth, *scope).is_some()
+            catalog_cache::load_cached_directory_plugins(
+                codex_home, config, auth, *scope, /*collection*/ None,
+            )
+            .is_some()
         })
         .collect()
 }
@@ -1127,6 +1166,7 @@ pub fn cached_global_remote_discoverable_plugins(
         config,
         auth,
         RemotePluginScope::Global,
+        /*collection*/ None,
     )
     .map(|cached| cached.plugins)
     .unwrap_or_default()
@@ -1146,26 +1186,34 @@ pub fn cached_global_remote_discoverable_plugins(
 pub async fn fetch_openai_curated_remote_collection_marketplace(
     config: &RemotePluginServiceConfig,
     auth: Option<&CodexAuth>,
-) -> Result<Option<RemoteMarketplace>, RemotePluginCatalogError> {
+    catalog_cache_root: Option<&Path>,
+    catalog_cache_mode: RemotePluginCatalogCacheMode,
+) -> Result<RemoteMarketplaceFetchOutcome, RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
     let scope = RemotePluginScope::Global;
     let (directory_plugins, installed_plugins) = tokio::try_join!(
-        fetch_directory_plugins_for_scope_with_collection(
+        fetch_directory_plugins_for_scope_with_cache(
+            catalog_cache_root,
             config,
             auth,
             scope,
-            OPENAI_CURATED_REMOTE_COLLECTION_KEY,
+            Some(OPENAI_CURATED_REMOTE_COLLECTION_KEY),
+            catalog_cache_mode,
         ),
         fetch_installed_plugins_for_scope(config, auth, scope),
     )?;
 
-    build_remote_marketplace(
+    let marketplace = build_remote_marketplace(
         REMOTE_GLOBAL_MARKETPLACE_NAME,
         REMOTE_GLOBAL_MARKETPLACE_DISPLAY_NAME,
-        directory_plugins,
+        directory_plugins.plugins,
         installed_plugins,
         /*include_installed_only*/ false,
-    )
+    )?;
+    Ok(RemoteMarketplaceFetchOutcome {
+        marketplace,
+        catalog_cache_used: directory_plugins.catalog_cache_used,
+    })
 }
 
 fn build_remote_marketplace(
@@ -1971,6 +2019,7 @@ fn normalize_remote_default_prompt(prompt: &str) -> Option<String> {
 struct DirectoryPluginsFetchOutcome {
     plugins: Vec<RemotePluginDirectoryItem>,
     cache_refresh_needed: bool,
+    catalog_cache_used: bool,
 }
 
 async fn fetch_directory_plugins_for_scope_with_cache(
@@ -1978,12 +2027,16 @@ async fn fetch_directory_plugins_for_scope_with_cache(
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
     scope: RemotePluginScope,
+    collection: Option<&str>,
     cache_mode: RemotePluginCatalogCacheMode,
 ) -> Result<DirectoryPluginsFetchOutcome, RemotePluginCatalogError> {
-    if cache_mode == RemotePluginCatalogCacheMode::PreferCache
+    if cache_mode != RemotePluginCatalogCacheMode::ForceRefetch
         && let Some(codex_home) = codex_home
-        && let Some(cached) =
-            catalog_cache::load_cached_directory_plugins(codex_home, config, auth, scope)
+        && let Some(cached) = catalog_cache::load_cached_directory_plugins(
+            codex_home, config, auth, scope, collection,
+        )
+        && (cache_mode == RemotePluginCatalogCacheMode::PreferCache
+            || cached.freshness == catalog_cache::RemotePluginCatalogCacheFreshness::Fresh)
     {
         return Ok(DirectoryPluginsFetchOutcome {
             plugins: cached.plugins,
@@ -1991,16 +2044,22 @@ async fn fetch_directory_plugins_for_scope_with_cache(
                 cached.freshness,
                 catalog_cache::RemotePluginCatalogCacheFreshness::Stale
             ),
+            catalog_cache_used: true,
         });
     }
 
-    let plugins = fetch_directory_plugins_for_scope(config, auth, scope).await?;
+    let plugins =
+        fetch_directory_plugins_for_scope_with_optional_collection(config, auth, scope, collection)
+            .await?;
     if let Some(codex_home) = codex_home {
-        catalog_cache::write_cached_directory_plugins(codex_home, config, auth, scope, &plugins);
+        catalog_cache::write_cached_directory_plugins(
+            codex_home, config, auth, scope, collection, &plugins,
+        );
     }
     Ok(DirectoryPluginsFetchOutcome {
         plugins,
         cache_refresh_needed: false,
+        catalog_cache_used: false,
     })
 }
 
@@ -2011,21 +2070,6 @@ async fn fetch_directory_plugins_for_scope(
 ) -> Result<Vec<RemotePluginDirectoryItem>, RemotePluginCatalogError> {
     fetch_directory_plugins_for_scope_with_optional_collection(
         config, auth, scope, /*collection*/ None,
-    )
-    .await
-}
-
-async fn fetch_directory_plugins_for_scope_with_collection(
-    config: &RemotePluginServiceConfig,
-    auth: &CodexAuth,
-    scope: RemotePluginScope,
-    collection: &str,
-) -> Result<Vec<RemotePluginDirectoryItem>, RemotePluginCatalogError> {
-    fetch_directory_plugins_for_scope_with_optional_collection(
-        config,
-        auth,
-        scope,
-        Some(collection),
     )
     .await
 }

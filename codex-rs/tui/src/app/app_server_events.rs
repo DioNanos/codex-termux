@@ -7,6 +7,7 @@ use super::app_server_event_targets::server_notification_thread_target;
 use super::app_server_event_targets::server_request_thread_id;
 use crate::app_command::AppCommand;
 use crate::app_event::AppEvent;
+use crate::app_event::RateLimitRefreshOrigin;
 use crate::app_info::app_info_from_api;
 use crate::app_server_session::AppServerSession;
 use crate::app_server_session::status_account_display_from_auth_mode;
@@ -77,6 +78,9 @@ impl App {
                     .await;
             }
             AppServerEvent::Disconnected { message } => {
+                if self.begin_reconnect() {
+                    return;
+                }
                 tracing::warn!("app-server event stream disconnected: {message}");
                 self.chat_widget.add_error_message(message.clone());
                 self.app_event_tx.send(AppEvent::FatalExitRequest(message));
@@ -133,6 +137,7 @@ impl App {
                 .entry(thread_id)
                 .or_default();
         }
+        self.track_agents_overview_notification(&notification);
         if matches!(
             &notification,
             ServerNotification::ThreadStarted(_)
@@ -143,7 +148,8 @@ impl App {
                 | ServerNotification::ThreadDeleted(_)
                 | ServerNotification::ThreadClosed(_)
         ) {
-            self.refresh_agents_overview_threads(app_server_client);
+            self.repaint_agents_overview();
+            self.refresh_changed_agents_overview_threads(app_server_client);
         }
         match &notification {
             ServerNotification::ServerRequestResolved(notification) => {
@@ -178,7 +184,7 @@ impl App {
                 self.refresh_mcp_startup_expected_servers_from_config();
             }
             ServerNotification::AccountRateLimitsUpdated(notification) => {
-                if matches!(
+                let workspace_hard_stop = matches!(
                     notification.rate_limits.rate_limit_reached_type,
                     Some(
                         RateLimitReachedType::WorkspaceOwnerCreditsDepleted
@@ -186,16 +192,24 @@ impl App {
                             | RateLimitReachedType::WorkspaceOwnerUsageLimitReached
                             | RateLimitReachedType::WorkspaceMemberUsageLimitReached
                     )
-                ) || notification.rate_limits.spend_control_reached == Some(true)
-                {
+                ) || notification.rate_limits.spend_control_reached
+                    == Some(true);
+                if workspace_hard_stop {
                     self.rate_limit_hard_stop_generation =
                         self.rate_limit_hard_stop_generation.wrapping_add(1);
                 }
                 self.chat_widget
                     .on_rolling_rate_limit_snapshot(notification.rate_limits.clone());
+                if workspace_hard_stop && self.chat_widget.has_chatgpt_account() {
+                    // Background inference may publish a hard stop without a foreground Error.
+                    self.refresh_rate_limits(app_server_client, RateLimitRefreshOrigin::Recovery);
+                }
                 return;
             }
             ServerNotification::AccountUpdated(notification) => {
+                self.rate_limit_hard_stop_generation =
+                    self.rate_limit_hard_stop_generation.wrapping_add(1);
+                self.rate_limit_refresh_state.invalidate_recovery();
                 // Deferred terminal writes must never carry the previous account's billing into
                 // the newly authenticated identity, even when both accounts share one thread.
                 self.last_thread_usage_status_cell = None;

@@ -4,6 +4,7 @@ mod analytics_capture;
 mod client;
 mod events;
 mod facts;
+mod guardian_v2;
 mod reducer;
 
 use std::time::SystemTime;
@@ -71,6 +72,8 @@ pub use facts::TurnSteerRequestError;
 pub use facts::TurnSteerResult;
 pub use facts::TurnTokenUsageFact;
 pub use facts::build_track_events_context;
+pub use guardian_v2::GuardianV2Event;
+pub use guardian_v2::GuardianV2EventKind;
 
 #[cfg(test)]
 mod analytics_client_tests;

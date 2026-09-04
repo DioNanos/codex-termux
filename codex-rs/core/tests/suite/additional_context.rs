@@ -31,7 +31,10 @@ async fn additional_context_is_model_visible_but_not_a_user_message_item() -> Re
     )
     .await;
     let test = test_codex()
-        .with_config(|config| config.include_environment_context = false)
+        .with_config(|config| {
+            config.update_plan_enabled = true;
+            config.include_environment_context = false;
+        })
         .build(&server)
         .await?;
 

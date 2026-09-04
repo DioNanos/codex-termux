@@ -257,6 +257,12 @@ fn normalize_plugin_mcp_server_value(
     }
 
     if let Some(JsonValue::Object(mut oauth)) = object.remove("oauth") {
+        if let Some(callback_url) = oauth.remove("callbackUrl") {
+            oauth
+                .entry("callback_url".to_string())
+                .or_insert(callback_url);
+        }
+
         if let Some(callback_port) = oauth.remove("callbackPort") {
             oauth
                 .entry("callback_port".to_string())

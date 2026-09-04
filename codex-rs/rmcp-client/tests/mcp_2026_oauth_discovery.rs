@@ -7,6 +7,7 @@ use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server::Environment;
 use codex_exec_server::HttpClient;
+use codex_rmcp_client::McpOAuthCallbackMode;
 use codex_rmcp_client::McpOAuthClientRegistration;
 use codex_rmcp_client::OAuthDiscoveryTimeout;
 use codex_rmcp_client::StreamableHttpOAuthDiscovery;
@@ -230,6 +231,7 @@ async fn assert_legacy_oauth_without_starting_an_mcp_session(
                     discovery?,
                     Some(StreamableHttpOAuthDiscovery {
                         scopes_supported: Some(vec!["mcp:read".to_string()]),
+                        callback_mode: McpOAuthCallbackMode::CallbackSpecific,
                     }),
                 );
             }
@@ -655,6 +657,7 @@ async fn interactive_oauth_rejects_untrusted_authorization_metadata() -> anyhow:
                 Some(/*timeout_secs*/ 5),
                 /*callback_port*/ None,
                 /*callback_url*/ None,
+                /*global_callback_url*/ None,
                 local_http_client(),
                 StreamableHttpRedirectMode::Legacy,
             )

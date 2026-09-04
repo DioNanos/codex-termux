@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::tests::make_session_and_context_with_rx;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::approvals::NetworkPolicyAmendment;
 use pretty_assertions::assert_eq;
@@ -93,4 +94,60 @@ fn guardian_cwd_rejects_foreign_remote_path() {
     let cwd = PathUri::parse("file:///C:/workspace").expect("valid Windows path URI");
 
     assert!(guardian_cwd(codex_exec_server::REMOTE_ENVIRONMENT_ID, cwd).is_err());
+}
+#[tokio::test]
+async fn explicit_mcp_reviewer_override_takes_precedence_over_action_context() {
+    let (session, turn, events) = make_session_and_context_with_rx().await;
+    let action = ApprovalAction::McpToolCall {
+        id: "mcp-override".to_string(),
+        server: "example".to_string(),
+        tool_name: "dangerous".to_string(),
+        arguments: None,
+        connector_id: None,
+        connector_name: None,
+        connector_description: None,
+        connected_account_email: None,
+        tool_title: None,
+        tool_description: None,
+        annotations: None,
+        hook_tool_name: HookToolName::new("mcp__example__dangerous"),
+        approval_policy: AskForApproval::OnRequest,
+        reviewer: ApprovalsReviewer::User,
+        approval_mode: AppToolApproval::Prompt,
+        allow_session_remember: false,
+        allow_persistent_approval: false,
+    };
+    let mut review_context = GuardianReviewContext::from(&turn);
+    review_context.approval_policy = AskForApproval::OnRequest;
+    review_context.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    let context = ApprovalContext {
+        review_context,
+        cancellation_token: None,
+        call_id: "mcp-override".to_string(),
+        tool_name: ToolName::plain("dangerous"),
+        strict_auto_review: false,
+        approval_reason: None,
+        retry_reason: None,
+        network_approval_context: None,
+    };
+
+    tokio::select! {
+        resolution = session.request_reviewer_approval(action, &context) => {
+            panic!("expected a user approval request, got {resolution:?}");
+        }
+        event = events.recv() => {
+            let codex_protocol::protocol::EventMsg::ElicitationRequest(request) =
+                event.expect("receive user approval request").msg
+            else {
+                panic!("expected an MCP user approval request");
+            };
+            assert_eq!(request.server_name, "example");
+            assert_eq!(
+                request.id,
+                codex_protocol::mcp::RequestId::String(
+                    "mcp_tool_call_approval_mcp-override".to_string()
+                )
+            );
+        }
+    }
 }

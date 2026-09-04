@@ -132,7 +132,7 @@ async fn emit_exec_command_begin(ctx: ToolEventCtx<'_>, exec_input: &ExecCommand
             .analytics_events_client
             .track_artifact_operation(
                 build_track_events_context(
-                    ctx.turn.model_info.slug.clone(),
+                    ctx.turn.model_info().slug.clone(),
                     ctx.session.thread_id.to_string(),
                     ctx.turn.sub_id.clone(),
                     ctx.turn.originator.clone(),
@@ -373,7 +373,7 @@ impl ToolEmitter {
         output: &ExecToolCallOutput,
         ctx: ToolEventCtx<'_>,
     ) -> String {
-        super::format_exec_output_for_model(output, ctx.turn.model_info.truncation_policy.into())
+        super::format_exec_output_for_model(output, ctx.turn.model_info().truncation_policy.into())
     }
 
     pub async fn finish(
@@ -521,7 +521,7 @@ async fn emit_exec_stage(
                 duration: output.duration,
                 formatted_output: format_exec_output_str(
                     &output,
-                    ctx.turn.model_info.truncation_policy.into(),
+                    ctx.turn.model_info().truncation_policy.into(),
                 ),
                 status: if output.exit_code == 0 {
                     ExecCommandStatus::Completed

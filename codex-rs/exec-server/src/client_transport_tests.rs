@@ -85,6 +85,7 @@ impl SequenceNoiseConnectProvider {
             ),
         )
         .await
+        .map(|(connection, options, _)| (connection, options))
     }
 }
 
@@ -340,6 +341,7 @@ async fn noise_session_resume_leaves_offline_retries_to_recovery() -> Result<()>
     ));
     let identity = NoiseChannelIdentity::generate()?;
     let strategy = ExecServerReconnectStrategy::NoiseRendezvous {
+        executor_public_key: NoiseChannelIdentity::generate()?.public_key(),
         provider: sequence.clone(),
         identity: identity.clone(),
         client_name: "test".to_string(),

@@ -22,6 +22,8 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::RequestContext;
+use crate::plugin_config_reload;
+use crate::plugin_config_reload::PluginStartupConfig;
 use crate::request_processors::AccountRequestProcessor;
 use crate::request_processors::AppsRequestProcessor;
 use crate::request_processors::CatalogRequestProcessor;
@@ -258,7 +260,8 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) code_mode_session_provider: Option<Arc<dyn CodeModeSessionProvider>>,
     pub(crate) rpc_transport: AppServerRpcTransport,
     pub(crate) remote_control_handle: Option<RemoteControlHandle>,
-    pub(crate) plugin_startup_tasks: crate::PluginStartupTasks,
+    /// `None` skips startup tasks; otherwise preserve the initial config-loading path.
+    pub(crate) plugin_startup_tasks: Option<PluginStartupConfig>,
 }
 
 impl MessageProcessor {
@@ -519,14 +522,23 @@ impl MessageProcessor {
             Arc::clone(&skills_watcher),
             turn_cost_worker.as_ref().map(TurnCostWorker::handle),
         );
-        if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
+        if let Some(startup_config) = plugin_startup_tasks {
             // Keep plugin startup warmups aligned at app-server startup.
+            let reload_config = match startup_config {
+                PluginStartupConfig::Current => {
+                    plugin_config_reload::for_cwd(config_manager.clone(), config.cwd.clone())
+                }
+                PluginStartupConfig::Defaults => {
+                    plugin_config_reload::defaults(config_manager.clone())
+                }
+            };
             let on_effective_plugins_changed =
                 plugin_processor.effective_plugins_changed_callback();
             thread_manager
                 .plugins_manager()
                 .maybe_start_plugin_startup_tasks_for_config(
                     &config.plugins_config_input(),
+                    reload_config,
                     Some(on_effective_plugins_changed),
                 );
         }
@@ -1329,7 +1341,7 @@ impl MessageProcessor {
                 self.thread_processor.thread_loaded_list(params).await
             }
             ClientRequest::ThreadRead { params, .. } => {
-                self.thread_processor.thread_read(params).await
+                self.thread_processor.thread_read(&request_id, params).await
             }
             ClientRequest::ThreadTurnsList { params, .. } => {
                 self.thread_processor.thread_turns_list(params).await
@@ -1376,6 +1388,15 @@ impl MessageProcessor {
             }
             ClientRequest::PluginInstalled { params, .. } => {
                 self.plugin_processor.plugin_installed(params).await
+            }
+            ClientRequest::PluginReconcile { params, .. } => {
+                self.plugin_processor
+                    .plugin_reconcile(
+                        params,
+                        self.config_processor.clone(),
+                        &self.request_serialization_queues,
+                    )
+                    .await
             }
             ClientRequest::PluginRead { params, .. } => {
                 self.plugin_processor.plugin_read(params).await
@@ -1454,6 +1475,11 @@ impl MessageProcessor {
             }
             ClientRequest::TurnSteer { params, .. } => {
                 self.turn_processor.turn_steer(&request_id, params).await
+            }
+            ClientRequest::TurnSettingsUpdate { params, .. } => {
+                self.turn_processor
+                    .turn_settings_update(&request_id, params)
+                    .await
             }
             ClientRequest::TurnInterrupt { params, .. } => {
                 self.turn_processor

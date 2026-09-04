@@ -9,7 +9,8 @@ export type ModelReasoningEffort =
   | "high"
   | "xhigh"
   | "max"
-  | "ultra";
+  | "ultra"
+  | "persistent";
 
 export type WebSearchMode = "disabled" | "cached" | "live";
 

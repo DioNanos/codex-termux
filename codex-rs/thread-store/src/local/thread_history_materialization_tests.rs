@@ -232,6 +232,7 @@ async fn split_homes_support_backfill_listing_and_paginated_history() {
                         phase: None,
                         memory_citation: None,
                         delivery: None,
+                        questions: None,
                     }),
                 ),
                 turn_completed("turn-1"),
@@ -325,6 +326,7 @@ async fn paginated_live_append_materializes_turn_items_and_state() {
                         phase: None,
                         memory_citation: None,
                         delivery: None,
+                        questions: None,
                     }),
                 ),
                 turn_completed("turn-1"),
@@ -480,6 +482,7 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
                         phase: None,
                         memory_citation: None,
                         delivery: None,
+                        questions: None,
                     }),
                 ),
                 RolloutItem::RealtimeItem(RealtimeItem {
@@ -908,6 +911,19 @@ async fn active_turn_stores_only_its_start_position() {
     assert!(prepared.model_context.iter().any(|item| {
         matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(event)) if event.turn_id == "turn-1")
     }));
+    // Another store may fork the persisted prefix while this store keeps the source writer open.
+    let other_store = projection_store(home.path()).await;
+    let other_prepared =
+        prepare_paginated_fork(&other_store, thread_id, ForkBoundary::Latest).await;
+    assert_eq!(
+        serde_json::to_value((
+            other_prepared.history_base,
+            other_prepared.model_context.as_ref()
+        ))
+        .expect("serialize other store's fork snapshot"),
+        serde_json::to_value((prepared.history_base, prepared.model_context.as_ref()))
+            .expect("serialize live store's fork snapshot"),
+    );
     assert_eq!(
         prepare_paginated_fork(
             &store,
@@ -943,7 +959,7 @@ async fn paginated_fork_persists_empty_source() {
 }
 
 #[tokio::test]
-async fn paginated_fork_materializes_compressed_source_and_ancestor() {
+async fn paginated_fork_reads_compressed_shared_lineage_without_materializing() {
     let home = TempDir::new().expect("temp dir");
     let store = projection_store(home.path()).await;
     let ancestor_thread_id = ThreadId::default();
@@ -975,6 +991,17 @@ async fn paginated_fork_materializes_compressed_source_and_ancestor() {
         .shutdown_thread(ancestor_thread_id)
         .await
         .expect("shutdown ancestor");
+
+    // A standalone source still becomes plain before its first shared reference, so the default
+    // mode does not introduce compressed lineages that older readers cannot follow.
+    compress_rollout(ancestor_path.as_path());
+    assert_eq!(
+        prepare_paginated_fork(&store, ancestor_thread_id, ForkBoundary::Latest)
+            .await
+            .history_base,
+        Some(ancestor_base)
+    );
+    assert!(ancestor_path.exists());
 
     let source_thread_id = ThreadId::default();
     create_paginated_subagent_thread(
@@ -1022,20 +1049,20 @@ async fn paginated_fork_materializes_compressed_source_and_ancestor() {
         prepare_paginated_fork(&store, source_thread_id, ForkBoundary::Latest),
         prepare_paginated_fork(&store, source_thread_id, ForkBoundary::Latest),
     );
-    assert!(ancestor_path.exists());
-    assert!(source_path.exists());
-    assert!(!ancestor_compressed_path.exists());
-    assert!(!source_compressed_path.exists());
+    assert!(!ancestor_path.exists());
+    assert!(!source_path.exists());
+    assert!(ancestor_compressed_path.exists());
+    assert!(source_compressed_path.exists());
     assert_eq!(
-        fs::metadata(&ancestor_path)
+        fs::metadata(&ancestor_compressed_path)
             .and_then(|metadata| metadata.modified())
-            .expect("read materialized ancestor timestamp"),
+            .expect("read compressed ancestor timestamp"),
         ancestor_modified
     );
     assert_eq!(
-        fs::metadata(&source_path)
+        fs::metadata(&source_compressed_path)
             .and_then(|metadata| metadata.modified())
-            .expect("read materialized source timestamp"),
+            .expect("read compressed source timestamp"),
         source_modified
     );
     for prepared in [first, second] {
@@ -1050,10 +1077,48 @@ async fn paginated_fork_materializes_compressed_source_and_ancestor() {
             ));
         }
     }
+
+    // Skipping materialization must not allow a reference that cannot be resolved inside this home.
+    let external_home = TempDir::new().expect("external temp dir");
+    let external_path = external_home.path().join(
+        source_compressed_path
+            .file_name()
+            .expect("source rollout filename"),
+    );
+    fs::rename(&source_compressed_path, &external_path).expect("move shared source outside home");
+    store
+        .resume_thread(ResumeThreadParams {
+            thread_id: source_thread_id,
+            rollout_path: Some(external_path),
+            history: None,
+            include_archived: true,
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(home.path().to_path_buf()),
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await
+        .expect("resume external shared source");
+    let error = store
+        .prepare_fork(PrepareForkParams {
+            thread_id: source_thread_id,
+            boundary: ForkBoundary::Latest,
+        })
+        .await
+        .expect_err("external shared source cannot be referenced by rollout id");
+    assert!(matches!(
+        error,
+        crate::ThreadStoreError::InvalidRequest { message } if message.contains("must be in Codex home")
+    ));
+    store
+        .shutdown_thread(source_thread_id)
+        .await
+        .expect("shutdown external source");
 }
 
 #[tokio::test]
-async fn cancelled_fork_keeps_source_reserved_until_lineage_materialization_finishes() {
+async fn cancelled_fork_keeps_source_reserved_until_lineage_resolution_finishes() {
     let home = TempDir::new().expect("temp dir");
     let store = projection_store(home.path()).await;
     let ancestor_thread_id = ThreadId::default();
@@ -1096,6 +1161,7 @@ async fn cancelled_fork_keeps_source_reserved_until_lineage_materialization_fini
     compress_rollout(source_path.as_path());
 
     let ancestor_writer_guard = store.live_writer_locks.lock(ancestor_thread_id).await;
+    let source_coordination = store.live_writer_locks.coordination(source_thread_id).await;
     let preparation_store = store.clone();
     let preparation = tokio::spawn(async move {
         preparation_store
@@ -1106,12 +1172,12 @@ async fn cancelled_fork_keeps_source_reserved_until_lineage_materialization_fini
             .await
     });
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !source_path.exists() {
+        while source_coordination.lifecycle.try_write().is_ok() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("detached lineage task should materialize the source");
+    .expect("fork preparation should reserve the source");
     preparation.abort();
     assert!(
         preparation
@@ -1126,14 +1192,14 @@ async fn cancelled_fork_keeps_source_reserved_until_lineage_materialization_fini
     tokio::select! {
         biased;
         result = &mut delete => {
-            panic!("source deletion completed while lineage materialization was active: {result:?}")
+            panic!("source deletion completed while lineage resolution was active: {result:?}")
         }
         _ = tokio::task::yield_now() => {}
     }
     drop(ancestor_writer_guard);
     delete
         .await
-        .expect("delete source after lineage materialization finishes");
+        .expect("delete source after lineage resolution finishes");
 }
 
 #[tokio::test]
@@ -2606,6 +2672,7 @@ fn agent_message(id: &str, phase: MessagePhase) -> TurnItem {
         phase: Some(phase),
         memory_citation: None,
         delivery: None,
+        questions: None,
     })
 }
 

@@ -75,6 +75,8 @@ fn model_with_collaboration_messages(
 ) -> codex_protocol::openai_models::ModelInfo {
     let mut model = model_info_from_slug(slug);
     let model_messages = model.model_messages.get_or_insert(ModelMessages {
+        persistent_instructions: None,
+        tools: None,
         instructions_template: None,
         instructions_variables: None,
         approvals: None,
@@ -83,6 +85,7 @@ fn model_with_collaboration_messages(
         permissions: None,
         multi_agent: None,
         token_budget: None,
+        confirmation_policies: None,
         guardian_v2: None,
     });
     model_messages.collaboration_modes = Some(CollaborationModeMessages {
@@ -167,8 +170,8 @@ async fn catalog_collaboration_messages_track_mode_changes() -> Result<()> {
     .await;
 
     let model_slug = "catalog-collaboration-model";
-    let default_text = "catalog default instructions";
-    let plan_text = "catalog plan instructions";
+    let default_text = "## Plan tool\nPreserve the custom default policy.\n";
+    let plan_text = "## `update_plan`\nPreserve the custom Plan Mode policy.\n";
     let model = model_with_collaboration_messages(model_slug, Some(default_text), Some(plan_text));
     let mut builder = test_codex()
         .with_model(model_slug)
@@ -608,46 +611,6 @@ async fn collaboration_instructions_omitted_when_disabled() -> Result<()> {
         count_messages_containing(&dev_texts, COLLABORATION_MODE_OPEN_TAG),
         0
     );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn override_then_next_turn_uses_updated_collaboration_instructions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let req = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-
-    let test = test_codex().build(&server).await?;
-    let collab_text = "override instructions";
-    let collaboration_mode = collab_mode_with_instructions(Some(collab_text));
-
-    core_test_support::submit_thread_settings(
-        &test.codex,
-        ThreadSettingsOverrides {
-            collaboration_mode: Some(collaboration_mode),
-            ..Default::default()
-        },
-    )
-    .await?;
-
-    test.codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "hello".into(),
-            text_elements: Vec::new(),
-        }]))
-        .await?;
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let input = req.single_request().input();
-    let dev_texts = developer_texts(&input);
-    let collab_text = collab_xml(collab_text);
-    assert_eq!(count_messages_containing(&dev_texts, &collab_text), 1);
 
     Ok(())
 }

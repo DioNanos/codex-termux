@@ -43,15 +43,15 @@ const SECOND_CALL_ID: &str = "write-from-second";
 const EXEC_SERVER_START_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
 
-struct ExecServerProcess {
+pub(super) struct ExecServerProcess {
     _codex_home: TempDir,
     child: Child,
     _stdout: BufReader<ChildStdout>,
-    websocket_url: String,
+    pub(super) websocket_url: String,
 }
 
 impl ExecServerProcess {
-    async fn start() -> Result<Self> {
+    pub(super) async fn start() -> Result<Self> {
         let codex_home = TempDir::new()?;
         let mut child = Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
             .args(["exec-server", "--listen", "ws://127.0.0.1:0"])

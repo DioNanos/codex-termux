@@ -4,17 +4,27 @@ use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use codex_app_server_protocol::AdditionalContextEntry;
 use codex_app_server_protocol::AdditionalContextKind;
+use codex_app_server_protocol::ItemCompletedNotification;
+use codex_app_server_protocol::ItemStartedNotification;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadInjectItemsParams;
 use codex_app_server_protocol::ThreadInjectItemsResponse;
+use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStartedNotification;
+use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::TurnToolOutput;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_core::RolloutRecorder;
 use codex_features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseItem;
 use codex_rollout::InitialHistory;
 use codex_rollout::RolloutItem;
@@ -27,12 +37,17 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+#[test_case(ThreadHistoryMode::Legacy; "legacy")]
+#[test_case(ThreadHistoryMode::Paginated; "paginated")]
 #[tokio::test]
-async fn thread_inject_items_adds_raw_response_items_to_thread_history() -> Result<()> {
+async fn thread_inject_items_adds_raw_response_items_to_thread_history(
+    history_mode: ThreadHistoryMode,
+) -> Result<()> {
     let server = responses::start_mock_server().await;
     let body = responses::sse(vec![
         responses::ev_response_created("resp-1"),
@@ -61,6 +76,7 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history() -> Resu
     let thread_req = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
+            history_mode: Some(history_mode),
             ..Default::default()
         })
         .await?;
@@ -110,6 +126,8 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history() -> Resu
         .await?;
     let _response: ThreadInjectItemsResponse =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(inject_req)).await??;
+    assert!(response_mock.requests().is_empty());
+
     assert_eq!(
         state_db
             .get_thread_memory_mode(ThreadId::from_string(&thread.id)?)
@@ -265,6 +283,79 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history() -> Resu
         model_input.contains(&named_tool_output),
         "named unpaired tool output should be sent in the next model request"
     );
+
+    let delegated_mock = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![responses::ev_completed("resp-delegated")]),
+    )
+    .await;
+    mcp.clear_message_buffer();
+    let delegated_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: Vec::new(),
+            tool_output: Some(Box::new(TurnToolOutput {
+                name: "send_message_to_thread".to_string(),
+                namespace: Some("codex_app".to_string()),
+                output: FunctionCallOutputBody::Text("Start a delegated turn.".to_string()),
+            })),
+            ..Default::default()
+        })
+        .await?;
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(delegated_req)).await??;
+    let turn_started: TurnStartedNotification =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("turn/started")).await??;
+    let item_started: ItemStartedNotification =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("item/started")).await??;
+    let item_completed: ItemCompletedNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("item/completed"),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    assert_eq!(turn.id, turn_started.turn.id);
+    assert_eq!(turn_started.turn.status, TurnStatus::InProgress);
+    assert_eq!(item_completed.turn_id, turn_started.turn.id);
+    assert_eq!(item_started.item, item_completed.item);
+    assert!(matches!(
+        &item_completed.item,
+        ThreadItem::FunctionCallOutput {
+            name,
+            namespace,
+            output: FunctionCallOutputBody::Text(output),
+            ..
+        } if name == "send_message_to_thread"
+            && namespace.as_deref() == Some("codex_app")
+            && output == "Start a delegated turn."
+    ));
+    assert!(
+        delegated_mock
+            .single_request()
+            .input()
+            .into_iter()
+            .any(|item| item["type"] == "function_call_output"
+                && item["output"] == "Start a delegated turn."),
+        "the delegated turn must preserve the original model-visible tool output"
+    );
+    let resume_req = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id,
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_req)).await??;
+    assert_eq!(thread.turns.len(), 2);
+    assert!(thread.turns.iter().any(|turn| {
+        turn.id == turn_started.turn.id
+            && turn.status == TurnStatus::Completed
+            && turn.items.contains(&item_completed.item)
+    }));
 
     Ok(())
 }
