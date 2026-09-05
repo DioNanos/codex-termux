@@ -110,6 +110,8 @@ jobs:
   tests:
     name: targeted tests
     runs-on: ubuntu-24.04
+    env:
+      RUST_MIN_STACK: "8388608"
     defaults:
       run:
         working-directory: codex-rs
@@ -147,3 +149,59 @@ jobs:
           grep -F 'termux_maps_only_the_attachments_directory_by_path_component ... ok' termux-gate-app-server-attachments.out
           grep -F 'turn_start_maps_local_image_to_the_termux_attachment_directory ... ok' termux-gate-app-server-attachments.out
           grep -F 'turn_steer_maps_local_image_to_the_termux_attachment_directory ... ok' termux-gate-app-server-attachments.out
+      - name: Test model message caps
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p codex-core -- persistent_instructions_reject_oversized_values persistent_instructions_preserve_empty_none_and_exact_limit persistent_instructions_validate_after_placeholder_rendering guardian_node_repl_policy_rejects_oversized_values guardian_node_repl_policy_accepts_none_empty_and_exact_limit local_catalog_loader_accepts_exact_limit_and_rejects_oversized_messages guardian_oversized_node_repl_policy_fails_closed_without_model_or_tool_requests 2>&1 | tee termux-gate-model-message-caps.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-model-message-caps.out
+          grep -F 'persistent_instructions_reject_oversized_values ... ok' termux-gate-model-message-caps.out
+          grep -F 'persistent_instructions_preserve_empty_none_and_exact_limit ... ok' termux-gate-model-message-caps.out
+          grep -F 'persistent_instructions_validate_after_placeholder_rendering ... ok' termux-gate-model-message-caps.out
+          grep -F 'guardian_node_repl_policy_rejects_oversized_values ... ok' termux-gate-model-message-caps.out
+          grep -F 'guardian_node_repl_policy_accepts_none_empty_and_exact_limit ... ok' termux-gate-model-message-caps.out
+          grep -F 'local_catalog_loader_accepts_exact_limit_and_rejects_oversized_messages ... ok' termux-gate-model-message-caps.out
+          grep -F 'guardian_oversized_node_repl_policy_fails_closed_without_model_or_tool_requests ... ok' termux-gate-model-message-caps.out
+      - name: Test terminal guardian cap proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p codex-rmcp-client --bin test_stdio_server
+          cargo test -p codex-core --test all -- suite::guardian_review::guardian_oversized_node_repl_policy_denies_before_tool_execution --exact 2>&1 | tee termux-gate-model-guardian-terminal.out
+          grep -F 'test suite::guardian_review::guardian_oversized_node_repl_policy_denies_before_tool_execution ... ok' termux-gate-model-guardian-terminal.out
+      - name: Test terminal guardian execution probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p codex-core --test all -- suite::guardian_review::guardian_approved_node_repl_policy_records_server_call --exact 2>&1 | tee termux-gate-model-guardian-execution-probe.out
+          grep -F 'test suite::guardian_review::guardian_approved_node_repl_policy_records_server_call ... ok' termux-gate-model-guardian-execution-probe.out
+      - name: Test terminal persistent cap proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p codex-core --test all -- suite::guardian_review::persistent_oversized_instructions_fail_session_before_inference --exact 2>&1 | tee termux-gate-model-persistent-terminal.out
+          grep -F 'test suite::guardian_review::persistent_oversized_instructions_fail_session_before_inference ... ok' termux-gate-model-persistent-terminal.out
+      - name: Test terminal rendered persistent cap proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p codex-core --test all -- suite::guardian_review::persistent_rendered_oversized_instructions_fail_session_before_inference --exact 2>&1 | tee termux-gate-model-rendered-persistent-terminal.out
+          grep -F 'test suite::guardian_review::persistent_rendered_oversized_instructions_fail_session_before_inference ... ok' termux-gate-model-rendered-persistent-terminal.out
+      - name: Test model catalog ingress caps
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p codex-api -- remote_models_loader_accepts_exact_limit_and_rejects_oversized_messages 2>&1 | tee termux-gate-model-api-caps.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-model-api-caps.out
+          grep -F 'remote_models_loader_accepts_exact_limit_and_rejects_oversized_messages ... ok' termux-gate-model-api-caps.out
+          cargo test -p codex-models-manager -- file_cache_loader_accepts_exact_limit_and_rejects_oversized_messages 2>&1 | tee termux-gate-model-cache-caps.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-model-cache-caps.out
+          grep -F 'file_cache_loader_accepts_exact_limit_and_rejects_oversized_messages ... ok' termux-gate-model-cache-caps.out
+      - name: Test protocol model message caps
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p codex-protocol -- model_message_text_cap_reports_field_slug_size_and_no_content model_message_text_cap_counts_utf8_bytes_without_truncating 2>&1 | tee termux-gate-model-protocol-caps.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-model-protocol-caps.out
+          grep -F 'model_message_text_cap_reports_field_slug_size_and_no_content ... ok' termux-gate-model-protocol-caps.out
+          grep -F 'model_message_text_cap_counts_utf8_bytes_without_truncating ... ok' termux-gate-model-protocol-caps.out

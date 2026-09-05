@@ -2,6 +2,8 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
@@ -644,13 +646,24 @@ impl ServerHandler for TestToolServer {
         match request.name.as_ref() {
             "js" => {
                 let args = Self::parse_call_args::<JsArgs>(&request, "js")?;
+                if let Ok(path) = std::env::var("TEST_STDIO_SERVER_CALL_LOG") {
+                    let mut log = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                    writeln!(log, "tool=js code={}", args.code)
+                        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                }
                 if args.code == "nodeRepl.fail()" {
                     Ok(CallToolResult::error(vec![
                         rmcp::model::ContentBlock::text("guardian-hidden-failed-result"),
                     ]))
                 } else if args.code == "nodeRepl.empty()" {
+                    let output = std::env::var("MCP_TEST_NODE_REPL_EXECUTION_MARKER")
+                        .unwrap_or_else(|_| " ".to_string());
                     Ok(CallToolResult::success(vec![
-                        rmcp::model::ContentBlock::text(" "),
+                        rmcp::model::ContentBlock::text(output),
                     ]))
                 } else if args.code == "await nodeRepl.emitImage(await tab.screenshot())" {
                     let mut meta = MetaObject::new();

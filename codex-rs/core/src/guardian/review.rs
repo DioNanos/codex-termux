@@ -963,8 +963,9 @@ pub(super) async fn guardian_review_session_config(
     Ok(GuardianReviewSessionConfig {
         spawn_config,
         node_repl_policy: GuardianNodeReplPolicy::from_model_messages(
+            guardian_model.as_str(),
             guardian_model_info.model_messages.as_ref(),
-        ),
+        )?,
         model: guardian_model,
         reasoning_effort: guardian_reasoning_effort,
         default_review_model_id: default_review_model_id.to_string(),

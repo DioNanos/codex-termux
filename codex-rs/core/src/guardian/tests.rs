@@ -3716,6 +3716,61 @@ async fn guardian_review_session_config_preserves_parent_network_proxy() {
 }
 
 #[tokio::test]
+async fn guardian_oversized_node_repl_policy_fails_closed_without_model_or_tool_requests() {
+    let server = start_mock_server().await;
+    let (mut session, mut turn) = guardian_test_session_and_turn(&server).await;
+    update_turn_settings_for_test(
+        Arc::get_mut(&mut turn).expect("turn should be unique"),
+        |settings| {
+            let model = Arc::make_mut(&mut settings.model_info);
+            let mut messages: serde_json::Value = serde_json::json!({
+                "instructions_template": "template",
+                "auto_review": {
+                    "node_repl_policy": "x".repeat(8 * 1024 + 1)
+                }
+            });
+            model.model_messages =
+                Some(serde_json::from_value(messages.take()).expect("guardian policy fixture"));
+        },
+    );
+    let parent_model = turn.model_info().as_ref().clone();
+    let auth_manager = Arc::clone(&session.services.auth_manager);
+    Arc::get_mut(&mut session)
+        .expect("session should be unique")
+        .services
+        .models_manager = Arc::new(StaticModelsManager::new(
+        Some(auth_manager),
+        ModelsResponse {
+            models: vec![parent_model],
+        },
+    ));
+
+    let (outcome, _) = run_guardian_review_session_for_test(
+        Arc::clone(&session),
+        turn,
+        guardian_exec_command_request("oversized-policy"),
+        ApprovalRequestReasons {
+            approval: Some("execute the requested command".to_string()),
+            retry: None,
+        },
+        guardian_output_schema(),
+        None,
+        1,
+    )
+    .await;
+
+    assert!(matches!(outcome, GuardianReviewOutcome::Error(_)));
+    let requests = server
+        .received_requests()
+        .await
+        .expect("inspect mock server requests");
+    assert!(
+        requests.is_empty(),
+        "invalid guardian policy must not execute a model request or tool"
+    );
+}
+
+#[tokio::test]
 async fn guardian_review_session_config_clears_context_overrides_for_distinct_effective_model() {
     let server = start_mock_server().await;
     let (session, mut turn) = guardian_test_session_and_turn(&server).await;

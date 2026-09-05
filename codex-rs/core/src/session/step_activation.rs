@@ -169,10 +169,17 @@ fn check_legacy_model_safety(
     // catalog refresh. V1 uses the admitted config; V2 can use the live config.
     // An unchanged explicit reviewer override prevents both fallback paths.
     if destination.auto_review_model_override.is_none() {
-        let destination_node_repl_policy =
-            GuardianNodeReplPolicy::from_model_messages(destination.model_messages.as_ref());
+        let destination_node_repl_policy = GuardianNodeReplPolicy::from_model_messages(
+            &destination.slug,
+            destination.model_messages.as_ref(),
+        )
+        .map_err(|error| error.to_string())?;
         for model in retained_models {
-            let policy = GuardianNodeReplPolicy::from_model_messages(model.model_messages.as_ref());
+            let policy = GuardianNodeReplPolicy::from_model_messages(
+                &model.slug,
+                model.model_messages.as_ref(),
+            )
+            .map_err(|error| error.to_string())?;
             if policy != destination_node_repl_policy {
                 return Err(
                     "the destination changes the Guardian parent-fallback node REPL policy"

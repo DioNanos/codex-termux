@@ -1,6 +1,7 @@
 use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::validate_model_infos;
 use serde::Deserialize;
 use serde::Serialize;
 use std::fmt;
@@ -215,8 +216,14 @@ async fn load_fresh_file(
 async fn load_file(cache_path: &PathBuf) -> io::Result<Option<ModelsCacheEntry>> {
     match fs::read(cache_path).await {
         Ok(contents) => {
-            let cache = serde_json::from_slice(&contents)
+            let cache: ModelsCacheEntry = serde_json::from_slice(&contents)
                 .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
+            validate_model_infos(&cache.models).map_err(|err| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid model cache model message: {err}"),
+                )
+            })?;
             Ok(Some(cache))
         }
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
@@ -234,4 +241,72 @@ async fn save_file(cache_path: &PathBuf, cache: &ModelsCacheEntry) -> Result<(),
 
 fn cache_error(error: impl fmt::Display) -> ModelsCacheError {
     ModelsCacheError::new(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn model_json_with_persistent_instructions(len: usize) -> serde_json::Value {
+        json!({
+            "slug": "cache-test-model",
+            "display_name": "Cache Test Model",
+            "description": "cache fixture",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [{"effort": "medium", "description": "medium"}],
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 1,
+            "upgrade": null,
+            "support_verbosity": false,
+            "default_verbosity": null,
+            "apply_patch_tool_type": null,
+            "truncation_policy": {"mode": "bytes", "limit": 10_000},
+            "supports_image_detail_original": false,
+            "context_window": 272_000,
+            "experimental_supported_tools": [],
+            "base_instructions": "template",
+            "model_messages": {
+                "instructions_template": "template",
+                "persistent_instructions": "x".repeat(len)
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn file_cache_loader_accepts_exact_limit_and_rejects_oversized_messages() {
+        for (len, expected_ok) in [(8 * 1024, true), (8 * 1024 + 1, false)] {
+            let dir = tempdir().expect("cache tempdir");
+            let path = dir.path().join("models.json");
+            let payload = json!({
+                "fetched_at": Utc::now(),
+                "client_version": "0.153.3",
+                "models": [model_json_with_persistent_instructions(len)]
+            });
+            fs::write(
+                &path,
+                serde_json::to_vec(&payload).expect("serialize cache fixture"),
+            )
+            .await
+            .expect("write cache fixture");
+
+            let result = load_fresh_file(&path, Duration::from_secs(60), "0.153.3").await;
+            if expected_ok {
+                assert!(
+                    result
+                        .expect("exact-limit cache load should not error")
+                        .is_some()
+                );
+            } else {
+                let error = result.expect_err("oversized cache model must be rejected");
+                let message = error.to_string();
+                assert!(message.contains("persistent_instructions"));
+                assert!(message.contains("8193"));
+                assert!(message.contains("8192"));
+            }
+        }
+    }
 }

@@ -6,6 +6,7 @@ use codex_client::HttpTransport;
 use codex_client::RequestTelemetry;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::validate_model_infos;
 use http::HeaderMap;
 use http::Method;
 use http::header::ETAG;
@@ -68,12 +69,10 @@ impl<T: HttpTransport> ModelsClient<T> {
             .map(ToString::to_string);
 
         let ModelsResponse { models } = serde_json::from_slice::<ModelsResponse>(&resp.body)
-            .map_err(|e| {
-                ApiError::Stream(format!(
-                    "failed to decode models response: {e}; body: {}",
-                    String::from_utf8_lossy(&resp.body)
-                ))
-            })?;
+            .map_err(|e| ApiError::Stream(format!("failed to decode models response: {e}")))?;
+        validate_model_infos(&models).map_err(|error| {
+            ApiError::Stream(format!("invalid model message in models response: {error}"))
+        })?;
 
         Ok((models, header_etag))
     }
@@ -155,6 +154,33 @@ mod tests {
             },
             stream_idle_timeout: Duration::from_secs(1),
         }
+    }
+
+    fn model_with_persistent_instructions(len: usize) -> ModelInfo {
+        serde_json::from_value(json!({
+            "slug": "gpt-test",
+            "display_name": "gpt-test",
+            "description": "desc",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [{"effort": "medium", "description": "medium"}],
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 1,
+            "upgrade": null,
+            "support_verbosity": false,
+            "default_verbosity": null,
+            "apply_patch_tool_type": null,
+            "truncation_policy": {"mode": "bytes", "limit": 10_000},
+            "supports_image_detail_original": false,
+            "context_window": 272_000,
+            "experimental_supported_tools": [],
+            "model_messages": {
+                "instructions_template": "template",
+                "persistent_instructions": "x".repeat(len)
+            }
+        }))
+        .expect("test model should deserialize")
     }
 
     #[tokio::test]
@@ -262,5 +288,33 @@ mod tests {
 
         assert_eq!(models.len(), 0);
         assert_eq!(etag, Some("\"abc\"".to_string()));
+    }
+
+    #[tokio::test]
+    async fn remote_models_loader_accepts_exact_limit_and_rejects_oversized_messages() {
+        for (len, expected_ok) in [(8 * 1024, true), (8 * 1024 + 1, false)] {
+            let response = ModelsResponse {
+                models: vec![model_with_persistent_instructions(len)],
+            };
+            let transport = CapturingTransport {
+                last_request: Arc::new(Mutex::new(None)),
+                body: Arc::new(response),
+                etag: None,
+            };
+            let provider = provider("https://example.com/api/codex");
+            let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.99.0");
+            let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
+
+            let result = client.list_models(request_url, HeaderMap::new()).await;
+            if expected_ok {
+                assert!(result.is_ok(), "exact-limit remote model should load");
+            } else {
+                let error = result.expect_err("oversized remote model must be rejected");
+                let message = error.to_string();
+                assert!(message.contains("persistent_instructions"));
+                assert!(message.contains("8193"));
+                assert!(message.contains("8192"));
+            }
+        }
     }
 }

@@ -213,7 +213,8 @@ impl Session {
                         .experimental_supported_tools
                         .iter()
                         .any(|tool| tool == "send_user_message_async");
-            world_state.add_section(PersistentModeState::new(
+            let persistent_mode = PersistentModeState::new(
+                &step_context.settings.model_info.slug,
                 step_context.settings.effective_reasoning_effort().as_ref(),
                 step_context
                     .settings
@@ -222,7 +223,11 @@ impl Session {
                     .as_ref()
                     .and_then(|messages| messages.persistent_instructions.as_deref()),
                 send_user_message_async_available,
-            ));
+            )
+            .map_err(|err| {
+                CodexErr::Fatal(format!("invalid persistent model instructions: {err}"))
+            })?;
+            world_state.add_section(persistent_mode);
         }
         if turn_context.config.include_environment_context {
             let current_date = self
