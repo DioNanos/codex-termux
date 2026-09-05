@@ -1,0 +1,45 @@
+name: Refresh Bazel lock
+
+on:
+  push:
+    branches:
+      - 'ci/**'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Full source commit SHA to lock
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: Refresh MODULE.bazel.lock
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Bazel
+        uses: ./.github/actions/setup-bazel-ci
+        with:
+          target: x86_64-unknown-linux-gnu
+
+      - name: Refresh Bazel lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          bazel mod deps --lockfile_mode=update
+
+      - name: Upload MODULE.bazel.lock
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: MODULE.bazel.lock
+          path: MODULE.bazel.lock
+          if-no-files-found: error

@@ -1,3 +1,15 @@
+# [0.153.3] - 2026-09-05
+
+## Codex Termux 0.153.3 — guardrails for model-owned prompts
+
+- Enforces an 8 KiB byte cap on catalog-supplied `persistent_instructions` and
+  Guardian `node_repl_policy` at every ingress and consumer; oversized values
+  are rejected, never truncated.
+- Guardian fails closed with a clear diagnostic, covered by dedicated CI
+  terminal tests.
+- Refreshes the Bazel lock and zlib snapshot URLs, keeps the SDK workflow on
+  hosted runners, guards the V8 release workflow, and cleans up README ASCII.
+
 # [0.153.2] - 2026-09-04
 
 ## GPT-6-Astra now available in the model picker
