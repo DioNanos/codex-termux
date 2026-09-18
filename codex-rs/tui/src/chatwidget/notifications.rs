@@ -4,7 +4,7 @@ use super::*;
 
 impl ChatWidget {
     pub(super) fn notify(&mut self, notification: Notification) {
-        if !notification.allowed_for(&self.config.tui_notifications.notifications) {
+        if !notification.allowed_for(&self.local_settings.tui.notification_settings.notifications) {
             return;
         }
         if let Some(existing) = self.pending_notification.as_ref()

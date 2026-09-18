@@ -5,6 +5,7 @@ use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadOptions;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
+use codex_core::config::ConfigOverrides;
 use codex_core::config::LoaderOverrides;
 use codex_core::config::bootstrap_auth_config;
 use codex_core::config::find_codex_home;
@@ -16,22 +17,31 @@ pub(crate) async fn load_config(
     config_overrides: &CliConfigOverrides,
     loader_overrides: LoaderOverrides,
 ) -> Result<Config> {
-    config_builder(config_overrides, loader_overrides)
-        .await?
-        .build()
-        .await
-        .context("failed to load configuration")
+    config_builder(
+        config_overrides,
+        loader_overrides,
+        ConfigOverrides::default(),
+    )
+    .await?
+    .build()
+    .await
+    .context("failed to load configuration")
 }
 
 pub(crate) async fn config_builder(
     config_overrides: &CliConfigOverrides,
     loader_overrides: LoaderOverrides,
+    harness_overrides: ConfigOverrides,
 ) -> Result<ConfigBuilder> {
     let cli_overrides = config_overrides
         .parse_overrides()
         .map_err(anyhow::Error::msg)?;
     let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
-    let cwd = AbsolutePathBuf::current_dir().context("failed to resolve current directory")?;
+    let cwd = match harness_overrides.cwd.as_deref() {
+        Some(cwd) => AbsolutePathBuf::relative_to_current_dir(cwd),
+        None => AbsolutePathBuf::current_dir(),
+    }
+    .context("failed to resolve current directory")?;
     let bootstrap_config = load_config_toml_with_layer_stack(
         codex_home.as_path(),
         Some(&cwd),
@@ -56,6 +66,7 @@ pub(crate) async fn config_builder(
         .codex_home(codex_home.to_path_buf())
         .cli_overrides(cli_overrides)
         .loader_overrides(loader_overrides)
+        .harness_overrides(harness_overrides)
         .cloud_config_bundle(cloud_config_bundle)
         .fallback_cwd(Some(cwd.to_path_buf())))
 }

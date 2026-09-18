@@ -25,6 +25,7 @@ use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputAsyncHandler;
 use crate::tools::handlers::RequestUserInputHandler;
+use crate::tools::handlers::SendMessageToUserAsyncHandler;
 use crate::tools::handlers::SleepHandler;
 use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
@@ -996,6 +997,10 @@ fn add_core_tool_sources(context: &CoreToolPlanContext<'_>, registry: &mut ToolR
             {
                 registry.add(ExecCommandHandler::new(ExecCommandHandlerOptions {
                     allow_login_shell: any_environment_allows_login_shell(context.environments),
+                    allow_tty: turn_context
+                        .config
+                        .features
+                        .enabled(Feature::UnifiedExecTty),
                     exec_permission_approvals_enabled: false,
                     include_environment_id,
                     include_shell_parameter: unified_exec_should_include_shell_parameter(
@@ -1087,6 +1092,7 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
     let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
     let options = ExecCommandHandlerOptions {
         allow_login_shell,
+        allow_tty: features.enabled(Feature::UnifiedExecTty),
         exec_permission_approvals_enabled,
         include_environment_id,
         include_shell_parameter: unified_exec_should_include_shell_parameter(
@@ -1181,6 +1187,16 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
             },
             ToolExposure::DirectModelOnly,
         );
+    }
+
+    if !turn_context.session_source.is_non_root_agent()
+        && context
+            .model_info
+            .experimental_supported_tools
+            .iter()
+            .any(|tool| tool == "send_message_to_user_async")
+    {
+        registry.add_with_exposure(SendMessageToUserAsyncHandler, ToolExposure::DirectModelOnly);
     }
 
     if environment_mode.has_environment() && features.enabled(Feature::RequestPermissionsTool) {

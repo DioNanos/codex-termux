@@ -208,6 +208,88 @@ async fn skills_for_config_reuses_cache_for_same_effective_config() {
 }
 
 #[tokio::test]
+async fn skills_for_config_bounds_plugin_generations_and_preserves_live_snapshots() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let skill_path = write_plugin_skill(
+        &codex_home,
+        "test",
+        "sample",
+        "search",
+        "search",
+        "initial description",
+    );
+    let plugin_root = plugin_skill_root_for_skill_path(&skill_path, "sample@test", "sample");
+    let base_input = HostSkillsLoadInput::new(
+        cwd.path().abs(),
+        vec![plugin_root],
+        config_stack(&codex_home, "[skills.bundled]\nenabled = false\n"),
+    );
+    let skills_service = HostSkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let mut generations = Vec::new();
+    let mut recent = None;
+    let mut held_snapshot = None;
+    let mut held_skills = Vec::new();
+
+    // Reloads allocate new handles even when roots repeat, as they do after a rollback.
+    for generation in 0..CONFIG_SKILLS_CACHE_CAPACITY + 2 {
+        fs::write(
+            &skill_path,
+            format!("---\nname: search\ndescription: generation {generation}\n---\n\n# Body\n"),
+        )
+        .expect("write updated skill");
+        let owner = Arc::new(TestPluginSkillSnapshotCache::default());
+        generations.push(Arc::downgrade(&owner));
+        let input = base_input
+            .clone()
+            .with_plugin_skill_snapshots(Some(SkillRootSnapshots::new(owner)));
+        let snapshot = skills_service
+            .snapshot_for_config(&input, Some(Arc::clone(&LOCAL_FS)))
+            .await;
+
+        if generation == 0 {
+            recent = Some((input, snapshot));
+        } else if generation == 1 {
+            held_skills = snapshot.outcome().skills.clone();
+            held_snapshot = Some(snapshot);
+        }
+        if generation == CONFIG_SKILLS_CACHE_CAPACITY - 1 {
+            let (input, snapshot) = recent.as_ref().expect("first generation");
+            let reused = skills_service
+                .snapshot_for_config(input, Some(Arc::clone(&LOCAL_FS)))
+                .await;
+            assert!(std::ptr::eq(snapshot.outcome(), reused.outcome()));
+        }
+    }
+    drop(recent);
+
+    let retained_generations = generations
+        .iter()
+        .enumerate()
+        .filter_map(|(generation, owner)| owner.upgrade().map(|_| generation))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retained_generations,
+        std::iter::once(/*value*/ 0)
+            .chain(3..CONFIG_SKILLS_CACHE_CAPACITY + 2)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        held_snapshot
+            .expect("evicted live snapshot")
+            .outcome()
+            .skills,
+        held_skills
+    );
+
+    skills_service.clear_cache();
+    assert_eq!(generations.iter().filter_map(Weak::upgrade).count(), 0);
+}
+
+#[tokio::test]
 async fn watchable_skill_root_paths_exclude_plugin_and_system_roots() {
     let codex_home = tempfile::tempdir().expect("tempdir");
     let cwd = tempfile::tempdir().expect("tempdir");

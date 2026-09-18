@@ -288,6 +288,7 @@ impl MessageProcessor {
             plugin_startup_tasks,
         } = args;
         let thread_state_manager = ThreadStateManager::new();
+        outgoing.watch_user_verification_auth(Arc::clone(&auth_manager));
         // The thread store is intentionally process-scoped. Config reloads can
         // affect per-thread behavior, but they must not move newly started,
         // resumed, or forked threads to a different persistence backend/root.
@@ -348,6 +349,7 @@ impl MessageProcessor {
                     config.codex_home.clone(),
                 )),
                 Some(analytics_events_client.clone()),
+                codex_core::passthrough_image_store(),
                 Arc::clone(&thread_store),
                 codex_core::local_agent_graph_store_from_state_db(state_db.as_ref()),
                 installation_id,
@@ -803,6 +805,9 @@ impl MessageProcessor {
         session_state: &ConnectionSessionState,
     ) {
         session_state.rpc_gate.close().await;
+        self.outgoing
+            .disconnect_user_verification_connection(connection_id)
+            .await;
         session_state.mcp_event_streams.clear().await;
         if timeout(
             CONNECTION_RPC_DRAIN_TIMEOUT,
@@ -834,14 +839,22 @@ impl MessageProcessor {
     }
 
     /// Handle a standalone JSON-RPC response originating from the peer.
-    pub(crate) async fn process_response(&self, response: JSONRPCResponse) {
+    pub(crate) async fn process_response(
+        &self,
+        connection_id: ConnectionId,
+        response: JSONRPCResponse,
+    ) {
         let JSONRPCResponse { id, result, .. } = response;
-        self.outgoing.notify_client_response(id, result).await
+        self.outgoing
+            .notify_client_response(connection_id, id, result)
+            .await
     }
 
     /// Handle an error object received from the peer.
-    pub(crate) async fn process_error(&self, err: JSONRPCError) {
-        self.outgoing.notify_client_error(err.id, err.error).await;
+    pub(crate) async fn process_error(&self, connection_id: ConnectionId, err: JSONRPCError) {
+        self.outgoing
+            .notify_client_error(connection_id, err.id, err.error)
+            .await;
     }
 
     async fn handle_client_request(
@@ -978,6 +991,12 @@ impl MessageProcessor {
         let result: Result<Option<ClientResponsePayload>, JSONRPCErrorError> = match codex_request {
             ClientRequest::Initialize { .. } => {
                 panic!("Initialize should be handled before initialized request dispatch");
+            }
+            ClientRequest::UserVerificationStatus { .. }
+            | ClientRequest::UserVerificationEnroll { .. }
+            | ClientRequest::UserVerificationDelete { .. }
+            | ClientRequest::UserVerificationVerify { .. } => {
+                Err(crate::user_verification::unavailable())
             }
             ClientRequest::ServerDiagnostics { .. } => Ok(Some(read_server_diagnostics().into())),
             ClientRequest::ConfigRead { params, .. } => self
@@ -1592,8 +1611,8 @@ impl MessageProcessor {
             ClientRequest::GetAuthStatus { params, .. } => {
                 self.account_processor.get_auth_status(params).await
             }
-            ClientRequest::GetAccountRateLimits { .. } => {
-                self.account_processor.get_account_rate_limits().await
+            ClientRequest::GetAccountRateLimits { params, .. } => {
+                self.account_processor.get_account_rate_limits(params).await
             }
             ClientRequest::ConsumeAccountRateLimitResetCredit { params, .. } => {
                 self.account_processor

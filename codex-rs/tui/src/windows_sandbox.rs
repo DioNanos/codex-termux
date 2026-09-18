@@ -61,26 +61,33 @@ pub(crate) fn sandbox_setup_is_complete(_codex_home: &Path) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn run_elevated_setup(
+pub(crate) fn prepare_elevated_sandbox(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
     command_cwd: &Path,
     env_map: &HashMap<String, String>,
     codex_home: &Path,
 ) -> anyhow::Result<()> {
-    let permissions = codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
-        permission_profile,
-        workspace_roots,
-    )?;
-    codex_windows_sandbox::run_elevated_setup(
-        codex_windows_sandbox::SandboxSetupRequest {
+    if !sandbox_setup_is_complete(codex_home) {
+        let permissions = codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+            permission_profile,
+            workspace_roots,
+        )?;
+        codex_windows_sandbox::run_elevated_setup(codex_windows_sandbox::SandboxSetupRequest {
             permissions: &permissions,
             command_cwd,
             env_map,
             codex_home,
             proxy_enforced: false,
-        },
-        codex_windows_sandbox::SetupRootOverrides::default(),
+        })?;
+    }
+    codex_windows_sandbox::run_setup_refresh(
+        permission_profile,
+        workspace_roots,
+        command_cwd,
+        env_map,
+        codex_home,
+        /*proxy_enforced*/ false,
     )
 }
 

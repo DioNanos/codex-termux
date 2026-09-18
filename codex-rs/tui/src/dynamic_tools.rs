@@ -438,6 +438,7 @@ async fn execute_inner(
                     request(&handle, |request_id| ClientRequest::ThreadList {
                         request_id,
                         params: ThreadListParams {
+                            originators: None,
                             cursor: arguments.cursor.clone(),
                             limit: Some(limit),
                             sort_key: Some(ThreadSortKey::UpdatedAt),

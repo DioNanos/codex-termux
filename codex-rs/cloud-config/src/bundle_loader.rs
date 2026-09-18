@@ -88,24 +88,45 @@ pub async fn cloud_config_bundle_loader_for_storage(
     auth_config: AuthConfig,
     enable_codex_api_key_env: bool,
 ) -> std::io::Result<CloudConfigBundleLoader> {
-    let auth_manager =
-        AuthManager::shared_from_auth_config(auth_config.clone(), enable_codex_api_key_env).await?;
-    Ok(cloud_config_bundle_loader_from_auth_config(
-        auth_config,
-        auth_manager,
-    ))
+    let service =
+        cloud_config_bundle_service_for_storage(auth_config, enable_codex_api_key_env).await?;
+    let (loader, refresh_task) = cloud_config_bundle_loader_for_service(service);
+    replace_refresh_task(refresher_task_slot(), refresh_task);
+    Ok(loader)
 }
 
-fn cloud_config_bundle_loader_from_auth_config(
+/// Fetches directly from the network on each load, without reading or writing
+/// the disk cache or starting a background refresher.
+pub async fn cloud_config_bundle_loader_for_storage_without_cache(
     auth_config: AuthConfig,
-    auth_manager: Arc<AuthManager>,
-) -> CloudConfigBundleLoader {
-    cloud_config_bundle_loader(
+    enable_codex_api_key_env: bool,
+) -> std::io::Result<CloudConfigBundleLoader> {
+    let service = Arc::new(
+        cloud_config_bundle_service_for_storage(auth_config, enable_codex_api_key_env)
+            .await?
+            .without_cache(),
+    );
+    Ok(CloudConfigBundleLoader::from_getter(move || {
+        let service = Arc::clone(&service);
+        async move { service.load_startup_bundle_with_timeout().await }
+    }))
+}
+
+async fn cloud_config_bundle_service_for_storage(
+    auth_config: AuthConfig,
+    enable_codex_api_key_env: bool,
+) -> std::io::Result<CloudConfigBundleService<BackendBundleClient>> {
+    let auth_manager =
+        AuthManager::shared_from_auth_config(auth_config.clone(), enable_codex_api_key_env).await?;
+    Ok(CloudConfigBundleService::new(
         auth_manager,
-        auth_config
-            .chatgpt_base_url
-            .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string()),
+        Arc::new(BackendBundleClient::new(
+            auth_config
+                .chatgpt_base_url
+                .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string()),
+            auth_config.auth_route_config.http_client_factory().clone(),
+        )),
         auth_config.codex_home,
-        auth_config.auth_route_config.http_client_factory().clone(),
-    )
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    ))
 }

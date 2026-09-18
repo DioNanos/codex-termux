@@ -16,7 +16,6 @@ use codex_core::config::Constrained;
 use codex_core::config::ThreadStoreConfig;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_plugin::PluginHookSource;
@@ -71,6 +70,7 @@ use core_test_support::wait_for_event;
 use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -1145,7 +1145,7 @@ fn rollout_hook_prompt_texts(text: &str) -> Result<Vec<String>> {
         if trimmed.is_empty() {
             continue;
         }
-        let rollout: RolloutLine = serde_json::from_str(trimmed).context("parse rollout line")?;
+        let rollout = codex_rollout::parse_rollout_line(trimmed).context("parse rollout line")?;
         if let RolloutItem::ResponseItem(envelope) = rollout.item
             && let ResponseItem::Message { role, content, .. } = envelope.item
             && role == "user"
@@ -2650,8 +2650,12 @@ async fn blocked_user_prompt_submit_persists_additional_context_for_next_turn() 
     Ok(())
 }
 
+#[test_case::test_case(/*thread_context_enabled*/ true; "retained context enabled")]
+#[test_case::test_case(/*thread_context_enabled*/ false; "retained context disabled")]
 #[tokio::test]
-async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Result<()> {
+async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt(
+    thread_context_enabled: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let (gate_completed_tx, gate_completed_rx) = oneshot::channel();
@@ -2694,7 +2698,13 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
             write_user_prompt_submit_hook(home, "blocked queued prompt", BLOCKED_PROMPT_CONTEXT)
                 .expect("failed to write user prompt submit hook test fixture");
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(move |config| {
+            trust_discovered_hooks(config);
+            config
+                .features
+                .set_enabled(Feature::GuardianThreadContext, thread_context_enabled)
+                .expect("test context mode");
+        });
     let test = builder.build_with_streaming_server(&server).await?;
 
     test.codex
@@ -2747,6 +2757,30 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
     assert!(
         !second_user_texts.contains(&"blocked queued prompt".to_string()),
         "second request should not include the blocked queued prompt",
+    );
+
+    let history = test.codex.conversation_history_snapshot().await;
+    assert_eq!(history.retained_context().is_some(), thread_context_enabled);
+    let retained = serde_json::to_value(history.retained_context().cloned().unwrap_or_default())?;
+    assert_eq!(
+        retained["user_messages"]
+            .as_array()
+            .expect("retained user messages")
+            .iter()
+            .map(|message| (message["order"].clone(), message["text"].clone()))
+            .collect::<Vec<_>>(),
+        if thread_context_enabled {
+            vec![
+                (json!(0), json!("initial prompt")),
+                (json!(1), json!("accepted queued prompt")),
+            ]
+        } else {
+            Vec::new()
+        },
+    );
+    assert_eq!(
+        retained["next_order"],
+        json!(if thread_context_enabled { 3 } else { 0 })
     );
 
     let hook_inputs = read_user_prompt_submit_hook_inputs(test.codex_home_path())?;

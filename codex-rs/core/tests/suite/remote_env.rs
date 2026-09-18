@@ -38,7 +38,6 @@ use codex_extension_api::WorldStateContributionInput;
 use codex_extension_api::WorldStateSectionContribution;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_network_proxy::NetworkProxyConfig;
@@ -384,7 +383,7 @@ async fn remote_test_env_exposes_target_shell_and_exec_guidance_to_model() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_remote_shell_runs_in_remote_cwd() -> Result<()> {
+async fn approved_remote_shell_runs_in_remote_cwd() -> Result<()> {
     const CALL_ID: &str = "remote-explicit-shell";
 
     skip_if_no_remote_env!(Ok(()));
@@ -407,9 +406,15 @@ async fn explicit_remote_shell_runs_in_remote_cwd() -> Result<()> {
         "shell": shell,
         "login": false,
         "yield_time_ms": 10_000,
+        "sandbox_permissions": SandboxPermissions::RequireEscalated,
+        "justification": "Test target-native command approval cwd.",
     }))?;
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.approvals_reviewer = ApprovalsReviewer::User;
+    });
     let test = builder.build_with_auto_env(&server).await?;
+    let selection = test.executor_environment().selection().clone();
     let response_mock = mount_sse_sequence(
         &server,
         vec![
@@ -427,16 +432,39 @@ async fn explicit_remote_shell_runs_in_remote_cwd() -> Result<()> {
     )
     .await;
 
-    test.submit_turn_with_environments(
+    submit_turn_with_approval_and_environments(
+        &test,
         "run the remote shell in the remote cwd",
-        Some(vec![TurnEnvironmentSelection {
-            environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
-            cwd: test.executor_environment().selection().cwd.clone(),
-            workspace_roots: vec![test.executor_environment().selection().cwd.clone()],
-            config: EnvironmentConfigState::FromThread,
-        }]),
+        vec![selection.clone()],
+        AskForApproval::OnRequest,
     )
     .await?;
+
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_)
+        )
+    })
+    .await;
+    let EventMsg::ExecApprovalRequest(approval) = event else {
+        panic!("expected remote command approval before completion: {event:?}");
+    };
+    assert_eq!(
+        approval.cwd.to_inferred_path_uri().as_ref(),
+        Some(&selection.cwd)
+    );
+    test.codex
+        .submit(Op::ExecApproval {
+            id: approval.effective_approval_id(),
+            turn_id: Some(approval.turn_id),
+            decision: ReviewDecision::Approved,
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
     let request = response_mock
         .last_request()
         .context("model should receive the command output")?;
@@ -1078,7 +1106,7 @@ async fn deferred_executor_promotes_primary_environment_when_startup_completes()
     let rollout = fs::read_to_string(test.codex.rollout_path().context("rollout path")?)?;
     let world_state_patch = rollout
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<serde_json::Result<Vec<_>>>()?
         .into_iter()
         .filter_map(|line| match line.item {
@@ -2766,7 +2794,7 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
     let rollout = fs::read_to_string(rollout_path)?;
     let world_state_items = rollout
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<serde_json::Result<Vec<_>>>()?
         .into_iter()
         .filter_map(|line| match line.item {
@@ -3287,7 +3315,16 @@ async fn remote_request_permissions_grant_unblocks_later_remote_exec() -> Result
         request.environment_id.as_deref(),
         Some(REMOTE_ENVIRONMENT_ID)
     );
-    assert_eq!(request.cwd.as_ref(), Some(&remote_cwd));
+    let request_cwd = request.cwd.expect("request cwd");
+    let expected_cwd = PathUri::from_abs_path(&remote_cwd);
+    assert_eq!(
+        request_cwd.as_str(),
+        expected_cwd.inferred_native_path_string()
+    );
+    let request_cwd: PathUri = request_cwd
+        .try_into()
+        .expect("request cwd should remain target-native");
+    assert_eq!(request_cwd, expected_cwd);
     assert_eq!(request.permissions, expected_permissions);
 
     test.codex

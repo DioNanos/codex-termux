@@ -20,8 +20,8 @@ use codex_protocol::request_permissions::PermissionGrantScope as CorePermissionG
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_utils_path_uri::LegacyAppPathString;
+use codex_utils_path_uri::PathUri;
 use core_test_support::responses;
-use core_test_support::skip_if_wine_exec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tokio::time::timeout;
@@ -30,12 +30,6 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_permissions_round_trip() -> Result<()> {
-    // TODO(anp): Remove after tool routing accepts a target-native cwd on a different host OS.
-    skip_if_wine_exec!(
-        Ok(()),
-        "request_permissions currently rejects the target-native Windows cwd on the Linux host"
-    );
-
     let codex_home = tempfile::TempDir::new()?;
     let project_root_entry = json!({
         "path": {
@@ -112,7 +106,13 @@ async fn request_permissions_round_trip() -> Result<()> {
     assert_eq!(params.thread_id, thread.id);
     assert_eq!(params.turn_id, turn.id);
     assert_eq!(params.item_id, "call1");
-    assert!(params.cwd.as_path().is_absolute());
+    assert_eq!(params.cwd.as_str(), cwd.inferred_native_path_string());
+    let request_cwd: PathUri = params
+        .cwd
+        .clone()
+        .try_into()
+        .expect("request cwd should remain target-native");
+    assert_eq!(request_cwd, cwd);
     assert_eq!(params.reason, Some("Select a workspace root".to_string()));
     let requested_file_system = params
         .permissions

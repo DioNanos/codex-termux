@@ -31,7 +31,7 @@ before:
 ~
 ───────────────────────────────────────────────────────────────────────── 100% ─
  ↑/↓ to scroll   pgup/pgdn to page   home/end to jump
- q to quit   esc to edit prev
+ q close   esc to edit prev
 
 
 after:
@@ -63,4 +63,4 @@ next message
 ~
 ───────────────────────────────────────────────────────────────────────── 100% ─
  ↑/↓ to scroll   pgup/pgdn to page   home/end to jump
- q to quit   esc to edit prev
+ q close   esc to edit prev

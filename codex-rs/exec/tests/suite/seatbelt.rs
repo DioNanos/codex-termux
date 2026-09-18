@@ -15,6 +15,110 @@ use std::process::Output;
 use std::time::Duration;
 use tempfile::TempDir;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_home_symlink_opt_out_uses_loaded_user_config() -> anyhow::Result<()> {
+    use core_test_support::responses;
+    use core_test_support::test_codex_exec::test_codex_exec;
+    use serde_json::json;
+
+    core_test_support::skip_if_sandbox!(Ok(()));
+    for (home_env, root_alias, enabled, ignore_user_config) in [
+        ("user-home", Some("user-home"), true, false),
+        ("home-link/../.codex", Some(".codex"), false, false),
+        ("home-link/../.codex", None, true, false),
+        ("user-home", Some("user-home"), true, true),
+    ] {
+        let test = test_codex_exec();
+        let home = test.home_path().join(".codex");
+        let project_home = test.cwd_path().join(".codex");
+        let child = test.home_path().join("child");
+        for directory in [&home, &project_home, &child] {
+            fs::create_dir(directory)?;
+        }
+        symlink(&home, test.cwd_path().join("user-home"))?;
+        symlink(&child, test.cwd_path().join("home-link"))?;
+        fs::write(
+            home.join("config.toml"),
+            format!("allow_symlinked_codex_home = {enabled}\n"),
+        )?;
+        // The checkout must not enable the opt-out, even when `..` follows a symlink.
+        fs::write(
+            project_home.join("config.toml"),
+            "allow_symlinked_codex_home = true\n",
+        )?;
+        let target = TempDir::new()?;
+        for root in [&home, &project_home] {
+            symlink(target.path(), root.join("visualizations"))?;
+        }
+        let writable_home =
+            root_alias.map_or_else(|| home.clone(), |alias| test.cwd_path().join(alias));
+        let visualizations = writable_home.join("visualizations");
+        let shell_args = json!({
+            "cmd": "printf shell > shell.txt",
+            "workdir": visualizations,
+            "shell": "/bin/sh",
+            "login": false,
+        })
+        .to_string();
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}/patch.txt\n+patched\n*** End Patch",
+            visualizations.display()
+        );
+        let server = responses::start_mock_server().await;
+        let should_run = enabled && !ignore_user_config;
+        let mock = responses::mount_sse_sequence(
+            &server,
+            vec![
+                responses::sse(vec![
+                    responses::ev_function_call("shell", "exec_command", &shell_args),
+                    responses::ev_apply_patch_custom_tool_call("patch", &patch),
+                    responses::ev_completed("response-1"),
+                ]),
+                responses::sse(vec![responses::ev_completed("response-2")]),
+            ],
+        )
+        .await;
+        let mut command = test.cmd_with_server(&server);
+        command
+            .env_remove("CODEX_API_KEY")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("CODEX_ACCESS_TOKEN")
+            .env("CODEX_HOME", home_env)
+            .args(["--skip-git-repo-check", "--sandbox", "workspace-write", "--add-dir"])
+            .arg(&visualizations)
+            .args(["-c", "approvals_reviewer=\"user\"", "-c", "features.shell_snapshot_v2=false"])
+            // Session overrides cannot authorize the host's exception either.
+            .args(["-c", "allow_symlinked_codex_home=true"])
+            .args(["-c", "model_provider=\"test\"", "-c"])
+            .arg(format!(
+                "model_providers.test={{name=\"test\",base_url={:?},wire_api=\"responses\",requires_openai_auth=false,supports_websockets=false}}",
+                format!("{}/v1", server.uri())
+            ))
+            .arg("write the files");
+        if ignore_user_config {
+            command.arg("--ignore-user-config");
+        }
+        let output = command.output()?;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(mock.requests().len(), 2);
+        if should_run {
+            assert_eq!(fs::read(target.path().join("shell.txt"))?, b"shell");
+            assert_eq!(fs::read(target.path().join("patch.txt"))?, b"patched\n");
+        } else {
+            let shell_output = mock
+                .function_call_output_text("shell")
+                .expect("shell tool output");
+            assert!(
+                shell_output.contains("symlinked writable roots are not supported"),
+                "{shell_output}"
+            );
+            assert!(!target.path().join("shell.txt").exists());
+            assert!(!target.path().join("patch.txt").exists());
+        }
+    }
+    Ok(())
+}
+
 fn workspace_fixture() -> (TempDir, AbsolutePathBuf) {
     let temp_dir = TempDir::new().expect("create temporary directory");
     let workspace = temp_dir.path().join("workspace");

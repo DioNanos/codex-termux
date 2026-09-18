@@ -33,11 +33,25 @@ runs:
         archive_path="${binding_dir}/${archive_name}"
         binding_path="${binding_dir}/${binding_name}"
         checksums_path="${binding_dir}/${checksums_name}"
+        trusted_checksums="${GITHUB_WORKSPACE}/third_party/v8/rusty_v8_${version//./_}_release_manifests.sha256"
+
+        if command -v sha256sum >/dev/null 2>&1; then
+          checksum_command=(sha256sum --check -)
+        else
+          checksum_command=(shasum -a 256 --check -)
+        fi
 
         mkdir -p "${binding_dir}"
+        curl -fsSL "${base_url}/${checksums_name}" -o "${checksums_path}"
+        # Check the original manifest bytes even when either checksum file uses CRLF.
+        expected_manifest_checksum="$(grep -F "  ${checksums_name}" "${trusted_checksums}" | cut -d ' ' -f 1)"
+        actual_manifest_checksum="$(python3 -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "${checksums_path}")"
+        if [[ "${actual_manifest_checksum}" != "${expected_manifest_checksum}" ]]; then
+          echo "Checksum mismatch for ${checksums_name}: expected ${expected_manifest_checksum}, got ${actual_manifest_checksum}" >&2
+          exit 1
+        fi
         curl -fsSL "${base_url}/${archive_name}" -o "${archive_path}"
         curl -fsSL "${base_url}/${binding_name}" -o "${binding_path}"
-        curl -fsSL "${base_url}/${checksums_name}" -o "${checksums_path}"
 
         if [[ "$(wc -l < "${checksums_path}")" -ne 2 ]]; then
           echo "Expected exactly two checksums for ${TARGET} in ${checksums_path}" >&2
@@ -45,10 +59,6 @@ runs:
         fi
 
         # Existing Windows-built release manifests use CRLF line endings.
-        if command -v sha256sum >/dev/null 2>&1; then
-          (cd "${binding_dir}" && tr -d '\r' < "${checksums_path}" | sha256sum -c -)
-        else
-          (cd "${binding_dir}" && tr -d '\r' < "${checksums_path}" | shasum -a 256 -c -)
-        fi
+        (cd "${binding_dir}" && tr -d '\r' < "${checksums_path}" | "${checksum_command[@]}")
         echo "RUSTY_V8_ARCHIVE=${archive_path}" >> "${GITHUB_ENV}"
         echo "RUSTY_V8_SRC_BINDING_PATH=${binding_path}" >> "${GITHUB_ENV}"

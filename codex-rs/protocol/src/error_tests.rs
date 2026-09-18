@@ -88,6 +88,7 @@ fn rate_limit_snapshot() -> RateLimitSnapshot {
     RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 50.0,
             window_minutes: Some(60),

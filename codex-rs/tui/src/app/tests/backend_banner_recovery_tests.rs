@@ -43,6 +43,85 @@ async fn next_rate_limits_loaded(
 }
 
 #[tokio::test]
+async fn luna_reserve_periodic_refresh_adapts_without_an_experiment_banner() -> Result<()> {
+    let backend = MockServer::start().await;
+    let home = tempdir()?;
+    write_chatgpt_auth(
+        home.path(),
+        ChatGptAuthFixture::new("local-test-token")
+            .account_id("workspace-a")
+            .chatgpt_user_id("user-a")
+            .plan_type("plus"),
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("write synthetic auth");
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "chatgpt_base_url = {:?}\ncli_auth_credentials_store = \"file\"\n",
+            backend.uri()
+        ),
+    )?;
+    let (mut app, mut events, _ops) = make_test_app_with_channels().await;
+    app.config.codex_home = home.path().to_path_buf().abs();
+    app.config.chatgpt_base_url = backend.uri();
+    app.config.sqlite = codex_state::SqliteConfig::new_for_testing(home.path().abs());
+    set_chatgpt_auth(&mut app.chat_widget);
+    let mut session = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    for (used, seconds) in [(10, 60), (75, 30), (90, 15), (99, 5), (20, 60)] {
+        backend.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/api/codex/usage"))
+            .respond_with(ResponseTemplate::new(/*s*/ 200).set_body_json(json!({
+                "account_id": "workspace-a", "user_id": "user-a", "plan_type": "plus",
+                "rate_limit": {"allowed": true, "limit_reached": false,
+                    "primary_window": {"used_percent": used, "limit_window_seconds": 18000,
+                        "reset_after_seconds": 1800, "reset_at": 2000000000}},
+                "rate_limit_reset_credits": {"available_count": 1}
+            })))
+            .expect(/*r*/ 1)
+            .mount(&backend)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/codex/rate-limit-reset-credits"))
+            .respond_with(ResponseTemplate::new(/*s*/ 200))
+            .expect(/*r*/ 0)
+            .mount(&backend)
+            .await;
+        app.refresh_rate_limits(&session, RateLimitRefreshOrigin::Periodic);
+        // A second timer tick while this RPC is pending must not add another request.
+        app.refresh_rate_limits(&session, RateLimitRefreshOrigin::Periodic);
+        assert!(
+            app.rate_limit_refresh_state
+                .poll_deadline(Duration::from_secs(/*secs*/ 60))
+                .is_none()
+        );
+        let loaded = next_rate_limits_loaded(&mut events).await?;
+        assert_matches!(&loaded, AppEvent::RateLimitsLoaded { result: Ok(_), .. });
+        let before = std::time::Instant::now();
+        app.handle_event(&mut tui, &mut session, loaded).await?;
+        let after = std::time::Instant::now();
+        let interval = app.chat_widget.rate_limit_refresh_interval().unwrap();
+        assert_eq!(interval, Duration::from_secs(seconds));
+        let deadline = app
+            .rate_limit_refresh_state
+            .poll_deadline(interval)
+            .unwrap();
+        assert!(deadline >= before + interval && deadline <= after + interval);
+        let requests = backend.received_requests().await.unwrap();
+        let usage = requests
+            .iter()
+            .find(|request| request.url.path() == "/api/codex/usage")
+            .unwrap();
+        assert!(usage.headers.contains_key("x-openai-codex-luna-reserve"));
+        backend.verify().await;
+    }
+    session.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn backend_banner_limit_error_refreshes_again_after_intervening_rolling_hard_stop()
 -> Result<()> {
     let server = MockServer::start().await;

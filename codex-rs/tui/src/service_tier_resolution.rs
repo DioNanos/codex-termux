@@ -3,15 +3,19 @@ use codex_features::Feature;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::openai_models::ModelPreset;
 
-pub(crate) fn configured_service_tier(config: &Config) -> Option<String> {
+pub(crate) fn configured_service_tier(
+    config: &Config,
+    notices: &codex_config::types::Notice,
+) -> Option<String> {
     config.service_tier.clone().or_else(|| {
-        (config.notices.fast_default_opt_out == Some(true))
+        (notices.fast_default_opt_out == Some(true))
             .then(|| SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())
     })
 }
 
 pub(crate) fn effective_service_tier(
     config: &Config,
+    notices: &codex_config::types::Notice,
     model: &str,
     models: &[ModelPreset],
 ) -> Option<String> {
@@ -19,7 +23,7 @@ pub(crate) fn effective_service_tier(
         return None;
     }
 
-    let configured = configured_service_tier(config);
+    let configured = configured_service_tier(config, notices);
     let Some(preset) = models.iter().find(|preset| preset.model == model) else {
         return configured;
     };
@@ -37,6 +41,7 @@ pub(crate) fn effective_service_tier(
 
 pub(crate) fn service_tier_update_for_core(
     config: &Config,
+    notices: &codex_config::types::Notice,
     model: &str,
     models: &[ModelPreset],
 ) -> Option<Option<String>> {
@@ -44,7 +49,7 @@ pub(crate) fn service_tier_update_for_core(
         return None;
     }
 
-    let effective = effective_service_tier(config, model, models);
+    let effective = effective_service_tier(config, notices, model, models);
     if let Some(service_tier) = effective {
         return Some(Some(service_tier));
     }

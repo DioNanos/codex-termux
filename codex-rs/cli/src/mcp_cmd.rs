@@ -660,7 +660,9 @@ async fn run_logout(config: &Config, logout_args: LogoutArgs) -> Result<()> {
         &url,
         config.mcp_oauth_credentials_store_mode,
         config.auth_keyring_backend_kind(),
-    ) {
+    )
+    .await
+    {
         Ok(true) => println!("Removed OAuth credentials for '{name}'."),
         Ok(false) => println!("No OAuth credentials stored for '{name}'."),
         Err(err) => return Err(anyhow!("failed to delete OAuth credentials: {err}")),

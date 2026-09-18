@@ -29,7 +29,7 @@ fn configure_fallback_model(app: &mut App) {
     app.chat_widget.set_model("gpt-5.4");
 }
 
-async fn start_fallback_thread(
+pub(super) async fn start_fallback_thread(
     app: &mut App,
 ) -> Result<session_lifecycle_requests::RecordingAppServer> {
     let (mut server, requests, proxy) = session_lifecycle_requests::start_recording_app_server(
@@ -268,13 +268,22 @@ async fn backend_banner_fallback_handles_settings_failure_and_queued_manual_sele
     use futures::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
 
-    for error_code in [Some(-32601), Some(-32603), None] {
+    for (use_reserve, error_code) in [false, true]
+        .into_iter()
+        .flat_map(|reserve| [Some(-32601), Some(-32603), None].map(|error| (reserve, error)))
+    {
         let (mut app, mut events, _ops) = make_test_app_with_channels().await;
         let id = ThreadId::new();
         app.active_thread_id = Some(id);
         app.chat_widget
             .handle_thread_session(test_thread_session(id, app.config.cwd.to_path_buf()));
-        configure_fallback_model(&mut app);
+        if use_reserve {
+            app.primary_session_configured =
+                Some(test_thread_session(id, app.config.cwd.to_path_buf()));
+            super::luna_reserve_recovery_tests::configure_reserve_catalog(&mut app);
+        } else {
+            configure_fallback_model(&mut app);
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let websocket_url = format!("ws://{}", listener.local_addr()?);
         let codex_home = app.config.codex_home.display().to_string();
@@ -322,7 +331,25 @@ async fn backend_banner_fallback_handles_settings_failure_and_queued_manual_sele
             crate::app_server_session::ThreadParamsMode::Embedded,
         );
         while events.try_recv().is_ok() {}
-        app.chat_widget.update_backend_banner(&fallback_response());
+        let pending_turn = if use_reserve && error_code.is_some() {
+            app.chat_widget
+                .restore_user_message_to_composer(UserMessage::from("queued before usage reply"));
+            app.chat_widget
+                .handle_key_event(KeyEvent::from(KeyCode::Enter));
+            Some(
+                std::iter::from_fn(|| events.try_recv().ok())
+                    .find(|event| matches!(event, AppEvent::CodexOp(AppCommand::UserTurn { .. })))
+                    .expect("turn already queued before the failed switch"),
+            )
+        } else {
+            None
+        };
+        let response = if use_reserve {
+            super::luna_reserve_recovery_tests::reserve_response()
+        } else {
+            fallback_response()
+        };
+        app.chat_widget.update_backend_banner(&response);
         app.apply_backend_banner_fallback(&mut server).await;
         let queued = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
         let switch_notices = queued
@@ -337,7 +364,14 @@ async fn backend_banner_fallback_handles_settings_failure_and_queued_manual_sele
             .count();
         assert_eq!(switch_notices, usize::from(error_code.is_none()));
         if error_code.is_none() {
-            assert_eq!(app.chat_widget.current_model(), "gpt-5.2");
+            assert_eq!(
+                app.chat_widget.current_model(),
+                if use_reserve {
+                    "gpt-reserve"
+                } else {
+                    "gpt-5.2"
+                }
+            );
             let manual_selection = queued
                 .into_iter()
                 .find(|event| matches!(event, AppEvent::UpdateModel(_)))
@@ -348,6 +382,43 @@ async fn backend_banner_fallback_handles_settings_failure_and_queued_manual_sele
         }
         assert_eq!(app.chat_widget.current_model(), "gpt-5.4");
         assert!(!render_bottom_popup(&app.chat_widget, /*width*/ 72).contains("View usage"));
+        if use_reserve && error_code.is_some() {
+            let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 90);
+            assert!(rendered.contains("Add credits"));
+            assert!(!rendered.contains("You’re now using Luna"));
+            if error_code == Some(-32601) {
+                insta::assert_snapshot!(
+                    "luna_reserve_settings_unavailable",
+                    normalize_snapshot_paths(rendered)
+                );
+            }
+            app.chat_widget
+                .handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+            assert!(
+                std::iter::from_fn(|| events.try_recv().ok())
+                    .any(|event| matches!(event, AppEvent::OpenUrlInBrowser { .. }))
+            );
+            let mut tui = crate::tui::test_support::make_test_tui()?;
+            app.handle_event(&mut tui, &mut server, pending_turn.unwrap())
+                .await?;
+            assert_eq!(
+                app.chat_widget.queued_user_message_texts(),
+                vec!["queued before usage reply"]
+            );
+            app.chat_widget.finish_rate_limit_recovery();
+            app.chat_widget
+                .restore_user_message_to_composer(UserMessage::from("after recovery"));
+            app.chat_widget
+                .handle_key_event(KeyEvent::from(KeyCode::Enter));
+            assert_eq!(
+                app.chat_widget.queued_user_message_texts(),
+                vec!["queued before usage reply", "after recovery"]
+            );
+            assert!(
+                !std::iter::from_fn(|| events.try_recv().ok())
+                    .any(|event| matches!(event, AppEvent::CodexOp(AppCommand::UserTurn { .. })))
+            );
+        }
         server.shutdown().await?;
         fake.await??;
     }

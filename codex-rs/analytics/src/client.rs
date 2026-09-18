@@ -505,6 +505,12 @@ impl AnalyticsEventsClient {
         ))));
     }
 
+    pub fn track_thread_hint_status(&self, event: crate::thread_hint::ThreadHintStatusEvent) {
+        self.record_fact(AnalyticsFact::Custom(
+            CustomAnalyticsFact::ThreadHintStatus(Box::new(event)),
+        ));
+    }
+
     pub fn track_image_preparation(&self, fact: ImagePreparationFact) {
         self.record_fact(AnalyticsFact::Custom(
             CustomAnalyticsFact::ImagePreparation(Box::new(fact)),

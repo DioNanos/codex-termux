@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::os::windows::io::BorrowedHandle;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -693,6 +694,7 @@ struct ElevationPayload {
 #[serde(rename_all = "kebab-case")]
 enum SetupMode {
     Full,
+    InteractiveProvision,
     ProvisionOnly,
 }
 
@@ -725,7 +727,7 @@ impl SandboxNetworkIdentity {
     }
 }
 
-const PROXY_ENV_KEYS: &[&str] = &[
+pub(crate) const PROXY_ENV_KEYS: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
@@ -792,7 +794,7 @@ pub(crate) fn proxy_ports_from_env(env_map: &HashMap<String, String>) -> Vec<u16
     ports.into_iter().collect()
 }
 
-fn loopback_proxy_port_from_url(url: &str) -> Option<u16> {
+pub(crate) fn loopback_proxy_port_from_url(url: &str) -> Option<u16> {
     let authority = url.trim().split_once("://")?.1.split('/').next()?;
     let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
 
@@ -896,6 +898,7 @@ fn run_setup_exe(
     payload: &ElevationPayload,
     needs_elevation: bool,
     codex_home: &Path,
+    retained_handles: &[BorrowedHandle<'_>],
 ) -> Result<()> {
     let payload_json = serde_json::to_string(payload).map_err(|err| {
         failure(
@@ -904,8 +907,13 @@ fn run_setup_exe(
         )
     })?;
     let payload_b64 = BASE64_STANDARD.encode(payload_json.as_bytes());
+    if !retained_handles.is_empty() {
+        // Service requests are serialized and must not join a bare setup flight
+        // whose helper was started without these directory protections.
+        return run_setup_exe_payload(&payload_b64, needs_elevation, codex_home, retained_handles);
+    }
     run_setup_singleflight(payload_b64.clone(), || {
-        run_setup_exe_payload(&payload_b64, needs_elevation, codex_home)
+        run_setup_exe_payload(&payload_b64, needs_elevation, codex_home, retained_handles)
     })
 }
 
@@ -913,6 +921,7 @@ fn run_setup_exe_payload(
     payload_b64: &str,
     needs_elevation: bool,
     codex_home: &Path,
+    retained_handles: &[BorrowedHandle<'_>],
 ) -> Result<()> {
     use windows_sys::Win32::System::Threading::GetExitCodeProcess;
     use windows_sys::Win32::System::Threading::INFINITE;
@@ -936,19 +945,27 @@ fn run_setup_exe_payload(
     };
 
     if !needs_elevation {
-        let status = Command::new(&exe)
-            .arg(payload_b64)
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|err| {
-                failure(
-                    SetupErrorCode::OrchestratorHelperLaunchFailed,
-                    format!("failed to launch setup helper (non-elevated): {err}"),
-                )
-            })?;
+        let status = if retained_handles.is_empty() {
+            Command::new(&exe)
+                .arg(payload_b64)
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+        } else {
+            crate::setup_launch::spawn_with_retained_handles(
+                Command::new(&exe).arg(payload_b64),
+                retained_handles,
+            )
+            .and_then(|mut child| child.wait())
+        }
+        .map_err(|err| {
+            failure(
+                SetupErrorCode::OrchestratorHelperLaunchFailed,
+                format!("failed to launch setup helper (non-elevated): {err}"),
+            )
+        })?;
         if !status.success() {
             return Err(report_helper_failure(
                 codex_home,
@@ -1018,26 +1035,19 @@ fn run_setup_exe_payload(
     Ok(())
 }
 
-pub fn run_elevated_setup(
-    request: SandboxSetupRequest<'_>,
-    overrides: SetupRootOverrides,
-) -> Result<()> {
-    run_elevated_setup_inner(
-        request, overrides, /*offline_proxy_settings_override*/ None,
-    )
+pub fn run_elevated_setup(request: SandboxSetupRequest<'_>) -> Result<()> {
+    run_elevated_setup_inner(request, /*offline_proxy_settings_override*/ None)
 }
 
 pub(crate) fn run_elevated_setup_with_proxy_settings(
     request: SandboxSetupRequest<'_>,
-    overrides: SetupRootOverrides,
     offline_proxy_settings: &OfflineProxySettings,
 ) -> Result<()> {
-    run_elevated_setup_inner(request, overrides, Some(offline_proxy_settings))
+    run_elevated_setup_inner(request, Some(offline_proxy_settings))
 }
 
 fn run_elevated_setup_inner(
     request: SandboxSetupRequest<'_>,
-    overrides: SetupRootOverrides,
     offline_proxy_settings_override: Option<&OfflineProxySettings>,
 ) -> Result<()> {
     if !request.permissions.is_enforceable_by_windows_sandbox() {
@@ -1051,41 +1061,56 @@ fn run_elevated_setup_inner(
             format!("failed to create sandbox dir {}: {err}", sbx_dir.display()),
         )
     })?;
-    let (read_roots, write_roots) = build_payload_roots(&request, &overrides);
-    let deny_read_paths = build_payload_deny_read_paths(overrides.deny_read_paths);
-    let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
-    let offline_proxy_settings =
-        offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
-    let payload = ElevationPayload {
-        version: SETUP_VERSION,
-        offline_username: OFFLINE_USERNAME.to_string(),
-        online_username: ONLINE_USERNAME.to_string(),
-        codex_home: request.codex_home.to_path_buf(),
-        command_cwd: request.command_cwd.to_path_buf(),
-        read_roots,
-        write_roots,
-        deny_read_paths,
-        deny_write_paths,
-        proxy_ports: offline_proxy_settings.proxy_ports,
-        allow_local_binding: offline_proxy_settings.allow_local_binding,
-        real_user: std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".to_string()),
-        otel: codex_otel::global_statsig_metrics_settings(),
-        mode: SetupMode::Full,
-        refresh_only: false,
-    };
+    let payload = elevated_provisioning_payload(&request, offline_proxy_settings_override);
     let needs_elevation = !is_elevated().map_err(|err| {
         failure(
             SetupErrorCode::OrchestratorElevationCheckFailed,
             format!("failed to determine elevation state: {err}"),
         )
     })?;
-    run_setup_exe(&payload, needs_elevation, request.codex_home)
+    run_setup_exe(&payload, needs_elevation, request.codex_home, &[])
+}
+
+fn elevated_provisioning_payload(
+    request: &SandboxSetupRequest<'_>,
+    offline_proxy_settings_override: Option<&OfflineProxySettings>,
+) -> ElevationPayload {
+    let offline_proxy_settings =
+        offline_proxy_settings_for_request(request, offline_proxy_settings_override);
+    ElevationPayload {
+        version: SETUP_VERSION,
+        offline_username: OFFLINE_USERNAME.to_string(),
+        online_username: ONLINE_USERNAME.to_string(),
+        codex_home: request.codex_home.to_path_buf(),
+        command_cwd: request.codex_home.to_path_buf(),
+        read_roots: Vec::new(),
+        write_roots: Vec::new(),
+        deny_read_paths: Vec::new(),
+        deny_write_paths: Vec::new(),
+        proxy_ports: offline_proxy_settings.proxy_ports,
+        allow_local_binding: offline_proxy_settings.allow_local_binding,
+        real_user: std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".to_string()),
+        otel: codex_otel::global_statsig_metrics_settings(),
+        mode: SetupMode::InteractiveProvision,
+        refresh_only: false,
+    }
 }
 
 pub fn run_elevated_provisioning_setup(
     codex_home: &Path,
     real_user: &str,
     settings: crate::WindowsSandboxProvisioningSettings,
+) -> Result<()> {
+    run_elevated_provisioning_setup_with_retained_handles(codex_home, real_user, settings, &[])
+}
+
+/// Runs service provisioning with directory protections retained by the helper
+/// itself, so they survive an unexpected exit of the provisioning service.
+pub fn run_elevated_provisioning_setup_with_retained_handles(
+    codex_home: &Path,
+    real_user: &str,
+    settings: crate::WindowsSandboxProvisioningSettings,
+    retained_handles: &[BorrowedHandle<'_>],
 ) -> Result<()> {
     if !codex_home.is_absolute()
         || !matches!(
@@ -1140,7 +1165,12 @@ pub fn run_elevated_provisioning_setup(
         mode: SetupMode::ProvisionOnly,
         refresh_only: false,
     };
-    run_setup_exe(&payload, /*needs_elevation*/ false, codex_home)
+    run_setup_exe(
+        &payload,
+        /*needs_elevation*/ false,
+        codex_home,
+        retained_handles,
+    )
 }
 
 pub(crate) fn build_payload_roots(
@@ -1362,6 +1392,8 @@ mod tests {
     use super::profile_read_roots;
     use super::proxy_ports_from_env;
     use super::verify_setup_completed;
+    use crate::WindowsSandboxProvisioningSettings;
+    use crate::WindowsSandboxProxyListeners;
     use crate::helper_materialization::BIN_DIRNAME;
     use crate::helper_materialization::RESOURCES_DIRNAME;
     use crate::helper_materialization::helper_bin_dir;
@@ -1537,6 +1569,43 @@ mod tests {
             super::offline_proxy_settings_for_request(&request, Some(&explicit)),
             explicit
         );
+    }
+
+    #[test]
+    fn elevated_setup_payload_contains_no_caller_acl_roots() {
+        let tmp = TempDir::new().expect("tempdir");
+        let command_cwd = tmp.path().join("caller-workspace");
+        let codex_home = tmp.path().join("codex-home");
+        fs::create_dir_all(&command_cwd).expect("create workspace");
+        let permissions = permissions_for(
+            &workspace_write_profile(
+                workspace_roots_for(&command_cwd).as_slice(),
+                /*exclude_tmpdir_env_var*/ true,
+                /*exclude_slash_tmp*/ true,
+            ),
+            workspace_roots_for(&command_cwd).as_slice(),
+        );
+        let request = super::SandboxSetupRequest {
+            permissions: &permissions,
+            command_cwd: &command_cwd,
+            env_map: &HashMap::new(),
+            codex_home: &codex_home,
+            proxy_enforced: false,
+        };
+
+        let payload = super::elevated_provisioning_payload(
+            &request, /*offline_proxy_settings_override*/ None,
+        );
+
+        assert_eq!(payload.command_cwd, codex_home);
+        assert_eq!(payload.read_roots, Vec::<PathBuf>::new());
+        assert_eq!(payload.write_roots, Vec::<PathBuf>::new());
+        assert_eq!(payload.deny_read_paths, Vec::<PathBuf>::new());
+        assert_eq!(payload.deny_write_paths, Vec::<PathBuf>::new());
+        assert!(matches!(
+            payload.mode,
+            super::SetupMode::InteractiveProvision
+        ));
     }
 
     #[test]
@@ -1787,6 +1856,26 @@ mod tests {
         );
 
         assert_eq!(proxy_ports_from_env(&env), vec![1081, 8080, 43128, 43129]);
+        assert_eq!(
+            WindowsSandboxProvisioningSettings::from_environment(
+                &PermissionProfile::workspace_write(),
+                &env,
+            ),
+            WindowsSandboxProvisioningSettings {
+                proxy_ports: vec![1081, 8080, 43128, 43129],
+                allow_local_binding: false,
+            }
+        );
+        assert_eq!(
+            WindowsSandboxProxyListeners::from_environment(
+                &PermissionProfile::workspace_write(),
+                &env,
+            ),
+            WindowsSandboxProxyListeners {
+                http_ports: vec![8080],
+                socks_ports: vec![1081],
+            }
+        );
     }
 
     #[test]
@@ -1808,6 +1897,20 @@ mod tests {
                 allow_local_binding: false,
             }
         );
+        let permission_profile = PermissionProfile::workspace_write_with(
+            &[],
+            NetworkSandboxPolicy::Enabled,
+            /*exclude_tmpdir_env_var*/ false,
+            /*exclude_slash_tmp*/ false,
+        );
+        assert_eq!(
+            WindowsSandboxProvisioningSettings::from_environment(&permission_profile, &env),
+            WindowsSandboxProvisioningSettings::default()
+        );
+        assert_eq!(
+            WindowsSandboxProxyListeners::from_environment(&permission_profile, &env),
+            WindowsSandboxProxyListeners::default()
+        );
     }
 
     #[test]
@@ -1827,12 +1930,104 @@ mod tests {
         );
 
         assert_eq!(
-            offline_proxy_settings_from_env(&env, super::SandboxNetworkIdentity::Offline),
-            super::OfflineProxySettings {
+            WindowsSandboxProvisioningSettings::from_environment(
+                &PermissionProfile::workspace_write(),
+                &env,
+            ),
+            WindowsSandboxProvisioningSettings {
                 proxy_ports: vec![1081, 8080],
                 allow_local_binding: true,
             }
         );
+        assert_eq!(
+            WindowsSandboxProxyListeners::from_environment(
+                &PermissionProfile::workspace_write(),
+                &env,
+            ),
+            WindowsSandboxProxyListeners {
+                http_ports: vec![8080],
+                socks_ports: vec![1081],
+            }
+        );
+
+        env.remove("ALL_PROXY");
+        for (all_proxy, socks_ports) in [
+            ("HTTP://localhost:8080", vec![]),
+            ("socks5h://[::1]:8080", vec![8080]),
+        ] {
+            env.insert("all_proxy".to_string(), all_proxy.to_string());
+            assert_eq!(
+                WindowsSandboxProxyListeners::from_environment(
+                    &PermissionProfile::workspace_write(),
+                    &env,
+                ),
+                WindowsSandboxProxyListeners {
+                    http_ports: vec![8080],
+                    socks_ports,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_settings_preserve_all_inherited_proxy_ports() {
+        for (proxy_env, proxy_ports, http_ports, socks_ports) in [
+            (
+                vec![("ALL_PROXY", "socks5h://127.0.0.1:1081")],
+                vec![1081],
+                vec![],
+                vec![1081],
+            ),
+            (
+                vec![
+                    ("HTTP_PROXY", "http://127.0.0.1:8080"),
+                    ("HTTPS_PROXY", "http://127.0.0.1:3128"),
+                ],
+                vec![3128, 8080],
+                vec![3128, 8080],
+                vec![],
+            ),
+            (
+                vec![
+                    ("HTTP_PROXY", "http://127.0.0.1:8080"),
+                    (WINDOWS_SANDBOX_PROXY_PORTS_ENV_KEY, "8080,1081"),
+                ],
+                vec![1081, 8080],
+                vec![8080],
+                vec![],
+            ),
+            (
+                vec![("ALL_PROXY", "ftp://127.0.0.1:3128")],
+                vec![3128],
+                vec![],
+                vec![],
+            ),
+        ] {
+            let env = proxy_env
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            assert_eq!(
+                WindowsSandboxProvisioningSettings::from_environment(
+                    &PermissionProfile::workspace_write(),
+                    &env,
+                ),
+                WindowsSandboxProvisioningSettings {
+                    proxy_ports,
+                    allow_local_binding: false,
+                }
+            );
+            assert_eq!(
+                WindowsSandboxProxyListeners::from_environment(
+                    &PermissionProfile::workspace_write(),
+                    &env,
+                ),
+                WindowsSandboxProxyListeners {
+                    http_ports,
+                    socks_ports,
+                }
+            );
+        }
     }
 
     #[test]

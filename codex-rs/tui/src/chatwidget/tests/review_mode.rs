@@ -360,14 +360,15 @@ async fn review_restores_context_window_indicator() {
 #[tokio::test]
 async fn restore_thread_input_state_restores_pending_steers_without_downgrading_them() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let mut pending_steers = VecDeque::new();
-    pending_steers.push_back(UserMessage::from("pending steer"));
     let expected_compare_key = PendingSteerCompareKey {
         message: "hidden IDE context\npending steer".to_string(),
         image_count: 0,
     };
-    let mut pending_steer_compare_keys = VecDeque::new();
-    pending_steer_compare_keys.push_back(expected_compare_key.clone());
+    let expected_pending = PendingSteer {
+        client_id: "saved-submission".to_string(),
+        compare_key: expected_compare_key,
+        ..pending_steer("pending steer")
+    };
     let mut rejected_steers_queue = VecDeque::new();
     rejected_steers_queue.push_back(UserMessage::from("already rejected"));
     let mut queued_user_messages = VecDeque::new();
@@ -375,11 +376,10 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
 
     chat.restore_thread_input_state(
         Some(ThreadInputState {
+            questions: None,
             composer: None,
             safety_buffering_prompt: None,
-            pending_steers,
-            pending_steer_history_records: VecDeque::new(),
-            pending_steer_compare_keys,
+            pending_steers: VecDeque::from([expected_pending.clone()]),
             rejected_steers_queue,
             rejected_steer_history_records: VecDeque::new(),
             queued_user_messages,
@@ -401,20 +401,36 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
         chat.queued_user_message_texts(),
         vec!["already rejected", "queued draft"]
     );
-    assert_eq!(chat.input_queue.pending_steers.len(), 1);
     assert_eq!(
-        chat.input_queue
-            .pending_steers
-            .front()
-            .unwrap()
-            .user_message
-            .text,
-        "pending steer"
+        chat.input_queue.pending_steers,
+        VecDeque::from([expected_pending])
     );
-    assert_eq!(
-        chat.input_queue.pending_steers.front().unwrap().compare_key,
-        expected_compare_key
-    );
+}
+
+#[tokio::test]
+async fn identical_steer_receipts_only_acknowledge_the_matching_submission() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let pending = pending_steer("continue");
+    chat.input_queue.pending_steers.push_back(pending.clone());
+
+    for (client_id, expected) in [
+        ("older-submission", VecDeque::from([pending.clone()])),
+        (pending.client_id.as_str(), VecDeque::new()),
+    ] {
+        chat.handle_thread_item(
+            AppServerThreadItem::UserMessage {
+                id: client_id.to_string(),
+                client_id: Some(client_id.to_string()),
+                content: vec![UserInput::Text {
+                    text: "continue".to_string(),
+                    text_elements: Vec::new(),
+                }],
+            },
+            "turn-1".to_string(),
+            ThreadItemRenderSource::Live,
+        );
+        assert_eq!(chat.input_queue.pending_steers, expected);
+    }
 }
 
 #[tokio::test]

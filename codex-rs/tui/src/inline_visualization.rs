@@ -64,9 +64,9 @@ impl InlineVisualizationContext {
             context.viewer_dir.parent()?.parent()?.to_path_buf(),
         ];
         for viewer_cache in viewer_caches {
-            if file_system_policy.can_write_path_with_cwd(&viewer_cache, config.cwd.as_path())
+            if file_system_policy.can_write_local_path_with_cwd(&viewer_cache, config.cwd.as_path())
                 || file_system_policy
-                    .can_write_path_with_cwd(viewer_cache.parent()?, config.cwd.as_path())
+                    .can_write_local_path_with_cwd(viewer_cache.parent()?, config.cwd.as_path())
                 || writable_roots.iter().any(|root| {
                     root.is_path_writable(&viewer_cache)
                         || root.root.as_path().starts_with(&viewer_cache)

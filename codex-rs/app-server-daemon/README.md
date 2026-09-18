@@ -14,6 +14,14 @@ The current daemon implementation is Unix-only. It uses pidfile-backed
 daemonization plus Unix process and file-locking primitives, and does not yet
 support Windows lifecycle management.
 
+Shared clients use the environment inherited when the daemon started. Opening a
+new terminal or clearing variables there does not clear the running daemon's
+environment; per-client environment isolation is not provided.
+An invocation that sets `CODEX_EXEC_SERVER_URL` skips implicit daemon attachment
+so its executor selection is preserved. If an implicitly discovered daemon cannot
+initialize the connection, the TUI starts an embedded server instead. Explicit
+`--remote` endpoints remain authoritative and report connection failures.
+
 ## Commands
 
 ```sh

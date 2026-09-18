@@ -1980,7 +1980,7 @@
               "type": "string"
             },
             "cwd": {
-              "$ref": "#/definitions/AbsolutePathBuf"
+              "$ref": "#/definitions/LegacyAppPathString"
             },
             "source": {
               "$ref": "#/definitions/GuardianCommandSource"
@@ -2073,11 +2073,11 @@
         {
           "properties": {
             "cwd": {
-              "$ref": "#/definitions/AbsolutePathBuf"
+              "$ref": "#/definitions/LegacyAppPathString"
             },
             "files": {
               "items": {
-                "$ref": "#/definitions/AbsolutePathBuf"
+                "$ref": "#/definitions/LegacyAppPathString"
               },
               "type": "array"
             },
@@ -3415,6 +3415,13 @@
             "null"
           ]
         },
+        "normalModelSlug": {
+          "description": "Normal model whose display name and reasoning options describe this quota alias.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "planType": {
           "anyOf": [
             {
@@ -4165,6 +4172,13 @@
             "null"
           ]
         },
+        "originator": {
+          "description": "Originator recorded when the thread was created, independent of its current client or executor. Null when the recorded originator is unavailable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "parentThreadId": {
           "description": "The ID of the parent thread. This will only be set if this thread is a subagent.",
           "type": [
@@ -4328,6 +4342,29 @@
       },
       "required": [
         "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadEnvironment": {
+      "description": "An environment selected by a loaded thread, independent of connection status.",
+      "properties": {
+        "cwd": {
+          "$ref": "#/definitions/LegacyAppPathString"
+        },
+        "environmentId": {
+          "type": "string"
+        },
+        "runtimeWorkspaceRoots": {
+          "items": {
+            "$ref": "#/definitions/LegacyAppPathString"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "cwd",
+        "environmentId",
+        "runtimeWorkspaceRoots"
       ],
       "type": "object"
     },

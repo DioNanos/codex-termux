@@ -1,8 +1,35 @@
 use crate::JsonSchema;
 use crate::TS;
+use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
+
+/// An environment selected by a loaded thread, independent of connection status.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadEnvironment {
+    pub environment_id: String,
+    pub cwd: LegacyAppPathString,
+    pub runtime_workspace_roots: Vec<LegacyAppPathString>,
+}
+
+impl From<&TurnEnvironmentSelection> for ThreadEnvironment {
+    fn from(selection: &TurnEnvironmentSelection) -> Self {
+        Self {
+            environment_id: selection.environment_id.clone(),
+            cwd: selection.cwd.clone().into(),
+            runtime_workspace_roots: selection
+                .workspace_roots
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect(),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]

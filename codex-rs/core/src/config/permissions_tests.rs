@@ -96,15 +96,15 @@ async fn restricted_read_implicitly_allows_helper_executables() -> std::io::Resu
     let policy = config.permissions.file_system_sandbox_policy();
 
     assert!(
-        policy.can_read_path_with_cwd(expected_zsh.as_path(), &cwd),
+        policy.can_read_local_path_with_cwd(expected_zsh.as_path(), &cwd),
         "expected zsh helper path to be readable, policy: {policy:?}"
     );
     assert!(
-        policy.can_read_path_with_cwd(expected_allowed_arg0_dir.as_path(), &cwd),
+        policy.can_read_local_path_with_cwd(expected_allowed_arg0_dir.as_path(), &cwd),
         "expected active arg0 helper dir to be readable, policy: {policy:?}"
     );
     assert!(
-        !policy.can_read_path_with_cwd(expected_sibling_arg0_dir.as_path(), &cwd),
+        !policy.can_read_local_path_with_cwd(expected_sibling_arg0_dir.as_path(), &cwd),
         "expected sibling arg0 helper dir to remain unreadable, policy: {policy:?}"
     );
 
@@ -493,7 +493,7 @@ docs = "read"
     let (read_deny_policy, _) =
         compile_permission_profile(&permissions, "read_deny", &mut startup_warnings)?;
     assert_eq!(
-        read_deny_policy.resolve_access_with_cwd(cwd.path(), cwd.path()),
+        read_deny_policy.resolve_access_for_local_path_with_cwd(cwd.path(), cwd.path()),
         FileSystemAccessMode::Deny
     );
 
@@ -501,7 +501,7 @@ docs = "read"
         compile_permission_profile(&permissions, "write_deny", &mut startup_warnings)?;
     assert!(!write_deny_policy.has_full_disk_write_access());
     assert_eq!(
-        write_deny_policy.resolve_access_with_cwd(cwd.path(), cwd.path()),
+        write_deny_policy.resolve_access_for_local_path_with_cwd(cwd.path(), cwd.path()),
         FileSystemAccessMode::Deny
     );
 
@@ -509,7 +509,7 @@ docs = "read"
         compile_permission_profile(&permissions, "write_read", &mut startup_warnings)?;
     assert!(!write_read_policy.has_full_disk_write_access());
     assert_eq!(
-        write_read_policy.resolve_access_with_cwd(&docs, cwd.path()),
+        write_read_policy.resolve_access_for_local_path_with_cwd(&docs, cwd.path()),
         FileSystemAccessMode::Read
     );
 

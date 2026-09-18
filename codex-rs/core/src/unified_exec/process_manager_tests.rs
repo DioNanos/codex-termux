@@ -54,6 +54,10 @@ fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
         ("PATH".to_string(), "/client-path".to_string()),
         ("SHELL_SET".to_string(), "policy".to_string()),
         (
+            CODEX_VERSION_ENV_VAR.to_string(),
+            "client-version".to_string(),
+        ),
+        (
             CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
             "current-profile".to_string(),
         ),
@@ -68,6 +72,10 @@ fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
         ("OpenAI_Federation_Rule_Id".to_string(), "rule".to_string()),
         ("SHELL_SET".to_string(), "policy".to_string()),
         ("CODEX_THREAD_ID".to_string(), "thread-1".to_string()),
+        (
+            CODEX_VERSION_ENV_VAR.to_string(),
+            "client-version".to_string(),
+        ),
         (
             CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
             "current-profile".to_string(),
@@ -88,6 +96,10 @@ fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
             ("PATH".to_string(), "/sandbox-path".to_string()),
             ("CODEX_THREAD_ID".to_string(), "thread-1".to_string()),
             (
+                CODEX_VERSION_ENV_VAR.to_string(),
+                "client-version".to_string()
+            ),
+            (
                 CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
                 "current-profile".to_string(),
             ),
@@ -107,6 +119,7 @@ fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
 fn exec_env_policy_excludes_non_inheritable_and_runtime_variables() {
     let policy = ShellEnvironmentPolicy {
         r#set: HashMap::from([
+            ("codex_version".to_string(), "stale-version".to_string()),
             (
                 "codex_permission_profile".to_string(),
                 "stale-profile".to_string(),
@@ -135,6 +148,7 @@ fn exec_env_policy_excludes_non_inheritable_and_runtime_variables() {
             ignore_default_excludes: policy.ignore_default_excludes,
             exclude: vec![
                 CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+                CODEX_VERSION_ENV_VAR.to_string(),
                 codex_apply_patch::CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR.to_string(),
                 PLUGIN_METRICS_OUTPUT_ENV_VAR.to_string(),
             ],
@@ -218,6 +232,7 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         exec_server_params_for_request(
             /*process_id*/ 123,
             request,
+            /*tool_ctx*/ None,
             proxy_settings_mode,
             /*tty*/ true,
         )
@@ -225,6 +240,7 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
     let params = params_for_request(&request);
 
     assert_eq!(params.process_id.as_str(), "123");
+    assert_eq!(params.metadata, None);
     assert_eq!(params.cwd, request.cwd);
     assert!(params.enforce_managed_network);
     assert_eq!(params.managed_network, Some(managed_network));

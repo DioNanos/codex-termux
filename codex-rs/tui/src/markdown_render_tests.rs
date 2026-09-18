@@ -984,6 +984,27 @@ fn file_link_keeps_absolute_paths_outside_cwd() {
 }
 
 #[test]
+fn file_links_preserve_foreign_windows_paths_and_anchors_snapshot() {
+    let rendered = [
+        ("file:///C:/repo/Quarterly%20Report.xlsx", "C:/repo"),
+        (
+            "file://server/share/Quarterly%20Report.xlsx",
+            "//server/share",
+        ),
+    ]
+    .map(|(destination, cwd)| {
+        render_markdown_text_for_cwd(&format!("[report]({destination}#L4C2)"), Path::new(cwd))
+            .to_string()
+    })
+    .join("\n");
+
+    insta::assert_snapshot!(rendered, @r"
+    report (Quarterly Report.xlsx:4:2)
+    report (Quarterly Report.xlsx:4:2)
+    ");
+}
+
+#[test]
 fn file_link_appends_hash_anchor_when_label_lacks_it() {
     let text = render_markdown_text_for_cwd(
         "[markdown_render.rs](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3)",

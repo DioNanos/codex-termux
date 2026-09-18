@@ -332,6 +332,37 @@ async fn thread_unarchive_preserves_pathless_store_metadata() -> Result<()> {
     assert_eq!(thread.path, None);
     assert_eq!(thread.forked_from_id, Some(parent_thread_id.to_string()));
     assert_eq!(thread.name, Some("named pathless thread".to_string()));
+    assert_eq!(thread.environments, None);
+
+    // Pathless stores can return an unarchived thread while it is still loaded.
+    for (request_id, environments) in [(2, None), (4, Some(vec![]))] {
+        let result = client
+            .request(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(request_id),
+                params: ThreadStartParams {
+                    model: Some("mock-model".to_string()),
+                    environments,
+                    ..Default::default()
+                },
+            })
+            .await?
+            .expect("thread/start should succeed");
+        let ThreadStartResponse {
+            thread: started, ..
+        } = serde_json::from_value(result)?;
+        assert!(started.environments.is_some());
+        let result = client
+            .request(ClientRequest::ThreadUnarchive {
+                request_id: RequestId::Integer(request_id + 1),
+                params: ThreadUnarchiveParams {
+                    thread_id: started.id,
+                },
+            })
+            .await?
+            .expect("thread/unarchive should succeed for a loaded pathless thread");
+        let ThreadUnarchiveResponse { thread } = serde_json::from_value(result)?;
+        assert_eq!(thread.environments, started.environments);
+    }
 
     client.shutdown().await?;
     Ok(())

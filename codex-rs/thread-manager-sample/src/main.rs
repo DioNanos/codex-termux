@@ -66,6 +66,7 @@ use codex_core_api::init_state_db;
 use codex_core_api::install_image_generation_extension;
 use codex_core_api::item_event_to_server_notification;
 use codex_core_api::local_agent_graph_store_from_state_db;
+use codex_core_api::passthrough_image_store;
 use codex_core_api::resolve_installation_id;
 use codex_core_api::set_default_originator;
 use codex_core_api::thread_store_from_config;
@@ -149,6 +150,7 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
         Arc::new(extensions.build()),
         user_instructions_provider,
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         Arc::clone(&thread_store),
         local_agent_graph_store_from_state_db(state_db.as_ref()),
         installation_id,
@@ -223,6 +225,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         notify: None,
         tui_notifications: TuiNotificationSettings::default(),
         animations: true,
+        tui_whimsy: true,
         show_tooltips: true,
         tui_auto_recap: true,
         model_availability_nux: ModelAvailabilityNuxConfig::default(),
@@ -239,6 +242,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         tui_session_picker_view: SessionPickerViewMode::Dense,
         tui_resume_cwd: None,
         tui_vim_mode_default: false,
+        tui_question_esc_back: true,
         cwd: cwd.clone(),
         workspace_roots: vec![cwd],
         workspace_roots_explicit: false,
@@ -299,10 +303,12 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         tool_registry: Default::default(),
         code_mode: Default::default(),
         background_terminal_max_timeout: 300_000,
+        thread_unload_delay: std::time::Duration::from_secs(60),
         ghost_snapshot: GhostSnapshotConfig::default(),
         multi_agent_v2: MultiAgentV2Config::default(),
         max_goal_token_budget: None,
         token_budget: None,
+        token_budget_startup_config: None,
         rollout_budget: None,
         current_time_reminder: None,
         sleep_tool_mode: Default::default(),

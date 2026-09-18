@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::process_telemetry::ProcessTelemetry;
 use codex_exec_server_protocol::JSONRPCErrorError;
 use codex_network_proxy::CUSTOM_CA_ENV_KEYS;
 use codex_network_proxy::ManagedNetworkSandboxContext;
@@ -75,12 +76,13 @@ impl PreparedExecRequest {
     }
 }
 
-pub(crate) async fn prepare_exec_request(
+pub(crate) async fn prepare_exec_request_with_telemetry(
     params: &ExecParams,
     env: HashMap<String, String>,
     runtime_paths: Option<&ExecServerRuntimePaths>,
     network_policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     network_policy_audit_observer: Option<NetworkPolicyAuditObserver>,
+    telemetry: &ProcessTelemetry,
 ) -> Result<PreparedExecRequest, JSONRPCErrorError> {
     #[cfg(target_os = "windows")]
     let mut env = env;
@@ -105,6 +107,7 @@ pub(crate) async fn prepare_exec_request(
             env,
             network_policy_decider,
             network_policy_audit_observer,
+            telemetry,
         )
         .await?;
     let Some(sandbox_context) = params.sandbox.as_ref() else {
@@ -182,6 +185,9 @@ pub(crate) async fn prepare_exec_request(
         network_policy,
     );
     let sandbox_manager = SandboxManager::new();
+    #[cfg(target_os = "macos")]
+    let sandbox_manager = sandbox_manager
+        .with_allowed_symlinked_codex_home(runtime_paths.allowed_symlinked_codex_home.clone());
     let sandbox = sandbox_manager.select_initial(
         &permissions,
         SandboxablePreference::Require,
@@ -299,6 +305,7 @@ async fn prepare_managed_network(
     env: HashMap<String, String>,
     network_policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     network_policy_audit_observer: Option<NetworkPolicyAuditObserver>,
+    telemetry: &ProcessTelemetry,
 ) -> Result<
     (
         HashMap<String, String>,
@@ -316,6 +323,20 @@ async fn prepare_managed_network(
     if let Some(observer) = network_policy_audit_observer {
         state.set_policy_audit_observer(observer);
     }
+    if let Some(launch_context) = &telemetry.launch_context {
+        state.set_launch_span_context(launch_context.clone());
+    }
+    state.set_process_log_metadata(codex_network_proxy::NetworkProxyProcessLogMetadata {
+        thread_id: telemetry.thread_id.clone(),
+        tool_call_id: telemetry.tool_call_id.clone(),
+        executor_identity: telemetry
+            .executor_registration
+            .as_ref()
+            .map(|registration| codex_network_proxy::ExecutorLogIdentity {
+                environment_id: registration.environment_id.clone(),
+                registration_id: registration.executor_registration_id.clone(),
+            }),
+    });
     let mut builder = NetworkProxy::builder().state(Arc::new(state));
     if let Some(network_policy_decider) = network_policy_decider {
         builder = builder.policy_decider_arc(network_policy_decider);

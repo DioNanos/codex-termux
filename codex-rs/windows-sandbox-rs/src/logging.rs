@@ -1,6 +1,11 @@
+use anyhow::Context;
+use anyhow::Result;
+use std::fs::File;
 use std::io::Write;
+use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use codex_utils_string::take_bytes_at_char_boundary;
@@ -11,6 +16,10 @@ const LOG_COMMAND_PREVIEW_LIMIT: usize = 200;
 pub const LOG_FILE_PREFIX: &str = "sandbox";
 pub const LOG_FILE_SUFFIX: &str = "log";
 pub const MAX_LOG_FILES: usize = 90;
+
+// Service provisioning never appends to a caller-controlled existing log entry.
+// An initialized but empty slot also prevents falling back after an open failure.
+static SETUP_LOG: OnceLock<Mutex<Option<(File, OwnedHandle)>>> = OnceLock::new();
 
 fn exe_label() -> &'static str {
     static LABEL: OnceLock<String> = OnceLock::new();
@@ -61,7 +70,33 @@ pub fn log_writer(base_dir: &Path) -> Option<RollingFileAppender> {
         .ok()
 }
 
+/// Opens one fresh log for service provisioning and retains its parent directory.
+/// Subsequent setup diagnostics share this handle instead of reopening a pathname.
+pub fn setup_log_writer(base_dir: &Path) -> Result<File> {
+    let mut log = SETUP_LOG
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("setup log lock poisoned"))?;
+    match log.as_ref() {
+        Some((file, _parent)) => file.try_clone().context("clone setup log"),
+        None => {
+            let (file, parent) = crate::file_write::create_temporary_file(base_dir, ".log")?;
+            let writer = file.try_clone().context("clone setup log")?;
+            *log = Some((file, parent));
+            Ok(writer)
+        }
+    }
+}
+
 fn append_line(line: &str, base_dir: Option<&Path>) {
+    if let Some(log) = SETUP_LOG.get() {
+        if let Ok(mut log) = log.lock()
+            && let Some((file, _parent)) = log.as_mut()
+        {
+            let _ = writeln!(file, "{line}");
+        }
+        return;
+    }
     if let Some(dir) = base_dir
         && let Some(mut f) = log_writer(dir)
     {

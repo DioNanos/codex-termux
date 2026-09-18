@@ -29,6 +29,9 @@ pub use codex_history::CompactedItem;
 pub use codex_history::InitialHistory;
 pub use codex_history::ResponseItemEnvelope;
 pub use codex_history::ResumedHistory;
+pub use codex_history::RetainedContextEntry;
+pub use codex_history::RetainedContextEvent;
+pub use codex_history::RetainedInputSource;
 pub use codex_history::RolloutItem;
 pub use codex_history::RolloutLine;
 pub(crate) use codex_protocol::protocol;
@@ -45,7 +48,9 @@ pub(crate) use codex_protocol::protocol;
 /// Remove it once Serde supports format-specific buffering.
 pub fn decode_rollout_line(value: Value) -> serde_json::Result<RolloutLine> {
     let Value::Object(mut fields) = value else {
-        return serde_json::from_value(value);
+        return Err(serde_json::Error::custom(
+            "rollout line must be a JSON object",
+        ));
     };
     let timestamp = fields
         .remove("timestamp")
@@ -63,6 +68,16 @@ pub fn decode_rollout_line(value: Value) -> serde_json::Result<RolloutLine> {
         ordinal,
         item,
     })
+}
+
+/// Parses a persisted JSONL rollout record through the canonical JSON decoder.
+pub fn parse_rollout_line(line: &str) -> serde_json::Result<RolloutLine> {
+    serde_json::from_str::<Value>(line).and_then(decode_rollout_line)
+}
+
+/// Parses persisted JSONL rollout record bytes through the canonical JSON decoder.
+pub fn parse_rollout_line_bytes(bytes: &[u8]) -> serde_json::Result<RolloutLine> {
+    serde_json::from_slice::<Value>(bytes).and_then(decode_rollout_line)
 }
 
 pub const SESSIONS_SUBDIR: &str = "sessions";

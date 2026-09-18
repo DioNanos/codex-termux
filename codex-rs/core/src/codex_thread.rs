@@ -160,18 +160,10 @@ pub use codex_guardian_context::GuardianRootMessage;
 pub struct GuardianAuthorizationVersion {
     /// User-message/reset revision, preserved across compaction and internal context.
     pub user_message_revision: u64,
-    /// Number of successful, host-produced answers to genuine user-input requests.
+    /// Successful host answers captured by the temporary legacy path.
     pub user_input_response_count: usize,
-}
-
-impl GuardianAuthorizationVersion {
-    /// Captures history replacement and genuine user input from the same snapshot.
-    pub fn from_history(history: &dyn ConversationHistorySnapshot) -> Self {
-        Self {
-            user_message_revision: history.user_message_revision(),
-            user_input_response_count: 0,
-        }
-    }
+    /// False when required retained answers or root instructions are unavailable.
+    pub retained_context_complete: bool,
 }
 
 /// Bounded root conversation and authorization state from one history snapshot.
@@ -813,15 +805,17 @@ impl CodexThread {
         self.session.multi_agent_version()
     }
 
+    /// Shares an immutable view of the live parent model context and retained host facts.
+    pub async fn conversation_history_snapshot(&self) -> Arc<dyn ConversationHistorySnapshot> {
+        self.session.conversation_history_snapshot().await
+    }
+
     /// Returns the current user-authorization revision for Guardian.
     pub async fn guardian_authorization_version(&self) -> GuardianAuthorizationVersion {
-        let history = self.session.conversation_history_snapshot().await;
+        let history = self.conversation_history_snapshot().await;
         self.thread_extension_data()
-            .get::<GuardianReviewEvidence>()
-            .map_or_else(
-                || GuardianAuthorizationVersion::from_history(history.as_ref()),
-                |evidence| evidence.authorization_version(history.as_ref()),
-            )
+            .get_or_init(GuardianReviewEvidence::default)
+            .authorization_version(history.as_ref())
     }
 
     /// Returns bounded root conversation evidence and its authorization version atomically.
@@ -843,6 +837,13 @@ impl CodexThread {
     /// Refresh MCP configuration and managed requirements without reloading unrelated settings.
     pub async fn refresh_mcp_config(&self, next_config: crate::config::Config) {
         self.session.refresh_mcp_config(next_config).await;
+    }
+
+    /// Refreshes this thread's Apps tools before returning their runtime state.
+    pub async fn refresh_codex_apps_tools(
+        &self,
+    ) -> anyhow::Result<codex_mcp::CodexAppsToolSnapshot> {
+        self.session.refresh_codex_apps_tools().await
     }
 
     pub async fn environment_selections(&self) -> Vec<TurnEnvironmentSelection> {

@@ -861,6 +861,8 @@ impl Tui {
         if let Some(saved) = self.alt_saved_viewport.take() {
             self.terminal.set_viewport_area(saved);
         }
+        // The restored main screen does not contain the alternate screen's diff baseline.
+        self.terminal.invalidate_viewport();
         self.alt_screen_active.store(false, Ordering::Relaxed);
         Ok(())
     }

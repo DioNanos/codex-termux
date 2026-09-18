@@ -16,6 +16,7 @@ import sys
 # without adding the caller's working directory to the module search path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from prepare_sources import MANIFEST, load_sources, prepare_sources
+from windows_build_inputs import build_environment
 
 TARGET_SYSTEMS = {
     "apple-darwin": "Darwin",
@@ -66,10 +67,44 @@ class NativeBuild:
             name: getattr(args, name).absolute()
             for name in ("cc", "cxx", "cmake", "make", "pkg_config", "shell")
         }
+        self.toolchain.update(
+            (name, path.absolute())
+            for name in ("ar", "ranlib")
+            if (path := getattr(args, name, None)) is not None
+        )
+        self.quote = subprocess.list2cmdline if self.windows else shlex.join
+        self.flags = {
+            variable: list(getattr(args, argument, []))
+            for variable, argument in (
+                ("CFLAGS", "c_flag"),
+                ("CXXFLAGS", "cxx_flag"),
+                ("LDFLAGS", "link_flag"),
+            )
+        }
+        if self.windows and (
+            any(self.flags.values())
+            or any(name in self.toolchain for name in ("ar", "ranlib"))
+        ):
+            raise ValueError("Explicit toolchain overrides require a Unix build host")
         self.bootstrap_make = (args.bootstrap_make or args.make).absolute()
         for tool in (*self.toolchain.values(), self.bootstrap_make):
             if not tool.is_file():
                 raise ValueError(f"Missing build tool: {tool}")
+        windows_inputs = getattr(args, "windows_build_inputs", None)
+        input_record = None
+        if windows_inputs is not None:
+            if not self.windows:
+                raise ValueError("Windows build inputs require a Windows MSVC target")
+            explicit, input_record = build_environment(
+                windows_inputs,
+                args.target,
+                {
+                    **self.toolchain,
+                    "bootstrap_make": self.bootstrap_make,
+                    "python": Path(sys.executable),
+                },
+            )
+            inherited_environment = {**inherited_environment, **explicit}
         if self.windows and not all(
             inherited_environment.get(key) for key in ("INCLUDE", "LIB")
         ):
@@ -98,9 +133,15 @@ class NativeBuild:
             )
             or (self.windows and key == "USERPROFILE")
         }
+        if windows_inputs is not None:
+            self.environment.pop("LIBPATH", None)
         paths = [
             str(self.tools / "bin"),
-            *(str(p.parent) for p in self.toolchain.values()),
+            *(
+                []
+                if windows_inputs is not None
+                else [str(p.parent) for p in self.toolchain.values()]
+            ),
         ]
         paths += (
             inherited_environment.get("PATH", "").split(os.pathsep)
@@ -127,16 +168,34 @@ class NativeBuild:
             }
         )
         self.cmake_platform = []
+        self.environment.update(
+            (name, self.quote(flags)) for name, flags in self.flags.items() if flags
+        )
+        self.environment.update(
+            (name.upper(), self.quote([str(self.toolchain[name])]))
+            for name in ("ar", "ranlib")
+            if name in self.toolchain
+        )
         if args.target.endswith("apple-darwin"):
             self.environment["MACOSX_DEPLOYMENT_TARGET"] = args.deployment_target
             self.cmake_platform = [
-                f"-DCMAKE_OSX_DEPLOYMENT_TARGET={args.deployment_target}"
+                f"-DCMAKE_OSX_DEPLOYMENT_TARGET={args.deployment_target}",
+                "-DCMAKE_INSTALL_NAME_DIR=@rpath",
+                "-DCMAKE_INSTALL_RPATH=@loader_path",
+            ]
+        elif not self.windows:
+            self.cmake_platform = [
+                "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON",
+                "-DCMAKE_INSTALL_RPATH=$ORIGIN",
             ]
         self.record = {
             "target": args.target,
             "deployment_target": args.deployment_target,
+            "flags": self.flags,
             "steps": [],
         }
+        if input_record is not None:
+            self.record["windows_build_inputs"] = input_record
 
     def run(self, name, command, cwd=None, environment=None):
         command = [str(part) for part in command]
@@ -192,6 +251,11 @@ class NativeBuild:
                 "-DCMAKE_INSTALL_LIBDIR=lib",
                 f"-DCMAKE_C_COMPILER={self.toolchain['cc']}",
                 f"-DCMAKE_CXX_COMPILER={self.toolchain['cxx']}",
+                *(
+                    f"-DCMAKE_{name.upper()}={self.toolchain[name]}"
+                    for name in ("ar", "ranlib")
+                    if name in self.toolchain
+                ),
                 f"-DCMAKE_PREFIX_PATH={self.prefix}",
                 "-DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF",
                 "-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF",
@@ -216,16 +280,23 @@ class NativeBuild:
     def meson(self, name, options):
         directory = self.output / "build" / name
         meson = [sys.executable, self.sources["meson"] / "meson.py"]
-        quote = subprocess.list2cmdline if self.windows else shlex.join
-        include = quote([f"{'/I' if self.windows else '-I'}{self.prefix / 'include'}"])
+        include = f"{'/I' if self.windows else '-I'}{self.prefix / 'include'}"
         link = (
             [f"/LIBPATH:{self.prefix / 'lib'}"]
             if self.windows
             else [f"-L{self.prefix / 'lib'}", f"-Wl,-rpath,{self.prefix / 'lib'}"]
         )
+        if self.args.target.endswith("unknown-linux-gnu"):
+            link[-1] = "-Wl,-rpath,$ORIGIN:$ORIGIN/.."
         self.environment.update(
-            {"CFLAGS": include, "CXXFLAGS": include, "LDFLAGS": quote(link)}
+            {
+                name: self.quote([*flags, *(link if name == "LDFLAGS" else [include])])
+                for name, flags in self.flags.items()
+            }
         )
+        if self.args.target.endswith("apple-darwin"):
+            self.environment["OBJC"] = str(self.toolchain["cc"])
+            self.environment["OBJCFLAGS"] = self.environment["CFLAGS"]
         self.run(
             name + "-configure",
             [
@@ -239,6 +310,7 @@ class NativeBuild:
                 "--wrap-mode=nofallback",
                 "-Dauto_features=disabled",
                 "-Ddefault_library=shared",
+                "-Dpkgconfig.relocatable=true",
                 *options,
             ],
         )
@@ -330,6 +402,46 @@ class NativeBuild:
                     "CONFIG_SHELL": self.posix_path(self.toolchain["shell"]),
                 }
             )
+        else:
+            if self.args.target.endswith("apple-darwin"):
+                # Libtool's partial links need -r, which ld64.lld does not support.
+                environment["CC"] += " -fuse-ld=/usr/bin/ld"
+            for name in ("ar", "ranlib"):
+                if name in self.toolchain:
+                    path = str(self.toolchain[name])
+                    if shlex.quote(path) != path:
+                        raise ValueError(
+                            f"libffi {name} path cannot require shell quoting"
+                        )
+            # Response files preserve compiler arguments through Autoconf's word
+            # splitting and Make/libtool's shell expansion without losing flags
+            # added by configure (such as -fexceptions).
+            for name, flags in self.flags.items():
+                if any(
+                    any(character.isspace() for character in flag) for flag in flags
+                ):
+                    raise ValueError("libffi flags cannot contain whitespace")
+                if flags:
+                    response = ffi_build / f"{name.lower()}.rsp"
+                    if shlex.quote(str(response)) != str(response):
+                        raise ValueError(
+                            "libffi response-file path cannot require shell quoting"
+                        )
+                    response.write_text(
+                        "\n".join(
+                            '"' + flag.replace("\\", "\\\\").replace('"', '\\"') + '"'
+                            for flag in flags
+                        )
+                        + "\n"
+                    )
+                    environment[name] = f"@{response}"
+            if self.args.target.endswith("unknown-linux-gnu"):
+                # Libtool otherwise drops Clang's declared CRT/runtime options.
+                environment["AM_LTLDFLAGS"] = shlex.join(
+                    argument
+                    for flag in self.flags["LDFLAGS"]
+                    for argument in ("-Xcompiler", flag)
+                )
         self.run(
             "libffi-configure",
             [
@@ -436,6 +548,15 @@ def main():
         type=Path,
         help="NMake on Windows; defaults to --make elsewhere",
     )
+    parser.add_argument(
+        "--windows-build-inputs",
+        type=Path,
+        help="Explicit Windows tool and SDK selection; no unrelated PATH fallback",
+    )
+    for name in ("ar", "ranlib"):
+        parser.add_argument(f"--{name}", type=Path)
+    for name in ("c-flag", "cxx-flag", "link-flag"):
+        parser.add_argument(f"--{name}", action="append", default=[])
     parser.add_argument("--target", required=True)
     parser.add_argument(
         "--deployment-target",

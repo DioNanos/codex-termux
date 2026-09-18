@@ -50,6 +50,8 @@ pub(crate) enum TerminalTitleItem {
     /// Compact runtime run-state text.
     #[strum(to_string = "run-state", serialize = "status")]
     Status,
+    /// Current thread name, omitted when unnamed.
+    ThreadName,
     /// Current thread title (if available).
     #[strum(to_string = "thread-title", serialize = "thread")]
     Thread,
@@ -104,6 +106,7 @@ impl TerminalTitleItem {
             TerminalTitleItem::Status => {
                 "Compact session run-state text (Ready, Working, Thinking)"
             }
+            TerminalTitleItem::ThreadName => "Current thread name (omitted when unnamed)",
             TerminalTitleItem::Thread => "Current thread title, or thread identifier when unnamed",
             TerminalTitleItem::GitBranch => "Current Git branch (omitted when unavailable)",
             TerminalTitleItem::ContextRemaining => {
@@ -148,6 +151,7 @@ impl TerminalTitleItem {
             TerminalTitleItem::CurrentDir => Some(StatusSurfacePreviewItem::CurrentDir),
             TerminalTitleItem::Spinner => None,
             TerminalTitleItem::Status => Some(StatusSurfacePreviewItem::Status),
+            TerminalTitleItem::ThreadName => Some(StatusSurfacePreviewItem::ThreadName),
             TerminalTitleItem::Thread => Some(StatusSurfacePreviewItem::ThreadTitle),
             TerminalTitleItem::GitBranch => Some(StatusSurfacePreviewItem::GitBranch),
             TerminalTitleItem::ContextRemaining => Some(StatusSurfacePreviewItem::ContextRemaining),

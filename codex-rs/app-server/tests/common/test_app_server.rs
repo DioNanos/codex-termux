@@ -195,7 +195,15 @@ impl TestAppServer {
     /// Closes stdio and waits for app-server's graceful thread teardown to finish.
     pub async fn shutdown_gracefully(&mut self) -> std::io::Result<ExitStatus> {
         drop(self.stdin.take());
-        self.process.wait().await
+        // Drain final notifications so a full stdout pipe cannot block runtime shutdown.
+        let mut sink = tokio::io::sink();
+        tokio::select! {
+            status = self.process.wait() => status,
+            drained = tokio::io::copy(&mut self.stdout, &mut sink) => {
+                drained?;
+                self.process.wait().await
+            }
+        }
     }
 
     /// Returns the automatically selected test environment retained by this server.
@@ -270,7 +278,7 @@ impl TestAppServer {
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::ExecutableFileBusy)
                 || retries == 2
             {
-                break process.context("codex-mcp-server proc should start")?;
+                break process.context("codex app-server proc should start")?;
             }
             retries += 1;
             tokio::time::sleep(Duration::from_millis(10)).await;

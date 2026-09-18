@@ -23,6 +23,7 @@ fn client_management_handle(
     });
     RemoteControlHandle {
         policy: RemoteControlPolicy::Allowed,
+        shutdown_token: CancellationToken::new(),
         desired_state_tx: Arc::new(desired_state_tx),
         desired_state_rpc_lock: Arc::new(Semaphore::new(1)),
         desired_state_persistence_lock: Arc::new(Semaphore::new(1)),

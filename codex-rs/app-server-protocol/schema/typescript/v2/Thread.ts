@@ -74,6 +74,10 @@ cwd: AbsolutePathBuf, /**
  * Version of the CLI that created the thread.
  */
 cliVersion: string, /**
+ * Originator recorded when the thread was created, independent of its current client or executor.
+ * Null when the recorded originator is unavailable.
+ */
+originator: string | null, /**
  * Origin of the thread (CLI, VSCode, codex exec, codex app-server, etc.).
  */
 source: SessionSource, /**

@@ -223,7 +223,10 @@ impl StatusIndicator<'_> {
     fn lines(&self, width: u16) -> Vec<Line<'static>> {
         let row = self.row;
         let now = Instant::now();
-        let elapsed_duration = self.timer.elapsed_at(now);
+        let elapsed_duration = self.timer.display_started_at.map_or_else(
+            || self.timer.elapsed_at(now),
+            |started_at| now.saturating_duration_since(started_at),
+        );
         let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());
         let motion_mode = MotionMode::from_animations_enabled(row.animations_enabled);
 
@@ -292,10 +295,13 @@ impl Renderable for StatusIndicator<'_> {
         if area.is_empty() {
             return;
         }
-        if self.row.animations_enabled {
-            self.row
-                .frame_requester
-                .schedule_frame_in(frame_interval_for_header(&self.row.header));
+        if self.row.animations_enabled || self.timer.display_started_at.is_some() {
+            let interval = if self.row.animations_enabled {
+                frame_interval_for_header(&self.row.header)
+            } else {
+                Duration::from_millis(1_000)
+            };
+            self.row.frame_requester.schedule_frame_in(interval);
         }
         Paragraph::new(Text::from(self.lines(area.width))).render(area, buf);
     }

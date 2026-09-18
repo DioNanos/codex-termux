@@ -731,6 +731,11 @@ pub struct Tui {
     #[serde(default = "default_true")]
     pub animations: bool,
 
+    /// Enable decorative effects such as Astra composer stars. Also requires animations.
+    /// Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub whimsy: bool,
+
     /// Show startup tooltips in the TUI welcome screen.
     /// Defaults to `true`.
     #[serde(default = "default_true")]
@@ -752,6 +757,10 @@ pub struct Tui {
     #[serde(default)]
     pub vim_mode_default: bool,
 
+    /// Escape returns from async questions to the composer, preserving the answer draft.
+    #[serde(default = "default_true")]
+    pub question_esc_back: bool,
+
     /// Start the TUI in raw scrollback mode for copy-friendly transcript output.
     /// Defaults to `false`.
     #[serde(default)]
@@ -768,7 +777,7 @@ pub struct Tui {
     /// Ordered list of status line item identifiers.
     ///
     /// When set, the TUI renders the selected items as the status line.
-    /// When unset, the TUI defaults to: `model-with-reasoning` and `current-dir`.
+    /// When unset, the TUI defaults to: `model-with-reasoning`, `current-dir`, and `thread-name`.
     #[serde(default)]
     pub status_line: Option<Vec<String>>,
 
@@ -780,7 +789,7 @@ pub struct Tui {
     /// Ordered list of terminal title item identifiers.
     ///
     /// When set, the TUI renders the selected items into the terminal window/tab title.
-    /// When unset, the TUI defaults to: `activity` and `project`.
+    /// When unset, the TUI defaults to: `activity`, `thread-name`, and `project-name`.
     /// The `activity` item spins while working and shows an action-required
     /// message when blocked on the user.
     #[serde(default)]

@@ -346,6 +346,7 @@ enabled = false
                     good_config.codex_home.clone(),
                 )),
                 /*analytics_events_client*/ None,
+                codex_core::passthrough_image_store(),
                 Arc::clone(&thread_store),
                 codex_core::local_agent_graph_store_from_state_db(Some(&state_db)),
                 "11111111-1111-4111-8111-111111111111".to_string(),

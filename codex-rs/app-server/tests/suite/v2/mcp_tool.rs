@@ -1397,6 +1397,16 @@ impl ServerHandler for ToolAppsMcpServer {
                 )])
                 .into());
             }
+            if matches!(result.action, ElicitationAction::Cancel) {
+                assert_eq!(
+                    serde_json::to_value(result).expect("cancelled elicitation response"),
+                    json!({ "action": "cancel", "_meta": { "approvals_reviewer": "auto_review" } }),
+                );
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "Tool execution was cancelled by Guardian.",
+                )])
+                .into());
+            }
             assert_eq!(
                 serde_json::to_value(result).expect("elicitation response"),
                 json!({

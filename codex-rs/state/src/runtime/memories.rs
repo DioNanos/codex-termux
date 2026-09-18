@@ -177,6 +177,7 @@ SELECT
     threads.updated_at_ms AS updated_at,
     threads.recency_at_ms AS recency_at,
     threads.source,
+    threads.originator,
     threads.history_mode,
     threads.thread_source,
     threads.agent_path,
@@ -209,6 +210,7 @@ SELECT
     threads.section_position,
     threads.section_entered_at_ms,
     threads.project_id,
+    threads.daybreak_enabled,
     threads.git_sha,
     threads.git_branch,
     threads.git_origin_url
@@ -567,6 +569,7 @@ SELECT
     threads.updated_at_ms AS updated_at,
     threads.recency_at_ms AS recency_at,
     threads.source,
+    threads.originator,
     threads.history_mode,
     threads.thread_source,
     threads.agent_nickname,
@@ -599,6 +602,7 @@ SELECT
     threads.section_position,
     threads.section_entered_at_ms,
     threads.project_id,
+    threads.daybreak_enabled,
     threads.git_sha,
     threads.git_branch,
     threads.git_origin_url

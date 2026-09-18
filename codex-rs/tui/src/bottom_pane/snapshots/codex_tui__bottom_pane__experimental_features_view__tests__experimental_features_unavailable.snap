@@ -1,0 +1,14 @@
+---
+source: tui/src/bottom_pane/experimental_features_view_tests.rs
+expression: buffer_text(&buffer)
+---
+
+  Experimental features
+  Checked features are configured on. Some experimental features take effect
+  only in new tasks or after restarting the Codex server.
+  Server experiments unavailable. Reopen /experimental to retry; restart this
+  Codex client if requests remain unanswered.
+
+  No experimental features available for now
+
+  Press space to select or enter to save

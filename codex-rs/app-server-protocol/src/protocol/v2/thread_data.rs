@@ -1,4 +1,5 @@
 use super::CodexErrorInfo;
+use super::ThreadEnvironment;
 use super::ThreadItem;
 use super::ThreadStatus;
 use super::TurnStatus;
@@ -203,6 +204,12 @@ pub struct ThreadSectionAppearance {
 pub struct Thread {
     /// Identifier for this thread. Codex-generated thread IDs are UUIDv7.
     pub id: String,
+    /// Current environments for a loaded thread, in priority order, primary first.
+    /// `null` means the thread is not loaded or the server does not expose its selection.
+    /// An empty list means no environments are selected. This does not report connection status.
+    #[experimental("thread.environments")]
+    #[serde(default)]
+    pub environments: Option<Vec<ThreadEnvironment>>,
     /// Optional implementation-specific thread data.
     #[experimental("thread.extra")]
     pub extra: Option<ThreadExtra>,
@@ -257,6 +264,9 @@ pub struct Thread {
     pub cwd: AbsolutePathBuf,
     /// Version of the CLI that created the thread.
     pub cli_version: String,
+    /// Originator recorded when the thread was created, independent of its current client or executor.
+    /// Null when the recorded originator is unavailable.
+    pub originator: Option<String>,
     /// Origin of the thread (CLI, VSCode, codex exec, codex app-server, etc.).
     pub source: SessionSource,
     /// Whether the app server accepts direct turn input for this loaded thread.
@@ -273,6 +283,9 @@ pub struct Thread {
     pub git_info: Option<GitInfo>,
     /// Optional user-facing thread title.
     pub name: Option<String>,
+    /// Saved Daybreak choice, independent of turn execution. Null if unset.
+    #[experimental("thread.daybreakEnabled")]
+    pub daybreak_enabled: Option<bool>,
     /// Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read`
     /// (when `includeTurns` is true) responses.
     /// For all other responses and notifications returning a Thread,
@@ -286,6 +299,8 @@ pub struct Thread {
 #[serde(rename_all = "camelCase")]
 struct ThreadCompatibility {
     id: String,
+    #[serde(default)]
+    environments: Option<Vec<ThreadEnvironment>>,
     extra: Option<ThreadExtra>,
     session_id: String,
     forked_from_id: Option<String>,
@@ -310,6 +325,7 @@ struct ThreadCompatibility {
     path: Option<PathBuf>,
     cwd: AbsolutePathBuf,
     cli_version: String,
+    originator: Option<String>,
     source: SessionSource,
     can_accept_direct_input: Option<bool>,
     thread_source: Option<ThreadSource>,
@@ -317,6 +333,7 @@ struct ThreadCompatibility {
     agent_role: Option<String>,
     git_info: Option<GitInfo>,
     name: Option<String>,
+    daybreak_enabled: Option<bool>,
     turns: Vec<Turn>,
 }
 
@@ -328,6 +345,7 @@ impl<'de> Deserialize<'de> for Thread {
         let thread = ThreadCompatibility::deserialize(deserializer)?;
         Ok(Self {
             id: thread.id,
+            environments: thread.environments,
             extra: thread.extra,
             session_id: thread.session_id,
             forked_from_id: thread.forked_from_id,
@@ -348,6 +366,7 @@ impl<'de> Deserialize<'de> for Thread {
             path: thread.path,
             cwd: thread.cwd,
             cli_version: thread.cli_version,
+            originator: thread.originator,
             source: thread.source,
             can_accept_direct_input: thread.can_accept_direct_input,
             thread_source: thread.thread_source,
@@ -355,6 +374,7 @@ impl<'de> Deserialize<'de> for Thread {
             agent_role: thread.agent_role,
             git_info: thread.git_info,
             name: thread.name,
+            daybreak_enabled: thread.daybreak_enabled,
             turns: thread.turns,
         })
     }

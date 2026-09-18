@@ -118,6 +118,11 @@ impl ComposerInput {
         self.inner.is_in_paste_burst()
     }
 
+    /// Delay until validation feedback expires and needs a redraw.
+    pub fn footer_flash_delay(&self) -> Option<Duration> {
+        self.inner.footer_flash_delay()
+    }
+
     /// Flush a pending paste-burst if the inter-key timeout has elapsed.
     /// Returns true if text changed and a redraw is warranted.
     pub fn flush_paste_burst_if_due(&mut self) -> bool {

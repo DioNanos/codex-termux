@@ -116,6 +116,7 @@ mod tests {
             .rejected_steers_queue
             .push_back(UserMessage::from("rejected"));
         state.pending_steers.push_back(PendingSteer {
+            client_id: "test-submission".to_string(),
             user_message: UserMessage::from("pending"),
             history_record: UserMessageHistoryRecord::UserMessageText,
             compare_key: crate::chatwidget::user_messages::PendingSteerCompareKey {

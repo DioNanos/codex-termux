@@ -93,6 +93,22 @@ fn finalized_markdown_reuses_lines_primed_by_transcript_height() {
 }
 
 #[test]
+fn finalized_assistant_file_citation_renders_as_local_path_snapshot() {
+    let cwd = std::env::temp_dir();
+    let output = cwd.join("Quarterly Report.xlsx").display().to_string();
+    let cell = AgentMarkdownCell::new(
+        format!(
+            r#"Generated :codex-file-citation{{artifact_kind="workbook" path="{output}" purpose="output"}}."#
+        ),
+        &cwd,
+    );
+
+    let rendered = ratatui::text::Text::from(cell.display_lines(/*width*/ 80));
+
+    insta::assert_snapshot!(rendered, @"• Generated Quarterly Report.xlsx.");
+}
+
+#[test]
 fn finalized_markdown_cache_misses_when_width_or_render_style_changes() {
     let cell = AgentMarkdownCell::new("finalized **markdown**".to_string(), Path::new("/tmp"));
     let width = 48;

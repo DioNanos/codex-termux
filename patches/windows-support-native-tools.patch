@@ -1,0 +1,166 @@
+diff --git a/windows/private/extensions/msvc_runtime.bzl b/windows/private/extensions/msvc_runtime.bzl
+--- a/windows/private/extensions/msvc_runtime.bzl
++++ b/windows/private/extensions/msvc_runtime.bzl
+@@ -204,13 +204,20 @@
+     _keep_only_children(
+         repository_ctx,
+         repository_ctx.path("{}/Contents/VC/Tools/MSVC/{}".format(sysroot_dir, msvc_version)),
+-        ["include", "lib"],
++        ["include", "lib", "bin"],
+     )
+     _keep_only_children(
+         repository_ctx,
+         repository_ctx.path("{}/Contents/VC/Tools/MSVC/{}/lib".format(sysroot_dir, msvc_version)),
+         architectures,
+     )
++
++    # Keep native-host tools and their support files separate from runtime inputs.
++    bin_dir = "{}/Contents/VC/Tools/MSVC/{}/bin".format(sysroot_dir, msvc_version)
++    _keep_only_children(repository_ctx, repository_ctx.path(bin_dir), ["HostArm64" if arch == "arm64" else "Host" + arch for arch in architectures])
++    for arch in architectures:
++        host = "HostArm64" if arch == "arm64" else "Host" + arch
++        _keep_only_children(repository_ctx, repository_ctx.path(bin_dir + "/" + host), [arch])
+ 
+ def _msvc_runtime_repository_impl(repository_ctx):
+     _check_msvc_license_requirements(repository_ctx)
+diff --git a/windows/private/extensions/msvc_runtime.BUILD.bazel b/windows/private/extensions/msvc_runtime.BUILD.bazel
+--- a/windows/private/extensions/msvc_runtime.BUILD.bazel
++++ b/windows/private/extensions/msvc_runtime.BUILD.bazel
+@@ -17,6 +17,7 @@
+     name = "sysroot_files",
+     srcs = glob(
+         ["__MSVC_RUNTIME_DIR__/**"],
++        exclude = ["__MSVC_RUNTIME_DIR__/Contents/VC/Tools/MSVC/__MSVC_VERSION__/bin/**"],
+         allow_empty = True,
+     ),
+ )
+@@ -98,6 +99,7 @@
+             "**/*.hh",
+             "**/*.hpp",
+         ],
++        exclude = ["__MSVC_RUNTIME_DIR__/Contents/VC/Tools/MSVC/__MSVC_VERSION__/bin/**"],
+         allow_empty = True,
+     ),
+ )
+@@ -106,6 +108,37 @@
+     name = "libs",
+     srcs = glob(
+         ["**/*.lib"],
++        exclude = ["__MSVC_RUNTIME_DIR__/Contents/VC/Tools/MSVC/__MSVC_VERSION__/bin/**"],
+         allow_empty = True,
+     ),
+ )
++
++# Native build tools are opt-in; ordinary sysroot users keep only headers/libs.
++
++directory(
++    name = "msvc_tools_x64_files",
++    srcs = glob(
++        ["__MSVC_RUNTIME_DIR__/Contents/VC/Tools/MSVC/__MSVC_VERSION__/bin/Hostx64/x64/**"],
++        allow_empty = True,
++    ),
++)
++
++subdirectory(
++    name = "msvc_tools_x64",
++    parent = ":msvc_tools_x64_files",
++    path = "__MSVC_RUNTIME_DIR__/Contents/VC/Tools/MSVC/__MSVC_VERSION__/bin/Hostx64/x64",
++)
++
++directory(
++    name = "msvc_tools_arm64_files",
++    srcs = glob(
++        ["__MSVC_RUNTIME_DIR__/Contents/VC/Tools/MSVC/__MSVC_VERSION__/bin/HostArm64/arm64/**"],
++        allow_empty = True,
++    ),
++)
++
++subdirectory(
++    name = "msvc_tools_arm64",
++    parent = ":msvc_tools_arm64_files",
++    path = "__MSVC_RUNTIME_DIR__/Contents/VC/Tools/MSVC/__MSVC_VERSION__/bin/HostArm64/arm64",
++)
+diff --git a/windows/private/extensions/windows_sdk.bzl b/windows/private/extensions/windows_sdk.bzl
+--- a/windows/private/extensions/windows_sdk.bzl
++++ b/windows/private/extensions/windows_sdk.bzl
+@@ -31,13 +31,18 @@
+ def _keep_exposed_windows_sdk_files(repository_ctx, sysroot_dir, include_version, architectures):
+     _keep_only_children(repository_ctx, repository_ctx.path(sysroot_dir), ["base"] + architectures)
+     _keep_only_children(repository_ctx, repository_ctx.path("{}/base".format(sysroot_dir)), ["c"])
+-    _keep_only_children(repository_ctx, repository_ctx.path("{}/base/c".format(sysroot_dir)), ["Include"])
++    _keep_only_children(repository_ctx, repository_ctx.path("{}/base/c".format(sysroot_dir)), ["Include", "bin"])
+     _keep_only_children(repository_ctx, repository_ctx.path("{}/base/c/Include".format(sysroot_dir)), [include_version])
+     _keep_only_children(
+         repository_ctx,
+         repository_ctx.path("{}/base/c/Include/{}".format(sysroot_dir, include_version)),
+         ["ucrt", "shared", "um", "winrt"],
+     )
++
++    # Resource and manifest tools share the selected SDK's versioned bin tree.
++    bin_dir = "{}/base/c/bin".format(sysroot_dir)
++    _keep_only_children(repository_ctx, repository_ctx.path(bin_dir), [include_version])
++    _keep_only_children(repository_ctx, repository_ctx.path(bin_dir + "/" + include_version), architectures)
+ 
+     seen_architectures = {}
+     for arch in architectures:
+diff --git a/windows/private/extensions/windows_sdk.BUILD.bazel b/windows/private/extensions/windows_sdk.BUILD.bazel
+--- a/windows/private/extensions/windows_sdk.BUILD.bazel
++++ b/windows/private/extensions/windows_sdk.BUILD.bazel
+@@ -19,6 +19,7 @@
+     name = "sysroot_files",
+     srcs = glob(
+         ["__WINSDK_DIR__/**"],
++        exclude = ["__WINSDK_DIR__/base/c/bin/__WINSDK_INCLUDE_VERSION__/**"],
+         allow_empty = True,
+     ) + _LOGICAL_ALIASES,
+ )
+@@ -210,6 +211,7 @@
+             "**/*.hh",
+             "**/*.hpp",
+         ],
++        exclude = ["__WINSDK_DIR__/base/c/bin/__WINSDK_INCLUDE_VERSION__/**"],
+         allow_empty = True,
+     ) + [
+         f
+@@ -222,6 +224,7 @@
+     name = "libs",
+     srcs = glob(
+         ["**/*.lib"],
++        exclude = ["__WINSDK_DIR__/base/c/bin/__WINSDK_INCLUDE_VERSION__/**"],
+         allow_empty = True,
+     ) + [
+         f
+@@ -229,3 +232,33 @@
+         if f.endswith(".lib")
+     ],
+ )
++
++# Native build tools are opt-in; ordinary sysroot users keep only headers/libs.
++
++directory(
++    name = "winsdk_tools_x64_files",
++    srcs = glob(
++        ["__WINSDK_DIR__/base/c/bin/__WINSDK_INCLUDE_VERSION__/x64/**"],
++        allow_empty = True,
++    ),
++)
++
++subdirectory(
++    name = "winsdk_tools_x64",
++    parent = ":winsdk_tools_x64_files",
++    path = "__WINSDK_DIR__/base/c/bin/__WINSDK_INCLUDE_VERSION__/x64",
++)
++
++directory(
++    name = "winsdk_tools_arm64_files",
++    srcs = glob(
++        ["__WINSDK_DIR__/base/c/bin/__WINSDK_INCLUDE_VERSION__/arm64/**"],
++        allow_empty = True,
++    ),
++)
++
++subdirectory(
++    name = "winsdk_tools_arm64",
++    parent = ":winsdk_tools_arm64_files",
++    path = "__WINSDK_DIR__/base/c/bin/__WINSDK_INCLUDE_VERSION__/arm64",
++)

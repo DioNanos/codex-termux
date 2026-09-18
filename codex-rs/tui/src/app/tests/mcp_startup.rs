@@ -86,9 +86,9 @@ async fn subagent_mcp_startup_settles_while_cached_servers_remain_deferred() {
     }
 
     insta::assert_snapshot!(visible_startup_states.join("\n"), @r"
-    eager: • Booting MCP server: eager
     eager: idle
-    deferred: • Booting MCP server: deferred
+    eager: idle
+    deferred: idle
     deferred: idle
     ");
 }

@@ -351,6 +351,7 @@ async fn run_remote_compact_task_inner_impl(
             window_number: new_window_number,
             window_ids: new_window_ids,
             compaction_response_id: Some(compaction_response_id),
+            compaction_model_hash: compaction_turn_context.model_info().comp_hash.clone(),
         },
     )
     .await;

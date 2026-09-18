@@ -14,7 +14,7 @@ expression: terminal_title_popup_snapshot(&mut chat)
   [ ] current-dir    Current working directory
   [ ] activity       Spinner while working, action-required message while blocked.
   [ ] run-state      Compact session run-state text (Ready, Working, Thinking)
-  [ ] git-branch     Current Git branch (omitted when unavailable)
+  [ ] thread-name    Current thread name (omitted when unnamed)
 
   project | Mixed preview thread | Tasks 0/0
   Press space to toggle; ←/→ to move; enter to confirm and close; esc to close

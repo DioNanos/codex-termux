@@ -297,6 +297,7 @@ access = "deny"
     assert_eq!(
         requirements.browser_use,
         Some(BrowserUseRequirements {
+            allow_webmcp: None,
             allow_history_access: Some(false),
             disable_auto_review: Some(true),
             allow_global_persistent_approval: Some(false),
@@ -822,6 +823,7 @@ access = "deny"
     assert_eq!(
         requirements.browser_use,
         Some(BrowserUseRequirements {
+            allow_webmcp: None,
             allow_history_access: Some(false),
             disable_auto_review: None,
             allow_global_persistent_approval: Some(false),

@@ -1513,6 +1513,10 @@ impl Renderable for McpServerElicitationOverlay {
 }
 
 impl BottomPaneView for McpServerElicitationOverlay {
+    fn next_frame_delay(&self) -> Option<std::time::Duration> {
+        self.composer.footer_flash_delay()
+    }
+
     fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
         if self.current_field_is_select() {
             crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
@@ -2263,6 +2267,34 @@ mod tests {
                 .iter()
                 .all(|tip| !tip.text.contains("submit"))
         );
+    }
+
+    #[test]
+    fn switching_fields_clears_length_validation_flash() {
+        let (tx, _rx) = test_sender();
+        let request = from_form_request(
+            ThreadId::default(),
+            form_request(
+                "Two fields",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+                    "required": ["a", "b"],
+                }),
+                /*meta*/ None,
+            ),
+        )
+        .expect("supported form");
+        let mut overlay = McpServerElicitationOverlay::new(
+            request, tx, /*has_input_focus*/ true, /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ true,
+        );
+        overlay.handle_paste("x".repeat(codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS + 1));
+        overlay.handle_key_event(KeyCode::Enter.into());
+        assert!(overlay.next_frame_delay().is_some());
+        overlay.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(overlay.next_frame_delay(), None);
+        assert!(overlay.composer.current_text().is_empty());
     }
 
     #[test]

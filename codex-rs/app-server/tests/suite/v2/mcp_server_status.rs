@@ -531,7 +531,15 @@ async fn mcp_server_status_list_returns_raw_server_and_tool_names() -> Result<()
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri())
         .with_extra_config(&format!(
-            "[mcp_servers.some-server]\nurl = \"{mcp_server_url}/mcp\""
+            "[mcp_servers.some-server]\nurl = \"{mcp_server_url}/mcp\"\n\
+             [mcp_servers.broken-server]\ncommand = {}",
+            toml::Value::String(
+                codex_home
+                    .path()
+                    .join("missing-mcp-server")
+                    .display()
+                    .to_string()
+            )
         ))
         .write(codex_home.path())?;
 
@@ -553,8 +561,25 @@ async fn mcp_server_status_list_returns_raw_server_and_tool_names() -> Result<()
         .await?;
 
     assert_eq!(response.next_cursor, None);
-    assert_eq!(response.data.len(), 1);
-    let status = &response.data[0];
+    assert_eq!(response.data.len(), 2);
+    let failed = response
+        .data
+        .iter()
+        .find(|status| status.name == "broken-server")
+        .unwrap();
+    assert!(failed.tools.is_empty());
+    assert!(
+        failed
+            .tools_error
+            .as_deref()
+            .is_some_and(|error| error.contains("MCP startup failed"))
+    );
+    let status = response
+        .data
+        .iter()
+        .find(|status| status.name == "some-server")
+        .unwrap();
+    assert_eq!(status.tools_error, None);
     assert_eq!(status.name, "some-server");
     assert_eq!(status.runtime_status, None);
     assert_eq!(status.plugin_id, None);

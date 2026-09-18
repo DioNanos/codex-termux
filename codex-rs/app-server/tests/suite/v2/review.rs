@@ -6,6 +6,7 @@ use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::DeprecationNoticeNotification;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
@@ -33,6 +34,7 @@ use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -79,12 +81,23 @@ async fn review_start_rejects_detached_delivery_for_paginated_parent() -> Result
         review_err.error.message,
         "paginated threads do not support detached review"
     );
+    assert!(
+        mcp.pending_notification_methods()
+            .iter()
+            .any(|method| method == "deprecationNotice"),
+        "rejected detached requests should still emit a deprecation notice"
+    );
 
     Ok(())
 }
 
+#[test_case(None; "omitted_delivery")]
+#[test_case(Some(json!(null)); "null_delivery")]
+#[test_case(Some(json!("inline")); "inline_delivery")]
 #[tokio::test]
-async fn review_start_runs_review_turn_and_emits_code_review_item() -> Result<()> {
+async fn review_start_runs_review_turn_and_emits_code_review_item(
+    delivery: Option<serde_json::Value>,
+) -> Result<()> {
     let review_payload = json!({
         "findings": [
             {
@@ -113,22 +126,22 @@ async fn review_start_runs_review_turn_and_emits_code_review_item() -> Result<()
         .build_initialized()
         .await?;
     let thread_id = start_default_thread(&mut mcp).await?;
+    let mut params = json!({
+        "threadId": thread_id,
+        "target": {
+            "type": "commit",
+            "sha": "1234567deadbeef",
+            "title": "Tidy UI colors",
+        },
+    });
+    if let Some(delivery) = delivery {
+        params["delivery"] = delivery;
+    }
+    let request_id = mcp.send_raw_request("review/start", Some(params)).await?;
     let ReviewStartResponse {
         turn,
         review_thread_id,
-    } = mcp
-        .request(|request_id| ClientRequest::ReviewStart {
-            request_id,
-            params: ReviewStartParams {
-                thread_id: thread_id.clone(),
-                delivery: Some(ReviewDelivery::Inline),
-                target: ReviewTarget::Commit {
-                    sha: "1234567deadbeef".to_string(),
-                    title: Some("Tidy UI colors".to_string()),
-                },
-            },
-        })
-        .await?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(review_thread_id, thread_id.clone());
     let turn_id = turn.id.clone();
     assert_eq!(turn.status, TurnStatus::InProgress);
@@ -187,6 +200,12 @@ async fn review_start_runs_review_turn_and_emits_code_review_item() -> Result<()
     let review = review_body.expect("did not observe a code review item");
     assert!(review.contains("Prefer Stylize helpers"));
     assert!(review.contains("/tmp/file.rs:10-20"));
+    assert!(
+        !mcp.pending_notification_methods()
+            .iter()
+            .any(|method| method == "deprecationNotice"),
+        "inline reviews should not emit a deprecation notice"
+    );
 
     Ok(())
 }
@@ -379,21 +398,31 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
     .await??;
     let thread_id = thread.id;
     materialize_thread_rollout(&mut mcp, &thread_id).await?;
-    let ReviewStartResponse {
-        turn,
-        review_thread_id,
-    } = mcp
-        .request(|request_id| ClientRequest::ReviewStart {
-            request_id,
-            params: ReviewStartParams {
-                thread_id: thread_id.clone(),
-                delivery: Some(ReviewDelivery::Detached),
-                target: ReviewTarget::Custom {
-                    instructions: "detached review".to_string(),
-                },
+    let review_id = mcp
+        .send_review_start_request(ReviewStartParams {
+            thread_id: thread_id.clone(),
+            delivery: Some(ReviewDelivery::Detached),
+            target: ReviewTarget::Custom {
+                instructions: "detached review".to_string(),
             },
         })
         .await?;
+    let notice: DeprecationNoticeNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("deprecationNotice"),
+    )
+    .await??;
+    assert_eq!(
+        notice,
+        DeprecationNoticeNotification {
+            summary: "review/start with delivery \"detached\" is deprecated and will be removed in a future release.".to_string(),
+            details: Some("Use thread/start followed by review/start with delivery \"inline\" for a separate review thread, or thread/fork followed by turn/start with your own review instructions.".to_string()),
+        }
+    );
+    let ReviewStartResponse {
+        turn,
+        review_thread_id,
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(review_id)).await??;
 
     assert_eq!(turn.status, TurnStatus::InProgress);
     assert_eq!(turn.items_view, TurnItemsView::NotLoaded);

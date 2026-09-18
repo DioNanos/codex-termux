@@ -1270,7 +1270,7 @@ impl SessionTelemetry {
 
     fn responses_type(event: &ResponseEvent) -> String {
         match event {
-            ResponseEvent::Created => "created".into(),
+            ResponseEvent::Created { .. } => "created".into(),
             ResponseEvent::OutputItemDone(item) | ResponseEvent::OutputItemAdded(item) => {
                 SessionTelemetry::responses_item_type(item)
             }
@@ -1309,6 +1309,7 @@ impl SessionTelemetry {
             ResponseItem::WebSearchCall { .. } => "web_search_call".into(),
             ResponseItem::ImageGenerationCall { .. } => "image_generation_call".into(),
             ResponseItem::Compaction { .. } => "compaction".into(),
+            ResponseItem::ConfigurationUpdate { .. } => "configuration_update".into(),
             ResponseItem::CompactionTrigger { .. } => "compaction_trigger".into(),
             ResponseItem::ContextCompaction { .. } => "context_compaction".into(),
             ResponseItem::Other => "other".into(),

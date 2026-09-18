@@ -1,0 +1,17 @@
+---
+source: tui/src/clipboard_html_tests.rs
+expression: render_markdown(markdown)
+---
+<h1>Findings</h1>
+<p>Read <a href="https://example.com/source?q=1&amp;v=2">the source</a>.</p>
+<ul>
+<li><strong>Bold</strong>, <em>italic</em>, <del>removed</del>, and <code>inline &lt;code&gt;</code></li>
+</ul>
+<blockquote>
+<p>A quoted finding.</p>
+</blockquote>
+<pre><code class="language-rust">fn main() { println!("&lt;hello&gt;"); }
+</code></pre>
+<table><thead><tr><th>Item</th><th>Result</th></tr></thead><tbody>
+<tr><td>Copy</td><td>Formatted</td></tr>
+</tbody></table>

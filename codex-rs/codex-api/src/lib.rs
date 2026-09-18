@@ -39,6 +39,7 @@ pub use crate::common::ReasoningContext;
 pub use crate::common::ReasoningSummaryDelivery;
 pub use crate::common::ResponseCreateWsRequest;
 pub use crate::common::ResponseEvent;
+pub use crate::common::ResponseId;
 pub use crate::common::ResponseStream;
 pub use crate::common::ResponsesApiRequest;
 pub use crate::common::ResponsesApiTools;

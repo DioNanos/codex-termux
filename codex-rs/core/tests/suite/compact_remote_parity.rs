@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use anyhow::Result;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::PermissionProfile;
@@ -791,7 +790,7 @@ fn replacement_history_from_rollout(path: &Path) -> Result<Value> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        let Ok(entry) = serde_json::from_str::<RolloutLine>(line) else {
+        let Ok(entry) = codex_rollout::parse_rollout_line(line) else {
             continue;
         };
         if let RolloutItem::Compacted(compacted) = entry.item

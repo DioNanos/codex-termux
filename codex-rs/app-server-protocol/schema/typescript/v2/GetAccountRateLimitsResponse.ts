@@ -7,6 +7,11 @@ import type { RateLimitSnapshot } from "./RateLimitSnapshot";
 
 export type GetAccountRateLimitsResponse = {
 /**
+ * Backend permission for ordinary included usage, validated against the active account.
+ * Null means unavailable; clients must not infer recovery from percentages or reset times.
+ */
+ordinaryUsageAllowed: boolean | null,
+/**
  * Backward-compatible single-bucket view; mirrors the historical payload.
  */
 rateLimits: RateLimitSnapshot,

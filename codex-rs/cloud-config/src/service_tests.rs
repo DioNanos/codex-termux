@@ -635,6 +635,74 @@ async fn get_bundle_uses_cache_when_valid() {
 }
 
 #[tokio::test]
+async fn get_bundle_without_cache_ignores_and_preserves_valid_cache() {
+    let codex_home = tempdir().expect("tempdir");
+    let cache = create_test_cache(codex_home.path());
+    cache
+        .save(
+            Some("user-12345".to_string()),
+            Some("account-12345".to_string()),
+            CloudConfigBundle::default(),
+        )
+        .await
+        .expect("write empty cache");
+    let cached_bytes = std::fs::read(cache.path()).expect("read cache");
+    let bundle = test_bundle();
+    let fetcher = Arc::new(StaticBundleClient::new(bundle.clone()));
+    let service = CloudConfigBundleService::new(
+        auth_manager_with_plan("business").await,
+        fetcher.clone(),
+        codex_home.path().to_path_buf(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    )
+    .without_cache();
+
+    assert_eq!(
+        service.load_startup_bundle_with_timeout().await,
+        Ok(Some(bundle))
+    );
+    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        std::fs::read(cache.path()).expect("read unchanged cache"),
+        cached_bytes
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn get_bundle_without_cache_fails_closed_on_request_failure() {
+    let codex_home = tempdir().expect("tempdir");
+    create_test_cache(codex_home.path())
+        .save(
+            Some("user-12345".to_string()),
+            Some("account-12345".to_string()),
+            test_bundle(),
+        )
+        .await
+        .expect("write valid cache");
+    let fetcher = Arc::new(SequenceBundleClient::new(vec![
+        Err(request_error());
+        CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS
+    ]));
+    let service = CloudConfigBundleService::new(
+        auth_manager_with_plan("business").await,
+        fetcher.clone(),
+        codex_home.path().to_path_buf(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    )
+    .without_cache();
+
+    let err = service
+        .load_startup_bundle_with_timeout()
+        .await
+        .expect_err("request failure must not fall back to the cache");
+    assert_eq!(err.code(), CloudConfigBundleLoadErrorCode::RequestFailed);
+    assert_eq!(
+        fetcher.request_count.load(Ordering::SeqCst),
+        CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS
+    );
+}
+
+#[tokio::test]
 async fn get_bundle_ignores_cache_for_different_auth_identity() {
     let codex_home = tempdir().expect("tempdir");
     let prime_service = CloudConfigBundleService::new(

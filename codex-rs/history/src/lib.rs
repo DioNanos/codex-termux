@@ -54,6 +54,22 @@ pub struct CodexHarnessMetadata {
     /// Measured in tokens, with any tool-specific allowance already included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_token_limit_override: Option<usize>,
+
+    /// Whether a response configuration update was created by the Codex harness itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub harness_authored_configuration: bool,
+
+    /// Producer compatibility for an opaque compaction item, never the currently selected model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_model_hash: Option<String>,
+
+    /// Thread acceptance order, independent of when queued user input reaches model history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_input_order: Option<u64>,
+
+    /// Copied parent context stays model-visible but must not become child-local authorization.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inherited_user_message: bool,
 }
 
 impl ResponseItemEnvelope {
@@ -111,6 +127,7 @@ pub enum RolloutItem {
     TokenUsageRecord(TokenUsageRecord),
     WorldState(WorldStateItem),
     SecurityRiskScore(SecurityRiskScore),
+    RetainedContext(RetainedContextEvent),
     EventMsg(EventMsg),
     /// Sparse, model-invisible facts used to reconstruct realtime presentation.
     RealtimeItem(RealtimeItem),
@@ -149,6 +166,18 @@ impl JsonSchema for RolloutItem {
 }
 
 mod guardian_history;
+mod reconciled_retained_context;
+mod retained_context;
+
+pub use reconciled_retained_context::ReconciledRetainedContext;
+pub use retained_context::RetainedContext;
+pub use retained_context::RetainedContextEntry;
+pub use retained_context::RetainedContextEvent;
+pub use retained_context::RetainedContextOrder;
+pub use retained_context::RetainedInputSource;
+pub use retained_context::RetainedUserMessage;
+pub use retained_context::VerifiedAnswer;
+pub use retained_context::VerifiedQuestionAnswer;
 mod rollout_payload;
 
 pub use guardian_history::GuardianHistoryCheckpoint;
@@ -158,6 +187,7 @@ pub struct CompactedItem {
     pub message: String,
     pub replacement_history: Option<Vec<ResponseItemEnvelope>>,
     pub guardian_history: Option<GuardianHistoryCheckpoint>,
+    pub retained_context: Option<RetainedContext>,
     pub mcp_resource_origins: Option<McpResourceOriginCheckpoint>,
     pub window_number: Option<u64>,
     pub first_window_id: Option<String>,
@@ -220,7 +250,11 @@ impl From<CompactedItem> for ResponseItem {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, JsonSchema)]
+/// One persisted rollout JSONL record.
+///
+/// This intentionally does not implement Deserialize: JSONL readers must use
+/// codex_rollout's canonical parser so nested decimal values survive the flattened envelope.
+#[derive(Serialize, Clone, JsonSchema)]
 pub struct RolloutLine {
     pub timestamp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -438,6 +472,7 @@ fn multi_agent_version_from_items(
             | RolloutItem::Compacted(_)
             | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::EventMsg(_) => None,

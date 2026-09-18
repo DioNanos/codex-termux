@@ -33,7 +33,6 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct ExecServerHarness {
     codex_home: TempDir,
-    _helper_paths: TestCodexHelperPaths,
     child: Child,
     websocket_url: String,
     websocket: tokio_tungstenite::WebSocketStream<
@@ -89,31 +88,40 @@ where
     V: AsRef<std::ffi::OsStr>,
 {
     let helper_paths = test_codex_helper_paths()?;
-    let codex_home = TempDir::new()?;
     let mut child = Command::new(&helper_paths.codex_exe);
     child.args(["exec-server", "--listen", "ws://127.0.0.1:0"]);
     child.args(args);
-    child.stdin(Stdio::null());
-    child.stdout(Stdio::piped());
-    child.stderr(Stdio::inherit());
-    child.kill_on_drop(true);
-    child.env("CODEX_HOME", codex_home.path());
     child.envs(env);
-    let mut child = child.spawn()?;
-
-    let websocket_url = read_listen_url_from_stdout(&mut child).await?;
-    let (websocket, _) = connect_websocket_when_ready(&websocket_url).await?;
-    Ok(ExecServerHarness {
-        codex_home,
-        _helper_paths: helper_paths,
-        child,
-        websocket_url,
-        websocket,
-        next_request_id: 1,
-    })
+    ExecServerHarness::start(child).await
 }
 
 impl ExecServerHarness {
+    pub(crate) async fn start(mut command: Command) -> anyhow::Result<Self> {
+        let codex_home = TempDir::new()?;
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::inherit());
+        command.kill_on_drop(true);
+        if !command
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == "CODEX_HOME" && value.is_some())
+        {
+            command.env("CODEX_HOME", codex_home.path());
+        }
+        let mut child = command.spawn()?;
+
+        let websocket_url = read_listen_url_from_stdout(&mut child).await?;
+        let (websocket, _) = connect_websocket_when_ready(&websocket_url).await?;
+        Ok(Self {
+            codex_home,
+            child,
+            websocket_url,
+            websocket,
+            next_request_id: 1,
+        })
+    }
+
     pub(crate) fn codex_home(&self) -> &std::path::Path {
         self.codex_home.path()
     }
@@ -136,30 +144,7 @@ impl ExecServerHarness {
     pub(crate) async fn disconnectable_websocket_proxy(
         &self,
     ) -> anyhow::Result<DisconnectableWebSocketProxy> {
-        let upstream = self
-            .websocket_url
-            .strip_prefix("ws://")
-            .ok_or_else(|| anyhow!("exec-server websocket URL must use ws://"))?
-            .to_string();
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let websocket_url = format!("ws://{}", listener.local_addr()?);
-        let (pause_tx, pause_rx) = oneshot::channel();
-        let (blocked_connection_tx, blocked_connection_rx) = oneshot::channel();
-        let (resume_tx, resume_rx) = oneshot::channel();
-        let task = tokio::spawn(run_disconnectable_proxy(
-            listener,
-            upstream,
-            pause_rx,
-            blocked_connection_tx,
-            resume_rx,
-        ));
-        Ok(DisconnectableWebSocketProxy {
-            websocket_url,
-            pause_tx: Some(pause_tx),
-            blocked_connection_rx: Some(blocked_connection_rx),
-            resume_tx: Some(resume_tx),
-            task,
-        })
+        DisconnectableWebSocketProxy::new(&self.websocket_url).await
     }
 
     pub(crate) async fn send_request(
@@ -270,6 +255,33 @@ impl ExecServerHarness {
 }
 
 impl DisconnectableWebSocketProxy {
+    pub(crate) async fn new(websocket_url: &str) -> anyhow::Result<Self> {
+        let upstream = websocket_url
+            .strip_prefix("ws://")
+            .ok_or_else(|| anyhow!("exec-server websocket URL must use ws://"))?
+            .trim_end_matches('/')
+            .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let websocket_url = format!("ws://{}", listener.local_addr()?);
+        let (pause_tx, pause_rx) = oneshot::channel();
+        let (blocked_connection_tx, blocked_connection_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let task = tokio::spawn(run_disconnectable_proxy(
+            listener,
+            upstream,
+            pause_rx,
+            blocked_connection_tx,
+            resume_rx,
+        ));
+        Ok(DisconnectableWebSocketProxy {
+            websocket_url,
+            pause_tx: Some(pause_tx),
+            blocked_connection_rx: Some(blocked_connection_rx),
+            resume_tx: Some(resume_tx),
+            task,
+        })
+    }
+
     pub(crate) fn websocket_url(&self) -> &str {
         &self.websocket_url
     }

@@ -870,7 +870,7 @@ pub(crate) fn footer_hint_items_width(items: &[(String, String)]) -> u16 {
     footer_hint_items_line(items).width() as u16
 }
 
-fn footer_hint_items_line(items: &[(String, String)]) -> Line<'static> {
+pub(crate) fn footer_hint_items_line(items: &[(String, String)]) -> Line<'static> {
     let mut spans = Vec::with_capacity(items.len() * 4);
     for (idx, (key, label)) in items.iter().enumerate() {
         spans.push(" ".into());

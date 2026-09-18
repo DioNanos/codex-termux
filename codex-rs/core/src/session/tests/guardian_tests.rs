@@ -786,6 +786,7 @@ async fn network_approval_uses_published_task_authority_within_same_turn(
                 exec_policy_hint: None,
                 execution_id: None,
                 disconnect: None,
+                cancellation: None,
             },
         );
     tokio::pin!(decision);

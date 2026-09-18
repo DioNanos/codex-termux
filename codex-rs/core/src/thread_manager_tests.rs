@@ -805,6 +805,7 @@ async fn mcp_invalidation_refreshes_threads_that_are_still_starting() {
         Arc::new(extensions.build()),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store_from_config(&config, /*state_db*/ None),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
@@ -918,6 +919,77 @@ async fn spawn_internal_guardian_session_preserves_windows_sandbox_proxy_setting
         )
     );
 
+    manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+}
+
+#[tokio::test]
+async fn fork_internal_session_uses_only_the_selected_history() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let parent = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start parent");
+    let selected = vec![
+        user_msg("committed review"),
+        assistant_msg("completed assessment"),
+    ];
+    parent
+        .thread
+        .inject_response_items(vec![user_msg("unrelated parent work")])
+        .await
+        .expect("inject parent history");
+    let reviewer = manager
+        .fork_internal_session(
+            parent.thread_id,
+            StartThreadOptions {
+                session_source: Some(SessionSource::Internal(InternalSessionSource::Guardian)),
+                ..StartThreadOptions::new(config)
+            },
+            selected
+                .iter()
+                .cloned()
+                .map(|item| RolloutItem::ResponseItem(item.into()))
+                .collect(),
+        )
+        .await
+        .expect("fork internal reviewer");
+    let history = reviewer.thread.conversation_history_snapshot().await;
+    let mut actual = history.items().cloned().collect::<Vec<_>>();
+    // Recording history assigns message IDs and provenance; compare the selected content.
+    for item in &mut actual {
+        if let ResponseItem::Message {
+            id,
+            internal_chat_message_metadata_passthrough,
+            ..
+        } = item
+        {
+            *id = None;
+            *internal_chat_message_metadata_passthrough = None;
+        }
+    }
+    assert_eq!(actual, selected);
+    assert_eq!(
+        reviewer.thread.config_snapshot().await.parent_thread_id,
+        Some(parent.thread_id)
+    );
+    assert!(Arc::ptr_eq(
+        &reviewer.thread.session.services.auth_manager,
+        &parent.thread.session.services.auth_manager,
+    ));
+    assert_eq!(manager.list_thread_ids().await, vec![parent.thread_id]);
+    assert!(manager.get_thread(reviewer.thread_id).await.is_err());
     manager
         .shutdown_all_threads_bounded(Duration::from_secs(10))
         .await;
@@ -1303,6 +1375,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
         Arc::new(extensions.build()),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store_from_config(&config, /*state_db*/ None),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
@@ -1510,6 +1583,7 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store_from_config(&config, /*state_db*/ None),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
@@ -1654,6 +1728,7 @@ async fn explicit_installation_id_skips_codex_home_file() {
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store,
         local_agent_graph_store_from_state_db(state_db.as_ref()),
         installation_id.clone(),
@@ -1697,6 +1772,7 @@ async fn resume_active_thread_from_rollout_returns_running_thread() {
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store_from_config(&config, /*state_db*/ None),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
@@ -1759,6 +1835,7 @@ async fn resume_stopped_thread_from_rollout_spawns_new_thread() {
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store_from_config(&config, /*state_db*/ None),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
@@ -1828,6 +1905,7 @@ async fn resume_stopped_thread_from_rollout_preserves_thread_source() {
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store,
         local_agent_graph_store_from_state_db(state_db.as_ref()),
         TEST_INSTALLATION_ID.to_string(),
@@ -1913,6 +1991,7 @@ async fn subtree_listing_uses_injected_graph_store_without_state_db() {
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store_from_config(&config, /*state_db*/ None),
         Some(agent_graph_store),
         TEST_INSTALLATION_ID.to_string(),
@@ -1960,6 +2039,7 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store.clone(),
         local_agent_graph_store_from_state_db(state_db.as_ref()),
         TEST_INSTALLATION_ID.to_string(),
@@ -2070,6 +2150,7 @@ async fn metadata_update_without_result_reads_only_when_the_caller_needs_the_thr
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store.clone(),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
@@ -2196,6 +2277,7 @@ async fn new_uses_active_provider_for_model_refresh() {
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store_from_config(&config, /*state_db*/ None),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
@@ -2243,6 +2325,7 @@ async fn injected_models_manager_controls_refresh_policy() {
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store_from_config(&config, /*state_db*/ None),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
@@ -2503,6 +2586,7 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store_from_config(&config, state_db.clone()),
         local_agent_graph_store_from_state_db(state_db.as_ref()),
         TEST_INSTALLATION_ID.to_string(),
@@ -2616,6 +2700,7 @@ async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store_from_config(&config, state_db.clone()),
         local_agent_graph_store_from_state_db(state_db.as_ref()),
         TEST_INSTALLATION_ID.to_string(),
@@ -2719,6 +2804,7 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store_from_config(&config, state_db.clone()),
         local_agent_graph_store_from_state_db(state_db.as_ref()),
         TEST_INSTALLATION_ID.to_string(),

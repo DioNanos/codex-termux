@@ -1009,6 +1009,79 @@ mod tests {
         ");
     }
 
+    #[tokio::test]
+    async fn leaving_alternate_screen_repaints_restored_inline_viewport() {
+        let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
+        let size = tui.terminal.last_known_screen_size;
+        let inline = Rect::new(/*x*/ 0, /*y*/ 3, size.width, /*height*/ 6);
+        tui.terminal.set_viewport_area(inline);
+        tui.enter_alt_screen().expect("enter alternate screen");
+        tui.terminal
+            .draw(|frame| {
+                Paragraph::new(vec![
+                    Line::from(" Resume a previous session"),
+                    Line::default(),
+                    Line::from(" Type to search".dim()),
+                ])
+                .render(frame.area(), frame.buffer_mut());
+            })
+            .expect("draw picker");
+        tui.leave_alt_screen().expect("leave alternate screen");
+
+        let mut terminal = Terminal::with_options(VT100Backend::new(size.width, size.height))
+            .expect("physical terminal");
+        write!(terminal.backend_mut(), "Previous conversation").expect("write history");
+        terminal.set_viewport_area(inline);
+        terminal
+            .draw(|frame| {
+                Paragraph::new(vec![
+                    Line::default(),
+                    Line::default(),
+                    Line::from(vec!["›".bold(), " ".into(), "/resume".dim()]),
+                ])
+                .render(frame.area(), frame.buffer_mut());
+            })
+            .expect("draw submitted command");
+
+        // Apply the real Tui screen-return baseline to the unchanged physical main screen.
+        // Matching spaces and letters in the picker must not leave /resume cells behind.
+        *terminal.previous_buffer_mut() = tui.terminal.previous_buffer().clone();
+        for _ in 0..2 {
+            terminal
+                .draw(|frame| {
+                    Paragraph::new(vec![
+                        Line::default(),
+                        Line::default(),
+                        Line::from(vec![
+                            "›".bold(),
+                            " ".into(),
+                            "Ask Codex to do anything".dim(),
+                        ]),
+                    ])
+                    .render(frame.area(), frame.buffer_mut());
+                })
+                .expect("restore composer");
+        }
+
+        let visible = terminal
+            .backend()
+            .vt100()
+            .screen()
+            .contents()
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_snapshot!(visible.trim_end(), @r"
+        Previous conversation
+
+
+
+
+        › Ask Codex to do anything
+        ");
+    }
+
     #[test]
     fn ordinary_redraws_with_known_size_do_not_query_backend_size() {
         let mut terminal =

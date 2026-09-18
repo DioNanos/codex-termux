@@ -4,6 +4,7 @@ use crate::app::AppExitInfo;
 use crate::app::ExitReason;
 use crate::app_server_session::AppServerSession;
 use crate::app_server_session::AppServerStartedThread;
+use crate::app_server_session::ForkPermissionMode;
 use crate::app_server_session::ResumeModelSettings;
 use crate::legacy_core::config::Config;
 use crate::resume_picker::SessionTarget;
@@ -14,14 +15,14 @@ use color_eyre::eyre::WrapErr;
 #[derive(Clone, Copy)]
 pub(crate) enum SessionStartAction {
     Resume(ResumeModelSettings),
-    Fork,
+    Fork(ForkPermissionMode),
 }
 
 impl SessionStartAction {
     pub(crate) fn verb(self) -> &'static str {
         match self {
             Self::Resume(_) => "resume",
-            Self::Fork => "fork",
+            Self::Fork(_) => "fork",
         }
     }
 
@@ -31,15 +32,21 @@ impl SessionStartAction {
         config: &Config,
         target: &SessionTarget,
     ) -> Result<AppServerStartedThread> {
+        let local_settings = crate::local_settings::LocalSettings::from(config);
         match self {
             Self::Resume(settings) => {
                 app_server
-                    .resume_thread(config.clone(), target.thread_id, settings)
+                    .resume_thread(&local_settings, config.clone(), target.thread_id, settings)
                     .await
             }
-            Self::Fork => {
+            Self::Fork(permission_mode) => {
                 app_server
-                    .fork_thread(config.clone(), target.thread_id)
+                    .fork_thread_with_permission_mode(
+                        &local_settings,
+                        config.clone(),
+                        target.thread_id,
+                        permission_mode,
+                    )
                     .await
             }
         }

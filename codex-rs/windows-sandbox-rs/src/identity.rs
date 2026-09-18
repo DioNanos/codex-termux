@@ -1,6 +1,8 @@
 use crate::dpapi;
 use crate::logging::debug_log;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
+use crate::setup::OFFLINE_USERNAME;
+use crate::setup::ONLINE_USERNAME;
 use crate::setup::SandboxNetworkIdentity;
 use crate::setup::SandboxUserRecord;
 use crate::setup::SandboxUsersFile;
@@ -12,6 +14,7 @@ use crate::setup::run_elevated_setup_with_proxy_settings;
 use crate::setup::run_setup_refresh_with_overrides_and_proxy_settings;
 use crate::setup::sandbox_users_path;
 use crate::setup::setup_marker_path;
+use crate::winutil::local_user_flags;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -21,6 +24,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use windows_sys::Win32::NetworkManagement::NetManagement::UF_ACCOUNTDISABLE;
 
 #[derive(Debug, Clone)]
 struct SandboxIdentity {
@@ -45,6 +49,24 @@ pub fn sandbox_setup_is_complete(codex_home: &Path) -> bool {
         return false;
     }
     matches!(load_users(codex_home), Ok(Some(users)) if users.version_matches())
+}
+
+/// Returns true when setup artifacts and provisioned network settings match.
+pub fn sandbox_setup_is_complete_with_settings(
+    codex_home: &Path,
+    settings: &crate::WindowsSandboxProvisioningSettings,
+) -> bool {
+    let Ok(Some(mut marker)) = load_marker(codex_home) else {
+        return false;
+    };
+
+    marker.proxy_ports.sort_unstable();
+    let mut proxy_ports = settings.proxy_ports.clone();
+    proxy_ports.sort_unstable();
+    marker.version_matches()
+        && marker.proxy_ports == proxy_ports
+        && marker.allow_local_binding == settings.allow_local_binding
+        && matches!(load_users(codex_home), Ok(Some(users)) if users.version_matches())
 }
 
 fn load_marker(codex_home: &Path) -> Result<Option<SetupMarker>> {
@@ -199,6 +221,23 @@ pub fn require_logon_sandbox_creds(
         }
     };
 
+    if identity.is_some() {
+        // Cleanup may also have removed the group, so repair missing or disabled accounts before ACL
+        // refresh can fail, not only after a later logon reports ERROR_ACCOUNT_DISABLED.
+        for username in [OFFLINE_USERNAME, ONLINE_USERNAME] {
+            let needs_repair = match local_user_flags(username) {
+                Ok(Some(flags)) => flags & UF_ACCOUNTDISABLE != 0,
+                Ok(None) => true,
+                Err(_) => false,
+            };
+            if needs_repair {
+                setup_reason = Some("sandbox account is missing or disabled".to_string());
+                identity = None;
+                break;
+            }
+        }
+    }
+
     if identity.is_none() {
         if let Some(reason) = &setup_reason {
             crate::logging::log_note(
@@ -215,13 +254,6 @@ pub fn require_logon_sandbox_creds(
                 env_map,
                 codex_home,
                 proxy_enforced,
-            },
-            crate::setup::SetupRootOverrides {
-                read_roots: Some(needed_read.clone()),
-                read_roots_include_platform_defaults,
-                write_roots: Some(needed_write.clone()),
-                deny_read_paths: Some(deny_read_paths_override.to_vec()),
-                deny_write_paths: Some(deny_write_paths_override.to_vec()),
             },
             &desired_offline_proxy_settings,
         )?;

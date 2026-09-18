@@ -56,7 +56,8 @@ pub fn resolve_windows_deny_read_paths(
             })
             .collect(),
     );
-    let Some(matcher) = ReadDenyMatcher::try_new(&glob_policy, cwd.as_path())? else {
+    let Some(matcher) = ReadDenyMatcher::try_new_for_local_paths(&glob_policy, cwd.as_path())?
+    else {
         return Ok(paths);
     };
 
@@ -72,7 +73,7 @@ pub fn resolve_windows_deny_read_paths(
 
         let directory_scan_mode = if let Some(file_paths) = ripgrep_files(&scan_plan)? {
             for path in file_paths {
-                if matcher.is_read_denied(&path) {
+                if matcher.is_local_path_read_denied(&path) {
                     push_absolute_path(&mut paths, &mut seen, path)?;
                 }
             }
@@ -131,7 +132,8 @@ fn ripgrep_files(scan_plan: &GlobScanPlan) -> Result<Option<Vec<PathBuf>>, Strin
             // Ripgrep uses exit 2 for traversal errors, including protected
             // Windows directories. Its output may be incomplete. The caller
             // must enumerate again using the matcher-backed walker; policy
-            // syntax has already been validated by ReadDenyMatcher::try_new.
+            // syntax has already been validated by
+            // ReadDenyMatcher::try_new_for_local_paths.
             return Ok(None);
         }
 

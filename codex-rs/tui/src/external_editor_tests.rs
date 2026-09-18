@@ -135,8 +135,8 @@ fn editor_directory_rejects_writable_codex_home_alias() {
     symlink(&paths.codex_home, &aliased_home).expect("create Codex home symlink");
     let policy = workspace_write_policy(&[]);
 
-    assert!(policy.can_write_path_with_cwd(&aliased_home.join("editor"), &paths.cwd));
-    assert!(!policy.can_write_path_with_cwd(&paths.codex_home.join("editor"), &paths.cwd));
+    assert!(policy.can_write_local_path_with_cwd(&aliased_home.join("editor"), &paths.cwd));
+    assert!(!policy.can_write_local_path_with_cwd(&paths.codex_home.join("editor"), &paths.cwd));
     assert!(editor_directory(&[&aliased_home], &policy, &paths.cwd).is_err());
 }
 
@@ -156,8 +156,8 @@ fn editor_directory_rejects_writable_codex_home_alias_target() {
     symlink(&paths.codex_home, &aliased_home).expect("create Codex home symlink");
     let policy = workspace_write_policy(&[&paths.codex_home]);
 
-    assert!(!policy.can_write_path_with_cwd(&aliased_home.join("editor"), &paths.cwd));
-    assert!(policy.can_write_path_with_cwd(&paths.codex_home.join("editor"), &paths.cwd));
+    assert!(!policy.can_write_local_path_with_cwd(&aliased_home.join("editor"), &paths.cwd));
+    assert!(policy.can_write_local_path_with_cwd(&paths.codex_home.join("editor"), &paths.cwd));
     assert!(editor_directory(&[&aliased_home], &policy, &paths.cwd).is_err());
 }
 
@@ -177,9 +177,9 @@ fn editor_directory_uses_protected_workspace_fallback_with_default_temporary_gra
     );
 
     assert!(!workspace_codex_home.exists());
-    assert!(policy.can_write_path_with_cwd(&codex_home, &cwd));
-    assert!(!policy.can_write_path_with_cwd(&workspace_codex_home, &cwd));
-    assert!(!policy.can_write_path_with_cwd(&workspace_codex_home.join("editor"), &cwd));
+    assert!(policy.can_write_local_path_with_cwd(&codex_home, &cwd));
+    assert!(!policy.can_write_local_path_with_cwd(&workspace_codex_home, &cwd));
+    assert!(!policy.can_write_local_path_with_cwd(&workspace_codex_home.join("editor"), &cwd));
 
     let directory = editor_directory(&[&codex_home, &workspace_codex_home], &policy, &cwd)
         .expect("use protected workspace metadata directory");
@@ -210,8 +210,8 @@ fn editor_directory_rejects_explicitly_writable_workspace_fallback() {
         /*exclude_slash_tmp*/ false,
     );
 
-    assert!(policy.can_write_path_with_cwd(&codex_home, &cwd));
-    assert!(policy.can_write_path_with_cwd(&workspace_codex_home, &cwd));
+    assert!(policy.can_write_local_path_with_cwd(&codex_home, &cwd));
+    assert!(policy.can_write_local_path_with_cwd(&workspace_codex_home, &cwd));
     assert!(
         editor_directory(&[&codex_home, &workspace_codex_home], &policy, &cwd).is_err(),
         "explicitly writable metadata must not be used for editor buffers"
@@ -229,8 +229,8 @@ fn editor_directory_rejects_workspace_fallback_symlink_to_writable_target() {
     symlink(&paths.codex_home, &workspace_codex_home).expect("create workspace metadata symlink");
     let policy = workspace_write_policy(&[&paths.codex_home]);
 
-    assert!(!policy.can_write_path_with_cwd(&workspace_codex_home, &paths.cwd));
-    assert!(policy.can_write_path_with_cwd(&paths.codex_home, &paths.cwd));
+    assert!(!policy.can_write_local_path_with_cwd(&workspace_codex_home, &paths.cwd));
+    assert!(policy.can_write_local_path_with_cwd(&paths.codex_home, &paths.cwd));
     assert!(
         editor_directory(
             &[&paths.codex_home, &workspace_codex_home],
@@ -347,9 +347,9 @@ async fn editor_process_uses_protected_workspace_fallback_with_default_temporary
     ];
 
     assert!(!workspace_codex_home.exists());
-    assert!(policy.can_write_path_with_cwd(&codex_home, &cwd));
-    assert!(policy.can_write_path_with_cwd(&default_codex_home, &cwd));
-    assert!(!policy.can_write_path_with_cwd(&workspace_codex_home, &cwd));
+    assert!(policy.can_write_local_path_with_cwd(&codex_home, &cwd));
+    assert!(policy.can_write_local_path_with_cwd(&default_codex_home, &cwd));
+    assert!(!policy.can_write_local_path_with_cwd(&workspace_codex_home, &cwd));
 
     let content = run_editor("seed", &editor_command, &codex_home, &policy, &cwd)
         .await

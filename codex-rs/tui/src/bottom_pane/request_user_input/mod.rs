@@ -18,7 +18,7 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 mod layout;
-mod render;
+pub(super) mod render;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
@@ -1523,6 +1523,9 @@ impl BottomPaneView for RequestUserInputOverlay {
 
     fn next_frame_delay(&self) -> Option<Duration> {
         self.auto_resolution_next_frame_delay_at(Instant::now())
+            .into_iter()
+            .chain(self.composer.footer_flash_delay())
+            .min()
     }
 
     fn try_consume_user_input_request(

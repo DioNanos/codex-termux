@@ -275,12 +275,19 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 StreamableHttpClientAdapterError::SessionExpired404,
             ));
         }
-        if response.status == StatusCode::UNAUTHORIZED.as_u16()
-            && let Some(header) = response_header(&response.headers, WWW_AUTHENTICATE)
-        {
-            return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
-                header,
-            )));
+        if response.status == StatusCode::UNAUTHORIZED.as_u16() {
+            let challenges = response
+                .headers
+                .iter()
+                .filter(|header| header.name.eq_ignore_ascii_case(WWW_AUTHENTICATE.as_str()))
+                .map(|header| header.value.as_str())
+                .collect::<Vec<_>>();
+            if !challenges.is_empty() {
+                // RFC 9110 allows combining these list-based fields; keep challenges after the first.
+                return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                    challenges.join(", "),
+                )));
+            }
         }
         if response.status == StatusCode::FORBIDDEN.as_u16()
             && let Some(challenge) = insufficient_scope_challenge(&response.headers)

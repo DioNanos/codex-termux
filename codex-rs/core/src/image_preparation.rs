@@ -19,7 +19,6 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_utils_image::ImageProcessingError;
 use codex_utils_image::PromptImageMode;
-use codex_utils_image::PromptImageResizeLimits;
 use codex_utils_image::load_data_url_for_prompt;
 use tracing::warn;
 
@@ -30,15 +29,6 @@ const IMAGE_TOO_LARGE_PLACEHOLDER: &str =
 const UNSUPPORTED_LOW_DETAIL_PLACEHOLDER: &str = "image content omitted because detail 'low' is not supported; use 'high', 'original', or 'auto'";
 const REMOTE_IMAGE_URL_PLACEHOLDER: &str =
     "image content omitted because remote image URLs are not supported";
-
-const HIGH_DETAIL_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits {
-    max_dimension: 2048,
-    max_patches: 2_500,
-};
-const UNIFIED_IMAGE_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits {
-    max_dimension: 6000,
-    max_patches: 10_000,
-};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ImagePreparationMode {
@@ -167,6 +157,7 @@ pub(crate) fn prepare_response_items(
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::Compaction { .. }
+            | ResponseItem::ConfigurationUpdate { .. }
             | ResponseItem::CompactionTrigger { .. }
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => None,
@@ -287,17 +278,23 @@ fn prepare_image(
         return Ok(None);
     }
 
-    let (effective_detail, limits) = match mode {
-        ImagePreparationMode::UnifiedBudget => (ImageDetailSetting::Original, UNIFIED_IMAGE_LIMITS),
+    let (effective_detail, image_mode) = match mode {
+        ImagePreparationMode::UnifiedBudget => (
+            ImageDetailSetting::Original,
+            PromptImageMode::ORIGINAL_DETAIL,
+        ),
         ImagePreparationMode::DetailBased => match detail {
             None | Some(ImageDetail::Auto | ImageDetail::High) => {
-                (ImageDetailSetting::High, HIGH_DETAIL_LIMITS)
+                (ImageDetailSetting::High, PromptImageMode::HIGH_DETAIL)
             }
-            Some(ImageDetail::Original) => (ImageDetailSetting::Original, UNIFIED_IMAGE_LIMITS),
+            Some(ImageDetail::Original) => (
+                ImageDetailSetting::Original,
+                PromptImageMode::ORIGINAL_DETAIL,
+            ),
             Some(ImageDetail::Low) => return Err(ImagePreparationError::UnsupportedLowDetail),
         },
     };
-    let image = load_data_url_for_prompt(image_url, PromptImageMode::ResizeWithLimits(limits))?;
+    let image = load_data_url_for_prompt(image_url, image_mode)?;
     metadata.push(ImagePreparationMetadata {
         message_role: origin.message_role.map(str::to_string),
         item_id: origin.item_id.map(str::to_string),

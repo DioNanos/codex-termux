@@ -9,6 +9,8 @@ use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::FWP_E_ALREADY_EXISTS;
 use windows_sys::Win32::Foundation::FWP_E_FILTER_NOT_FOUND;
 use windows_sys::Win32::Foundation::FWP_E_NOT_FOUND;
+use windows_sys::Win32::Foundation::FWP_E_PROVIDER_NOT_FOUND;
+use windows_sys::Win32::Foundation::FWP_E_SUBLAYER_NOT_FOUND;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HLOCAL;
 use windows_sys::Win32::Foundation::LocalFree;
@@ -43,7 +45,9 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineO
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterAdd0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterDeleteByKey0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmProviderAdd0;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmProviderDeleteByKey0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmSubLayerAdd0;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmSubLayerDeleteByKey0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionAbort0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionBegin0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionCommit0;
@@ -75,9 +79,10 @@ const SUBLAYER_KEY: GUID = GUID::from_u128(0xe65054fd_4d32_4c7c_95ef_621f0cf6431
 /// Installs the persistent Codex WFP filters for `account`.
 ///
 /// This is intended to run from the already-elevated setup helper. Callers
-/// should treat any returned error as non-fatal to the rest of setup.
+/// may continue ordinary setup after an error, but must restore these filters
+/// before re-enabling accounts left disabled by interrupted cleanup.
 pub fn install_wfp_filters_for_account(account: &str) -> Result<usize> {
-    let engine = Engine::open()?;
+    let engine = Engine::open(INFINITE)?;
     let mut transaction = engine.begin_transaction()?;
     ensure_provider(engine.handle)?;
     ensure_sublayer(engine.handle)?;
@@ -94,20 +99,44 @@ pub fn install_wfp_filters_for_account(account: &str) -> Result<usize> {
     Ok(installed_filter_count)
 }
 
+pub(crate) fn remove_wfp_filters() -> Result<()> {
+    // Leave time for other cleanup if a WFP policy writer holds the transaction lock.
+    let engine = Engine::open(/*transaction_wait_timeout_ms*/ 1_000)?;
+    let mut transaction = engine.begin_transaction()?;
+    for spec in FILTER_SPECS {
+        delete_filter_if_present(engine.handle, &spec.key)?;
+    }
+    for (result, operation, missing) in [
+        (
+            unsafe { FwpmSubLayerDeleteByKey0(engine.handle, &SUBLAYER_KEY) },
+            "FwpmSubLayerDeleteByKey0",
+            FWP_E_SUBLAYER_NOT_FOUND as u32,
+        ),
+        (
+            unsafe { FwpmProviderDeleteByKey0(engine.handle, &PROVIDER_KEY) },
+            "FwpmProviderDeleteByKey0",
+            FWP_E_PROVIDER_NOT_FOUND as u32,
+        ),
+    ] {
+        ensure_success_or(result, operation, &[missing, FWP_E_NOT_FOUND as u32])?;
+    }
+    transaction.commit()
+}
+
 /// Owns an open WFP engine handle and closes it on drop.
 struct Engine {
     handle: HANDLE,
 }
 
 impl Engine {
-    fn open() -> Result<Self> {
+    fn open(transaction_wait_timeout_ms: u32) -> Result<Self> {
         let session_name = to_wide(OsStr::new(SESSION_NAME));
         let mut session: FWPM_SESSION0 = unsafe { zeroed() };
         session.displayData = FWPM_DISPLAY_DATA0 {
             name: session_name.as_ptr() as *mut _,
             description: null_mut(),
         };
-        session.txnWaitTimeoutInMSec = INFINITE;
+        session.txnWaitTimeoutInMSec = transaction_wait_timeout_ms;
 
         let mut handle = HANDLE::default();
         let result = unsafe {

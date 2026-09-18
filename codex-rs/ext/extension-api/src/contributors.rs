@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use codex_context_fragments::ContextualUserFragment;
 use codex_protocol::items::TurnItem;
-use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_tools::ToolCall;
 use codex_tools::ToolExecutor;
@@ -23,10 +22,12 @@ mod turn_input;
 mod turn_lifecycle;
 mod world_state;
 
-pub use approval_review::ApprovalAssessment;
+pub use approval_review::ApprovalDecision;
+pub use approval_review::ApprovalDecisionInput;
 pub use approval_review::ApprovalReviewError;
 pub use approval_review::ApprovalReviewInput;
 pub use approval_review::GuardianV2Enabled;
+pub use approval_review::SynchronousApprovalReviewer;
 pub use context::TurnContextContributionInput;
 pub use mcp::McpServerContribution;
 pub use mcp::McpServerContributionContext;
@@ -346,28 +347,14 @@ pub trait ToolLifecycleContributor: Send + Sync {
     }
 }
 
-/// Extension contribution for fast approval decisions and full action reviews.
-///
-/// Implementations can provide a fast decision from existing evidence, perform
-/// a full structured review, or support both paths. Returning `None` leaves the
-/// request available to the next contributor or the host's fallback path.
+/// Owns the complete approval decision, including whether to consult a reviewer.
+/// Returning `None` leaves the request to the next contributor.
 pub trait ApprovalReviewContributor: Send + Sync {
-    /// Returns an available approval decision without performing a full review.
-    fn fast_decision<'a>(
+    /// Claims one request, including a handoff to the user.
+    fn decide<'a>(
         &'a self,
-        _session_store: &'a ExtensionData,
-        _thread_store: &'a ExtensionData,
-        _prompt: &'a str,
-        _extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
-    ) -> ExtensionFuture<'a, Option<ReviewDecision>> {
-        Box::pin(std::future::ready(None))
-    }
-
-    /// Performs a full review of a structured host-owned approval request.
-    fn full_review<'a>(
-        &'a self,
-        _input: &'a ApprovalReviewInput<'_>,
-    ) -> ExtensionFuture<'a, Option<Result<ApprovalAssessment, ApprovalReviewError>>> {
+        _input: &'a ApprovalDecisionInput<'_>,
+    ) -> ExtensionFuture<'a, Option<ApprovalDecision>> {
         Box::pin(std::future::ready(None))
     }
 }

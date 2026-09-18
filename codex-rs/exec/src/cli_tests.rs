@@ -127,3 +127,21 @@ fn approve_for_me_flag_conflicts_with_other_sandbox_modes() {
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }
+
+#[test]
+fn worktree_flag_is_accepted_after_fork_subcommand() {
+    let cli = Cli::try_parse_from(["codex-exec", "fork", "session-id", "--worktree"])
+        .expect("worktree should be a global exec argument");
+
+    assert!(cli.worktree);
+    assert!(matches!(cli.command, Some(Command::Fork(_))));
+}
+
+#[test]
+fn worktree_flag_is_accepted_before_fork_subcommand() {
+    let cli = Cli::try_parse_from(["codex-exec", "--worktree", "fork", "session-id"])
+        .expect("worktree should be accepted before the fork subcommand");
+
+    assert!(cli.worktree);
+    assert!(matches!(cli.command, Some(Command::Fork(_))));
+}

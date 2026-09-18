@@ -1,7 +1,7 @@
 use crate::models::AdditionalPermissionProfile;
 use crate::models::FileSystemPermissions;
 use crate::models::NetworkPermissions;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -95,5 +95,5 @@ pub struct RequestPermissionsEvent {
     pub permissions: RequestPermissionProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub cwd: Option<AbsolutePathBuf>,
+    pub cwd: Option<LegacyAppPathString>,
 }

@@ -10,6 +10,7 @@ use codex_app_server_protocol::DynamicToolFunctionSpec;
 use codex_app_server_protocol::DynamicToolSpec;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
@@ -20,6 +21,7 @@ use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
+use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
 use codex_app_server_protocol::ThreadUnsubscribeResponse;
 use codex_app_server_protocol::ThreadUnsubscribeStatus;
@@ -32,6 +34,7 @@ use core_test_support::streaming_sse::start_streaming_sse_server;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -41,6 +44,7 @@ async fn thread_unsubscribe_keeps_thread_loaded_until_idle_timeout() -> Result<(
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
         .with_sandbox_mode("danger-full-access")
+        .with_root_config("thread_unload_delay_secs = 2")
         .write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
@@ -55,6 +59,20 @@ async fn thread_unsubscribe_keeps_thread_loaded_until_idle_timeout() -> Result<(
         })
         .await?;
     let thread_id = thread.id;
+
+    // Persist a rollout so both warm and cold resumes can find the thread.
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: thread_id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "hello".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        }),
+    )
+    .await??;
 
     let unsubscribe: ThreadUnsubscribeResponse = mcp
         .request(|request_id| ClientRequest::ThreadUnsubscribe {
@@ -81,14 +99,105 @@ async fn thread_unsubscribe_keeps_thread_loaded_until_idle_timeout() -> Result<(
             params: ThreadLoadedListParams::default(),
         })
         .await?;
-    assert_eq!(data, vec![thread_id]);
+    assert_eq!(data, vec![thread_id.clone()]);
     assert_eq!(next_cursor, None);
+
+    let resume: ThreadResumeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                ..Default::default()
+            },
+        })
+        .await?;
+    assert_eq!(resume.thread.id, thread_id);
+
+    // Resubscribing cancels the pending unload, even after the original deadline.
+    assert!(
+        timeout(
+            std::time::Duration::from_millis(2200),
+            mcp.read_stream_until_notification_message("thread/closed"),
+        )
+        .await
+        .is_err()
+    );
+    let _: ThreadUnsubscribeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadUnsubscribe {
+            request_id,
+            params: ThreadUnsubscribeParams {
+                thread_id: thread_id.clone(),
+            },
+        })
+        .await?;
+    // Losing the last subscriber starts a fresh countdown.
+    assert!(
+        timeout(
+            std::time::Duration::from_millis(250),
+            mcp.read_stream_until_notification_message("thread/closed"),
+        )
+        .await
+        .is_err()
+    );
+
+    let closed: ThreadClosedNotification =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("thread/closed")).await??;
+    assert_eq!(
+        closed,
+        ThreadClosedNotification {
+            thread_id: thread_id.clone()
+        }
+    );
+    let status = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let status: ThreadStatusChangedNotification =
+                mcp.read_notification("thread/status/changed").await?;
+            if status.status == ThreadStatus::NotLoaded {
+                return anyhow::Ok(status);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(
+        status,
+        ThreadStatusChangedNotification {
+            thread_id: thread_id.clone(),
+            status: ThreadStatus::NotLoaded,
+        }
+    );
+    let loaded: ThreadLoadedListResponse = mcp
+        .request(|request_id| ClientRequest::ThreadLoadedList {
+            request_id,
+            params: ThreadLoadedListParams::default(),
+        })
+        .await?;
+    assert_eq!(
+        loaded,
+        ThreadLoadedListResponse {
+            data: Vec::new(),
+            next_cursor: None
+        }
+    );
+
+    let resume: ThreadResumeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                ..Default::default()
+            },
+        })
+        .await?;
+    assert_eq!(resume.thread.id, thread_id);
+    assert_eq!(resume.thread.status, ThreadStatus::Idle);
 
     Ok(())
 }
 
+#[test_case(0; "zero_delay")]
+#[test_case(1; "one_second_delay")]
 #[tokio::test]
-async fn thread_unsubscribe_during_turn_keeps_turn_running() -> Result<()> {
+async fn thread_unsubscribe_during_turn_keeps_turn_running(delay_secs: u64) -> Result<()> {
     let call_id = "deterministic-wait-call";
     let tool_name = "deterministic_wait";
     let tool_args = json!({});
@@ -121,6 +230,7 @@ async fn thread_unsubscribe_during_turn_keeps_turn_running() -> Result<()> {
     let final_response_completed = completions.remove(0);
     MockResponsesConfig::new(server.uri())
         .with_sandbox_mode("danger-full-access")
+        .with_root_config(&format!("thread_unload_delay_secs = {delay_secs}"))
         .write(&codex_home)?;
 
     let mut mcp = TestAppServer::builder()
@@ -145,6 +255,16 @@ async fn thread_unsubscribe_during_turn_keeps_turn_running() -> Result<()> {
         })
         .await?;
     let thread_id = thread.id;
+
+    // A subscribed, idle thread stays loaded even with no unload delay.
+    assert!(
+        timeout(
+            std::time::Duration::from_millis(250),
+            mcp.read_stream_until_notification_message("thread/closed"),
+        )
+        .await
+        .is_err()
+    );
 
     let _: TurnStartResponse = mcp
         .request(|request_id| ClientRequest::TurnStart {
@@ -207,7 +327,7 @@ async fn thread_unsubscribe_during_turn_keeps_turn_running() -> Result<()> {
     assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
 
     let closed_while_tool_call_blocked = timeout(
-        std::time::Duration::from_millis(250),
+        std::time::Duration::from_millis(1200),
         mcp.read_stream_until_notification_message("thread/closed"),
     );
     let closed_while_tool_call_blocked = closed_while_tool_call_blocked.await;
@@ -228,6 +348,20 @@ async fn thread_unsubscribe_during_turn_keeps_turn_running() -> Result<()> {
     )
     .await?;
     timeout(DEFAULT_READ_TIMEOUT, final_response_completed).await??;
+    if delay_secs > 0 {
+        // Once the turn finishes, inactivity starts a fresh countdown.
+        assert!(
+            timeout(
+                std::time::Duration::from_millis(250),
+                mcp.read_stream_until_notification_message("thread/closed"),
+            )
+            .await
+            .is_err()
+        );
+    }
+    let closed: ThreadClosedNotification =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("thread/closed")).await??;
+    assert_eq!(closed, ThreadClosedNotification { thread_id });
     server.shutdown().await;
 
     Ok(())

@@ -1033,6 +1033,7 @@ fn stored_thread_from_state(
         });
 
     Ok(StoredThread {
+        originator: (!created.originator.is_empty()).then(|| created.originator.clone()),
         thread_id,
         extra_config: created.extra_config.clone(),
         rollout_path: metadata
@@ -1077,6 +1078,7 @@ fn stored_thread_from_state(
         section_position: state.section_positions.get(&thread_id).copied(),
         section_entered_at: state.section_entered_at.get(&thread_id).copied(),
         project_id: None,
+        daybreak_enabled: metadata.and_then(|metadata| metadata.daybreak_enabled),
         cwd: metadata
             .and_then(|metadata| metadata.cwd.clone())
             .unwrap_or_default(),

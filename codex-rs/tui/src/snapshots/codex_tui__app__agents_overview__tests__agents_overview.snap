@@ -10,19 +10,19 @@ expression: "render_bottom_popup(&app.chat_widget,\n96).replace(&format!(\"{proj
     ● Repair authentication  Working                  │ Build the dashboard
     ✓ Review yesterday's changes  Finished            │ ● Needs input
                                                       │
+                                                      │ Agent: Inspect keyboard shortcuts
+                                                      │ Open task to review.
+                                                      │ Waiting for approval.
+                                                      │
                                                       │ Project
                                                       │ /tmp/project
                                                       │
-                                                      │ Latest activity
+                                                      │ Prompt
                                                       │ Build the dashboard
                                                       │
-                                                      │
-                                                      │
-                                                      │
-                                                      │
-                                                      │
-                                                      │
-                                                      │
-                                                      │
-  New task › Describe a task and press enter to dispatch it
-  ↑↓ navigate  enter open  ctrl+f search  ctrl+s group  ctrl+r rename  ctrl+x stop  esc back
+  New task
+
+› First line
+  Second line
+
+   enter create task    ctrl+j newline    esc tasks

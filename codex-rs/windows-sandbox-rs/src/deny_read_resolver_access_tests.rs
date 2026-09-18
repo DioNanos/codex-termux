@@ -219,11 +219,11 @@ fn native_walk_preserves_canonical_matches_through_directory_links_and_cycles() 
         access: FileSystemAccessMode::Deny,
         missing_path_behavior: None,
     }]);
-    let matcher = ReadDenyMatcher::try_new(&policy, cwd.as_path())
+    let matcher = ReadDenyMatcher::try_new_for_local_paths(&policy, cwd.as_path())
         .expect("valid matcher")
         .expect("deny restriction");
     assert!(
-        matcher.is_read_denied_with_canonical_path(
+        matcher.is_local_path_read_denied_with_canonical_path(
             &alias.join("secret.env"),
             &target
                 .canonicalize()

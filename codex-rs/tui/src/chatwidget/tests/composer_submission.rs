@@ -1243,7 +1243,7 @@ async fn startup_draft_handoff_keeps_vim_insert_mode_for_nonempty_drafts() {
         let startup_draft = startup_chat.bottom_pane.composer_draft_snapshot();
 
         let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-        chat.config.tui_vim_mode_default = true;
+        chat.local_settings.tui.vim_mode_default = true;
         chat.bottom_pane.set_vim_enabled(/*enabled*/ true);
         chat.restore_startup_draft(startup_draft);
         chat.bottom_pane
@@ -1756,14 +1756,16 @@ async fn restore_thread_input_state_applies_running_state_policy() {
         text_elements: Vec::new(),
     });
     let input_state = ThreadInputState {
+        questions: None,
         composer: Some(ThreadComposerState {
             text: "composer draft".to_string(),
             ..Default::default()
         }),
         safety_buffering_prompt: Some(UserMessage::from("buffered prompt")),
-        pending_steers: VecDeque::from([UserMessage::from("submitted to the interrupted turn")]),
-        pending_steer_history_records: VecDeque::from([pending_history.clone()]),
-        pending_steer_compare_keys: VecDeque::new(),
+        pending_steers: VecDeque::from([PendingSteer {
+            history_record: pending_history.clone(),
+            ..pending_steer("submitted to the interrupted turn")
+        }]),
         rejected_steers_queue: VecDeque::new(),
         rejected_steer_history_records: VecDeque::new(),
         queued_user_messages: VecDeque::from([UserMessage::from("already queued").into()]),
@@ -2440,8 +2442,12 @@ async fn reconnect_holds_only_recovered_input_until_manually_edited() {
         chat.set_queue_autosend_suppressed(/*suppressed*/ false);
         if let Some(text) = recovered {
             assert!(!chat.maybe_send_next_queued_input());
-            assert_eq!(chat.pop_latest_queued_composer_state().unwrap().text, text);
+            chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+            assert_eq!(chat.bottom_pane.composer_text(), text);
             assert_no_submit_op(&mut ops);
+            chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+            assert_matches!(next_submit_op(&mut ops), Op::UserTurn { .. });
+            chat.input_queue.user_turn_pending_start = false;
         }
         chat.input_queue
             .queued_user_messages

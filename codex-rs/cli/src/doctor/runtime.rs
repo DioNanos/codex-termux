@@ -6,7 +6,6 @@
 //! package files or from PATH.
 
 use std::env;
-use std::process::Command;
 
 use codex_install_context::InstallContext;
 use codex_install_context::InstallMethod;
@@ -48,7 +47,7 @@ pub(super) fn runtime_check() -> DoctorCheck {
     .details(details)
 }
 
-/// Verifies that the search command selected by the install context is usable.
+/// Inspects the search command selected by the install context without executing it.
 ///
 /// Package-layout installs should point at a bundled ripgrep binary, while local
 /// installs without that layout usually resolve rg from PATH. A warning here
@@ -80,22 +79,11 @@ pub(super) fn search_check() -> DoctorCheck {
             }
         }
     } else {
-        match Command::new(&rg_command).arg("--version").output() {
-            Ok(output) if output.status.success() => {
-                let version = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .next()
-                    .unwrap_or("rg version unknown")
-                    .to_string();
-                details.push(format!("search command readiness: {version}"));
+        match which::which(&rg_command) {
+            Ok(path) => {
+                details.push(format!("search command path: {}", path.display()));
+                details.push("search command readiness: found; execution not verified".to_string());
                 CheckStatus::Ok
-            }
-            Ok(output) => {
-                details.push(format!(
-                    "search command readiness: exited with status {}",
-                    output.status
-                ));
-                CheckStatus::Warning
             }
             Err(err) => {
                 details.push(format!("search command readiness: {err}"));
@@ -105,7 +93,7 @@ pub(super) fn search_check() -> DoctorCheck {
     };
 
     let summary = match status {
-        CheckStatus::Ok => format!("search is OK ({provider})"),
+        CheckStatus::Ok => format!("search command found ({provider}); execution not verified"),
         CheckStatus::Warning => "search command could not be verified".to_string(),
         CheckStatus::Fail => unreachable!(),
     };

@@ -25,7 +25,7 @@ pub fn add_dir_warning_message(
         return None;
     }
 
-    if file_system_policy.can_write_path_with_cwd(cwd, cwd) {
+    if file_system_policy.can_write_local_path_with_cwd(cwd, cwd) {
         return None;
     }
 

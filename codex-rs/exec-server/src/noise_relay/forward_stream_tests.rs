@@ -59,6 +59,7 @@ async fn forwards_opaque_noise_payloads_and_drains_before_closing() -> Result<()
         physical_outgoing_tx,
         closed_stream_tx,
         executor_transport,
+        /*executor_registration*/ None,
     );
     let (socket, _) = timeout(TEST_TIMEOUT, destination.accept()).await??;
     let mut socket = timeout(TEST_TIMEOUT, accept_async(socket)).await??;

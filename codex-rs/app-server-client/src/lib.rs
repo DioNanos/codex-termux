@@ -677,6 +677,23 @@ impl AppServerRequestHandle {
 }
 
 impl AppServerClient {
+    /// App-server platform family, which can differ from the executor's platform.
+    /// Older remote servers may omit this metadata.
+    pub fn platform_family(&self) -> Option<&str> {
+        match self {
+            Self::InProcess(_) => Some(std::env::consts::FAMILY),
+            Self::Remote(client) => client.platform_family(),
+        }
+    }
+
+    /// App-server operating system as reported at initialization, including unknown values.
+    pub fn platform_os(&self) -> Option<&str> {
+        match self {
+            Self::InProcess(_) => Some(std::env::consts::OS),
+            Self::Remote(client) => client.platform_os(),
+        }
+    }
+
     pub fn codex_home(&self, local_codex_home: &AbsolutePathBuf) -> Option<AppServerPath> {
         match self {
             Self::InProcess(_) => Some(AppServerPath::from_app_server(
@@ -931,6 +948,22 @@ mod tests {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        expect_remote_initialize_with_metadata(
+            websocket,
+            serde_json::json!({
+                "userAgent": "codex_cli_rs/9.8.7-test (Test OS; x86_64) rust",
+                "codexHome": "/server/.codex",
+            }),
+        )
+        .await;
+    }
+
+    async fn expect_remote_initialize_with_metadata<S>(
+        websocket: &mut tokio_tungstenite::WebSocketStream<S>,
+        metadata: serde_json::Value,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let JSONRPCMessage::Request(request) = read_websocket_message(websocket).await else {
             panic!("expected initialize request");
         };
@@ -939,10 +972,7 @@ mod tests {
             websocket,
             JSONRPCMessage::Response(JSONRPCResponse {
                 id: request.id,
-                result: serde_json::json!({
-                    "userAgent": "codex_cli_rs/9.8.7-test (Test OS; x86_64) rust",
-                    "codexHome": "/server/.codex",
-                }),
+                result: metadata,
             }),
         )
         .await;
@@ -1079,7 +1109,15 @@ mod tests {
 
     #[tokio::test]
     async fn typed_request_roundtrip_works() {
-        let client = start_test_client(SessionSource::Exec).await;
+        let TestClient {
+            _codex_home,
+            client,
+        } = start_test_client(SessionSource::Exec).await;
+        let client = AppServerClient::InProcess(client);
+        assert_eq!(
+            (client.platform_family(), client.platform_os()),
+            (Some(std::env::consts::FAMILY), Some(std::env::consts::OS))
+        );
         let _response: ConfigRequirementsReadResponse = client
             .request_typed(ClientRequest::ConfigRequirementsRead {
                 request_id: RequestId::Integer(1),
@@ -1253,6 +1291,41 @@ mod tests {
         );
 
         client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_platform_metadata_preserves_reported_and_missing_values() {
+        for (family, os) in [
+            (Some("windows"), Some("windows")),
+            (Some("unix"), Some("linux")),
+            (Some("future-family"), Some("future-os")),
+            (Some("unix"), None),
+            (None, Some("linux")),
+            (None, None),
+        ] {
+            let websocket_url = start_test_remote_server(move |mut websocket| async move {
+                let mut metadata = serde_json::json!({});
+                if let Some(family) = family {
+                    metadata["platformFamily"] = family.into();
+                }
+                if let Some(os) = os {
+                    metadata["platformOs"] = os.into();
+                }
+                expect_remote_initialize_with_metadata(&mut websocket, metadata).await;
+                websocket.close(None).await.expect("close should succeed");
+            })
+            .await;
+            let client = AppServerClient::Remote(
+                RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+                    .await
+                    .expect("remote client should connect"),
+            );
+            assert_eq!(
+                (client.platform_family(), client.platform_os()),
+                (family, os)
+            );
+            client.shutdown().await.expect("shutdown should complete");
+        }
     }
 
     #[tokio::test]

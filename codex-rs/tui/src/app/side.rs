@@ -515,6 +515,8 @@ impl App {
             });
         self.abort_thread_event_listener(thread_id);
         self.thread_event_channels.remove(&thread_id);
+        self.pending_server_profiles.remove(&thread_id);
+        self.agents_overview.activity.remove(&thread_id);
         self.side_threads.remove(&thread_id);
         self.agent_navigation.remove(thread_id);
         if self.active_thread_id == Some(thread_id) {
@@ -682,6 +684,13 @@ impl App {
             self.chat_widget.add_error_message(message.to_string());
             return Ok(AppRunControl::Continue);
         }
+        if self.pending_server_profiles.contains_key(&parent_thread_id) {
+            self.restore_side_user_message(user_message.take());
+            self.sync_side_thread_ui();
+            self.chat_widget
+                .add_error_message("Wait for permissions to update before forking.".into());
+            return Ok(AppRunControl::Continue);
+        }
 
         if let Some((&side_thread_id, state)) = self.side_threads.iter().next()
             && (parent_thread_id != state.parent_thread_id
@@ -702,7 +711,7 @@ impl App {
 
         let fork_config = self.side_fork_config();
         match app_server
-            .fork_side_thread(fork_config, parent_thread_id)
+            .fork_side_thread(&self.local_settings, fork_config, parent_thread_id)
             .await
         {
             Ok(forked) => {

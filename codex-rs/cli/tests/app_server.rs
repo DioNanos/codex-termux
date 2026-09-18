@@ -47,7 +47,7 @@ fn agents_accept_interactive_configuration_overrides() -> Result<()> {
     ] {
         let mut cmd = codex_command(codex_home.path())?;
         cmd.env("TERM", "xterm-256color").args(args);
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         cmd.args(["--remote", "ws://127.0.0.1:4512"]);
 
         cmd.assert()

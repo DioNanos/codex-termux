@@ -36,7 +36,7 @@ async fn automatic_reconnect_restores_draft_and_routes_new_notifications() -> Re
             "status": {"type": "active", "activeFlags": []}, "cwd": server_cwd,
             "cliVersion": "0.0.0", "source": "cli", "turns": [{"id": "running", "items": [], "status": "inProgress", "error": null}]
         });
-        for connection in 0..2 {
+        for connection in 0..3 {
             let mut socket = loop {
                 let (stream, _) = listener.accept().await?;
                 // Startup probes the default daemon socket before opening its WebSocket.
@@ -61,6 +61,19 @@ async fn automatic_reconnect_restores_draft_and_routes_new_notifications() -> Re
                 methods.push(request.method.clone());
                 if connection == 1 && request.method == "initialize" {
                     restore_rx.take().unwrap().await?;
+                }
+                if connection == 1 && request.method == "thread/resume" {
+                    socket
+                        .send(Message::Text(
+                            json!({"id": request.id, "error": {
+                                "code": -32600,
+                                "message": format!("thread {id} is closing; retry after the thread is closed")
+                            }})
+                            .to_string()
+                            .into(),
+                        ))
+                        .await?;
+                    continue;
                 }
                 let result = match request.method.as_str() {
                     "initialize" => json!({"userAgent": "reconnect-pty"}),
@@ -97,7 +110,7 @@ async fn automatic_reconnect_restores_draft_and_routes_new_notifications() -> Re
                             .into(),
                     ))
                     .await?;
-                if connection == 1 && request.method == "thread/resume" {
+                if connection == 2 && request.method == "thread/resume" {
                     // Keep the recovered turn running: its output must appear without waiting
                     // for turn/completed or rebuilding the transcript.
                     socket
@@ -117,7 +130,7 @@ async fn automatic_reconnect_restores_draft_and_routes_new_notifications() -> Re
         }
         Ok::<_, anyhow::Error>(methods)
     });
-    let mut terminal = PtyCodex::start(&repo_root, codex_home)?;
+    let mut terminal = PtyCodex::start(&repo_root, codex_home, &[])?;
     terminal.wait_for_startup()?;
     let mut disconnect_tx = Some(disconnect_tx);
     let mut restore_tx = Some(restore_tx);
@@ -160,7 +173,7 @@ async fn automatic_reconnect_restores_draft_and_routes_new_notifications() -> Re
             .iter()
             .filter(|method| *method == "thread/resume")
             .count(),
-        1
+        2
     );
     assert!(!methods.iter().any(|method| method == "turn/start"));
     Ok(())

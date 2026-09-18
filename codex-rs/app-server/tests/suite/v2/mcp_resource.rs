@@ -1,39 +1,83 @@
+use std::path::Path;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::task::Poll;
 use std::time::Duration;
 
+use anyhow::Context;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
+use app_test_support::create_fake_rollout;
+use app_test_support::create_mock_responses_server_repeating_assistant;
+use app_test_support::rollout_path;
 use app_test_support::write_chatgpt_auth;
 use axum::Router;
 use codex_app_server::in_process;
+use codex_app_server::in_process::InProcessServerEvent;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::GitInfo;
+use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::McpResourceContent;
 use codex_app_server_protocol::McpResourceReadParams;
 use codex_app_server_protocol::McpResourceReadResponse;
+use codex_app_server_protocol::McpServerToolCallParams;
+use codex_app_server_protocol::McpServerToolCallResponse;
+use codex_app_server_protocol::ProjectCreateParams;
+use codex_app_server_protocol::ProjectCreateResponse;
+use codex_app_server_protocol::ProjectDeleteParams;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ThreadArchiveParams;
+use codex_app_server_protocol::ThreadDeleteParams;
+use codex_app_server_protocol::ThreadLoadedListParams;
+use codex_app_server_protocol::ThreadLoadedListResponse;
+use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
+use codex_app_server_protocol::ThreadMetadataUpdateParams;
+use codex_app_server_protocol::ThreadMetadataUpdateResponse;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
+use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
+use codex_app_server_protocol::ThreadSection;
+use codex_app_server_protocol::ThreadSectionMoveParams;
+use codex_app_server_protocol::ThreadSectionMoveResponse;
+use codex_app_server_protocol::ThreadSetNameParams;
+use codex_app_server_protocol::ThreadSetNameResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
+use codex_config::ThreadConfigContext;
+use codex_config::ThreadConfigLoader;
+use codex_config::ThreadConfigLoaderFuture;
+use codex_config::ThreadConfigSource;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_core::config::ConfigBuilder;
 use codex_exec_server::EnvironmentManager;
 use codex_features::Feature;
 use codex_feedback::CodexFeedback;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
+use codex_state::PINNED_THREAD_SECTION_ID;
+use codex_state::PINNED_THREAD_SECTION_NAME;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::responses;
+use futures::poll;
 use pretty_assertions::assert_eq;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::CallToolRequestParams;
@@ -62,6 +106,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use test_case::test_case;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -713,40 +758,12 @@ apps = true
 #[tokio::test]
 async fn mcp_resource_read_returns_error_for_unknown_thread() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let loader_overrides = LoaderOverrides::without_managed_config_for_tests();
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .loader_overrides(loader_overrides.clone())
-        .build()
-        .await?;
     // This negative-path test does not need the stdio subprocess; keeping it
     // in-process avoids child-process teardown timing in nextest leak detection.
-    let client = in_process::start(InProcessStartArgs {
-        arg0_paths: Arg0DispatchPaths::default(),
-        config: Arc::new(config),
-        cli_overrides: Vec::new(),
-        loader_overrides,
-        strict_config: false,
-        cloud_config_bundle: CloudConfigBundleLoader::default(),
-        thread_config_loader: Arc::new(codex_config::NoopThreadConfigLoader),
-        feedback: CodexFeedback::new(),
-        log_db: None,
-        state_db: None,
-        environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
-        config_warnings: Vec::new(),
-        session_source: SessionSource::Cli,
-        enable_codex_api_key_env: false,
-        initialize: InitializeParams {
-            client_info: ClientInfo {
-                name: "codex-app-server-tests".to_string(),
-                title: None,
-                version: "0.1.0".to_string(),
-            },
-            capabilities: None,
-        },
-        channel_capacity: in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
-    })
+    let client = start_resource_in_process_client(
+        codex_home.path(),
+        Arc::new(codex_config::NoopThreadConfigLoader),
+    )
     .await?;
 
     let response = client
@@ -773,6 +790,583 @@ async fn mcp_resource_read_returns_error_for_unknown_thread() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_and_mcp_requests_complete_while_unrelated_resume_loads_config() -> Result<()> {
+    let responses_server = responses::start_mock_server().await;
+    let (mcp_server_url, calls, mcp_server_handle) = start_resource_apps_mcp_server().await?;
+    calls.tools_enabled.store(/*val*/ true, Ordering::Relaxed);
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&responses_server.uri())
+        .with_extra_config(&format!(
+            "[mcp_servers.resource_server]\nurl = \"{mcp_server_url}/api/codex/ps/mcp\""
+        ))
+        .write(codex_home.path())?;
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let resume_cwd = TempDir::new()?;
+    let blocked_resume = Arc::new(BlockedResumeConfig {
+        cwd: AbsolutePathBuf::from_absolute_path(resume_cwd.path())?,
+        matching_loads: AtomicUsize::new(0),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    let client =
+        start_resource_in_process_client(codex_home.path(), blocked_resume.clone()).await?;
+    let sender = client.sender();
+    let ThreadResumeResponse { thread, .. } = serde_json::from_value(
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            sender.request(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(1),
+                params: ThreadResumeParams {
+                    thread_id,
+                    cwd: Some(codex_home.path().to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await??
+        .expect("resume persisted target thread"),
+    )?;
+
+    let mut resume = pin!(sender.request(ClientRequest::ThreadResume {
+        request_id: RequestId::Integer(3),
+        params: ThreadResumeParams {
+            thread_id: "00000000-0000-4000-8000-000000000000".to_string(),
+            cwd: Some(resume_cwd.path().to_string_lossy().into_owned()),
+            history: Some(vec![ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "Resume this unrelated thread.".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }]),
+            ..Default::default()
+        },
+    }));
+    // Submit the request, retaining immediate errors until after cleanup.
+    let mut early_resume = poll!(&mut resume);
+    let request_results = async {
+        // Wait for the slow config load before submitting metadata or MCP work.
+        timeout(DEFAULT_READ_TIMEOUT, blocked_resume.entered.notified())
+            .await
+            .context("unrelated resume did not enter config loading")?;
+        let results = timeout(DEFAULT_READ_TIMEOUT, async {
+            futures::try_join!(
+                sender.request(ClientRequest::ThreadSetName {
+                    request_id: RequestId::Integer(4),
+                    params: ThreadSetNameParams {
+                        thread_id: thread.id.clone(),
+                        name: "Viewer thread".to_string(),
+                    },
+                }),
+                sender.request(ClientRequest::ThreadMetadataUpdate {
+                    request_id: RequestId::Integer(5),
+                    params: ThreadMetadataUpdateParams {
+                        thread_id: thread.id.clone(),
+                        project_id: None,
+                        daybreak_enabled: None,
+                        git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                            sha: None,
+                            branch: Some(Some("feature/viewer".to_string())),
+                            origin_url: None,
+                        }),
+                    },
+                }),
+                sender.request(ClientRequest::ThreadSectionMove {
+                    request_id: RequestId::Integer(6),
+                    params: ThreadSectionMoveParams {
+                        thread_id: thread.id.clone(),
+                        section_id: Some(PINNED_THREAD_SECTION_ID.to_string()),
+                        before_thread_id: None,
+                    },
+                }),
+                sender.request(ClientRequest::McpResourceRead {
+                    request_id: RequestId::Integer(7),
+                    params: McpResourceReadParams {
+                        thread_id: Some(thread.id.clone()),
+                        origin_call_id: None,
+                        server: "resource_server".to_string(),
+                        uri: TEST_RESOURCE_URI.to_string(),
+                        connector_id: None,
+                    },
+                }),
+                sender.request(ClientRequest::McpServerToolCall {
+                    request_id: RequestId::Integer(8),
+                    params: McpServerToolCallParams {
+                        thread_id: thread.id.clone(),
+                        server: "resource_server".to_string(),
+                        tool: "best_buy_product_search".to_string(),
+                        arguments: Some(json!({ "query": "lamps" })),
+                        meta: None,
+                    },
+                }),
+            )
+        })
+        .await
+        .context("metadata and MCP requests did not finish while unrelated resume was blocked")??;
+        anyhow::Ok(results)
+    }
+    .await;
+    if early_resume.is_pending() {
+        early_resume = poll!(&mut resume);
+    }
+    let resume_pending = early_resume.is_pending();
+    // Always release and drain the blocked resume, including on regression.
+    blocked_resume.release.notify_one();
+    let resume_result = match early_resume {
+        Poll::Pending => timeout(DEFAULT_READ_TIMEOUT, &mut resume).await,
+        Poll::Ready(result) => Ok(result),
+    };
+    let read_result = timeout(
+        DEFAULT_READ_TIMEOUT,
+        sender.request(ClientRequest::ThreadRead {
+            request_id: RequestId::Integer(9),
+            params: ThreadReadParams {
+                thread_id: thread.id,
+                include_turns: false,
+            },
+        }),
+    )
+    .await;
+    client.shutdown().await?;
+    mcp_server_handle.abort();
+    let _ = mcp_server_handle.await;
+
+    let (rename, metadata, section, resource, tool) = request_results?;
+    assert!(resume_pending, "resume completed early");
+    assert_eq!(
+        serde_json::from_value::<ThreadSetNameResponse>(rename.expect("set thread name"))?,
+        ThreadSetNameResponse {},
+    );
+    let updated: ThreadMetadataUpdateResponse =
+        serde_json::from_value(metadata.expect("update thread metadata"))?;
+    let expected_git_info = Some(GitInfo {
+        sha: None,
+        branch: Some("feature/viewer".to_string()),
+        origin_url: None,
+    });
+    assert_eq!(updated.thread.git_info, expected_git_info);
+    assert_eq!(
+        serde_json::from_value::<ThreadSectionMoveResponse>(section.expect("pin thread"))?,
+        ThreadSectionMoveResponse {},
+    );
+    assert_eq!(
+        serde_json::from_value::<McpResourceReadResponse>(resource.expect("read resource"))?,
+        expected_resource_read_response(),
+    );
+    assert_eq!(
+        serde_json::from_value::<McpServerToolCallResponse>(tool.expect("call tool"))?,
+        serde_json::from_value::<McpServerToolCallResponse>(serde_json::to_value(
+            CallToolResult::structured(json!({ "products": [] })),
+        )?)?,
+    );
+    resume_result??.expect("finish unrelated resume");
+    let read: ThreadReadResponse = serde_json::from_value(read_result??.expect("read thread"))?;
+    assert_eq!(
+        (read.thread.name, read.thread.git_info, read.thread.section),
+        (
+            Some("Viewer thread".to_string()),
+            expected_git_info,
+            Some(ThreadSection {
+                id: PINNED_THREAD_SECTION_ID.to_string(),
+                name: PINNED_THREAD_SECTION_NAME.to_string(),
+                appearance: None,
+            }),
+        ),
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ResumeMutation {
+    GitMetadata,
+    ProjectDeletion,
+    Archive,
+    Delete,
+    DuplicateResume,
+}
+
+#[test_case(ResumeMutation::GitMetadata; "git_metadata_and_project_assignment")]
+#[test_case(ResumeMutation::ProjectDeletion; "project_deletion")]
+#[test_case(ResumeMutation::Archive; "archive")]
+#[test_case(ResumeMutation::Delete; "delete")]
+#[test_case(ResumeMutation::DuplicateResume; "duplicate_resume")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_revalidates_persisted_thread_after_config_load(
+    mutation: ResumeMutation,
+) -> Result<()> {
+    let responses_server = create_mock_responses_server_repeating_assistant("Ready").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&responses_server.uri()).write(codex_home.path())?;
+    let filename_timestamp = "2025-01-05T12-00-00";
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        filename_timestamp,
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        matches!(mutation, ResumeMutation::GitMetadata).then(|| {
+            codex_protocol::protocol::GitInfo {
+                commit_hash: None,
+                branch: Some("feature/before-resume".to_string()),
+                repository_url: None,
+            }
+        }),
+    )?;
+    let path = rollout_path(codex_home.path(), filename_timestamp, &thread_id);
+    let resume_cwd = TempDir::new()?;
+    let blocked_resume = Arc::new(BlockedResumeConfig {
+        cwd: AbsolutePathBuf::from_absolute_path(resume_cwd.path())?,
+        matching_loads: AtomicUsize::new(0),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    let mut client =
+        start_resource_in_process_client(codex_home.path(), blocked_resume.clone()).await?;
+    let sender = client.sender();
+    let project_id = if matches!(
+        mutation,
+        ResumeMutation::GitMetadata | ResumeMutation::ProjectDeletion
+    ) {
+        let created: ProjectCreateResponse = serde_json::from_value(
+            sender
+                .request(ClientRequest::ProjectCreate {
+                    request_id: RequestId::Integer(100),
+                    params: ProjectCreateParams {
+                        name: "Resume project".to_string(),
+                        roots: Vec::new(),
+                        metadata: None,
+                        idempotency_key: "resume-project".to_string(),
+                    },
+                })
+                .await?
+                .expect("create project"),
+        )?;
+        Some(created.project.id)
+    } else {
+        None
+    };
+    if matches!(mutation, ResumeMutation::ProjectDeletion) {
+        sender
+            .request(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(101),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: thread_id.clone(),
+                    project_id: project_id.clone(),
+                    daybreak_enabled: None,
+                    git_info: None,
+                },
+            })
+            .await?
+            .expect("assign project before resume");
+    }
+    let mut resume = pin!(sender.request(ClientRequest::ThreadResume {
+        request_id: RequestId::Integer(1),
+        params: ThreadResumeParams {
+            // A path alias reaches the same persisted thread through a different
+            // request queue, so its canonical-ID mutation can run during config loading.
+            thread_id: "resume-by-path".to_string(),
+            path: Some(path.canonicalize()?),
+            cwd: Some(resume_cwd.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+    }));
+    let mut early_resume = poll!(&mut resume);
+    let mutation_request = match mutation {
+        ResumeMutation::GitMetadata => ClientRequest::ThreadMetadataUpdate {
+            request_id: RequestId::Integer(2),
+            params: ThreadMetadataUpdateParams {
+                thread_id: thread_id.clone(),
+                project_id: project_id.clone(),
+                daybreak_enabled: None,
+                git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                    sha: None,
+                    branch: Some(Some("feature/updated-during-resume".to_string())),
+                    origin_url: None,
+                }),
+            },
+        },
+        ResumeMutation::ProjectDeletion => ClientRequest::ProjectDelete {
+            request_id: RequestId::Integer(2),
+            params: ProjectDeleteParams {
+                project_id: project_id.clone().expect("project to delete"),
+            },
+        },
+        ResumeMutation::Archive => ClientRequest::ThreadArchive {
+            request_id: RequestId::Integer(2),
+            params: ThreadArchiveParams {
+                thread_id: thread_id.clone(),
+            },
+        },
+        ResumeMutation::Delete => ClientRequest::ThreadDelete {
+            request_id: RequestId::Integer(2),
+            params: ThreadDeleteParams {
+                thread_id: thread_id.clone(),
+            },
+        },
+        ResumeMutation::DuplicateResume => ClientRequest::ThreadResume {
+            request_id: RequestId::Integer(2),
+            params: ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                cwd: Some(resume_cwd.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        },
+    };
+    let mutation_result = async {
+        timeout(DEFAULT_READ_TIMEOUT, blocked_resume.entered.notified())
+            .await
+            .context("resume did not enter config loading")?;
+        let result = timeout(DEFAULT_READ_TIMEOUT, sender.request(mutation_request))
+            .await
+            .context("mutation must complete while resume config loading is blocked")??;
+        anyhow::Ok(result)
+    }
+    .await;
+    if early_resume.is_pending() {
+        early_resume = poll!(&mut resume);
+    }
+    let resume_pending = early_resume.is_pending();
+    blocked_resume.release.notify_one();
+    let resume_result = match early_resume {
+        Poll::Pending => timeout(DEFAULT_READ_TIMEOUT, &mut resume).await,
+        Poll::Ready(result) => Ok(result),
+    };
+    let resume_config_loads = blocked_resume.matching_loads.load(Ordering::Relaxed);
+    let turn_result = match mutation {
+        ResumeMutation::GitMetadata | ResumeMutation::ProjectDeletion => {
+            complete_in_process_turn(&mut client, RequestId::Integer(3), &thread_id).await
+        }
+        ResumeMutation::Archive | ResumeMutation::Delete | ResumeMutation::DuplicateResume => {
+            Ok(())
+        }
+    };
+    let loaded_result = timeout(
+        DEFAULT_READ_TIMEOUT,
+        sender.request(ClientRequest::ThreadLoadedList {
+            request_id: RequestId::Integer(4),
+            params: ThreadLoadedListParams::default(),
+        }),
+    )
+    .await;
+    client.shutdown().await?;
+
+    let mutation_response = mutation_result?.expect("mutate persisted thread during resume");
+    assert!(resume_pending, "resume must still be loading config");
+    let resumed = resume_result??;
+    let loaded: ThreadLoadedListResponse =
+        serde_json::from_value(loaded_result??.expect("list loaded threads"))?;
+    assert_eq!(
+        loaded,
+        ThreadLoadedListResponse {
+            data: match mutation {
+                ResumeMutation::Archive | ResumeMutation::Delete => Vec::new(),
+                ResumeMutation::GitMetadata
+                | ResumeMutation::ProjectDeletion
+                | ResumeMutation::DuplicateResume => vec![thread_id.clone()],
+            },
+            next_cursor: None,
+        }
+    );
+    match mutation {
+        ResumeMutation::GitMetadata | ResumeMutation::ProjectDeletion => {
+            let resumed: ThreadResumeResponse =
+                serde_json::from_value(resumed.expect("resume updated thread"))?;
+            let expected_git_info =
+                matches!(mutation, ResumeMutation::GitMetadata).then(|| GitInfo {
+                    sha: None,
+                    branch: Some("feature/updated-during-resume".to_string()),
+                    origin_url: None,
+                });
+            let expected_project_id = if matches!(mutation, ResumeMutation::GitMetadata) {
+                project_id
+            } else {
+                None
+            };
+            assert_eq!(
+                (resumed.thread.git_info, resumed.thread.project_id),
+                (expected_git_info.clone(), expected_project_id.clone())
+            );
+            assert!(
+                resume_config_loads >= 2,
+                "changed persisted metadata must reload config"
+            );
+            turn_result?;
+
+            // Check persisted metadata after the resumed writer appends a turn
+            // and shuts down; an in-memory response alone can hide stale writes.
+            let reader = start_resource_in_process_client(
+                codex_home.path(),
+                Arc::new(codex_config::NoopThreadConfigLoader),
+            )
+            .await?;
+            let read_result = timeout(
+                DEFAULT_READ_TIMEOUT,
+                reader.request(ClientRequest::ThreadRead {
+                    request_id: RequestId::Integer(1),
+                    params: ThreadReadParams {
+                        thread_id,
+                        include_turns: false,
+                    },
+                }),
+            )
+            .await;
+            reader.shutdown().await?;
+            let read: ThreadReadResponse =
+                serde_json::from_value(read_result??.expect("read persisted thread metadata"))?;
+            assert_eq!(
+                (read.thread.git_info, read.thread.project_id),
+                (expected_git_info, expected_project_id)
+            );
+        }
+        ResumeMutation::Archive | ResumeMutation::Delete => {
+            assert!(resumed.is_err(), "resume must not reopen a removed rollout");
+            assert!(
+                !path.exists(),
+                "resume must not recreate the active rollout"
+            );
+            let archived_path = codex_home
+                .path()
+                .join(ARCHIVED_SESSIONS_SUBDIR)
+                .join(path.file_name().expect("rollout filename"));
+            assert_eq!(
+                archived_path.exists(),
+                matches!(mutation, ResumeMutation::Archive)
+            );
+        }
+        ResumeMutation::DuplicateResume => {
+            let resumed: ThreadResumeResponse =
+                serde_json::from_value(resumed.expect("rejoin thread resumed during config load"))?;
+            let concurrent: ThreadResumeResponse = serde_json::from_value(mutation_response)?;
+            assert_eq!(
+                (resumed.thread.id, concurrent.thread.id),
+                (thread_id.clone(), thread_id)
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn complete_in_process_turn(
+    client: &mut in_process::InProcessClientHandle,
+    request_id: RequestId,
+    thread_id: &str,
+) -> Result<()> {
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        client
+            .request(ClientRequest::TurnStart {
+                request_id,
+                params: TurnStartParams {
+                    thread_id: thread_id.to_string(),
+                    input: vec![UserInput::Text {
+                        text: "Persist the thread.".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    ..Default::default()
+                },
+            })
+            .await?
+            .expect("start persistence turn");
+        loop {
+            let event = client
+                .next_event()
+                .await
+                .context("app-server stopped before turn/completed")?;
+            if let InProcessServerEvent::ServerNotification(notification) = event
+                && let ServerNotification::TurnCompleted(completed) = notification.as_ref()
+                && completed.thread_id == thread_id
+            {
+                assert_eq!(completed.turn.status, TurnStatus::Completed);
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await?
+}
+
+struct BlockedResumeConfig {
+    cwd: AbsolutePathBuf,
+    matching_loads: AtomicUsize,
+    entered: Notify,
+    release: Notify,
+}
+
+impl ThreadConfigLoader for BlockedResumeConfig {
+    fn load(
+        &self,
+        context: ThreadConfigContext,
+    ) -> ThreadConfigLoaderFuture<'_, Vec<ThreadConfigSource>> {
+        Box::pin(async move {
+            if context.cwd.as_ref() == Some(&self.cwd)
+                && self.matching_loads.fetch_add(/*val*/ 1, Ordering::Relaxed) == 0
+            {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(Vec::new())
+        })
+    }
+}
+
+async fn start_resource_in_process_client(
+    codex_home: &Path,
+    thread_config_loader: Arc<dyn ThreadConfigLoader>,
+) -> Result<in_process::InProcessClientHandle> {
+    let loader_overrides = LoaderOverrides::without_managed_config_for_tests();
+    // Keep unrelated plugin repository syncs out of these in-process RPC tests.
+    let cli_overrides = vec![("features.plugins".to_string(), toml::Value::Boolean(false))];
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.to_path_buf())
+        .fallback_cwd(Some(codex_home.to_path_buf()))
+        .cli_overrides(cli_overrides.clone())
+        .loader_overrides(loader_overrides.clone())
+        .build()
+        .await?;
+    let state_db = codex_rollout::state_db::try_init(&config).await?;
+    // Metadata, persistence, and HTTP MCP do not need local execution or shell startup.
+    let environment_manager = Arc::new(EnvironmentManager::without_environments(
+        config.http_client_factory(),
+    ));
+    Ok(in_process::start(InProcessStartArgs {
+        arg0_paths: Arg0DispatchPaths::default(),
+        config: Arc::new(config),
+        cli_overrides,
+        loader_overrides,
+        strict_config: false,
+        cloud_config_bundle: CloudConfigBundleLoader::default(),
+        thread_config_loader,
+        feedback: CodexFeedback::new(),
+        log_db: None,
+        state_db: Some(state_db),
+        environment_manager,
+        config_warnings: Vec::new(),
+        session_source: SessionSource::Cli,
+        enable_codex_api_key_env: false,
+        initialize: InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-app-server-tests".to_string(),
+                title: None,
+                version: "0.1.0".to_string(),
+            },
+            capabilities: Some(InitializeCapabilities {
+                experimental_api: true,
+                ..Default::default()
+            }),
+        },
+        channel_capacity: in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+    })
+    .await?)
 }
 
 pub(super) async fn start_resource_test_app_server(

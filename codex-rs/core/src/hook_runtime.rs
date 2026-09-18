@@ -705,11 +705,16 @@ pub(crate) async fn record_pending_input(
     persist_context: PersistContext,
 ) {
     match pending_input {
-        TurnInput::UserInput { content, client_id } => {
+        TurnInput::UserInput {
+            content,
+            client_id,
+            acceptance_order,
+        } => {
             sess.record_user_prompt_and_emit_turn_item(
                 turn_context.as_ref(),
                 content.as_slice(),
                 client_id,
+                acceptance_order,
                 persist_context,
             )
             .await;

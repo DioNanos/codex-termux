@@ -311,6 +311,10 @@ impl TranscriptConfig {
 struct SnapshotHistory<'a>(&'a dyn ConversationHistorySnapshot);
 
 impl SectionHistory for SnapshotHistory<'_> {
+    fn retained_context(&self) -> Option<&codex_history::RetainedContext> {
+        self.0.retained_context()
+    }
+
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
         self.0.review_items()
     }

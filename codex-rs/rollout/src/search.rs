@@ -18,7 +18,6 @@ use super::SESSIONS_SUBDIR;
 use super::compression;
 use crate::ResponseItemEnvelope;
 use crate::RolloutItem;
-use crate::RolloutLine;
 
 const MATCH_CONTEXT_BEFORE_CHARS: usize = 48;
 const MATCH_CONTEXT_AFTER_CHARS: usize = 96;
@@ -248,7 +247,7 @@ fn case_insensitive_literal_regex(search_term: impl AsRef<str>) -> io::Result<Re
 }
 
 fn content_match_snippet(jsonl_line: &str, search_term: &Regex) -> Option<String> {
-    let rollout_line = serde_json::from_str::<RolloutLine>(jsonl_line.trim()).ok()?;
+    let rollout_line = crate::parse_rollout_line(jsonl_line.trim()).ok()?;
     let text = conversation_text_from_item(&rollout_line.item)?;
     excerpt_around_match(text.as_str(), search_term)
 }
@@ -293,6 +292,7 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
         | RolloutItem::RealtimeItem(_)
+        | RolloutItem::RetainedContext(_)
         | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::WorldState(_) => None,

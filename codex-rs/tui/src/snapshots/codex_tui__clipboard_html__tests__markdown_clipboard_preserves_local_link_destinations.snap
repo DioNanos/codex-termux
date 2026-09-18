@@ -1,0 +1,12 @@
+---
+source: tui/src/clipboard_html_tests.rs
+expression: render_markdown(markdown)
+---
+<p>parser (/repo/src/parser.rs:42)</p>
+<p><strong>Windows parser</strong> (C:\repo\src\parser.rs:42:7)</p>
+<p><code>relative parser</code> (../src/parser.rs#L42-L48)</p>
+<p>file URL (file:///repo/src/parser.rs#L42)</p>
+<p>escaped path (/repo/a&amp;b/&lt;parser&gt;.rs:42)</p>
+<p>Unicode path (/repo/my project/解析.rs:42)</p>
+<p>diagram (/repo/diagram.rs:7)</p>
+<p><a href="https://example.com/source">web link</a> and another file (src/lib.rs:9)</p>

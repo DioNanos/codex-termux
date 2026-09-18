@@ -4,6 +4,7 @@ use crate::app::session_lifecycle::ThreadAttachPresentation;
 use crate::chatwidget::UserMessage;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::ModelSafetyBufferingUpdatedNotification;
+use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -163,9 +164,26 @@ async fn wait_for_turn_completed(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_turn_interrupt_is_nonblocking_and_coalesces_repeated_requests() -> Result<()> {
+    Box::pin(interrupt_after_inactive_steer(SteerSwitch::WithinTask)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_overview_acknowledges_inactive_steer_before_interrupt() -> Result<()> {
+    Box::pin(interrupt_after_inactive_steer(SteerSwitch::BetweenTasks)).await
+}
+
+enum SteerSwitch {
+    WithinTask,
+    BetweenTasks,
+}
+
+async fn interrupt_after_inactive_steer(switch: SteerSwitch) -> Result<()> {
+    let via_overview = matches!(switch, SteerSwitch::BetweenTasks);
     let (chunks, release_response) =
         gated_response_chunks("interrupt-response", ev_completed("interrupt-response"));
-    let (server, _completions) = start_streaming_sse_server(vec![chunks]).await;
+    let (steered_chunks, release_steered_response) =
+        gated_response_chunks("steered-response", ev_completed("steered-response"));
+    let (server, _completions) = start_streaming_sse_server(vec![chunks, steered_chunks]).await;
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let codex_home = tempdir()?;
     std::fs::write(
@@ -210,18 +228,117 @@ stream_max_retries = 0
     .await?;
     while app_event_rx.try_recv().is_ok() {}
 
-    submit_prompt(&mut app, "Keep this turn running until interrupted");
+    submit_prompt(&mut app, COMMITTED_STEER);
     let turn = next_user_turn_event(&mut app_event_rx);
     app.submit_thread_op(&mut app_server, thread_id, turn)
         .await?;
     let turn_id = next_turn_started(&mut app, &mut app_server, thread_id).await;
-    drive_until_request_count(
-        &mut app,
-        &mut app_server,
-        &server,
-        /*expected_request_count*/ 1,
+    // Leave the original message's completion queued until after submitting the identical steer.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(/*secs*/ 5),
+        server.wait_for_request_count(/*count*/ 1),
     )
-    .await;
+    .await?;
+
+    let acknowledged_input = app.chat_widget.capture_thread_input_state();
+    submit_prompt(&mut app, COMMITTED_STEER);
+    let steer = next_user_turn_event(&mut app_event_rx);
+    let AppCommand::UserTurn {
+        client_user_message_id,
+        ..
+    } = &steer
+    else {
+        unreachable!("user turn");
+    };
+    let expected_client_id = client_user_message_id.clone();
+    let pending_input = app.chat_widget.capture_thread_input_state();
+    app.submit_thread_op(&mut app_server, thread_id, steer)
+        .await?;
+    let other_id = ThreadId::from_string(
+        &app_test_support::create_fake_rollout(
+            app.config.codex_home.as_path(),
+            "2025-01-05T12-00-00",
+            "2025-01-05T12:00:00Z",
+            "Other task",
+            Some(MODEL_PROVIDER_ID),
+            /*git_info*/ None,
+        )
+        .expect("materialize other task"),
+    )?;
+    let other = app_server
+        .resume_thread(
+            &app.local_settings,
+            app.config.clone(),
+            other_id,
+            crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        )
+        .await?;
+    app.thread_event_channels.insert(
+        other_id,
+        ThreadEventChannel::new_with_session(
+            THREAD_EVENT_CHANNEL_CAPACITY,
+            other.session,
+            other.turns,
+        ),
+    );
+    // Receive the real commit while another thread is visible, with no replay capacity.
+    if via_overview {
+        Box::pin(app.select_agents_overview_thread(&mut tui, &mut app_server, other_id)).await?;
+    } else {
+        Box::pin(app.select_agent_thread(&mut tui, &mut app_server, other_id)).await?;
+        app.thread_event_channels[&thread_id]
+            .store
+            .lock()
+            .await
+            .capacity = 0;
+    }
+    assert_eq!(app.current_displayed_thread_id(), Some(other_id));
+    let mut release_response = Some(release_response);
+    loop {
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(/*secs*/ 5),
+            app_server.next_event(),
+        )
+        .await?
+        .expect("app-server remains open");
+        let committed_id = if let AppServerEvent::ServerNotification(notification) = &event
+            && let ServerNotification::ItemCompleted(item) = notification.as_ref()
+            && let ThreadItem::UserMessage {
+                content, client_id, ..
+            } = &item.item
+            && ChatWidget::user_message_display_from_inputs(content).message == COMMITTED_STEER
+        {
+            Some(client_id.clone().expect("receipt echoes the submission ID"))
+        } else {
+            None
+        };
+        app.handle_app_server_event(&app_server, event).await;
+        if let Some(client_id) = committed_id {
+            let saved_input = if via_overview {
+                assert!(!app.thread_event_channels.contains_key(&thread_id));
+                app.agents_overview.input_states.get(&thread_id).cloned()
+            } else {
+                let store = app.thread_event_channels[&thread_id].store.lock().await;
+                assert!(store.buffer.is_empty());
+                store.input_state.clone()
+            };
+            if let Some(release_response) = release_response.take() {
+                assert_ne!(client_id, expected_client_id);
+                assert_eq!(saved_input, pending_input);
+                let _ = release_response.send(());
+            } else {
+                assert_eq!(client_id, expected_client_id);
+                assert_eq!(saved_input, acknowledged_input);
+                break;
+            }
+        }
+    }
+    if via_overview {
+        Box::pin(app.select_agents_overview_thread(&mut tui, &mut app_server, thread_id)).await?;
+    } else {
+        Box::pin(app.select_agent_thread(&mut tui, &mut app_server, thread_id)).await?;
+    }
+    assert_eq!(app.active_thread_id, Some(thread_id));
 
     let interrupt = AppCommand::interrupt();
     assert!(
@@ -270,7 +387,16 @@ stream_max_retries = 0
         None
     );
 
-    let _ = release_response.send(());
+    insta::assert_snapshot!(app.chat_widget.composer_text_with_pending(), @"");
+    assert!(
+        std::iter::from_fn(|| app_event_rx.try_recv().ok())
+            .all(|event| !matches!(event, AppEvent::CodexOp(AppCommand::UserTurn { .. })))
+    );
+    let source = app_server
+        .thread_read(thread_id, /*include_turns*/ true)
+        .await?;
+    assert_eq!(user_message_count(&source, COMMITTED_STEER), 2);
+    let _ = release_steered_response.send(());
     app_server.shutdown().await?;
     server.shutdown().await;
     Ok(())
@@ -714,6 +840,13 @@ goals = true
             .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let second_retry = loop {
             match app_event_rx.try_recv() {
+                Ok(event @ AppEvent::ConfirmSafetyBufferedRetry { .. }) => {
+                    Box::pin(app.handle_event(&mut tui, &mut app_server, event)).await?;
+                    app.chat_widget
+                        .handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                    app.chat_widget
+                        .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
                 Ok(AppEvent::RetrySafetyBufferedTurn {
                     thread_id,
                     turn_id,

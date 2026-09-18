@@ -21,7 +21,10 @@ async fn misalignment_policy_failure_stops_the_thread_and_renders_once() {
         }),
         /*replay_kind*/ None,
     );
-    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("thinking a bit more"));
+    assert!(
+        render_bottom_popup(&chat, /*width*/ 80)
+            .contains("Giving this request a little extra thought")
+    );
     chat.queue_user_message(UserMessage::from("queued follow-up"));
     chat.bottom_pane
         .set_composer_text("stale draft".to_string(), Vec::new(), Vec::new());
@@ -119,4 +122,92 @@ async fn misalignment_policy_failure_stops_the_thread_and_renders_once() {
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
     assert_matches!(rx.try_recv(), Ok(AppEvent::OpenAgentsOverview));
     assert!(chat.bottom_pane.has_active_view());
+}
+
+fn review_details() -> codex_app_server_protocol::MisalignmentErrorDetails {
+    codex_app_server_protocol::MisalignmentErrorDetails {
+        error_type: Some("new_category".to_string()),
+        detailed_explanation: Some(
+            "The agent proposed a change outside your instructions.".to_string(),
+        ),
+        steer: Some(codex_app_server_protocol::MisalignmentSteer {
+            message: "Continue with the requested change only.".to_string(),
+        }),
+    }
+}
+
+fn select_review(
+    chat: &mut ChatWidget,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> Arc<MisalignmentReview> {
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            AppEvent::ReviewMisalignment(review) => Some(review),
+            _ => None,
+        })
+        .expect("review action")
+}
+
+#[tokio::test]
+async fn misalignment_review_requires_current_findings() {
+    let (mut chat, mut rx, _) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    handle_turn_started(&mut chat, "turn-1");
+    chat.on_misalignment_error(Some("turn-1".to_string()), Some(review_details()));
+    let review = select_review(&mut chat, &mut rx);
+    chat.show_misalignment_review_confirmation(Arc::clone(&review));
+    assert_chatwidget_snapshot!(
+        "misalignment_review_narrow",
+        render_bottom_popup(&chat, /*width*/ 38)
+    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert!(
+        matches!(rx.try_recv(), Ok(AppEvent::ContinueMisalignment(current)) if Arc::ptr_eq(&current, &review))
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert!(rx.try_recv().is_err());
+
+    // A duplicate terminal event must not reset an in-progress review.
+    chat.on_misalignment_error(Some("turn-1".to_string()), Some(review_details()));
+    chat.on_misalignment_error(Some("turn-1".to_string()), /*details*/ None);
+    assert!(chat.is_current_misalignment_review(&review));
+    let mut changed = review_details();
+    changed.detailed_explanation = Some("Updated findings".to_string());
+    chat.on_misalignment_error(Some("turn-1".to_string()), Some(changed));
+    assert!(!chat.is_current_misalignment_review(&review));
+
+    // Present-but-invalid findings withdraw the old authorization.
+    for explanation in [None, Some(" ".to_string()), Some("a".repeat(65537))] {
+        chat.on_misalignment_error(Some("turn-1".to_string()), Some(review_details()));
+        let replacement = select_review(&mut chat, &mut rx);
+        let mut details = review_details();
+        details.detailed_explanation = explanation;
+        chat.on_misalignment_error(Some("turn-1".to_string()), Some(details));
+        assert!(!chat.is_current_misalignment_review(&replacement));
+    }
+
+    for steer in [None, Some(" ".to_string()), Some("a".repeat(1025))] {
+        let mut details = review_details();
+        details.steer =
+            steer.map(|message| codex_app_server_protocol::MisalignmentSteer { message });
+        chat.on_misalignment_error(Some("turn-1".to_string()), Some(details));
+        let review = select_review(&mut chat, &mut rx);
+        chat.show_misalignment_review_confirmation(Arc::clone(&review));
+        assert!(review.continuation_message().is_none());
+        chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|event| matches!(event, AppEvent::ContinueMisalignment(_)))
+        );
+        assert!(!chat.bottom_pane.composer_input_enabled());
+    }
+    handle_turn_started(&mut chat, "turn-2");
+    chat.on_misalignment_error(Some("turn-1".to_string()), Some(review_details()));
+    assert!(!chat.has_misalignment_policy_violation());
+    assert!(chat.bottom_pane.composer_input_enabled());
+    // A queued Back action cannot reopen the precaution after a new turn starts.
+    chat.show_misalignment_policy_precaution();
+    assert!(!chat.bottom_pane.has_active_view());
 }

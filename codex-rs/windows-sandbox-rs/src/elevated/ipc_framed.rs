@@ -19,12 +19,6 @@ use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// Safety cap for a single framed message payload.
-///
-/// This is not a protocol requirement; it simply bounds memory use and rejects
-/// obviously invalid frames.
-const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
-
 /// Protocol version shared by the parent process and elevated command runner.
 pub const IPC_PROTOCOL_VERSION: u8 = 6;
 
@@ -151,34 +145,13 @@ pub fn decode_bytes(data: &str) -> Result<Vec<u8>> {
 }
 
 /// Write a length-prefixed JSON frame.
-pub fn write_frame<W: Write>(mut writer: W, msg: &FramedMessage) -> Result<()> {
-    let payload = serde_json::to_vec(msg)?;
-    if payload.len() > MAX_FRAME_LEN {
-        anyhow::bail!("frame too large: {}", payload.len());
-    }
-    let len = payload.len() as u32;
-    writer.write_all(&len.to_le_bytes())?;
-    writer.write_all(&payload)?;
-    writer.flush()?;
-    Ok(())
+pub fn write_frame<W: Write>(writer: W, msg: &FramedMessage) -> Result<()> {
+    crate::framed_io::write_frame(writer, msg)
 }
 
 /// Read a length-prefixed JSON frame; returns `Ok(None)` on EOF.
-pub fn read_frame<R: Read>(mut reader: R) -> Result<Option<FramedMessage>> {
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err.into()),
-    }
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_FRAME_LEN {
-        anyhow::bail!("frame too large: {len}");
-    }
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload)?;
-    let msg: FramedMessage = serde_json::from_slice(&payload)?;
-    Ok(Some(msg))
+pub fn read_frame<R: Read>(reader: R) -> Result<Option<FramedMessage>> {
+    crate::framed_io::read_frame(reader)
 }
 
 #[cfg(test)]

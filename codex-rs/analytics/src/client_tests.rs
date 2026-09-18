@@ -424,6 +424,7 @@ async fn api_key_auth_sends_only_plugin_events_to_codex_backend() {
                 thread_id: thread_id.to_string(),
                 turn_id: "turn-1".to_string(),
                 item_id: "item-1".to_string(),
+                originator: "codex_cli_rs".to_string(),
                 plugin_id: plugin_id.to_string(),
                 execution_id: "execution-1".to_string(),
                 operation: "security_scan".to_string(),
@@ -588,6 +589,8 @@ fn sample_thread_archive_request() -> ClientRequest {
 
 fn sample_thread(thread_id: &str) -> Thread {
     Thread {
+        originator: None,
+        environments: None,
         id: thread_id.to_string(),
         extra: None,
         session_id: format!("session-{thread_id}"),
@@ -598,6 +601,7 @@ fn sample_thread(thread_id: &str) -> Thread {
         section: None,
         section_entered_at: None,
         project_id: None,
+        daybreak_enabled: None,
         history_mode: Default::default(),
         model_provider: "openai".to_string(),
         model: None,
@@ -705,6 +709,7 @@ fn track_plugin_measurements_rejects_unbounded_inputs_before_queueing() {
         thread_id: "thread-1".to_string(),
         turn_id: "turn-1".to_string(),
         item_id: "item-1".to_string(),
+        originator: "codex_cli_rs".to_string(),
         plugin_id: "sample@openai-curated".to_string(),
         execution_id: "execution-1".to_string(),
         operation: "security_scan".to_string(),

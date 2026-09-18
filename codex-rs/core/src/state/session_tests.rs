@@ -89,6 +89,7 @@ async fn set_rate_limits_defaults_limit_id_to_codex_when_missing() {
     state.set_rate_limits(RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 12.0,
             window_minutes: Some(60),
@@ -135,6 +136,7 @@ async fn set_rate_limits_defaults_to_codex_when_limit_id_missing_after_other_buc
     state.set_rate_limits(RateLimitSnapshot {
         limit_id: Some("codex_other".to_string()),
         limit_name: Some("codex_other".to_string()),
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 20.0,
             window_minutes: Some(60),
@@ -150,6 +152,7 @@ async fn set_rate_limits_defaults_to_codex_when_limit_id_missing_after_other_buc
     state.set_rate_limits(RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 30.0,
             window_minutes: Some(60),
@@ -180,6 +183,7 @@ async fn set_rate_limits_carries_account_metadata_from_codex_to_codex_other() {
     state.set_rate_limits(RateLimitSnapshot {
         limit_id: Some("codex".to_string()),
         limit_name: Some("codex".to_string()),
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 10.0,
             window_minutes: Some(60),
@@ -205,6 +209,7 @@ async fn set_rate_limits_carries_account_metadata_from_codex_to_codex_other() {
     state.set_rate_limits(RateLimitSnapshot {
         limit_id: Some("codex_other".to_string()),
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 30.0,
             window_minutes: Some(120),
@@ -223,6 +228,7 @@ async fn set_rate_limits_carries_account_metadata_from_codex_to_codex_other() {
         Some(RateLimitSnapshot {
             limit_id: Some("codex_other".to_string()),
             limit_name: None,
+            normal_model_slug: None,
             primary: Some(RateLimitWindow {
                 used_percent: 30.0,
                 window_minutes: Some(120),
@@ -249,6 +255,7 @@ async fn set_rate_limits_carries_account_metadata_from_codex_to_codex_other() {
     state.set_rate_limits(RateLimitSnapshot {
         limit_id: Some("codex_other".to_string()),
         limit_name: None,
+        normal_model_slug: None,
         primary: None,
         secondary: None,
         credits: None,

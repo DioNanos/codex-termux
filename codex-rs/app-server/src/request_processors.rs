@@ -605,12 +605,19 @@ use crate::thread_state::ThreadStateManager;
 use token_usage_replay::restored_token_usage_turn_id;
 use token_usage_replay::send_thread_token_usage_update_to_connection;
 
-pub(crate) fn apply_live_model_settings(
+pub(crate) fn apply_live_thread_settings(
     thread: &mut Thread,
     config_snapshot: &ThreadConfigSnapshot,
 ) {
     thread.model = Some(config_snapshot.model.clone());
     thread.reasoning_effort = config_snapshot.reasoning_effort.clone();
+    thread.environments = Some(
+        config_snapshot
+            .environment_selections()
+            .iter()
+            .map(Into::into)
+            .collect(),
+    );
 }
 
 fn resolve_request_cwd(cwd: Option<PathBuf>) -> Result<Option<AbsolutePathBuf>, JSONRPCErrorError> {

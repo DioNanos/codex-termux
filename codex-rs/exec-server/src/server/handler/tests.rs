@@ -27,6 +27,7 @@ fn exec_params(process_id: &str) -> ExecParams {
 
 fn exec_params_with_argv(process_id: &str, argv: Vec<String>) -> ExecParams {
     ExecParams {
+        metadata: Default::default(),
         process_id: ProcessId::from(process_id),
         argv,
         cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
@@ -116,8 +117,8 @@ async fn duplicate_process_ids_allow_only_one_successful_start() {
     let second_handler = Arc::clone(&handler);
 
     let (first, second) = tokio::join!(
-        first_handler.exec(exec_params("proc-1")),
-        second_handler.exec(exec_params("proc-1")),
+        first_handler.exec(exec_params("proc-1"), /*launch_context*/ None),
+        second_handler.exec(exec_params("proc-1"), /*launch_context*/ None),
     );
 
     let (successes, failures): (Vec<_>, Vec<_>) =
@@ -141,7 +142,7 @@ async fn duplicate_process_ids_allow_only_one_successful_start() {
 async fn terminate_reports_false_after_process_exit() {
     let handler = initialized_handler().await;
     handler
-        .exec(exec_params("proc-1"))
+        .exec(exec_params("proc-1"), /*launch_context*/ None)
         .await
         .expect("start process");
 
@@ -188,10 +189,13 @@ async fn long_poll_read_fails_after_session_resume() {
     // Keep the process quiet and alive so the pending read can only complete
     // after session resume, not because the process produced output or exited.
     first_handler
-        .exec(exec_params_with_argv(
-            "proc-long-poll",
-            shell_argv("sleep 5", "ping -n 6 127.0.0.1 >NUL"),
-        ))
+        .exec(
+            exec_params_with_argv(
+                "proc-long-poll",
+                shell_argv("sleep 5", "ping -n 6 127.0.0.1 >NUL"),
+            ),
+            /*launch_context*/ None,
+        )
         .await
         .expect("start process");
 
@@ -306,13 +310,16 @@ async fn output_and_exit_are_retained_after_notification_receiver_closes() {
 
     let process_id = ProcessId::from("proc-notification-fail");
     handler
-        .exec(exec_params_with_argv(
-            process_id.as_str(),
-            shell_argv(
-                "sleep 0.05; printf 'first\\n'; sleep 0.05; printf 'second\\n'",
-                "echo first&& ping -n 2 127.0.0.1 >NUL&& echo second",
+        .exec(
+            exec_params_with_argv(
+                process_id.as_str(),
+                shell_argv(
+                    "sleep 0.05; printf 'first\\n'; sleep 0.05; printf 'second\\n'",
+                    "echo first&& ping -n 2 127.0.0.1 >NUL&& echo second",
+                ),
             ),
-        ))
+            /*launch_context*/ None,
+        )
         .await
         .expect("start process");
 
@@ -324,7 +331,10 @@ async fn output_and_exit_are_retained_after_notification_receiver_closes() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     handler
-        .exec(exec_params(process_id.as_str()))
+        .exec(
+            exec_params(process_id.as_str()),
+            /*launch_context*/ None,
+        )
         .await
         .expect("process id should be reusable after exit retention");
 

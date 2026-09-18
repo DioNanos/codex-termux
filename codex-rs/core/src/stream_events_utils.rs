@@ -412,6 +412,7 @@ pub(crate) async fn handle_non_tool_response_item(
         ResponseItem::WebSearchCall { .. } => "web_search_call",
         ResponseItem::ImageGenerationCall { .. } => "image_generation_call",
         ResponseItem::Compaction { .. } => "compaction",
+        ResponseItem::ConfigurationUpdate { .. } => "configuration_update",
         ResponseItem::CompactionTrigger { .. } => "compaction_trigger",
         ResponseItem::ContextCompaction { .. } => "context_compaction",
         ResponseItem::Other => "other",

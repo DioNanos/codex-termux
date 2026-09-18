@@ -1,0 +1,5 @@
+---
+source: tui/src/chatwidget/tests/app_server.rs
+expression: "cells.iter().map(|lines| lines_to_single_string(lines)).collect::<String>()"
+---
+⚠ Invalid configuration; using defaults.: Check the project configuration.

@@ -2,6 +2,51 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn external_writer_snapshot_freezes_active_command_and_mcp_rows() {
+    let mut rendered = Vec::new();
+    for active_mcp in [false, true] {
+        let (mut chat, _events, _operations) =
+            make_chatwidget_manual(/*model_override*/ None).await;
+        chat.on_task_started();
+        if active_mcp {
+            chat.transcript.active_cell = Some(Box::new(history_cell::new_active_mcp_tool_call(
+                "mcp-running".to_string(),
+                McpInvocation {
+                    server: "server".to_string(),
+                    tool: "tool".to_string(),
+                    arguments: None,
+                },
+                /*animations_enabled*/ true,
+            )));
+        } else {
+            begin_exec(&mut chat, "call-running", "sleep 5");
+        }
+
+        chat.show_external_writer_thread();
+
+        assert!(!chat.is_task_running_for_test());
+        let cell = chat
+            .transcript
+            .active_cell
+            .as_ref()
+            .expect("active tool row");
+        rendered.push(lines_to_single_string(&cell.display_lines(/*width*/ 80)));
+        if active_mcp {
+            assert!(cell.transcript_animation_tick().is_none());
+        } else {
+            assert!(
+                !cell
+                    .as_any()
+                    .downcast_ref::<ExecCell>()
+                    .expect("active command row")
+                    .animations_enabled()
+            );
+        }
+    }
+    insta::assert_snapshot!(rendered.join("\n---\n"));
+}
+
+#[tokio::test]
 async fn replayed_command_completion_preserves_tracking_without_duplicate_starts() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();

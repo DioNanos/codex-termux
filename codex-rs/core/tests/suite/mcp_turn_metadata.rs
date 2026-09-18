@@ -8,7 +8,6 @@ use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_protocol::approvals::ElicitationRequest;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
@@ -528,6 +527,10 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request(
     let mcp_turn_metadata = apps_tool_call
         .pointer("/params/_meta/x-codex-turn-metadata")
         .expect("MCP tools/call turn metadata");
+    assert_eq!(
+        mcp_turn_metadata["codex_version"],
+        env!("CARGO_PKG_VERSION")
+    );
     assert_eq!(
         (
             mcp_turn_metadata.get("root_turn_id"),
@@ -1229,7 +1232,7 @@ async fn apps_default_writes_prompts_for_writes_but_not_reads() -> Result<()> {
     let persisted_hints = tokio::fs::read_to_string(rollout_path)
         .await?
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<serde_json::Result<Vec<_>>>()?
         .into_iter()
         .filter_map(|line| match line.item {

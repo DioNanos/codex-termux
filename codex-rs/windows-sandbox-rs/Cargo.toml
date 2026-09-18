@@ -18,6 +18,10 @@ path = "src/bin/setup_main/main.rs"
 name = "codex-command-runner"
 path = "src/bin/command_runner/main.rs"
 
+[[bin]]
+name = "codex-windows-managed-deny-probe"
+path = "src/bin/managed_deny_probe/main.rs"
+
 [lints]
 workspace = true
 
@@ -74,6 +78,7 @@ features = [
     "Win32_System_Memory",
     "Win32_System_Kernel",
     "Win32_System_Console",
+    "Win32_System_RemoteDesktop",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_NetworkManagement_NetManagement",
@@ -89,6 +94,7 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_System_Registry",
+    "Win32_System_Services",
 ]
 version = "0.52"
 

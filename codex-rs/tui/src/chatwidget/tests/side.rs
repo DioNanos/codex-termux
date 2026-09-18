@@ -302,7 +302,7 @@ async fn slash_side_requests_forked_side_question_while_task_running() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let parent_thread_id = ThreadId::new();
     chat.thread_id = Some(parent_thread_id);
-    chat.config.tui_status_line = Some(vec!["model-with-reasoning".to_string()]);
+    chat.local_settings.tui.status_line = Some(vec!["model-with-reasoning".to_string()]);
     chat.refresh_status_line();
     chat.on_task_started();
     chat.show_welcome_banner = false;
@@ -385,7 +385,7 @@ async fn slash_btw_requests_forked_side_question_while_task_running() {
 async fn side_context_label_preserves_status_line_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.show_welcome_banner = false;
-    chat.config.tui_status_line = Some(vec!["model-name".to_string()]);
+    chat.local_settings.tui.status_line = Some(vec!["model-name".to_string()]);
     chat.refresh_status_line();
     chat.set_side_conversation_active(/*active*/ true);
     chat.set_side_conversation_context_label(Some(
@@ -427,7 +427,7 @@ async fn side_context_label_shows_parent_status_snapshot() {
 async fn side_context_label_shows_hidden_side_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.show_welcome_banner = false;
-    chat.config.tui_status_line = Some(vec!["model-name".to_string()]);
+    chat.local_settings.tui.status_line = Some(vec!["model-name".to_string()]);
     chat.refresh_status_line();
     chat.set_side_conversation_context_label(Some("ctrl + / for side".to_string()));
 

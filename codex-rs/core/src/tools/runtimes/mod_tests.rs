@@ -494,12 +494,12 @@ fn maybe_wrap_shell_lc_with_snapshot_restores_explicit_override_precedence() {
 }
 
 #[test]
-fn maybe_wrap_shell_lc_with_snapshot_restores_codex_thread_id_from_env() {
+fn maybe_wrap_shell_lc_with_snapshot_restores_codex_metadata_from_env() {
     let dir = tempdir().expect("create temp dir");
     let snapshot_path = dir.path().join("snapshot.sh");
     std::fs::write(
         &snapshot_path,
-        "# Snapshot file\nexport CODEX_THREAD_ID='parent-thread'\n",
+        "# Snapshot file\nexport CODEX_THREAD_ID='parent-thread'\nexport CODEX_VERSION='old-version'\n",
     )
     .expect("write snapshot");
     let (session_shell, shell_snapshot) =
@@ -507,24 +507,34 @@ fn maybe_wrap_shell_lc_with_snapshot_restores_codex_thread_id_from_env() {
     let command = vec![
         "/bin/bash".to_string(),
         "-lc".to_string(),
-        "printf '%s' \"$CODEX_THREAD_ID\"".to_string(),
+        "printf '%s|%s' \"$CODEX_THREAD_ID\" \"$CODEX_VERSION\"".to_string(),
     ];
+    let env = HashMap::from([
+        ("CODEX_THREAD_ID".to_string(), "nested-thread".to_string()),
+        (
+            "CODEX_VERSION".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ),
+    ]);
     let rewritten = maybe_wrap_shell_lc_with_snapshot(
         &command,
         &session_shell,
         Some(&shell_snapshot),
         &HashMap::new(),
-        &HashMap::from([("CODEX_THREAD_ID".to_string(), "nested-thread".to_string())]),
+        &env,
         &RuntimePathPrepends::default(),
     );
     let output = Command::new(&rewritten[0])
         .args(&rewritten[1..])
-        .env("CODEX_THREAD_ID", "nested-thread")
+        .envs(env)
         .output()
         .expect("run rewritten command");
 
     assert!(output.status.success(), "command failed: {output:?}");
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "nested-thread");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!("nested-thread|", env!("CARGO_PKG_VERSION")),
+    );
 }
 
 #[test]

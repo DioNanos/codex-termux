@@ -203,6 +203,7 @@ async fn transport_provided_bearer_token_avoids_placeholder_headers_and_redirect
         /*auth_provider*/ None,
         McpProtocolMode::Legacy,
         StreamableHttpRedirectMode::AgentPluginV1,
+        codex_rmcp_client::McpOAuthRefreshMode::Legacy,
     )
     .await?;
 
@@ -267,7 +268,8 @@ async fn auto_store_remains_pinned_across_session_recovery_child() -> anyhow::Re
         &file_tokens,
         OAuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::Direct,
-    )?;
+    )
+    .await?;
     let file_snapshot = stored_oauth_credential_snapshot(
         SERVER_NAME,
         &server_url,
@@ -281,13 +283,15 @@ async fn auto_store_remains_pinned_across_session_recovery_child() -> anyhow::Re
         &keyring_tokens,
         OAuthCredentialsStoreMode::Auto,
         AuthKeyringBackendKind::Direct,
-    )?;
+    )
+    .await?;
     save_oauth_tokens(
         SERVER_NAME,
         &file_tokens,
         OAuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::Direct,
-    )?;
+    )
+    .await?;
     assert_eq!(
         file_snapshot.reload(
             SERVER_NAME,

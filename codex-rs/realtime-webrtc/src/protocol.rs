@@ -1,4 +1,4 @@
-//! Bounded, same-build lifecycle protocol; this stage carries no audio or credentials.
+//! Bounded same-build controls and redacted signaling; audio never crosses this pipe.
 
 use std::io;
 use std::io::Read;
@@ -6,7 +6,64 @@ use std::io::Read;
 use serde::Deserialize;
 use serde::Serialize;
 
-pub const MAX_FRAME_BYTES: usize = 256;
+pub const MAX_FRAME_BYTES: usize = 128 * 1024;
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioControls {
+    pub microphone_muted: bool,
+    pub speaker_suppressed: bool,
+}
+
+/// Peaks contain levels only, never retained audio or backend messages.
+#[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioState {
+    pub microphone_peak: u16,
+    pub speaker_peak: u16,
+}
+
+/// SDP contains ICE credentials. Bound it at construction and never expose it in diagnostics.
+#[derive(Deserialize, PartialEq, Serialize)]
+#[serde(try_from = "String")]
+pub struct SessionDescription(String);
+
+impl TryFrom<String> for SessionDescription {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.is_empty() || value.len() > 64 * 1024 {
+            return Err("invalid voice session description length");
+        }
+        Ok(Self(value))
+    }
+}
+
+impl std::fmt::Debug for SessionDescription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionDescription([REDACTED])")
+    }
+}
+
+impl SessionDescription {
+    pub fn into_sdp(self) -> String {
+        self.0
+    }
+}
+
+/// Fixed child settings prevent native initialization from scanning system plugins or caches.
+pub const RUNTIME_ENVIRONMENT: [(&str, &str); 7] = [
+    ("GST_PLUGIN_PATH", ""),
+    ("GST_PLUGIN_PATH_1_0", ""),
+    ("GST_PLUGIN_SYSTEM_PATH", ""),
+    ("GST_PLUGIN_SYSTEM_PATH_1_0", ""),
+    (
+        "GST_REGISTRY",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    ),
+    ("GST_REGISTRY_UPDATE", "no"),
+    ("GST_REGISTRY_FORK", "no"),
+];
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 #[serde(
@@ -18,9 +75,25 @@ pub const MAX_FRAME_BYTES: usize = 256;
 pub enum Message {
     Hello { protocol: u32, build_commit: String },
     Ready {},
+    InitializeRuntime {},
+    RuntimeReady {},
+    StartTransport {},
+    Offer { sdp: SessionDescription },
+    ApplyAnswer { sdp: SessionDescription },
+    TransportReady {},
+    OpenDevices {},
+    DevicesOpened {},
+    SetAudioControls { controls: AudioControls },
+    AudioControlsApplied {},
+    InspectAudio {},
+    AudioState { state: AudioState },
     Close {},
     Closed {},
 }
+
+#[cfg(test)]
+#[path = "protocol_tests.rs"]
+mod tests;
 
 pub fn encode_frame(message: &Message) -> io::Result<Vec<u8>> {
     let payload = serde_json::to_vec(message)?;

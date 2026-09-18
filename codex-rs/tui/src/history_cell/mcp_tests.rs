@@ -28,6 +28,7 @@ fn mcp_inventory_connection_states() {
         plugin_id: None,
         server_info: None,
         tools: HashMap::new(),
+        tools_error: None,
         resources: Vec::new(),
         resource_templates: Vec::new(),
         auth_status: McpAuthStatus::Unknown,

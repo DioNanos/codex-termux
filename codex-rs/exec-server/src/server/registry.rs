@@ -1,3 +1,4 @@
+use opentelemetry::trace::TraceContextExt;
 use std::sync::Arc;
 
 use crate::protocol::CAPABILITY_ROOTS_DISCOVER_METHOD;
@@ -68,9 +69,15 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
             handler.http_request(request_id, params).await
         },
     );
-    router.request(
+    router.request_with_trace(
         EXEC_METHOD,
-        |handler: Arc<ExecServerHandler>, params: ExecParams| async move { handler.exec(params).await },
+        |handler: Arc<ExecServerHandler>, params: ExecParams, trace| async move {
+            let launch_context = trace
+                .as_ref()
+                .and_then(codex_otel::context_from_w3c_trace_context)
+                .map(|context| context.span().span_context().clone());
+            handler.exec(params, launch_context).await
+        },
     );
     router.request(
         ENVIRONMENT_INFO_METHOD,

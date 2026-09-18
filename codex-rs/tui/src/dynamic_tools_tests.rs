@@ -90,6 +90,7 @@ async fn test_server() -> color_eyre::Result<(TempDir, AppServerSession, String,
         .to_string();
     server
         .resume_thread(
+            &crate::local_settings::LocalSettings::from(&config),
             config,
             ThreadId::from_string(&target)?,
             ResumeModelSettings::RestoreFromThread,

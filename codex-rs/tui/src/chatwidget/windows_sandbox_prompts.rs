@@ -29,7 +29,7 @@ impl ChatWidget {
     #[cfg(target_os = "windows")]
     pub(crate) fn world_writable_warning_details(&self) -> Option<(Vec<String>, usize, bool)> {
         if self
-            .config
+            .local_settings
             .notices
             .hide_world_writable_warning
             .unwrap_or(false)
@@ -91,7 +91,7 @@ impl ChatWidget {
                 "Full Access mode"
             } else if profile
                 .file_system_sandbox_policy()
-                .can_write_path_with_cwd(self.config.cwd.as_path(), self.config.cwd.as_path())
+                .can_write_local_path_with_cwd(self.config.cwd.as_path(), self.config.cwd.as_path())
             {
                 "Agent mode"
             } else {

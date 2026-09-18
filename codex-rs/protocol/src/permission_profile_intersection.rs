@@ -143,9 +143,9 @@ pub fn intersect_effective_permission_profiles(
         policy.entries.retain(|entry| entry.path != tmpdir);
     }
 
-    let authority_denies = ReadDenyMatcher::try_new(&authority_policy, cwd)
+    let authority_denies = ReadDenyMatcher::try_new_for_local_paths(&authority_policy, cwd)
         .map_err(PermissionIntersectionError::UnsupportedPath)?;
-    let requested_denies = ReadDenyMatcher::try_new(&requested_policy, cwd)
+    let requested_denies = ReadDenyMatcher::try_new_for_local_paths(&requested_policy, cwd)
         .map_err(PermissionIntersectionError::UnsupportedPath)?;
     let sources = [
         (&authority_policy, authority_denies.as_ref()),
@@ -214,7 +214,8 @@ pub fn intersect_effective_permission_profiles(
     denies.sort_by_cached_key(|entry| format!("{:?}", entry.path));
     let mut intersection = FileSystemSandboxPolicy::restricted(denies);
     intersection.glob_scan_max_depth = glob_depth.flatten();
-    let intersection_denies = ReadDenyMatcher::new(&intersection, cwd);
+    let intersection_denies = ReadDenyMatcher::try_new_for_local_paths(&intersection, cwd)
+        .map_err(PermissionIntersectionError::UnsupportedPath)?;
 
     for path in paths {
         let [left, right] =
@@ -395,11 +396,11 @@ fn effective_access(
     path: &Path,
     cwd: &Path,
 ) -> FileSystemAccessMode {
-    if denies.is_some_and(|matcher| matcher.is_read_denied(path)) {
+    if denies.is_some_and(|matcher| matcher.is_local_path_read_denied(path)) {
         FileSystemAccessMode::Deny
-    } else if policy.can_write_path_with_cwd(path, cwd) {
+    } else if policy.can_write_local_path_with_cwd(path, cwd) {
         FileSystemAccessMode::Write
-    } else if policy.can_read_path_with_cwd(path, cwd) {
+    } else if policy.can_read_local_path_with_cwd(path, cwd) {
         FileSystemAccessMode::Read
     } else {
         FileSystemAccessMode::Deny

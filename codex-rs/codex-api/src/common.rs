@@ -94,9 +94,16 @@ pub struct MemorySummarizeOutput {
     pub memory_summary: String,
 }
 
+/// The server response currently being handled, shared with tool-review extensions.
+#[derive(Clone, Debug)]
+pub struct ResponseId(pub String);
+
 #[derive(Debug)]
 pub enum ResponseEvent {
-    Created,
+    Created {
+        /// Existing server response ID, when supplied by the stream.
+        response_id: Option<String>,
+    },
     SafetyBuffering(SafetyBuffering),
     OutputItemDone(ResponseItem),
     OutputItemAdded(ResponseItem),

@@ -23,6 +23,8 @@ use codex_agent_graph_store::LocalAgentGraphStore;
 use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::TurnStatus;
+use codex_attachment_store::AttachmentStore;
+use codex_attachment_store::InlineAttachmentStore;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::DisabledCodeModeSessionProvider;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
@@ -355,6 +357,7 @@ pub(crate) struct ThreadManagerState {
     code_mode_session_provider: Arc<dyn CodeModeSessionProvider>,
     extensions: Arc<ExtensionRegistry<Config>>,
     user_instructions_provider: Arc<dyn UserInstructionsProvider>,
+    image_store: Arc<dyn AttachmentStore>,
     thread_store: Arc<dyn ThreadStore>,
     agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
@@ -414,6 +417,11 @@ pub fn thread_store_from_config(
     }
 }
 
+/// Constructs the default image store that preserves inline images.
+pub fn passthrough_image_store() -> Arc<dyn AttachmentStore> {
+    Arc::new(InlineAttachmentStore)
+}
+
 /// Construct the default SQLite-backed agent graph store when local state is available.
 pub fn local_agent_graph_store_from_state_db(
     state_db: Option<&StateDbHandle>,
@@ -435,6 +443,7 @@ impl ThreadManager {
         extensions: Arc<ExtensionRegistry<Config>>,
         user_instructions_provider: Arc<dyn UserInstructionsProvider>,
         analytics_events_client: Option<AnalyticsEventsClient>,
+        image_store: Arc<dyn AttachmentStore>,
         thread_store: Arc<dyn ThreadStore>,
         agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
         installation_id: String,
@@ -483,6 +492,7 @@ impl ThreadManager {
                 code_mode_session_provider,
                 extensions,
                 user_instructions_provider,
+                image_store,
                 thread_store,
                 agent_graph_store,
                 attestation_provider,
@@ -633,6 +643,7 @@ impl ThreadManager {
                 user_instructions_provider: Arc::new(
                     crate::test_support::EmptyUserInstructionsProvider,
                 ),
+                image_store: passthrough_image_store(),
                 thread_store,
                 agent_graph_store,
                 attestation_provider: None,
@@ -670,6 +681,10 @@ impl ThreadManager {
 
     pub fn environment_manager(&self) -> Arc<EnvironmentManager> {
         self.state.environment_manager.clone()
+    }
+
+    pub fn image_store(&self) -> Arc<dyn AttachmentStore> {
+        Arc::clone(&self.state.image_store)
     }
 
     /// Starts the local rollout migration path after a runtime feature enablement.
@@ -945,7 +960,35 @@ impl ThreadManager {
     pub async fn spawn_internal_session(
         &self,
         parent_thread_id: ThreadId,
+        options: StartThreadOptions,
+    ) -> CodexResult<NewThread> {
+        self.spawn_internal_session_with_history(parent_thread_id, options, InitialHistory::New)
+            .await
+    }
+
+    /// Starts an internal session from an explicitly selected, committed history.
+    ///
+    /// The caller selects the history; this never reads an in-flight parent turn or
+    /// appends an interruption marker. Authentication and budget still come from the parent.
+    pub async fn fork_internal_session(
+        &self,
+        parent_thread_id: ThreadId,
+        options: StartThreadOptions,
+        history: Vec<RolloutItem>,
+    ) -> CodexResult<NewThread> {
+        self.spawn_internal_session_with_history(
+            parent_thread_id,
+            options,
+            InitialHistory::Forked(history),
+        )
+        .await
+    }
+
+    async fn spawn_internal_session_with_history(
+        &self,
+        parent_thread_id: ThreadId,
         mut options: StartThreadOptions,
+        history: InitialHistory,
     ) -> CodexResult<NewThread> {
         if !matches!(options.session_source, Some(SessionSource::Internal(_))) {
             return Err(CodexErr::InvalidRequest(
@@ -953,13 +996,15 @@ impl ThreadManager {
             ));
         }
         let parent = self.get_thread(parent_thread_id).await?;
-        options.initial_history = InitialHistory::New;
+        let forked_from_thread_id = history.forked_from_id();
+        options.initial_history = history;
         let mut request = ThreadSpawnRequest::new(
             options,
             Arc::clone(&parent.session.services.auth_manager),
             parent.session.services.agent_control.clone(),
         );
         request.parent_thread_id = Some(parent_thread_id);
+        request.forked_from_thread_id = forked_from_thread_id;
         Box::pin(self.state.spawn_thread(request)).await
     }
 

@@ -322,6 +322,9 @@ impl ChatWidget {
         turn_id: &str,
         from_replay: bool,
     ) {
+        if !from_replay && let Some(questions) = &item.questions {
+            self.add_async_questions(&item.id, questions);
+        }
         self.transcript.last_completed_agent_message = Some((turn_id.to_string(), item.id.clone()));
         let mut message = String::new();
         for content in &item.content {
@@ -330,7 +333,28 @@ impl ChatWidget {
             }
         }
         let parsed = parse_assistant_markdown(&message, self.config.cwd.as_path());
-        self.finalize_completed_assistant_message(Some(parsed.visible_markdown.as_str()));
+        if from_replay && self.stream_controller.is_none() && !parsed.visible_markdown.is_empty() {
+            self.prepare_assistant_message();
+            self.mark_safety_buffering_agent_message_started();
+            self.bottom_pane.hide_status_indicator();
+            let context = self.thread_id.and_then(|thread_id| {
+                crate::inline_visualization::InlineVisualizationContext::from_config(
+                    &self.config,
+                    thread_id,
+                )
+            });
+            self.add_to_history(
+                history_cell::AgentMarkdownCell::new_with_inline_visualizations(
+                    parsed.visible_markdown.clone(),
+                    self.config.cwd.as_path(),
+                    context,
+                ),
+            );
+            self.handle_stream_finished();
+            self.request_redraw();
+        } else {
+            self.finalize_completed_assistant_message(Some(parsed.visible_markdown.as_str()));
+        }
         if matches!(item.phase, Some(MessagePhase::FinalAnswer) | None)
             && !parsed.visible_markdown.is_empty()
         {
@@ -357,11 +381,14 @@ impl ChatWidget {
                 }
             });
         }
-        self.status_state.pending_status_indicator_restore = match item.phase {
-            // Models that don't support preambles only output AgentMessageItems on turn completion.
-            Some(MessagePhase::FinalAnswer) | None => !self.input_queue.pending_steers.is_empty(),
-            Some(MessagePhase::Commentary) => true,
-        };
+        self.status_state.pending_status_indicator_restore = item.questions.is_some()
+            || match item.phase {
+                // Models that don't support preambles only output AgentMessageItems on turn completion.
+                Some(MessagePhase::FinalAnswer) | None => {
+                    !self.input_queue.pending_steers.is_empty()
+                }
+                Some(MessagePhase::Commentary) => true,
+            };
         self.maybe_restore_status_indicator_after_stream_idle();
     }
 
@@ -453,20 +480,7 @@ impl ChatWidget {
             self.mark_safety_buffering_agent_message_started();
         }
         if self.stream_controller.is_none() {
-            // Before starting an agent stream, flush any active exec cell group.
-            self.flush_unified_exec_wait_streak();
-            self.flush_active_cell();
-            // If the previous turn inserted non-stream history (exec output, patch status, MCP
-            // calls), render a separator before starting the next streamed assistant message.
-            if self.transcript.needs_final_message_separator && self.transcript.had_work_activity {
-                self.add_to_history(history_cell::FinalMessageSeparator::new(
-                    /*elapsed_seconds*/ None, /*runtime_metrics*/ None,
-                ));
-                self.transcript.needs_final_message_separator = false;
-            } else if self.transcript.needs_final_message_separator {
-                // Reset the flag even if we don't show separator (no work was done)
-                self.transcript.needs_final_message_separator = false;
-            }
+            self.prepare_assistant_message();
             let inline_visualization_context = self.thread_id.and_then(|thread_id| {
                 crate::inline_visualization::InlineVisualizationContext::from_config(
                     &self.config,

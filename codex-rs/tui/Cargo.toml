@@ -22,6 +22,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+codex-build-info = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true, default-features = false, features = ["http1", "tokio"] }
 base64 = { workspace = true }
@@ -34,6 +35,7 @@ codex-arg0 = { workspace = true }
 codex-install-context = { workspace = true }
 codex-cloud-config = { workspace = true }
 codex-config = { workspace = true }
+codex-context-fragments = { workspace = true }
 codex-connectors = { workspace = true }
 codex-core-plugins = { workspace = true }
 codex-history = { workspace = true }
@@ -56,7 +58,9 @@ codex-sandboxing = { workspace = true }
 codex-shell-command = { workspace = true }
 codex-state = { workspace = true }
 codex-terminal-detection = { workspace = true }
+codex-worktree = { workspace = true }
 codex-utils-approval-presets = { workspace = true }
+codex-uds = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-cli = { workspace = true }
 codex-utils-elapsed = { workspace = true }
@@ -79,7 +83,7 @@ image = { workspace = true, features = ["jpeg", "png", "gif", "webp"] }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 pathdiff = { workspace = true }
-pulldown-cmark = { workspace = true }
+pulldown-cmark = { workspace = true, features = ["html"] }
 rand = { workspace = true }
 ratatui = { workspace = true, features = [
     "scrolling-regions",

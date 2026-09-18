@@ -77,9 +77,9 @@ pub(super) fn build(
     };
     let trusted_user_answers = input
         .thread_store
-        .get::<GuardianReviewEvidence>()
-        .map(|evidence| evidence.user_input_fragments(input.conversation_history.as_ref()))
-        .unwrap_or_default();
+        .get_or_init(GuardianReviewEvidence::default)
+        .user_input_snapshot(input.conversation_history.as_ref())
+        .fragments;
     let node_repl_inputs = input
         .thread_store
         .get::<NodeReplReviewEvidence>()

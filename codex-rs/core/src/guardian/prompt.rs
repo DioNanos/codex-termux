@@ -13,11 +13,7 @@ use codex_guardian_context::TranscriptEntryLimits;
 use codex_guardian_context::TranscriptRetentionConfig;
 use codex_guardian_context::default_registry;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::GuardianRiskLevel;
-use codex_protocol::protocol::GuardianUserAuthorization;
 use codex_protocol::user_input::UserInput;
-use serde::Deserialize;
-use serde_json::Value;
 
 use crate::context::GuardianReviewEvidence;
 use crate::context::NodeReplReviewEvidence;
@@ -38,7 +34,6 @@ use super::GUARDIAN_MAX_TOOL_ENTRY_TOKENS;
 use super::GUARDIAN_MAX_TOOL_TRANSCRIPT_TOKENS;
 use super::GUARDIAN_RECENT_ENTRY_LIMIT;
 use super::GuardianApprovalRequest;
-use super::GuardianAssessment;
 use super::GuardianReviewContext;
 use super::approval_request::format_guardian_action_pretty;
 
@@ -87,6 +82,7 @@ pub(crate) async fn build_guardian_prompt_items(
 ) -> anyhow::Result<GuardianPromptItems> {
     build_guardian_prompt_items_with_parent_turn(
         session,
+        session.conversation_history_snapshot().await.as_ref(),
         /*parent_context*/ None,
         ApprovalRequestReasons {
             approval: None,
@@ -101,6 +97,7 @@ pub(crate) async fn build_guardian_prompt_items(
 
 pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     session: &Session,
+    history: &dyn ConversationHistorySnapshot,
     parent_context: Option<&GuardianReviewContext>,
     reasons: ApprovalRequestReasons,
     request: GuardianApprovalRequest,
@@ -116,7 +113,6 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     } else {
         GUARDIAN_MAX_TOOL_ENTRY_TOKENS
     };
-    let history = session.conversation_history_snapshot().await;
     let root_authorization = session
         .services
         .agent_control
@@ -126,14 +122,14 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     let trusted_user_inputs = session
         .services
         .thread_extension_data
-        .get::<GuardianReviewEvidence>()
-        .map(|evidence| evidence.user_input_fragments(history.as_ref()))
-        .unwrap_or_default();
+        .get_or_init(GuardianReviewEvidence::default)
+        .user_input_snapshot(history)
+        .fragments;
     let ComposedContext {
         authorization,
         transcript: transcript_entries,
     } = collect_guardian_context(
-        &GuardianReviewHistory(history.as_ref()),
+        &GuardianReviewHistory(history),
         node_repl_result_token_limit,
         root_authorization.as_deref().unwrap_or_default(),
         &trusted_user_inputs,
@@ -496,6 +492,10 @@ pub(super) fn collect_guardian_context(
 struct GuardianReviewHistory<'a>(&'a dyn ConversationHistorySnapshot);
 
 impl SectionHistory for GuardianReviewHistory<'_> {
+    fn retained_context(&self) -> Option<&codex_history::RetainedContext> {
+        self.0.retained_context()
+    }
+
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
         self.0.review_items()
     }
@@ -504,6 +504,10 @@ impl SectionHistory for GuardianReviewHistory<'_> {
 struct FilteredGuardianHistory<'a>(&'a dyn SectionHistory);
 
 impl SectionHistory for FilteredGuardianHistory<'_> {
+    fn retained_context(&self) -> Option<&codex_history::RetainedContext> {
+        self.0.retained_context()
+    }
+
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
         Box::new(self.0.items().filter(|item| {
             !matches!(
@@ -522,106 +526,8 @@ pub(crate) fn guardian_truncate_text(content: &str, token_cap: usize) -> (String
     )
 }
 
-/// The model is asked for strict JSON, but we still accept a surrounding prose
-/// wrapper so transient formatting drift fails less noisily during dogfooding.
-/// Non-JSON output is still a review failure; this is only a thin recovery path
-/// for cases where the model wrapped the JSON in extra prose.
-pub(crate) fn parse_guardian_assessment(text: Option<&str>) -> anyhow::Result<GuardianAssessment> {
-    let Some(text) = text else {
-        anyhow::bail!("guardian review completed without an assessment payload");
-    };
-    let parsed_payload =
-        if let Ok(payload) = serde_json::from_str::<GuardianAssessmentPayload>(text) {
-            payload
-        } else if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}'))
-            && start < end
-            && let Some(slice) = text.get(start..=end)
-        {
-            serde_json::from_str::<GuardianAssessmentPayload>(slice)?
-        } else {
-            anyhow::bail!("guardian assessment was not valid JSON");
-        };
-
-    let outcome = parsed_payload.outcome;
-    let risk_level = parsed_payload.risk_level.unwrap_or(match outcome {
-        super::GuardianAssessmentOutcome::Allow => GuardianRiskLevel::Low,
-        super::GuardianAssessmentOutcome::Deny => GuardianRiskLevel::High,
-    });
-    let rationale = parsed_payload
-        .rationale
-        .filter(|rationale| !rationale.trim().is_empty())
-        .unwrap_or_else(|| match outcome {
-            super::GuardianAssessmentOutcome::Allow => {
-                "Auto-review returned a low-risk allow decision.".to_string()
-            }
-            super::GuardianAssessmentOutcome::Deny => {
-                "Auto-review returned a deny decision without a rationale.".to_string()
-            }
-        });
-
-    Ok(GuardianAssessment {
-        risk_level,
-        user_authorization: parsed_payload
-            .user_authorization
-            .unwrap_or(GuardianUserAuthorization::Unknown),
-        outcome,
-        rationale,
-    })
-}
-
-#[derive(Deserialize)]
-struct GuardianAssessmentPayload {
-    risk_level: Option<GuardianRiskLevel>,
-    user_authorization: Option<GuardianUserAuthorization>,
-    outcome: super::GuardianAssessmentOutcome,
-    rationale: Option<String>,
-}
-
-/// JSON schema supplied as `final_output_json_schema` to guide a structured
-/// final answer from the guardian review session.
-///
-/// Keep this next to `guardian_output_contract_prompt()` so the prompt text and
-/// output schema stay aligned.
-pub(crate) fn guardian_output_schema() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "risk_level": {
-                "type": "string",
-                "enum": ["low", "medium", "high", "critical"]
-            },
-            "user_authorization": {
-                "type": "string",
-                "enum": ["unknown", "low", "medium", "high"]
-            },
-            "outcome": {
-                "type": "string",
-                "enum": ["allow", "deny"]
-            },
-            "rationale": {
-                "type": "string"
-            }
-        },
-        "required": ["outcome"]
-    })
-}
-
-/// Prompt fragment that describes the exact JSON contract paired with
-/// `guardian_output_schema()`.
-fn guardian_output_contract_prompt() -> &'static str {
-    r#"You may use read-only tool checks to gather any additional context you need before deciding. When you are ready to answer, your final message must be strict JSON.
-
-For low-risk actions, give the final answer directly: {"outcome":"allow"}.
-
-For anything else, use this JSON schema:
-{
-  "risk_level": "low" | "medium" | "high" | "critical",
-  "user_authorization": "unknown" | "low" | "medium" | "high",
-  "outcome": "allow" | "deny",
-  "rationale": string
-}"#
-}
+use super::assessment::guardian_output_contract_prompt;
+pub use super::assessment::parse_guardian_assessment;
 
 pub(crate) const BUNDLED_GUARDIAN_POLICY: &str = include_str!("../../assets/guardian/policy.md");
 pub(crate) const BUNDLED_GUARDIAN_POLICY_TEMPLATE: &str =

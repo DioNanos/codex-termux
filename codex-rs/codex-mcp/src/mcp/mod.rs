@@ -459,6 +459,7 @@ pub async fn read_mcp_resource(
 pub struct McpServerStatusSnapshot {
     pub server_infos: HashMap<String, McpServerInfo>,
     pub tools_by_server: HashMap<String, HashMap<String, Tool>>,
+    pub tools_errors: HashMap<String, String>,
     pub resources: HashMap<String, Vec<Resource>>,
     pub resource_templates: HashMap<String, Vec<ResourceTemplate>>,
     pub auth_statuses: HashMap<String, McpAuthStatus>,
@@ -479,6 +480,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         return McpServerStatusSnapshot {
             server_infos: HashMap::new(),
             tools_by_server: HashMap::new(),
+            tools_errors: HashMap::new(),
             resources: HashMap::new(),
             resource_templates: HashMap::new(),
             auth_statuses: HashMap::new(),
@@ -761,10 +763,10 @@ async fn collect_mcp_server_status_snapshot_from_manager(
     server_names: Vec<String>,
     detail: McpSnapshotDetail,
 ) -> McpServerStatusSnapshot {
-    let ((server_infos, tools), resources, resource_templates) = tokio::join!(
+    let ((server_infos, (tools, tools_errors)), resources, resource_templates) = tokio::join!(
         async {
             let server_infos = mcp_connection_manager.list_available_server_infos().await;
-            let tools = mcp_connection_manager.list_all_tools().await;
+            let tools = mcp_connection_manager.list_tools_with_errors().await;
             (server_infos, tools)
         },
         async {
@@ -801,6 +803,7 @@ async fn collect_mcp_server_status_snapshot_from_manager(
     McpServerStatusSnapshot {
         server_infos,
         tools_by_server,
+        tools_errors,
         resources: convert_mcp_resources(resources),
         resource_templates: convert_mcp_resource_templates(resource_templates),
         auth_statuses: auth_statuses_from_entries(&auth_status_entries),

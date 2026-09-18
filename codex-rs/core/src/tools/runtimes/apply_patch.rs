@@ -109,6 +109,7 @@ impl ApplyPatchRuntime {
             windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
             windows_sandbox_proxy_settings_mode: None,
             use_legacy_landlock: attempt.use_legacy_landlock,
+            sandbox_unavailable_by_construction: cfg!(target_os = "android"),
         })
     }
 }

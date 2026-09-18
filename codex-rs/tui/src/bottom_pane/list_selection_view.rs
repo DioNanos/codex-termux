@@ -183,6 +183,8 @@ pub(crate) struct SelectionViewParams {
     /// Rendered left-column width to use for auto-sized rows.
     pub name_column_width: Option<usize>,
     pub header: Box<dyn Renderable>,
+    /// Blank rows after the header; defaults to one. Inline banners use zero.
+    pub header_gap: u16,
     pub initial_selected_idx: Option<usize>,
 
     /// Rich content rendered beside (wide terminals) or below (narrow terminals)
@@ -234,6 +236,7 @@ impl Default for SelectionViewParams {
             description_layout: SelectionDescriptionLayout::Columns,
             name_column_width: None,
             header: Box::new(()),
+            header_gap: 1,
             initial_selected_idx: None,
             side_content: Box::new(()),
             side_content_width: SideContentWidth::default(),
@@ -275,6 +278,7 @@ pub(crate) struct ListSelectionView {
     last_selected_actual_idx: Option<usize>,
     rendered_item_count: std::cell::Cell<usize>,
     header: Box<dyn Renderable>,
+    header_gap: u16,
     initial_selected_idx: Option<usize>,
     side_content: Box<dyn Renderable>,
     side_content_width: SideContentWidth,
@@ -411,6 +415,7 @@ impl ListSelectionView {
             last_selected_actual_idx: None,
             rendered_item_count: std::cell::Cell::new(0),
             header,
+            header_gap: params.header_gap,
             initial_selected_idx: params.initial_selected_idx,
             side_content: params.side_content,
             side_content_width: params.side_content_width,
@@ -1170,7 +1175,7 @@ impl Renderable for ListSelectionView {
         let tab_height = tab_bar_height(&self.tabs, self.active_tab_idx.unwrap_or(0), inner_width);
         let mut height = header.desired_height(inner_width);
         height = height.saturating_add(tab_height + u16::from(tab_height > 0));
-        height = height.saturating_add(rows_height + 3);
+        height = height.saturating_add(rows_height + 2 + self.header_gap);
         if self.is_searchable {
             height = height.saturating_add(1);
         }
@@ -1265,7 +1270,7 @@ impl Renderable for ListSelectionView {
             stacked_side_area,
         ] = Layout::vertical([
             Constraint::Max(header_height),
-            Constraint::Max(1),
+            Constraint::Max(self.header_gap),
             Constraint::Length(tab_height),
             Constraint::Length(u16::from(tab_height > 0)),
             Constraint::Length(if self.is_searchable { 1 } else { 0 }),

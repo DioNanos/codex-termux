@@ -4,7 +4,6 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_core::TurnInputRequest;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
@@ -50,7 +49,7 @@ fn find_user_message_with_image(text: &str) -> Option<ResponseItem> {
         if trimmed.is_empty() {
             continue;
         }
-        let rollout: RolloutLine = match serde_json::from_str(trimmed) {
+        let rollout = match codex_rollout::parse_rollout_line(trimmed) {
             Ok(rollout) => rollout,
             Err(_) => continue,
         };
@@ -321,7 +320,7 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
 
     let mut rollout_lines = fs::read_to_string(&rollout_path)?
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<serde_json::Result<Vec<_>>>()?;
     let historical_content = rollout_lines
         .iter_mut()
@@ -501,7 +500,7 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
         .lines()
         .skip(existing_rollout_lines)
         .filter_map(|line| {
-            let RolloutItem::ResponseItem(envelope) = serde_json::from_str::<RolloutLine>(line)
+            let RolloutItem::ResponseItem(envelope) = codex_rollout::parse_rollout_line(line)
                 .expect("new rollout line should deserialize")
                 .item
             else {

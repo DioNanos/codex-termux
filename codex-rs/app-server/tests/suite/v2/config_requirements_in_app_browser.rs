@@ -106,6 +106,7 @@ async fn import_policy_is_separate_from_browser_feature_and_agent_policy() -> Re
                 allow_external_browser_settings_import: Some(false),
             }),
             Some(BrowserUseRequirements {
+                allow_webmcp: None,
                 allow_history_access: None,
                 disable_auto_review: Some(true),
                 allow_global_persistent_approval: None,

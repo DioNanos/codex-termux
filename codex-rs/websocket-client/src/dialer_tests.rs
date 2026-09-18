@@ -194,6 +194,7 @@ async fn direct_route_connects_secure_websocket() {
         Some(tls_config),
         OutboundProxyRoute::Direct,
         TcpNodelay::Enabled,
+        /*loopback_direct*/ false,
     )
     .await
     .expect("direct websocket handshake should succeed");
@@ -281,6 +282,7 @@ async fn no_proxy_subprocess_probe() {
             no_proxy: Some(no_proxy),
         },
         TcpNodelay::Enabled,
+        /*loopback_direct*/ false,
     )
     .await
     .expect("websocket handshake should succeed");
@@ -355,6 +357,32 @@ async fn happy_eyeballs_does_not_wait_for_stalled_preferred_family() {
     .expect("alternate family should connect");
 
     assert_eq!(connected, reachable);
+}
+
+#[test]
+fn loopback_direct_drops_non_loopback_resolved_addresses() {
+    let loopback = "127.0.0.1:8080"
+        .parse::<SocketAddr>()
+        .expect("loopback address should parse");
+    let remote = "192.0.2.1:8080"
+        .parse::<SocketAddr>()
+        .expect("remote address should parse");
+
+    assert_eq!(
+        loopback_addresses(vec![remote, loopback]).expect("loopback result should remain"),
+        vec![loopback]
+    );
+}
+
+#[test]
+fn loopback_direct_rejects_localhost_resolution_without_loopback_addresses() {
+    let remote = "192.0.2.1:8080"
+        .parse::<SocketAddr>()
+        .expect("remote address should parse");
+
+    let error = loopback_addresses(vec![remote])
+        .expect_err("localhost resolution without loopback addresses must fail");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
 #[tokio::test]
@@ -613,6 +641,7 @@ async fn assert_proxy_tunnels_secure_websocket(proxy_tls: bool) {
             no_proxy: None,
         },
         TcpNodelay::Enabled,
+        /*loopback_direct*/ false,
     )
     .await
     .expect("proxied websocket handshake should succeed");

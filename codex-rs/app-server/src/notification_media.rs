@@ -47,6 +47,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
                 | ResponseItem::ToolSearchOutput { .. }
                 | ResponseItem::WebSearchCall { .. }
                 | ResponseItem::Compaction { .. }
+                | ResponseItem::ConfigurationUpdate { .. }
                 | ResponseItem::CompactionTrigger { .. }
                 | ResponseItem::ContextCompaction { .. }
                 | ResponseItem::Other => {}

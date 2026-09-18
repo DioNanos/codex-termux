@@ -10,6 +10,72 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
+async fn native_output(command: Command) -> anyhow::Result<std::process::Output> {
+    let mut child = crate::local_child::spawn(command)?;
+    assert!(matches!(child.inner, ChildKind::Native(_)));
+    drop(child.stdin.take());
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let mut output = Vec::new();
+    let mut diagnostic = Vec::new();
+    let (_, _, status) = tokio::try_join!(
+        stdout.read_to_end(&mut output),
+        stderr.read_to_end(&mut diagnostic),
+        child.wait()
+    )?;
+    Ok(std::process::Output {
+        status,
+        stdout: output,
+        stderr: diagnostic,
+    })
+}
+
+#[tokio::test]
+async fn bare_script_search_matches_child_path_and_preserves_script_spelling() -> anyhow::Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let program = std::ffi::OsString::from("server=é");
+    let bin = root.path().join("bin");
+    let blocked = root.path().join("blocked");
+    fs::create_dir(&bin)?;
+    fs::create_dir(&blocked)?;
+    fs::write(blocked.join(&program), "not executable")?;
+    let script = bin.join(&program);
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$1\" \"$MCP_TEST\"; /bin/pwd; printf diagnostic >&2; exit 23\n",
+    )?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(/*mode*/ 0o755))?;
+    symlink(&script, root.path().join(&program))?;
+    for path in [
+        bin.into_os_string(),
+        "bin/".into(),
+        "missing:blocked:bin".into(),
+        "missing:".into(),
+        "".into(),
+    ] {
+        let mut command = Command::new(&program);
+        command
+            .current_dir(root.path())
+            .env_clear()
+            .env("PATH", path)
+            .env("MCP_TEST", "kept")
+            .arg("spaces ; literal $arg");
+        let expected = command.output().await?;
+        assert_eq!(native_output(command).await?, expected);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn bare_executable_uses_default_path_and_preserves_argv0() -> anyhow::Result<()> {
+    let mut command = Command::new("sh");
+    command.env_clear().args(["-c", "printf '%s' \"$0\""]);
+    let expected = command.output().await?;
+    assert_eq!(native_output(command).await?, expected);
+    Ok(())
+}
+
 #[tokio::test]
 async fn relative_script_preserves_paths_stdio_environment_and_process_group() -> anyhow::Result<()>
 {
@@ -137,11 +203,17 @@ async fn launch_failures_preserve_os_errors() -> anyhow::Result<()> {
     for (program, cwd, errno) in [
         ("./missing", root.path().to_path_buf(), libc::ENOENT),
         ("./not-executable", root.path().to_path_buf(), libc::EACCES),
+        ("missing", root.path().to_path_buf(), libc::ENOENT),
+        ("not-executable", root.path().to_path_buf(), libc::EACCES),
+        ("", root.path().to_path_buf(), libc::ENOENT),
         ("/bin/sh", root.path().join("missing"), libc::ENOENT),
     ] {
-        let mut command = std::process::Command::new(program);
-        command.env_clear().current_dir(cwd);
-        let error = NativeChild::spawn(&command)
+        let mut command = Command::new(program);
+        command
+            .env_clear()
+            .env("PATH", root.path())
+            .current_dir(cwd);
+        let error = crate::local_child::spawn(command)
             .err()
             .expect("spawn should fail");
         assert_eq!(error.raw_os_error(), Some(errno));
@@ -155,18 +227,23 @@ async fn executable_text_without_shebang_retains_command_fallback() -> anyhow::R
     let script = root.path().join("server");
     fs::write(&script, "printf '%s' \"$0\"\n")?;
     fs::set_permissions(script, fs::Permissions::from_mode(0o755))?;
-    let mut command = Command::new("./server");
-    command.current_dir(root.path()).env_clear();
-    let mut child = crate::local_child::spawn(command)?;
-    let mut output = Vec::new();
-    child
-        .stdout
-        .take()
-        .expect("piped stdout")
-        .read_to_end(&mut output)
-        .await?;
-    assert!(child.wait().await?.success());
-    assert_eq!(output, b"./server");
+    for program in ["./server", "server"] {
+        let mut command = Command::new(program);
+        command
+            .current_dir(root.path())
+            .env_clear()
+            .env("PATH", ".");
+        let mut child = crate::local_child::spawn(command)?;
+        let mut output = Vec::new();
+        child
+            .stdout
+            .take()
+            .expect("piped stdout")
+            .read_to_end(&mut output)
+            .await?;
+        assert!(child.wait().await?.success());
+        assert_eq!(output, b"./server");
+    }
     Ok(())
 }
 

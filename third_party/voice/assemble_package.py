@@ -1,4 +1,4 @@
-"""Add a lifecycle-only helper to a fresh private copy of a canonical Codex package."""
+"""Add a helper and its prepared runtime to a fresh private Codex package."""
 
 import argparse
 import hashlib
@@ -6,9 +6,23 @@ import json
 from pathlib import Path
 import re
 import shutil
+import sys
+
+# Import only this script's siblings, including under PYTHONSAFEPATH.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from package_runtime import runtime_files
+from runtime import digest
 
 
-def assemble(package: Path, helper: Path, voice_target: str, commit: str, output: Path):
+def assemble(
+    package: Path,
+    helper: Path,
+    voice_target: str,
+    commit: str,
+    output: Path,
+    *,
+    runtime: Path,
+):
     package, helper = package.resolve(strict=True), helper.resolve(strict=True)
     output = output.absolute()
     if (
@@ -57,6 +71,15 @@ def assemble(package: Path, helper: Path, voice_target: str, commit: str, output
         raise ValueError("helper and app entrypoint must be regular files")
     if not suffix and not helper.stat().st_mode & 0o111:
         raise ValueError("helper is not executable")
+    runtime = runtime.resolve(strict=True)
+    if any(parent.samefile(package) for parent in (runtime, *runtime.parents)):
+        raise ValueError("runtime must be outside the input package")
+    if any(
+        parent.exists() and parent.samefile(runtime)
+        for parent in output.resolve().parents
+    ):
+        raise ValueError("output must be outside the runtime input")
+    inputs = runtime_files(runtime, voice_target)
     output.mkdir()  # Exclusive creation: never clean or overwrite a pre-existing output.
     try:
         shutil.copytree(package, output, dirs_exist_ok=True)
@@ -64,10 +87,19 @@ def assemble(package: Path, helper: Path, voice_target: str, commit: str, output
         destination = output / relative_helper
         destination.parent.mkdir(parents=True)
         shutil.copy2(helper, destination)
+        for relative, expected_digest in inputs.items():
+            copied = output / "codex-resources/voice" / relative
+            copied.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(runtime / relative, copied)
+            if digest(copied) != expected_digest:
+                raise ValueError("runtime file changed during copying")
         digests = {}
         for relative in (entrypoint, relative_helper):
             with (output / relative).open("rb") as source:
                 digests[relative] = hashlib.file_digest(source, "sha256").hexdigest()
+        digests.update(
+            {f"codex-resources/voice/{name}": value for name, value in inputs.items()}
+        )
         manifest = {
             "schemaVersion": 1,
             "buildCommit": commit,
@@ -91,7 +123,18 @@ if __name__ == "__main__":
     parser.add_argument("--voice-target", required=True)
     parser.add_argument("--build-commit", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--runtime",
+        type=Path,
+        required=True,
+        help="prepared development runtime required by the helper",
+    )
     args = parser.parse_args()
     assemble(
-        args.package, args.helper, args.voice_target, args.build_commit, args.output
+        args.package,
+        args.helper,
+        args.voice_target,
+        args.build_commit,
+        args.output,
+        runtime=args.runtime,
     )

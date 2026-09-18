@@ -1,0 +1,10 @@
+---
+source: tui/src/app/tests/backend_banner_fallback_tests.rs
+expression: normalize_snapshot_paths(rendered)
+---
+  Usage limit reached
+  Your included usage is exhausted. Choose an option below to continue.
+
+› 1. Add credits
+
+  Press enter to confirm or esc to go back

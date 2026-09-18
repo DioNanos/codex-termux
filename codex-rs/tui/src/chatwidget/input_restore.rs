@@ -1,7 +1,6 @@
 //! Input queue restore and thread-input snapshot behavior for `ChatWidget`.
 
 use std::collections::HashSet;
-use std::collections::VecDeque;
 
 use crate::bottom_pane::ComposerDraftSnapshot;
 
@@ -83,7 +82,7 @@ impl ChatWidget {
             draft.last_composer_activity_at,
             draft.startup_local_history,
         );
-        if startup_has_content && self.config.tui_vim_mode_default {
+        if startup_has_content && self.local_settings.tui.vim_mode_default {
             self.bottom_pane.enable_vim_in_insert_mode();
         }
     }
@@ -99,6 +98,11 @@ impl ChatWidget {
         pending_draft: &mut Option<ComposerDraftSnapshot>,
     ) {
         if self.has_active_view()
+            || self
+                .bottom_pane
+                .questions
+                .as_ref()
+                .is_some_and(|q| q.expanded)
             || self.has_pending_protected_request()
             || !self.bottom_pane.composer_input_enabled()
         {
@@ -433,7 +437,7 @@ impl ChatWidget {
         }
     }
 
-    pub(crate) fn capture_thread_input_state(&self) -> Option<ThreadInputState> {
+    pub(crate) fn capture_thread_input_state(&mut self) -> Option<ThreadInputState> {
         let draft = self.bottom_pane.composer_draft_snapshot();
         let composer = ThreadComposerState {
             text: draft.text,
@@ -444,26 +448,14 @@ impl ChatWidget {
             pending_pastes: draft.pending_pastes,
         };
         Some(ThreadInputState {
+            questions: self
+                .bottom_pane
+                .questions
+                .as_deref_mut()
+                .map(crate::bottom_pane::AsyncQuestions::capture),
             composer: composer.has_content().then_some(composer),
             safety_buffering_prompt: self.safety_buffering_prompt.clone(),
-            pending_steers: self
-                .input_queue
-                .pending_steers
-                .iter()
-                .map(|pending| pending.user_message.clone())
-                .collect(),
-            pending_steer_history_records: self
-                .input_queue
-                .pending_steers
-                .iter()
-                .map(|pending| pending.history_record.clone())
-                .collect(),
-            pending_steer_compare_keys: self
-                .input_queue
-                .pending_steers
-                .iter()
-                .map(|pending| pending.compare_key.clone())
-                .collect(),
+            pending_steers: self.input_queue.pending_steers.clone(),
             rejected_steers_queue: self.input_queue.rejected_steers_queue.clone(),
             rejected_steer_history_records: self.input_queue.rejected_steer_history_records.clone(),
             queued_user_messages: self.input_queue.queued_user_messages.clone(),
@@ -492,6 +484,7 @@ impl ChatWidget {
         let restored_task_running =
             preserve_in_flight_turn && input_state.as_ref().is_some_and(|state| state.task_running);
         if let Some(input_state) = input_state {
+            self.bottom_pane.restore_questions(input_state.questions);
             self.input_queue.recovered_queue = input_state.recovered_queue;
             self.current_collaboration_mode = input_state.current_collaboration_mode;
             self.active_collaboration_mask = input_state.active_collaboration_mask;
@@ -507,42 +500,18 @@ impl ChatWidget {
             self.update_collaboration_mode_indicator();
             self.refresh_model_dependent_surfaces();
             self.restore_composer_state(input_state.composer.unwrap_or_default());
-            let mut pending_steer_history_records = input_state.pending_steer_history_records;
-            pending_steer_history_records.resize(
-                input_state.pending_steers.len(),
-                UserMessageHistoryRecord::UserMessageText,
-            );
-            let mut pending_steer_compare_keys = input_state.pending_steer_compare_keys;
             let pending_steers = input_state.pending_steers;
             let mut queued_user_messages = input_state.queued_user_messages;
             let mut queued_user_message_history_records =
                 input_state.queued_user_message_history_records;
             if preserve_in_flight_turn {
-                self.input_queue.pending_steers = pending_steers
-                    .into_iter()
-                    .zip(pending_steer_history_records)
-                    .map(|(user_message, history_record)| PendingSteer {
-                        compare_key: pending_steer_compare_keys.pop_front().unwrap_or_else(|| {
-                            PendingSteerCompareKey {
-                                message: user_message.text.clone(),
-                                image_count: user_message.local_images.len()
-                                    + user_message.remote_image_urls.len(),
-                            }
-                        }),
-                        history_record,
-                        user_message,
-                    })
-                    .collect();
+                self.input_queue.pending_steers = pending_steers;
             } else {
                 self.input_queue.pending_steers.clear();
-                let mut safety_retry_follow_ups = pending_steers
-                    .into_iter()
-                    .map(QueuedUserMessage::from)
-                    .collect::<VecDeque<_>>();
-                safety_retry_follow_ups.append(&mut queued_user_messages);
-                queued_user_messages = safety_retry_follow_ups;
-                pending_steer_history_records.append(&mut queued_user_message_history_records);
-                queued_user_message_history_records = pending_steer_history_records;
+                for pending in pending_steers.into_iter().rev() {
+                    queued_user_messages.push_front(pending.user_message.into());
+                    queued_user_message_history_records.push_front(pending.history_record);
+                }
             }
             self.input_queue.rejected_steers_queue = input_state.rejected_steers_queue;
             self.input_queue.rejected_steer_history_records =

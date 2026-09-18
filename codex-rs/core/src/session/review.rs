@@ -130,9 +130,6 @@ pub(super) async fn spawn_review_thread(
         auto_review_enabled,
         &model_info,
     ));
-    if turn_metadata_state.can_start_root_turn(&session_source) {
-        turn_metadata_state.set_root_turn_id(review_turn_id.clone());
-    }
 
     let extension_data = Arc::new(codex_extension_api::ExtensionData::new(
         review_turn_id.clone(),
@@ -182,6 +179,7 @@ pub(super) async fn spawn_review_thread(
 
     // Seed the child task with the review prompt as the initial user message.
     let input = vec![TurnInput::UserInput {
+        acceptance_order: None,
         content: vec![UserInput::Text {
             text: review_prompt,
             // Review prompt is synthesized; no UI element ranges to preserve.

@@ -126,8 +126,9 @@ pub(super) fn editor_directory(
                     let Some(parent) = directory.parent() else {
                         return true;
                     };
-                    let is_writable = file_system_policy.can_write_path_with_cwd(directory, cwd)
-                        || file_system_policy.can_write_path_with_cwd(parent, cwd)
+                    let is_writable = file_system_policy
+                        .can_write_local_path_with_cwd(directory, cwd)
+                        || file_system_policy.can_write_local_path_with_cwd(parent, cwd)
                         || writable_roots.iter().any(|root| {
                             root.is_path_writable(directory)
                                 || root.root.as_path().starts_with(directory)

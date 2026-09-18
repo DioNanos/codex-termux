@@ -26,7 +26,7 @@ pub fn apply_rollout_item(
         | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
         RolloutItem::Compacted(_) => {}
         RolloutItem::WorldState(_) => {}
-        RolloutItem::SecurityRiskScore(_) => {}
+        RolloutItem::RetainedContext(_) | RolloutItem::SecurityRiskScore(_) => {}
         RolloutItem::RealtimeItem(_) => {}
         RolloutItem::TokenUsageRecord(_) => {}
     }
@@ -56,6 +56,7 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
         | RolloutItem::RealtimeItem(_)
+        | RolloutItem::RetainedContext(_)
         | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::WorldState(_) => false,
@@ -70,6 +71,9 @@ fn apply_session_meta_from_item(metadata: &mut ThreadMetadata, meta_line: &Sessi
     }
     metadata.id = meta_line.meta.id;
     metadata.source = enum_to_string(&meta_line.meta.source);
+    if metadata.originator.is_none() && !meta_line.meta.originator.is_empty() {
+        metadata.originator = Some(meta_line.meta.originator.clone());
+    }
     // Later SessionMeta lines do not redefine the canonical history_mode.
     metadata.thread_source = meta_line.meta.thread_source.clone();
     metadata.agent_nickname = meta_line.meta.agent_nickname.clone();
@@ -695,6 +699,7 @@ mod tests {
         let id = ThreadId::from_string(&Uuid::from_u128(42).to_string()).expect("thread id");
         let created_at = DateTime::<Utc>::from_timestamp(1_735_689_600, 0).expect("timestamp");
         ThreadMetadata {
+            originator: None,
             id,
             rollout_path: PathBuf::from("/tmp/a.jsonl"),
             created_at,
@@ -723,6 +728,7 @@ mod tests {
             section_position: None,
             section_entered_at: None,
             project_id: None,
+            daybreak_enabled: None,
             git_sha: None,
             git_branch: None,
             git_origin_url: None,

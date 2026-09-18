@@ -114,7 +114,7 @@ impl ResolvedWindowsSandboxPermissions {
         }) && cwd
             .ancestors()
             .last()
-            .is_some_and(|root| self.file_system.can_read_path_with_cwd(root, cwd))
+            .is_some_and(|root| self.file_system.can_read_local_path_with_cwd(root, cwd))
     }
 
     pub(crate) fn include_platform_defaults(&self) -> bool {

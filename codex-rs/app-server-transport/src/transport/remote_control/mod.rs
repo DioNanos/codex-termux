@@ -106,6 +106,7 @@ pub(super) struct QueuedServerEnvelope {
 #[derive(Clone)]
 pub struct RemoteControlHandle {
     policy: RemoteControlPolicy,
+    shutdown_token: CancellationToken,
     desired_state_tx: Arc<watch::Sender<RemoteControlDesiredState>>,
     desired_state_rpc_lock: Arc<Semaphore>,
     desired_state_persistence_lock: Arc<Semaphore>,
@@ -592,14 +593,23 @@ impl RemoteControlHandle {
             RemoteControlEnrollmentSelection::ReplaceExisting => {}
         }
 
-        let enrollment = enroll_pairing_server(
-            &self.auth_manager,
-            auth,
-            &remote_control_target,
-            installation_id,
-            server_name,
-        )
-        .await?;
+        // Reused enrollments must still reach durable persistence during shutdown.
+        let enrollment = tokio::select! {
+            biased;
+            _ = self.shutdown_token.cancelled() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "remote control is shutting down",
+                ));
+            }
+            result = enroll_pairing_server(
+                &self.auth_manager,
+                auth,
+                &remote_control_target,
+                installation_id,
+                server_name,
+            ) => result?,
+        };
         Ok((enrollment, true))
     }
 
@@ -1005,6 +1015,7 @@ pub async fn start_remote_control(
     let installation_id_for_log = installation_id.clone();
     let server_name_for_log = server_name.clone();
     let shutdown_token_for_log = shutdown_token.clone();
+    let handle_shutdown_token = shutdown_token.clone();
     let join_handle = tokio::spawn(async move {
         info!(
             remote_control_url = %remote_control_url_for_log,
@@ -1070,6 +1081,7 @@ pub async fn start_remote_control(
         join_handle,
         RemoteControlHandle {
             policy,
+            shutdown_token: handle_shutdown_token,
             desired_state_tx,
             desired_state_rpc_lock,
             desired_state_persistence_lock,

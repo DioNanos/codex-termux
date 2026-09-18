@@ -2,7 +2,7 @@
 source: tui/src/chatwidget/tests/app_server.rs
 expression: popup
 ---
-  Our systems are thinking a bit more about this request before responding.
+  Giving this request a little extra thought
 
 › 1. Dismiss and keep waiting
   2. Learn more

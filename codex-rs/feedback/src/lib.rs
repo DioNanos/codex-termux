@@ -501,10 +501,19 @@ impl FeedbackSnapshot {
             "bug" | "bad_result" | "safety_check" => Level::Error,
             _ => Level::Info,
         };
-        let title = format!(
-            "[{}]: Codex session {}",
-            display_classification(classification),
-            self.thread_id
+        let custom_title = tags
+            .and_then(|tags| tags.get("feedback_title"))
+            .map(|title| title.trim())
+            .filter(|title| !title.is_empty());
+        let title = custom_title.map_or_else(
+            || {
+                format!(
+                    "[{}]: Codex session {}",
+                    display_classification(classification),
+                    self.thread_id
+                )
+            },
+            str::to_owned,
         );
         let mut event = Event {
             level,
@@ -512,6 +521,10 @@ impl FeedbackSnapshot {
             tags: self.upload_tags(classification, reason, tags, session_source),
             ..Default::default()
         };
+        if custom_title.is_some() {
+            // A shared title must not merge independent reports and suppress new-issue alerts.
+            event.fingerprint = vec![event.event_id.to_string().into()].into();
+        }
         if let Some(reason) = reason {
             event.exception = Values::from(vec![Exception {
                 ty: title,
@@ -863,6 +876,10 @@ impl Visit for FeedbackTagsVisitor {
             .insert(field.name().to_string(), format!("{value:?}"));
     }
 }
+
+#[cfg(test)]
+#[path = "feedback_event_tests.rs"]
+mod feedback_event_tests;
 
 #[cfg(test)]
 mod tests {

@@ -5,7 +5,6 @@ use super::Config;
 use super::DoctorCheck;
 use super::DoctorIssue;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -543,7 +542,7 @@ async fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
             Err(_) => continue,
         };
         if item_type == "session_meta" {
-            return match serde_json::from_str::<RolloutLine>(line.trim()) {
+            return match codex_rollout::parse_rollout_line(line.trim()) {
                 Ok(line) => match line.item {
                     RolloutItem::SessionMeta(session_meta) => {
                         RolloutThreadId::Id(session_meta.meta.id.to_string())
@@ -560,7 +559,7 @@ async fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
             };
         }
         if !has_legacy_item {
-            has_legacy_item = serde_json::from_str::<RolloutLine>(line.trim()).is_ok();
+            has_legacy_item = codex_rollout::parse_rollout_line(line.trim()).is_ok();
         }
     }
 
@@ -745,6 +744,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_history::RolloutLine;
     use codex_protocol::ThreadId;
     use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
@@ -862,7 +862,7 @@ mod tests {
             fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", filename_id);
         let contents = std::fs::read_to_string(&path).expect("rollout file");
         let mut rollout_line =
-            serde_json::from_str::<RolloutLine>(contents.trim()).expect("rollout line");
+            codex_rollout::parse_rollout_line(contents.trim()).expect("rollout line");
         let RolloutItem::SessionMeta(session_meta) = &mut rollout_line.item else {
             panic!("expected session metadata");
         };
@@ -981,7 +981,7 @@ mod tests {
             fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", filename_id);
         let contents = std::fs::read_to_string(&metadata_path).expect("rollout file");
         let mut rollout_line =
-            serde_json::from_str::<RolloutLine>(contents.trim()).expect("rollout line");
+            codex_rollout::parse_rollout_line(contents.trim()).expect("rollout line");
         let RolloutItem::SessionMeta(session_meta) = &mut rollout_line.item else {
             panic!("expected session metadata");
         };
@@ -1114,7 +1114,7 @@ mod tests {
             fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", filename_id);
         let contents = std::fs::read_to_string(&path).expect("rollout file");
         let mut rollout_line =
-            serde_json::from_str::<RolloutLine>(contents.trim()).expect("rollout line");
+            codex_rollout::parse_rollout_line(contents.trim()).expect("rollout line");
         let RolloutItem::SessionMeta(session_meta) = &mut rollout_line.item else {
             panic!("expected session metadata");
         };
@@ -1148,7 +1148,7 @@ mod tests {
             fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", filename_id);
         let contents = std::fs::read_to_string(&path).expect("rollout file");
         let mut rollout_line =
-            serde_json::from_str::<RolloutLine>(contents.trim()).expect("rollout line");
+            codex_rollout::parse_rollout_line(contents.trim()).expect("rollout line");
         let RolloutItem::SessionMeta(session_meta) = &mut rollout_line.item else {
             panic!("expected session metadata");
         };

@@ -1,4 +1,7 @@
 //! Structured-output schema and normalization for generated TUI thread titles.
+//!
+//! Automatic titles are persisted only after generation, including for inactive threads;
+//! the originating thread's saved name takes precedence over an automatic result.
 
 use super::App;
 use super::thread_events::ThreadBufferedEvent;
@@ -31,6 +34,25 @@ struct GeneratedThreadTitle {
 }
 
 impl App {
+    pub(super) fn sync_thread_title_progress(&mut self) {
+        let pending = self.chat_widget.thread_id().is_some_and(|thread_id| {
+            self.pending_thread_titles
+                .iter()
+                .any(|(id, _)| *id == thread_id)
+        });
+        self.chat_widget
+            .set_thread_title_generation_pending(pending);
+    }
+
+    pub(super) fn finish_thread_title_generation(
+        &mut self,
+        thread_id: ThreadId,
+        destination: ThreadTitleDestination,
+    ) {
+        self.pending_thread_titles.remove(&(thread_id, destination));
+        self.sync_thread_title_progress();
+    }
+
     /// Start a hidden title-generation thread without blocking the UI loop.
     pub(super) fn generate_thread_title(
         &mut self,
@@ -39,6 +61,10 @@ impl App {
         destination: ThreadTitleDestination,
         prompt: String,
     ) {
+        if !self.pending_thread_titles.insert((thread_id, destination)) {
+            return;
+        }
+        self.sync_thread_title_progress();
         let request_handle = app_server.request_handle();
         let model = if self.chat_widget.config_ref().model_provider_id == "openai"
             && self.chat_widget.has_chatgpt_account()
@@ -96,6 +122,7 @@ impl App {
             Ok(thread_id) => thread_id,
             Err(error) => {
                 tracing::debug!(%error, "failed to start title-generation thread");
+                self.finish_thread_title_generation(thread_id, destination);
                 if let ThreadTitleDestination::RenameSuggestion { request_id } = destination {
                     self.chat_widget.apply_thread_name_suggestion(
                         thread_id, request_id, /*suggestion*/ None,
@@ -106,6 +133,7 @@ impl App {
         };
 
         let Ok(temporary_thread_id) = ThreadId::from_string(&temporary_thread_id_text) else {
+            self.finish_thread_title_generation(thread_id, destination);
             if let ThreadTitleDestination::RenameSuggestion { request_id } = destination {
                 self.chat_widget
                     .apply_thread_name_suggestion(thread_id, request_id, /*suggestion*/ None);

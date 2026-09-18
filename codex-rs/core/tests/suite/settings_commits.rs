@@ -241,7 +241,7 @@ async fn compaction_checkpoints_settings_changed_during_its_model_request() -> R
     let rollout_path = test.session_configured.rollout_path.expect("rollout path");
     let rollout: Vec<RolloutLine> = std::fs::read_to_string(rollout_path)?
         .lines()
-        .map(serde_json::from_str)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<std::result::Result<_, _>>()?;
     let checkpoint = rollout
         .iter()

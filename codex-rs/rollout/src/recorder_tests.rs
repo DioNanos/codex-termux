@@ -14,11 +14,14 @@ use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
+use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::security_risk::SecurityRiskScore;
@@ -103,7 +106,7 @@ fn read_rollout_lines(path: &Path) -> std::io::Result<Vec<RolloutLine>> {
     fs::read_to_string(path)?
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).map_err(std::io::Error::other))
+        .map(|line| crate::parse_rollout_line(line).map_err(std::io::Error::other))
         .collect()
 }
 
@@ -687,7 +690,7 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
         vec![Some(0), Some(1), Some(2)]
     );
     let first_line = text.lines().next().expect("session metadata line");
-    let session_meta: RolloutLine = serde_json::from_str(first_line)?;
+    let session_meta = crate::parse_rollout_line(first_line)?;
     let RolloutItem::SessionMeta(session_meta) = session_meta.item else {
         panic!("expected session metadata in rollout");
     };
@@ -996,6 +999,68 @@ async fn resumed_paginated_rollout_continues_after_ordinal_gap() -> std::io::Res
 }
 
 #[tokio::test]
+async fn resumed_paginated_rollout_continues_after_decimal_token_count() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let thread_id = ThreadId::new();
+    let recorder = RolloutRecorder::new(
+        &config,
+        RolloutRecorderParams::new(
+            thread_id,
+            /*forked_from_id*/ None,
+            /*parent_thread_id*/ None,
+            SessionSource::Exec,
+            /*thread_source*/ None,
+            "test_originator".to_string(),
+            BaseInstructions::default(),
+            Vec::new(),
+        )
+        .with_history_mode(ThreadHistoryMode::Paginated),
+    )
+    .await?;
+    let rollout_path = recorder.rollout_path().to_path_buf();
+    recorder
+        .record_canonical_items(&[RolloutItem::EventMsg(EventMsg::TokenCount(
+            TokenCountEvent {
+                info: None,
+                rate_limits: Some(RateLimitSnapshot {
+                    limit_id: None,
+                    limit_name: None,
+                    primary: Some(RateLimitWindow {
+                        used_percent: 0.0,
+                        window_minutes: Some(60),
+                        resets_at: Some(1_800_000_000),
+                    }),
+                    secondary: None,
+                    credits: None,
+                    individual_limit: None,
+                    spend_control_reached: None,
+                    plan_type: None,
+                    rate_limit_reached_type: None,
+                    normal_model_slug: None,
+                }),
+            },
+        ))])
+        .await?;
+    recorder.persist().await?;
+    recorder.shutdown().await?;
+
+    let resumed =
+        RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path.clone())).await?;
+    resumed
+        .record_canonical_items(&[agent_message_item("after-resume")])
+        .await?;
+    resumed.shutdown().await?;
+
+    let ordinals = read_rollout_lines(&rollout_path)?
+        .into_iter()
+        .map(|line| line.ordinal)
+        .collect::<Vec<_>>();
+    assert_eq!(ordinals, vec![Some(0), Some(1), Some(2)]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn resumed_paginated_rollout_repairs_unsafe_tail() -> std::io::Result<()> {
     let valid_unterminated = serde_json::to_string(&RolloutLine {
         timestamp: "2026-07-09T00:00:05Z".to_string(),
@@ -1034,7 +1099,7 @@ async fn resumed_paginated_rollout_repairs_unsafe_tail() -> std::io::Result<()> 
         assert!(contents.ends_with('\n'), "{name} tail should be terminated");
         let ordinals = contents
             .lines()
-            .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+            .filter_map(|line| crate::parse_rollout_line(line).ok())
             .map(|line| line.ordinal)
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1529,11 +1594,13 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
     let filesystem_path = PathBuf::from("/tmp/filesystem-rollout.jsonl");
     let state_path = PathBuf::from("/tmp/state-rollout.jsonl");
     let mut item = ThreadItem {
+        originator: None,
         path: filesystem_path.clone(),
         thread_id: Some(filesystem_thread_id),
         first_user_message: Some("filesystem message".to_string()),
         preview: Some("filesystem preview".to_string()),
         project_id: None,
+        daybreak_enabled: None,
         section: None,
         cwd: None,
         git_branch: Some("filesystem-branch".to_string()),
@@ -1556,11 +1623,13 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         updated_at: None,
     };
     let state_item = ThreadItem {
+        originator: None,
         path: state_path,
         thread_id: Some(state_thread_id),
         first_user_message: Some("state message".to_string()),
         preview: Some("state preview".to_string()),
         project_id: None,
+        daybreak_enabled: Some(true),
         section: Some(codex_state::ThreadSection {
             id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
             name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
@@ -1591,6 +1660,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
 
     assert_eq!(item.path, filesystem_path);
     assert_eq!(item.thread_id, Some(filesystem_thread_id));
+    assert_eq!(item.daybreak_enabled, Some(true));
     assert_eq!(
         item.section,
         Some(codex_state::ThreadSection {

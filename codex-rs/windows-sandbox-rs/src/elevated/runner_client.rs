@@ -21,7 +21,6 @@ use anyhow::Context;
 use anyhow::Result;
 use std::ffi::c_void;
 use std::fs::File;
-use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::ptr;
@@ -32,6 +31,7 @@ use std::time::Instant;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;
 use windows_sys::Win32::Foundation::DuplicateHandle;
+use windows_sys::Win32::Foundation::ERROR_ACCOUNT_DISABLED;
 use windows_sys::Win32::Foundation::ERROR_LOGON_FAILURE;
 use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
 use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
@@ -39,18 +39,17 @@ use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode;
 use windows_sys::Win32::System::IO::CancelSynchronousIo;
-use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::Threading::CreateProcessWithLogonW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetCurrentThread;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
+use windows_sys::Win32::System::Threading::STARTF_FORCEOFFFEEDBACK;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
 use windows_sys::Win32::System::Threading::TerminateProcess;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 const RUNNER_SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const RUNNER_PIPE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const RUNNER_SPAWN_READY_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const RUNNER_ERROR_MODE_FLAGS: u32 = 0x0001 | 0x0002;
 const WAIT_OBJECT_0: u32 = 0;
 
@@ -100,7 +99,10 @@ pub(crate) struct RunnerTransport {
 }
 
 fn is_refreshable_windows_error(code: u32) -> bool {
-    matches!(code, ERROR_LOGON_FAILURE | ERROR_NO_SUCH_LOGON_SESSION)
+    matches!(
+        code,
+        ERROR_ACCOUNT_DISABLED | ERROR_LOGON_FAILURE | ERROR_NO_SUCH_LOGON_SESSION
+    )
 }
 
 fn command_targets_windows_apps(command: &[String]) -> bool {
@@ -159,7 +161,11 @@ impl RunnerTransport {
     }
 
     pub(crate) fn read_spawn_ready(&mut self) -> Result<()> {
-        wait_for_complete_frame(&self.pipe_read, RUNNER_SPAWN_READY_TIMEOUT)?;
+        crate::framed_io::wait_for_complete_frame(
+            &self.pipe_read,
+            Instant::now() + RUNNER_SPAWN_READY_TIMEOUT,
+        )
+        .context("wait for runner spawn_ready")?;
         let msg = read_frame(&mut self.pipe_read)?
             .ok_or_else(|| anyhow::anyhow!("runner pipe closed before spawn_ready"))?;
         match msg.message {
@@ -345,6 +351,7 @@ pub(crate) fn spawn_runner_transport(
     let password_w = to_wide(&sandbox_creds.password);
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    si.dwFlags = STARTF_FORCEOFFFEEDBACK;
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let env_block: Option<Vec<u16>> = None;
 
@@ -446,52 +453,6 @@ pub(crate) fn spawn_runner_transport(
     Ok(transport)
 }
 
-fn wait_for_complete_frame(pipe_read: &File, timeout: Duration) -> Result<()> {
-    let handle = pipe_read.as_raw_handle() as HANDLE;
-    let deadline = Instant::now() + timeout;
-    let mut len_buf = [0u8; 4];
-
-    loop {
-        let mut bytes_read = 0u32;
-        let mut total_available = 0u32;
-        let ok = unsafe {
-            PeekNamedPipe(
-                handle,
-                len_buf.as_mut_ptr() as *mut c_void,
-                len_buf.len() as u32,
-                &mut bytes_read,
-                &mut total_available,
-                ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            let err = unsafe { GetLastError() } as i32;
-            return Err(anyhow::anyhow!(
-                "PeekNamedPipe failed while waiting for spawn_ready: {err}"
-            ));
-        }
-
-        if bytes_read == len_buf.len() as u32 {
-            let frame_len = u32::from_le_bytes(len_buf) as usize;
-            let total_len = frame_len
-                .checked_add(len_buf.len())
-                .ok_or_else(|| anyhow::anyhow!("runner frame length overflow"))?;
-            if total_available as usize >= total_len {
-                return Ok(());
-            }
-        }
-
-        if Instant::now() >= deadline {
-            return Err(anyhow::anyhow!(
-                "timed out after {}ms waiting for runner spawn_ready",
-                timeout.as_millis()
-            ));
-        }
-
-        std::thread::sleep(RUNNER_SPAWN_READY_POLL_INTERVAL);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::RunnerLogonError;
@@ -500,6 +461,7 @@ mod tests {
     use crate::ipc_framed::ErrorPayload;
     use crate::ipc_framed::ErrorStage;
     use pretty_assertions::assert_eq;
+    use windows_sys::Win32::Foundation::ERROR_ACCOUNT_DISABLED;
     use windows_sys::Win32::Foundation::ERROR_LOGON_FAILURE;
     use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
     use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
@@ -508,6 +470,7 @@ mod tests {
     fn refreshable_sandbox_creds_error_recognizes_credential_and_child_start_failures() {
         assert_eq!(
             [
+                ERROR_ACCOUNT_DISABLED,
                 ERROR_LOGON_FAILURE,
                 ERROR_NO_SUCH_LOGON_SESSION,
                 ERROR_NOT_FOUND,
@@ -517,7 +480,7 @@ mod tests {
                     anyhow::Error::new(RunnerLogonError { code }).context("runner launch failed");
                 is_refreshable_sandbox_creds_error(&err, &[])
             }),
-            [true, true, false]
+            [true, true, true, false]
         );
 
         assert_eq!(

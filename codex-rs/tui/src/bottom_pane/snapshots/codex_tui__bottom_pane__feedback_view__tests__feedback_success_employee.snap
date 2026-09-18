@@ -1,0 +1,10 @@
+---
+source: tui/src/bottom_pane/feedback_view.rs
+expression: rendered
+---
+• Feedback uploaded. You can share this in #codex-feedback:
+
+  http://go/codex-feedback-internal
+
+  Sentry Feedback ID: thread-2
+  Sentry URL: https://go/codex-feedback/thread-2

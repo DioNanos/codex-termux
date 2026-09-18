@@ -355,22 +355,18 @@ jobs:
           restore-keys: |
             rusty-v8-source-${{ matrix.target }}-sandbox-
 
-      - name: Install and start sccache
+      - name: Install sccache
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: sccache@0.8.2
+
+      - name: Start sccache
         shell: pwsh
         env:
           SCCACHE_CACHE_SIZE: 256M
           SCCACHE_DIR: ${{ github.workspace }}/upstream-rusty-v8/target/sccache
           SCCACHE_IDLE_TIMEOUT: 0
-        run: |
-          $version = "v0.8.2"
-          $platform = "x86_64-pc-windows-msvc"
-          $basename = "sccache-$version-$platform"
-          $url = "https://github.com/mozilla/sccache/releases/download/$version/$basename.tar.gz"
-          cd ~
-          curl -LO $url
-          tar -xzvf "$basename.tar.gz"
-          . $basename/sccache --start-server
-          echo "$(pwd)/$basename" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        run: sccache --start-server
 
       - name: Install Chromium clang for ARM64 MSVC cross build
         if: matrix.target == 'aarch64-pc-windows-msvc'
@@ -439,7 +435,6 @@ jobs:
 
     steps:
       - name: Check whether release already exists
-        id: release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
@@ -447,10 +442,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
-            echo "exists=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          if is_draft="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [[ "${is_draft}" != "true" ]]; then
+              echo "Refusing to replace existing published release ${RELEASE_TAG}." >&2
+              exit 1
+            fi
+
+            echo "Removing unfinished draft release for ${RELEASE_TAG}."
+            gh release delete "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --yes
           fi
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -458,22 +457,25 @@ jobs:
           path: dist
 
       - name: Create GitHub Release
-        if: ${{ steps.release.outputs.exists != 'true' }}
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
-        with:
-          tag_name: ${{ needs.metadata.outputs.release_tag }}
-          name: ${{ needs.metadata.outputs.release_tag }}
-          files: dist/**
-          # Keep V8 artifact releases out of Codex's normal "latest release" channel.
-          prerelease: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets=()
+          while IFS= read -r -d '' asset; do
+            assets+=("${asset}")
+          done < <(find dist -type f -print0)
+          if [[ "${#assets[@]}" -eq 0 ]]; then
+            echo "No V8 release artifacts were found." >&2
+            exit 1
+          fi
 
-      - name: Amend existing GitHub Release
-        if: ${{ steps.release.outputs.exists == 'true' }}
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
-        with:
-          tag_name: ${{ needs.metadata.outputs.release_tag }}
-          name: ${{ needs.metadata.outputs.release_tag }}
-          files: dist/**
-          overwrite_files: true
-          # Keep V8 artifact releases out of Codex's normal "latest release" channel.
-          prerelease: true
+          # GitHub CLI keeps asset-bearing releases in draft until all uploads finish.
+          gh release create "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${RELEASE_TAG}" \
+            --verify-tag \
+            --prerelease \
+            "${assets[@]}"

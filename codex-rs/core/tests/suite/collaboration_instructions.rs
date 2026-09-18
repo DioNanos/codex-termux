@@ -2,7 +2,6 @@ use anyhow::Result;
 use codex_core::TurnInputRequest;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::config_types::CollaborationMode;
@@ -1037,7 +1036,7 @@ async fn cold_resume_refreshes_legacy_collaboration_snapshot_once(
     let legacy_rollout = std::fs::read_to_string(&rollout_path)?
         .lines()
         .map(|original_line| {
-            let mut line = serde_json::from_str::<RolloutLine>(original_line)?;
+            let mut line = codex_rollout::parse_rollout_line(original_line)?;
             if let RolloutItem::WorldState(world_state) = &mut line.item
                 && let Some(snapshot) = world_state.state.get_mut("collaboration_mode")
             {

@@ -4153,6 +4153,7 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        crate::thread_manager::passthrough_image_store(),
         thread_store_from_config(&config, state_db.clone()),
         local_agent_graph_store_from_state_db(state_db.as_ref()),
         "11111111-1111-4111-8111-111111111111".to_string(),
@@ -4370,8 +4371,10 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     assert_eq!(shutdown_report.timed_out, Vec::<ThreadId>::new());
 }
 
+#[test_case::test_case(false; "inactive_parent")]
+#[test_case::test_case(true; "active_parent")]
 #[tokio::test]
-async fn build_agent_spawn_config_uses_turn_context_values() {
+async fn build_agent_spawn_config_uses_turn_context_values(parent_enabled: bool) {
     fn pick_allowed_sandbox_policy(
         permissions: &crate::config::Permissions,
         base: SandboxPolicy,
@@ -4442,8 +4445,26 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         .set(AskForApproval::OnRequest)
         .expect("approval policy set");
 
+    let parent_config = Arc::make_mut(&mut turn.config);
+    parent_config
+        .prepare_token_budget_for_startup()
+        .expect("capture configured token budget");
+    parent_config
+        .features
+        .set_enabled(Feature::TokenBudget, parent_enabled)
+        .expect("set parent experimental context");
+    parent_config
+        .token_budget
+        .get_or_insert_default()
+        .use_history_notes_extension = parent_enabled;
+    let mut expected = parent_config.clone();
+    turn.configured_token_budget = expected.token_budget.clone();
+    Arc::make_mut(&mut turn.config)
+        .token_budget
+        .get_or_insert_default()
+        .guidance_message = Some("Parent model's resolved guidance.".to_string());
+
     let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
-    let mut expected = (*turn.config).clone();
     expected.base_instructions_provenance = base_instructions.provenance.clone();
     expected.base_instructions = Some(base_instructions.text);
     expected.model = Some(turn.model_info().slug.clone());

@@ -48,6 +48,7 @@ pub(crate) async fn load_session_transcript(
             /*turn_cursor*/ None,
             /*item_cursor*/ None,
             /*config*/ None,
+            /*local_settings*/ None,
             HistoryHydrationScope::Complete,
         )
         .await

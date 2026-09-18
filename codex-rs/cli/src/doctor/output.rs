@@ -642,7 +642,6 @@ fn display_summary(check: &DoctorCheck, options: HumanOutputOptions) -> String {
         "runtime" => runtime_summary(check),
         "install" if check.status == CheckStatus::Ok => "consistent".to_string(),
         "search" => search_summary(check),
-        "git" => git_summary(check),
         "terminal" => terminal_summary(check),
         "title" => title_summary(check, options),
         "state" => state_summary(check),
@@ -679,12 +678,6 @@ fn search_summary(check: &DoctorCheck) -> String {
         }
         _ => check.summary.clone(),
     }
-}
-
-fn git_summary(check: &DoctorCheck) -> String {
-    detail::detail_value(check, "git version")
-        .or_else(|| detail::detail_value(check, "selected git"))
-        .unwrap_or_else(|| check.summary.clone())
 }
 
 fn terminal_summary(check: &DoctorCheck) -> String {

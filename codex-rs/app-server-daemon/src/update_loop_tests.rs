@@ -39,3 +39,24 @@ async fn standalone_installer_is_intentionally_a_noop() {
         .await
         .expect("Termux standalone updater must fail closed as a no-op");
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn powershell_installer_is_noninteractive_and_reports_script_failure() {
+    let valid = FakeInstallerHttp::new(InstallerResponse::Success(
+        br#"
+function Test-Installer {
+    if ($env:CODEX_NON_INTERACTIVE -ne '1') { throw 'interactive installer' }
+}
+Test-Installer
+"#
+        .to_vec(),
+    ));
+    super::install_latest_standalone(&valid)
+        .await
+        .expect("installer succeeds");
+    let failing = FakeInstallerHttp::new(InstallerResponse::Success(
+        b"throw 'installer failed'".to_vec(),
+    ));
+    assert!(super::install_latest_standalone(&failing).await.is_err());
+}

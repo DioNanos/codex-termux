@@ -28,6 +28,7 @@ impl ChatWidget {
     pub(crate) fn service_tier_update_for_core(&self) -> Option<Option<String>> {
         service_tier_resolution::service_tier_update_for_core(
             &self.config,
+            &self.local_settings.notices,
             self.current_model(),
             &self.model_catalog.try_list_models().unwrap_or_default(),
         )
@@ -151,6 +152,7 @@ impl ChatWidget {
     pub(super) fn refresh_effective_service_tier(&mut self) {
         self.effective_service_tier = service_tier_resolution::effective_service_tier(
             &self.config,
+            &self.local_settings.notices,
             self.current_model(),
             &self.model_catalog.try_list_models().unwrap_or_default(),
         );

@@ -69,8 +69,8 @@ impl GlobWalker<'_> {
         let denied = match canonical {
             Some(canonical) => self
                 .matcher
-                .is_read_denied_with_canonical_path(path, canonical),
-            None => self.matcher.is_read_denied(path),
+                .is_local_path_read_denied_with_canonical_path(path, canonical),
+            None => self.matcher.is_local_path_read_denied(path),
         };
         if denied {
             push_absolute_path(self.paths, self.seen_paths, path.to_path_buf())?;

@@ -14,7 +14,7 @@ Buffer {
         "m-updated.txt (+1 -1)                           ",
         "─────────────────────────────────────────── 0% ─",
         " ↑/↓ to scroll   pgup/pgdn to page   home/end to",
-        " q to quit                                      ",
+        " q close                                        ",
         "                                                ",
     ],
     styles: [
@@ -35,6 +35,6 @@ Buffer {
         x: 18, y: 6, fg: Red, bg: Reset, underline: Reset, modifier: NONE,
         x: 20, y: 6, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
         x: 0, y: 7, fg: Reset, bg: Reset, underline: Reset, modifier: DIM,
-        x: 10, y: 9, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+        x: 8, y: 9, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
     ]
 }

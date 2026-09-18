@@ -650,6 +650,8 @@ pub struct UsageLimitReachedError {
 
 impl std::fmt::Display for UsageLimitReachedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Reserve is a fallback for exhausted ordinary usage, so keep the standard
+        // promo/plan recovery copy below instead of suggesting another model.
         if let Some(limit_name) = self
             .rate_limits
             .as_ref()
@@ -657,6 +659,7 @@ impl std::fmt::Display for UsageLimitReachedError {
             .map(str::trim)
             .filter(|name| !name.is_empty())
             && !limit_name.eq_ignore_ascii_case("codex")
+            && !limit_name.eq_ignore_ascii_case("gpt-reserve")
         {
             return write!(
                 f,

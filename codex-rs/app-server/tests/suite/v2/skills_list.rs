@@ -30,8 +30,10 @@ use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::config::set_project_trust_level;
+use codex_core_plugins::store::PluginStore;
 use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
 use codex_exec_server::CreateDirectoryOptions;
+use codex_plugin::PluginId;
 use codex_protocol::config_types::TrustLevel;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -923,6 +925,95 @@ enabled = false
         }
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn skills_list_refreshes_externally_updated_plugin_versions() -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "skills/list currently requires host-native cwd paths for workspace config"
+    );
+    let codex_home = TempDir::new()?;
+    let cwd = TempDir::new()?;
+    let source = TempDir::new()?;
+    std::fs::create_dir_all(source.path().join(".codex-plugin"))?;
+    std::fs::create_dir_all(source.path().join("skills"))?;
+    std::fs::write(
+        source.path().join(".codex-plugin/plugin.json"),
+        r#"{"name":"sample"}"#,
+    )?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"[features]
+plugins = true
+
+[plugins."sample@test"]
+enabled = true
+"#,
+    )?;
+    let plugin_id = PluginId::parse("sample@test")?;
+    let store = PluginStore::new(codex_home.path().to_path_buf());
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+    let file_system = mcp.auto_env()?.environment().get_filesystem();
+    file_system
+        .create_directory(
+            &PathUri::from_abs_path(&AbsolutePathBuf::try_from(cwd.path())?).join(".git")?,
+            CreateDirectoryOptions {
+                recursive: true,
+                follow_symlinks: true,
+            },
+            /*sandbox*/ None,
+        )
+        .await?;
+
+    // Mutate the shared store from outside app-server, without its cache invalidation callback.
+    for version in ["1.0.0", "2.0.0", "0.9.0"] {
+        let body = format!("---\nname: search\ndescription: version {version}\n---\n");
+        std::fs::write(source.path().join("skills/SKILL.md"), &body)?;
+        let installed = store.install_with_version(
+            AbsolutePathBuf::try_from(source.path())?,
+            plugin_id.clone(),
+            version.to_string(),
+        )?;
+        let expected_path = AbsolutePathBuf::try_from(std::fs::canonicalize(
+            installed.installed_path.join("skills/SKILL.md"),
+        )?)?;
+        // Exercise both invalidation and the subsequent warm read for the same cwd.
+        for _ in 0..2 {
+            let request_id = mcp
+                .send_skills_list_request(SkillsListParams {
+                    cwds: vec![cwd.path().to_path_buf()],
+                    force_reload: false,
+                })
+                .await?;
+            let SkillsListResponse { data } =
+                timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+            let skills = data[0]
+                .skills
+                .iter()
+                .filter(|skill| skill.name == "sample:search")
+                .map(|skill| {
+                    Ok((
+                        skill.path.clone(),
+                        skill.description.clone(),
+                        std::fs::read_to_string(&skill.path)?,
+                    ))
+                })
+                .collect::<std::io::Result<Vec<_>>>()?;
+            assert_eq!(
+                skills,
+                vec![(
+                    expected_path.clone(),
+                    format!("version {version}"),
+                    body.clone()
+                )],
+            );
+        }
+    }
     Ok(())
 }
 

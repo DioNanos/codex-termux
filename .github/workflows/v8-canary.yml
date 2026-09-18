@@ -372,22 +372,18 @@ jobs:
           restore-keys: |
             rusty-v8-source-${{ matrix.target }}-${{ matrix.runner }}-sandbox-
 
-      - name: Install and start sccache
+      - name: Install sccache
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: sccache@0.8.2
+
+      - name: Start sccache
         shell: pwsh
         env:
           SCCACHE_CACHE_SIZE: 256M
           SCCACHE_DIR: ${{ steps.setup_ci.outputs.cargo-target-dir }}/sccache
           SCCACHE_IDLE_TIMEOUT: 0
-        run: |
-          $version = "v0.8.2"
-          $platform = "x86_64-pc-windows-msvc"
-          $basename = "sccache-$version-$platform"
-          $url = "https://github.com/mozilla/sccache/releases/download/$version/$basename.tar.gz"
-          cd ~
-          curl -LO $url
-          tar -xzvf "$basename.tar.gz"
-          . $basename/sccache --start-server
-          echo "$(pwd)/$basename" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        run: sccache --start-server
 
       - name: Install Chromium clang for ARM64 MSVC cross build
         if: matrix.target == 'aarch64-pc-windows-msvc'

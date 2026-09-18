@@ -1,5 +1,8 @@
 //! Daemon-wide overview of recent and locally retained sessions and their subagents.
 
+#[path = "agents_overview_composer.rs"]
+mod composer;
+
 use super::agents_overview_view::AgentsOverviewGroup;
 use super::agents_overview_view::AgentsOverviewRow;
 use super::agents_overview_view::AgentsOverviewView;
@@ -25,6 +28,8 @@ pub(crate) const AGENTS_OVERVIEW_VIEW_ID: &str = "agents-overview";
 pub(super) struct AgentsOverviewState {
     /// Missing metadata records a local resume until the next metadata refresh.
     pub(super) threads: HashMap<ThreadId, Option<Thread>>,
+    pub(super) last_messages: HashMap<ThreadId, String>,
+    pub(super) activity: HashMap<ThreadId, super::agents_overview_details::AgentsOverviewActivity>,
     pub(super) initialized: bool,
     pub(super) request_id: Option<Uuid>,
     pub(super) refresh_pending: bool,
@@ -56,14 +61,14 @@ impl App {
                 subtitle: Some(
                     if workload_identity_selected {
                         "The agents dashboard is unavailable while workload identity is active."
-                    } else if cfg!(unix) {
+                    } else if cfg!(any(unix, windows)) {
                         "This session isn’t connected to a shared background server."
                     } else {
                         "Connect to a remote background server to use the agents dashboard."
                     }
                     .to_string(),
                 ),
-                footer_note: (cfg!(unix) && !workload_identity_selected).then(|| {
+                footer_note: (cfg!(any(unix, windows)) && !workload_identity_selected).then(|| {
                     Line::from(
                         "Starting a background server will not interrupt or move this session."
                             .dim(),
@@ -71,7 +76,7 @@ impl App {
                 }),
                 footer_hint: Some(standard_popup_hint_line_for_keymap(&self.keymap.list)),
                 items: [
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     (!workload_identity_selected).then(|| SelectionItem {
                         name: "Start background server".to_string(),
                         description: Some(
@@ -98,6 +103,11 @@ impl App {
             return;
         }
 
+        self.agents_overview
+            .view_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .focus_composer();
         let threads = self
             .agents_overview
             .threads
@@ -125,10 +135,15 @@ impl App {
         match result {
             Ok(refresh) => {
                 self.agents_overview.initialized = refresh.recent_seed_complete;
+                self.agents_overview
+                    .last_messages
+                    .extend(refresh.last_messages);
                 for (thread_id, thread) in refresh.threads {
                     if let Some(mut thread) = thread {
                         if thread.ephemeral {
                             self.agents_overview.threads.remove(&thread_id);
+                            self.agents_overview.last_messages.remove(&thread_id);
+                            self.agents_overview.activity.remove(&thread_id);
                             continue;
                         }
                         thread.turns.clear();
@@ -154,6 +169,13 @@ impl App {
             std::mem::take(&mut self.agents_overview.refresh_notifications).into_values()
         {
             for notification in notifications {
+                if let ServerNotification::ThreadReverted(reverted) = &notification
+                    && let Ok(thread_id) = ThreadId::from_string(&reverted.thread_id)
+                {
+                    // Discard stale read results without clearing activity received after the revert.
+                    self.agents_overview.last_messages.remove(&thread_id);
+                    continue;
+                }
                 self.track_agents_overview_notification(&notification);
             }
         }
@@ -245,6 +267,7 @@ impl App {
                 continue;
             };
             rows.push(AgentsOverviewRow {
+                details: self.agents_overview_details(root, &children),
                 thread: root.clone(),
                 thread_id,
                 group,
@@ -252,10 +275,17 @@ impl App {
             });
         }
 
+        self.sync_agents_overview_composer();
+
         AgentsOverviewView::new(
             rows,
             selected_thread_id,
             self.primary_thread_id.is_none(),
+            self.config.features.enabled(Feature::Worktrees)
+                && !crate::uses_remote_workspace_or_environment(
+                    &self.app_server_target,
+                    self.environment_manager.as_ref(),
+                ),
             self.app_event_tx.clone(),
             self.keymap.clone(),
             Arc::clone(&self.agents_overview.view_state),
@@ -273,7 +303,6 @@ impl App {
         {
             return Ok(AppRunControl::Continue);
         }
-
         if self.primary_thread_id != Some(root_thread_id) {
             let previous_displayed_thread_id = self.current_displayed_thread_id();
             let mut previous_thread_ids =
@@ -336,10 +365,11 @@ impl App {
                 target_thread.status,
                 codex_app_server_protocol::ThreadStatus::NotLoaded
             );
-            let mut resume_config = if unloaded {
+            let (mut resume_config, local_settings) = if unloaded {
                 let target_session = SessionTarget {
                     path: target_thread.path.clone(),
                     thread_id: root_thread_id,
+                    cwd: Some(target_thread.cwd.to_path_buf()),
                     history_mode: Some(target_thread.history_mode),
                 };
                 match self
@@ -368,6 +398,9 @@ impl App {
                     }
                 }
             };
+            if unloaded && self.reject_remote_resume_permission_override(&resume_config) {
+                return Ok(AppRunControl::Continue);
+            }
             let baseline_approval = resume_config.permissions.approval_policy.value();
             let baseline_permissions =
                 RuntimePermissionProfileOverride::from_config(&resume_config);
@@ -404,7 +437,12 @@ impl App {
                 }
             };
             let resumed = match app_server
-                .resume_thread(resume_config.clone(), root_thread_id, resume_model_settings)
+                .resume_thread(
+                    &local_settings,
+                    resume_config.clone(),
+                    root_thread_id,
+                    resume_model_settings,
+                )
                 .await
             {
                 Ok(resumed) => resumed,
@@ -455,10 +493,11 @@ impl App {
                         && profile.turn_override
                             == RuntimePermissionProfileTurnOverride::LegacySandbox
                 });
+            self.local_settings = local_settings;
             self.config = resume_config;
             tui.set_notification_settings(
-                self.config.tui_notifications.method,
-                self.config.tui_notifications.condition,
+                self.local_settings.tui.notification_settings.method,
+                self.local_settings.tui.notification_settings.condition,
             );
             self.file_search
                 .update_search_dir(self.config.cwd.to_path_buf());
@@ -593,9 +632,7 @@ impl App {
             Some(cwd) => match self.rebuild_config_for_cwd(cwd.to_path_buf()).await {
                 Ok(config) => config,
                 Err(error) => {
-                    if let Ok(mut state) = self.agents_overview.view_state.lock() {
-                        state.input = prompt;
-                    }
+                    self.restore_agents_overview_prompt(prompt);
                     return self
                         .chat_widget
                         .add_error_message(format!("Failed to load project settings: {error}"));
@@ -609,25 +646,86 @@ impl App {
                 || config.permissions.profile_workspace_roots()
                     != self.config.permissions.profile_workspace_roots())
         {
-            if let Ok(mut state) = self.agents_overview.view_state.lock() {
-                state.input = prompt;
-            }
+            self.restore_agents_overview_prompt(prompt);
             return self
                 .chat_widget
                 .add_error_message("Permission profile has different settings.".to_string());
         }
         self.apply_runtime_policy_overrides(&mut config, RuntimePolicyOverrideScope::All);
+        let defaults_cwd = match app_server.thread_params_mode() {
+            crate::app_server_session::ThreadParamsMode::Embedded => config.cwd.as_path(),
+            crate::app_server_session::ThreadParamsMode::Remote => remote_cwd
+                .as_deref()
+                .or_else(|| app_server.remote_cwd_override())
+                .unwrap_or(Path::new(".")),
+        };
+        let mut server_model_cleared = false;
+        match super::new_session::read_new_session_defaults(app_server, defaults_cwd).await {
+            Ok(Some(defaults)) => {
+                server_model_cleared = defaults.model.is_none();
+                let use_server_provider = matches!(
+                    app_server.thread_params_mode(),
+                    crate::app_server_session::ThreadParamsMode::Embedded
+                ) && self.harness_overrides.model.is_none()
+                    && !super::new_session::has_launch_setting(
+                        &config,
+                        &self.cli_kv_overrides,
+                        "model",
+                    )
+                    && self.harness_overrides.model_provider.is_none()
+                    && !super::new_session::has_launch_setting(
+                        &config,
+                        &self.cli_kv_overrides,
+                        "model_provider",
+                    );
+                super::new_session::overlay_new_session_defaults(
+                    &mut config,
+                    &defaults,
+                    &self.cli_kv_overrides,
+                    &self.harness_overrides,
+                );
+                // Embedded thread/start sends a provider ID alongside the selected model.
+                if use_server_provider {
+                    config.model_provider_id = defaults
+                        .model_provider
+                        .unwrap_or_else(|| "openai".to_string());
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.restore_agents_overview_prompt(prompt);
+                return self.chat_widget.add_error_message(format!(
+                    "Failed to load background task settings: {error}"
+                ));
+            }
+        }
         apply_managed_new_thread_defaults(
             &mut config,
             app_server.managed_new_thread_defaults(),
             &self.cli_kv_overrides,
             &self.harness_overrides,
         );
+        if server_model_cleared
+            && config.model.is_none()
+            && config.features.enabled(Feature::FastMode)
+        {
+            // Bootstrap's fallback model may be seeded from the client. Resolve tiers
+            // against the server catalog when config/read cleared the model.
+            config.model = self
+                .model_catalog
+                .models
+                .iter()
+                .find(|model| model.is_default)
+                .or_else(|| self.model_catalog.models.first())
+                .map(|model| model.model.clone());
+        }
         match app_server
             .start_thread_with_session_start_source(
+                &self.local_settings,
                 &config,
                 /*session_start_source*/ None,
                 remote_cwd.as_deref(),
+                /*selected_profile*/ None,
             )
             .await
         {
@@ -640,9 +738,7 @@ impl App {
                     .await;
             }
             Err(error) => {
-                if let Ok(mut state) = self.agents_overview.view_state.lock() {
-                    state.input = prompt;
-                }
+                self.restore_agents_overview_prompt(prompt);
                 self.chat_widget
                     .add_error_message(format!("Failed to start background task: {error}"));
             }
@@ -670,9 +766,7 @@ impl App {
             })
             .await;
         if let Err(error) = result {
-            if let Ok(mut state) = self.agents_overview.view_state.lock() {
-                state.input = prompt;
-            }
+            self.restore_agents_overview_prompt(prompt);
             self.chat_widget
                 .add_error_message(format!("Failed to send task message: {error}"));
         }
@@ -731,7 +825,7 @@ impl App {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn start_agents_daemon(&self) {
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
@@ -740,9 +834,19 @@ impl App {
                     std::env::current_exe().map_err(|error| error.to_string())?;
                 let executable = if current_executable
                     .file_stem()
-                    .is_some_and(|name| name == "codex-tui")
-                {
-                    current_executable.with_file_name("codex")
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| {
+                        if cfg!(windows) {
+                            name.eq_ignore_ascii_case("codex-tui")
+                        } else {
+                            name == "codex-tui"
+                        }
+                    }) {
+                    current_executable.with_file_name(if cfg!(windows) {
+                        "codex.exe"
+                    } else {
+                        "codex"
+                    })
                 } else {
                     current_executable
                 };

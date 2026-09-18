@@ -13,6 +13,7 @@ use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
 use crate::context::ContextualUserFragment;
+use crate::context::UserVerificationNotice;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::feedback_tags;
 use crate::hook_runtime::drain_async_hook_results;
@@ -138,6 +139,13 @@ use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
 
+/// Explicit MCP startup requirements retained across restarts within one user turn.
+#[derive(Default)]
+pub(crate) struct McpStartupRequirements {
+    required_servers: Vec<String>,
+    required_plugins: HashSet<String>,
+}
+
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
 ///
@@ -156,6 +164,7 @@ pub(crate) async fn run_turn(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<TurnInput>,
+    mcp_startup_requirements: &mut McpStartupRequirements,
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
@@ -192,7 +201,16 @@ pub(crate) async fn run_turn(
     }
 
     let user_input = turn_user_input(&input);
-    let (required_servers, mentioned_plugins) =
+    let allow_plugin_mentions =
+        !crate::guardian::is_basic_session_source(&turn_context.session_source);
+    let McpStartupRequirements {
+        required_servers,
+        required_plugins,
+    } = mcp_startup_requirements;
+    if allow_plugin_mentions {
+        required_plugins.extend(crate::plugins::collect_explicit_plugin_ids(&user_input));
+    }
+    let (input_required_servers, mentioned_plugins) =
         match required_mcp_servers_for_input(&sess, turn_context.as_ref(), &user_input)
             .or_cancel(&cancellation_token)
             .await
@@ -205,12 +223,17 @@ pub(crate) async fn run_turn(
             }
         };
 
+    required_servers.extend(input_required_servers);
+    required_servers.sort_unstable();
+    required_servers.dedup();
+
     // run_turn owns the step used to seed context and make the first sampling request.
     let first_step_context = match sess
         .capture_step_context_with_required_mcp_servers(
             Arc::clone(&turn_context),
             &cancellation_token,
-            &required_servers,
+            required_servers,
+            required_plugins,
         )
         .await
     {
@@ -343,24 +366,38 @@ pub(crate) async fn run_turn(
 
         // Capture once so context, advertised tools, and tool calls share one request view.
         let step_context = match next_step_context.take() {
-            Some(step_context) => step_context,
+            Some(step_context) if pending_input.is_empty() => step_context,
             None if pending_input.is_empty() => {
-                sess.capture_step_context(Arc::clone(&turn_context), &cancellation_token)
-                    .await?
+                sess.capture_step_context_with_required_mcp_servers(
+                    Arc::clone(&turn_context),
+                    &cancellation_token,
+                    required_servers,
+                    required_plugins,
+                )
+                .await?
             }
-            None => {
+            Some(_) | None => {
                 let pending_user_input = turn_user_input(&pending_input);
-                let (required_servers, _) = required_mcp_servers_for_input(
+                if allow_plugin_mentions {
+                    required_plugins.extend(crate::plugins::collect_explicit_plugin_ids(
+                        &pending_user_input,
+                    ));
+                }
+                let (pending_required_servers, _) = required_mcp_servers_for_input(
                     &sess,
                     turn_context.as_ref(),
                     &pending_user_input,
                 )
                 .or_cancel(&cancellation_token)
                 .await?;
+                required_servers.extend(pending_required_servers);
+                required_servers.sort_unstable();
+                required_servers.dedup();
                 sess.capture_step_context_with_required_mcp_servers(
                     Arc::clone(&turn_context),
                     &cancellation_token,
-                    &required_servers,
+                    required_servers,
+                    required_plugins,
                 )
                 .await?
             }
@@ -376,6 +413,10 @@ pub(crate) async fn run_turn(
             world_state = sess
                 .record_step_world_state_if_changed(&world_state, step_context.as_ref())
                 .await?;
+
+            // Keep the override after accepted input so ordinary turn rollback removes it too.
+            sess.record_reasoning_effort_override(step_context.as_ref())
+                .await;
 
             // Construct the input that we will send to the model.
             let sampling_request_input: Vec<ResponseItem> = async {
@@ -1033,14 +1074,7 @@ async fn track_turn_resolved_config_analytics(
                 .services
                 .thread_extension_data
                 .get::<codex_extension_api::GuardianV2Enabled>()
-                .is_some_and(|state| {
-                    state.computer_use_only
-                        || !turn_context
-                            .config
-                            .config_layer_stack
-                            .requirements()
-                            .auto_review_required_for_model(&turn_context.model_info().slug)
-                }),
+                .is_some(),
             sandbox_network_access: turn_context.network_sandbox_policy().is_enabled(),
             collaboration_mode: turn_context.mode(),
             personality: turn_context.personality(),
@@ -1408,6 +1442,10 @@ async fn run_sampling_request(
     let mut original_input = None;
     let mut executed_tool_calls_by_output = HashMap::new();
     loop {
+        // A retry must not attribute the next tool call to the previous response.
+        turn_context
+            .extension_data
+            .remove::<codex_api::ResponseId>();
         let prompt_input = if let Some(input) = initial_input.take() {
             input
         } else {
@@ -1796,6 +1834,14 @@ pub(super) fn agent_message_text(item: &codex_protocol::items::AgentMessageItem)
 
 pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<MessagePhase>)> {
     match msg {
+        EventMsg::ElicitationRequest(request)
+            if matches!(
+                &request.request,
+                codex_protocol::approvals::ElicitationRequest::UserVerification { .. }
+            ) =>
+        {
+            Some((UserVerificationNotice.render(), None))
+        }
         EventMsg::AgentMessage(event) => Some((event.message.clone(), event.phase.clone())),
         EventMsg::ItemCompleted(event) => match &event.item {
             TurnItem::AgentMessage(item) => Some((agent_message_text(item), item.phase.clone())),
@@ -2343,7 +2389,13 @@ async fn try_run_sampling_request(
         record_turn_ttft_metric(&turn_context, &event).await;
 
         match event {
-            ResponseEvent::Created => {}
+            ResponseEvent::Created { response_id } => {
+                if let Some(response_id) = response_id {
+                    turn_context
+                        .extension_data
+                        .insert(codex_api::ResponseId(response_id));
+                }
+            }
             ResponseEvent::OutputItemDone(mut item) => {
                 assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
                 if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
@@ -2427,6 +2479,7 @@ async fn try_run_sampling_request(
                     | ResponseItem::WebSearchCall { .. }
                     | ResponseItem::ImageGenerationCall { .. }
                     | ResponseItem::Compaction { .. }
+                    | ResponseItem::ConfigurationUpdate { .. }
                     | ResponseItem::CompactionTrigger { .. }
                     | ResponseItem::ContextCompaction { .. }
                     | ResponseItem::Other => false,

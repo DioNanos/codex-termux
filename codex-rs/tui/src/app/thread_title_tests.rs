@@ -7,12 +7,16 @@ use super::recent_conversation_thread_title_prompt;
 use super::thread_title_prompt;
 use crate::app::session_lifecycle::ThreadAttachPresentation;
 use crate::app::test_support::make_test_app;
-use crate::app_command::AppCommand;
+use crate::app::thread_events::ThreadBufferedEvent;
 use crate::app_event::AppEvent;
+use crate::app_event::ThreadTitleDestination;
 use crate::app_event_sender::AppEventSender;
+use crate::app_server_session::ResumeModelSettings;
 use crate::chatwidget::tests::helpers::render_bottom_popup;
 use crate::test_support::PathBufExt;
 use codex_app_server_client::AppServerEvent;
+use codex_app_server_protocol::ItemCompletedNotification;
+use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnStatus;
@@ -82,39 +86,97 @@ fn bounds_the_entire_title_prompt_for_dense_unicode() {
 }
 
 #[tokio::test]
-async fn manual_rename_invalidates_pending_automatic_title_before_notification()
--> color_eyre::Result<()> {
-    let mut app = make_test_app().await;
-    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
-    let started = app_server.start_thread(&app.config).await?;
-    let thread_id = started.session.thread_id;
-    app.enqueue_primary_thread_session(started.session, started.turns)
+async fn automatic_thread_title_respects_origin_metadata_after_switching() -> color_eyre::Result<()>
+{
+    for (switch_threads, manual_name) in [
+        (true, None),
+        (true, Some("Manual title")),
+        (false, Some("Manual title")),
+    ] {
+        let mut app = make_test_app().await;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+        let started = app_server.start_thread(&app.config).await?;
+        let thread_id = started.session.thread_id;
+        let user_message = serde_json::from_str(
+            r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the login timeout"}]}"#,
+        )?;
+        app_server
+            .thread_inject_items(thread_id, vec![user_message])
+            .await?;
+        app.enqueue_primary_thread_session(started.session, started.turns)
+            .await?;
+        app.pending_thread_titles
+            .insert((thread_id, ThreadTitleDestination::Automatic));
+
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        if switch_threads {
+            let second = app_server.start_thread(&app.config).await?;
+            let second_id = second.session.thread_id;
+            app.ensure_thread_channel(second_id)
+                .store
+                .lock()
+                .await
+                .set_session(second.session, second.turns);
+            app.select_agent_thread(&mut tui, &mut app_server, second_id)
+                .await?;
+        }
+        if let Some(name) = manual_name {
+            // The saved name must win even before its notification reaches the widget.
+            app_server
+                .thread_set_name(thread_id, name.to_string())
+                .await?;
+        }
+        let displayed_thread = (app.chat_widget.thread_id(), app.chat_widget.thread_name());
+        app.handle_event(
+            &mut tui,
+            &mut app_server,
+            AppEvent::GeneratedThreadTitle {
+                thread_id,
+                temporary_thread_id: codex_protocol::ThreadId::new(),
+                destination: ThreadTitleDestination::Automatic,
+                result: Ok(r#"{"title":"Generated title"}"#.to_string()),
+            },
+        )
         .await?;
-    app_server
-        .thread_set_name(thread_id, "Provisional title".to_string())
-        .await?;
-    app.chat_widget
-        .expect_automatic_thread_name("Provisional title".to_string());
-
-    app.submit_thread_op(
-        &mut app_server,
-        thread_id,
-        AppCommand::set_thread_name("Manual title".to_string()),
-    )
-    .await?;
-
-    assert_eq!(
-        app.chat_widget.thread_name(),
-        Some("Manual title".to_string())
-    );
-
-    app_server.shutdown().await?;
+        let expected_name = Some(manual_name.unwrap_or("Generated title").to_string());
+        assert_eq!(
+            app_server
+                .thread_read(thread_id, /*include_turns*/ false)
+                .await?
+                .name,
+            expected_name
+        );
+        assert_eq!(
+            (app.chat_widget.thread_id(), app.chat_widget.thread_name()),
+            displayed_thread
+        );
+        assert!(app.pending_thread_titles.is_empty());
+        let resumed = app_server
+            .resume_thread(
+                &app.local_settings,
+                app.config.clone(),
+                thread_id,
+                ResumeModelSettings::PreserveExistingThread,
+            )
+            .await?;
+        assert_eq!(resumed.session.thread_name, expected_name);
+        app_server.shutdown().await?;
+    }
     Ok(())
 }
 
 #[tokio::test]
 async fn slash_rename_generates_editable_title_through_embedded_app_server()
 -> color_eyre::Result<()> {
+    check_thread_title_generation(/*automatic*/ false).await
+}
+
+#[tokio::test]
+async fn automatic_thread_title_generates_without_a_provisional_name() -> color_eyre::Result<()> {
+    check_thread_title_generation(/*automatic*/ true).await
+}
+
+async fn check_thread_title_generation(automatic: bool) -> color_eyre::Result<()> {
     let server = wiremock::MockServer::start().await;
     let response = responses::mount_sse_once(
         &server,
@@ -186,10 +248,37 @@ async fn slash_rename_generates_editable_title_through_embedded_app_server()
         });
     while event_rx.try_recv().is_ok() {}
 
-    app.chat_widget.apply_external_edit("/rename".to_string());
-    app.chat_widget
-        .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(render_bottom_popup(&app.chat_widget, /*width*/ 80).contains("Generating"));
+    if automatic {
+        for _ in 0..2 {
+            app.handle_active_thread_event(
+                &mut tui,
+                &mut app_server,
+                ThreadBufferedEvent::Notification(Box::new(ServerNotification::ItemCompleted(
+                    ItemCompletedNotification {
+                        thread_id: thread_id.to_string(),
+                        turn_id: "existing-turn".to_string(),
+                        item: title_user_message("user-message", "Fix the login timeout"),
+                        completed_at_ms: 0,
+                    },
+                ))),
+            )
+            .await?;
+        }
+        assert_eq!(app.chat_widget.thread_name(), None);
+        assert!(render_bottom_popup(&app.chat_widget, /*width*/ 120).contains("renaming..."));
+        assert_eq!(
+            app_server
+                .thread_read(thread_id, /*include_turns*/ false)
+                .await?
+                .name,
+            None
+        );
+    } else {
+        app.chat_widget.apply_external_edit("/rename".to_string());
+        app.chat_widget
+            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(render_bottom_popup(&app.chat_widget, /*width*/ 80).contains("Generating"));
+    }
 
     enum TitleDriveEvent {
         Ui(Box<AppEvent>),
@@ -220,10 +309,34 @@ async fn slash_rename_generates_editable_title_through_embedded_app_server()
         }
     }
 
-    let popup = render_bottom_popup(&app.chat_widget, /*width*/ 80);
-    assert!(popup.contains("Fix login timeout"));
-    assert!(!popup.contains("Generating a title suggestion"));
+    if automatic {
+        assert_eq!(
+            app.chat_widget.thread_name(),
+            Some("Fix login timeout".to_string())
+        );
+        assert_eq!(
+            app_server
+                .thread_read(thread_id, /*include_turns*/ false)
+                .await?
+                .name,
+            Some("Fix login timeout".to_string())
+        );
+        assert!(app.pending_thread_titles.is_empty());
+    } else {
+        let popup = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+        assert!(popup.contains("Fix login timeout"));
+        assert!(!popup.contains("Generating a title suggestion"));
+        assert_eq!(
+            app_server
+                .thread_read(thread_id, /*include_turns*/ false)
+                .await?
+                .name,
+            None
+        );
+    }
     assert!(app.temporary_structured_requests.is_empty());
+    assert!(app.pending_thread_titles.is_empty());
+    assert!(!render_bottom_popup(&app.chat_widget, /*width*/ 120).contains("renaming..."));
 
     let request = response.single_request();
     assert!(
@@ -481,4 +594,84 @@ fn title_agent_message(id: &str, text: &str, phase: Option<MessagePhase>) -> Thr
         delivery: None,
         questions: None,
     }
+}
+
+#[tokio::test]
+async fn thread_title_progress_clears_failed_requests_and_follows_thread_switches()
+-> color_eyre::Result<()> {
+    let mut app = make_test_app().await;
+    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let started = app_server.start_thread(&app.config).await?;
+    let thread_id = started.session.thread_id;
+    app.enqueue_primary_thread_session(started.session, started.turns)
+        .await?;
+    let suggestion = ThreadTitleDestination::RenameSuggestion {
+        request_id: uuid::Uuid::new_v4(),
+    };
+    app.pending_thread_titles.extend([
+        (thread_id, ThreadTitleDestination::Automatic),
+        (thread_id, suggestion),
+    ]);
+    app.sync_thread_title_progress();
+    assert!(render_bottom_popup(&app.chat_widget, /*width*/ 120).contains("renaming..."));
+
+    app.on_thread_title_started(
+        &app_server,
+        thread_id,
+        ThreadTitleDestination::Automatic,
+        "prompt".to_string(),
+        /*effort*/ None,
+        Err("startup failed".to_string()),
+    );
+    assert!(render_bottom_popup(&app.chat_widget, /*width*/ 120).contains("renaming..."));
+    app.on_thread_title_started(
+        &app_server,
+        thread_id,
+        suggestion,
+        "prompt".to_string(),
+        /*effort*/ None,
+        Ok("invalid-thread-id".to_string()),
+    );
+    assert!(app.pending_thread_titles.is_empty());
+    assert!(!render_bottom_popup(&app.chat_widget, /*width*/ 120).contains("renaming..."));
+
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.pending_thread_titles
+        .insert((thread_id, ThreadTitleDestination::Automatic));
+    let second = app_server.start_thread(&app.config).await?;
+    let second_id = second.session.thread_id;
+    app.ensure_thread_channel(second_id)
+        .store
+        .lock()
+        .await
+        .set_session(second.session, second.turns);
+    app.select_agent_thread(&mut tui, &mut app_server, second_id)
+        .await?;
+    app.render_chat_widget_frame(
+        &mut tui,
+        ratatui::layout::Size::new(/*width*/ 120, /*height*/ 30),
+    )?;
+    assert!(!render_bottom_popup(&app.chat_widget, /*width*/ 120).contains("renaming..."));
+    app.select_agent_thread(&mut tui, &mut app_server, thread_id)
+        .await?;
+    app.render_chat_widget_frame(
+        &mut tui,
+        ratatui::layout::Size::new(/*width*/ 120, /*height*/ 30),
+    )?;
+    assert!(render_bottom_popup(&app.chat_widget, /*width*/ 120).contains("renaming..."));
+    app.handle_event(
+        &mut tui,
+        &mut app_server,
+        AppEvent::GeneratedThreadTitle {
+            thread_id,
+            temporary_thread_id: codex_protocol::ThreadId::new(),
+            destination: ThreadTitleDestination::Automatic,
+            result: Err("generation failed".to_string()),
+        },
+    )
+    .await?;
+    assert!(app.pending_thread_titles.is_empty());
+    assert!(!render_bottom_popup(&app.chat_widget, /*width*/ 120).contains("renaming..."));
+    app_server.shutdown().await?;
+    Ok(())
 }

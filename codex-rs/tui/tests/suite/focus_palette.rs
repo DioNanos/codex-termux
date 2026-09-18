@@ -14,6 +14,8 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
+#[cfg(target_os = "macos")]
+use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
 // Full startup continues after the composer first appears and can be slower under Rosetta in CI.
@@ -27,7 +29,7 @@ fn focus_gained_with_unanswered_palette_queries_preserves_immediate_input() -> R
     let codex_home = tempfile::tempdir()?;
     write_test_config(codex_home.path(), &repo_root)?;
 
-    let mut terminal = PtyCodex::start(&repo_root, codex_home)?;
+    let mut terminal = PtyCodex::start(&repo_root, codex_home, &[])?;
     terminal.wait_for_startup()?;
 
     let startup_output_len = terminal.output.len();
@@ -45,6 +47,108 @@ fn focus_gained_with_unanswered_palette_queries_preserves_immediate_input() -> R
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_startup_honors_codex_home_symlink_opt_out() -> Result<()> {
+    use core_test_support::responses;
+    use wiremock::matchers::body_string_contains;
+
+    core_test_support::skip_if_sandbox!(Ok(()));
+    let workspace = tempfile::tempdir()?;
+    let workspace_path = workspace.path().canonicalize()?;
+    let codex_home = tempfile::tempdir()?;
+    let target = tempfile::tempdir()?;
+    let visualizations = codex_home.path().join("visualizations");
+    std::os::unix::fs::symlink(target.path(), &visualizations)?;
+    write_test_config(codex_home.path(), &workspace_path)?;
+
+    let server = responses::start_mock_server().await;
+    // Automatic thread-title requests must not consume the tool responses.
+    let _title_mock = responses::mount_sse_once_match(
+        &server,
+        body_string_contains(r#"\"thread_source\":\"system\""#),
+        responses::sse(vec![
+            responses::ev_assistant_message("title", r#"{"title":"Symlink probe"}"#),
+            responses::ev_completed("title"),
+        ]),
+    )
+    .await;
+    let _write_mock = responses::mount_sse_once_match(
+        &server,
+        body_string_contains(r#"\"thread_source\":\"user\""#),
+        responses::sse(vec![
+            responses::ev_exec_command_call_with_args(
+                "write",
+                &serde_json::json!({
+                    "cmd": "printf ready > ready.txt",
+                    "workdir": visualizations,
+                    "shell": "/bin/sh",
+                    "login": false,
+                }),
+            ),
+            responses::ev_completed("startup"),
+        ]),
+    )
+    .await;
+    let completion_mock = responses::mount_sse_once_match(
+        &server,
+        body_string_contains(r#"\"thread_source\":\"user\""#),
+        responses::sse(vec![
+            responses::ev_assistant_message("ready", "symlink-opt-out-ready"),
+            responses::ev_completed("complete"),
+        ]),
+    )
+    .await;
+    let base_url = server.uri();
+    let visualizations = toml::Value::String(visualizations.display().to_string());
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        config_path,
+        format!(
+            "allow_symlinked_codex_home = true\n\
+             sandbox_mode = \"workspace-write\"\n\
+             approval_policy = \"never\"\n\
+             {config}\n\
+             [sandbox_workspace_write]\nwritable_roots = [{visualizations}]\n\
+             [model_providers.test]\nname = \"Mock\"\n\
+             base_url = \"{base_url}/v1\"\nwire_api = \"responses\"\n\
+             requires_openai_auth = false\nsupports_websockets = false\n"
+        ),
+    )?;
+
+    // A fresh home has no daemon. Writing through the link exercises the embedded server's
+    // local executor and its sandbox policy.
+    let mut terminal = PtyCodex::start(
+        &workspace_path,
+        codex_home,
+        &["-c", "model_provider=\"test\"", "Write ready.txt"],
+    )?;
+    terminal.wait_for_startup()?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while Instant::now() < deadline {
+        terminal.read_output(Duration::from_millis(/*millis*/ 50))?;
+        if terminal.screen_contains("symlink-opt-out-ready") {
+            let tool_output = completion_mock
+                .function_call_output_text("write")
+                .context("missing symlink write tool output")?;
+            ensure!(
+                tool_output.contains("Process exited with code 0"),
+                "{tool_output}"
+            );
+            assert_eq!(std::fs::read(target.path().join("ready.txt"))?, b"ready");
+            return Ok(());
+        }
+        if terminal.child.try_wait()?.is_some() {
+            break;
+        }
+    }
+    bail!(
+        "interactive startup did not honor the symlink opt-out; screen:\n{}",
+        terminal.screen_contents(),
+    );
+}
+
 pub(super) struct PtyCodex {
     master: File,
     child: Child,
@@ -57,7 +161,11 @@ pub(super) struct PtyCodex {
 }
 
 impl PtyCodex {
-    pub(super) fn start(repo_root: &Path, codex_home: TempDir) -> Result<Self> {
+    pub(super) fn start(
+        repo_root: &Path,
+        codex_home: TempDir,
+        extra_args: &[&str],
+    ) -> Result<Self> {
         let mut master_fd = -1;
         let mut slave_fd = -1;
         let mut window_size = libc::winsize {
@@ -92,6 +200,7 @@ impl PtyCodex {
         let codex = codex_utils_cargo_bin::cargo_bin("codex-tui")
             .or_else(|_| codex_utils_cargo_bin::cargo_bin("codex"))?;
         let child = Command::new(codex)
+            .args(extra_args)
             .arg("--no-alt-screen")
             .arg("-C")
             .arg(repo_root)
@@ -234,6 +343,29 @@ impl PtyCodex {
 
     pub(super) fn screen_contents(&self) -> String {
         self.parser.screen().contents()
+    }
+
+    pub(super) fn wait_for_screen(&mut self, text: &str) -> Result<()> {
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        while Instant::now() < deadline {
+            self.read_output(Duration::from_millis(/*millis*/ 50))?;
+            if self.screen_contains(text) {
+                return Ok(());
+            }
+            if let Some(status) = self.child.try_wait()? {
+                bail!("Codex exited while waiting for {text:?} ({status})");
+            }
+        }
+        bail!("missing {text:?}; screen:\n{}", self.screen_contents())
+    }
+
+    pub(super) fn ensure_running(&mut self) -> Result<()> {
+        ensure!(
+            self.child.try_wait()?.is_none(),
+            "Codex exited unexpectedly; screen:\n{}",
+            self.screen_contents()
+        );
+        Ok(())
     }
 }
 

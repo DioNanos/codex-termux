@@ -6,6 +6,7 @@ mod events;
 mod facts;
 mod guardian_v2;
 mod reducer;
+mod thread_hint;
 
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -74,6 +75,8 @@ pub use facts::TurnTokenUsageFact;
 pub use facts::build_track_events_context;
 pub use guardian_v2::GuardianV2Event;
 pub use guardian_v2::GuardianV2EventKind;
+pub use thread_hint::ThreadHintStatus;
+pub use thread_hint::ThreadHintStatusEvent;
 
 #[cfg(test)]
 mod analytics_client_tests;

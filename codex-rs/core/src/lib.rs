@@ -68,6 +68,7 @@ mod exec_policy;
 #[cfg(test)]
 mod git_info_tests;
 mod guardian;
+pub mod guardian_review;
 mod hook_mcp_executor;
 mod hook_runtime;
 mod image_preparation;
@@ -125,6 +126,7 @@ pub use thread_manager::ThreadManager;
 pub use thread_manager::ThreadShutdownReport;
 pub use thread_manager::build_models_manager;
 pub use thread_manager::local_agent_graph_store_from_state_db;
+pub use thread_manager::passthrough_image_store;
 pub use thread_manager::thread_store_from_config;
 pub use tools::handlers::WaitForEnvironmentToolConfig;
 pub use web_search::web_search_action_detail;

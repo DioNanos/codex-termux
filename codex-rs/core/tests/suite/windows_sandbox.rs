@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use tempfile::TempDir;
 
 struct EnvVarGuard {
@@ -121,6 +122,143 @@ fn stage_windows_sandbox_helpers() -> anyhow::Result<()> {
             });
         }
     }
+    Ok(())
+}
+
+fn escape_toml_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "\\\\")
+}
+
+fn stage_windows_sandbox_cli(fixture_bin: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+    std::fs::create_dir_all(fixture_bin)?;
+    let resources_dir = fixture_bin.join("codex-resources");
+    std::fs::create_dir_all(&resources_dir)?;
+
+    let codex_source = codex_utils_cargo_bin::cargo_bin("codex")?;
+    let codex = fixture_bin.join("codex.exe");
+    std::fs::copy(&codex_source, &codex)
+        .with_context(|| format!("copy {} to {}", codex_source.display(), codex.display()))?;
+    for helper_name in ["codex-windows-sandbox-setup", "codex-command-runner"] {
+        let helper = codex_utils_cargo_bin::cargo_bin(helper_name)?;
+        let destination = resources_dir.join(Path::new(helper_name).with_extension("exe"));
+        std::fs::copy(&helper, &destination)
+            .with_context(|| format!("copy {} to {}", helper.display(), destination.display()))?;
+    }
+
+    let probe_source = codex_utils_cargo_bin::cargo_bin("codex-windows-managed-deny-probe")?;
+    let probe = fixture_bin.join("managed-deny-probe.exe");
+    std::fs::copy(&probe_source, &probe)
+        .with_context(|| format!("copy {} to {}", probe_source.display(), probe.display()))?;
+    Ok((codex, probe))
+}
+
+fn assert_managed_deny_probe(output: &std::process::Output, launch: usize) -> anyhow::Result<()> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "managed deny probe launch {launch} failed: status={:?}; stdout={stdout}; stderr={stderr}",
+        output.status.code()
+    );
+    assert!(
+        stdout.contains("allowed-read:OK") && stdout.contains("allowed-import:OK"),
+        "managed deny probe launch {launch} lost allowed access: {stdout}"
+    );
+    assert!(
+        stdout.contains("denied-read:DENIED") && stdout.contains("denied-import:DENIED"),
+        "managed deny probe launch {launch} did not enforce denied access: {stdout}"
+    );
+    assert!(
+        !stdout.contains("UNEXPECTED_SUCCESS"),
+        "managed deny probe launch {launch} leaked denied content: {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+#[serial(codex_home)]
+fn windows_sandbox_cli_preserves_managed_deny_reads_across_launches() -> anyhow::Result<()> {
+    let codex_home =
+        codex_home_for_windows_sandbox_test("windows-cli-managed-deny-read-codex-home")?;
+
+    let fixture = TempDir::new()?;
+    let fixture_root = dunce::canonicalize(fixture.path())?;
+    let work = fixture_root.join("work");
+    let runtime = fixture_root.join("runtime");
+    let denied = runtime.join("denied");
+    let bin = fixture_root.join("bin");
+    std::fs::create_dir_all(&work)?;
+    std::fs::create_dir_all(&denied)?;
+    let (codex, probe) = stage_windows_sandbox_cli(&bin)?;
+
+    let allowed_text = runtime.join("allowed.txt");
+    let denied_text = denied.join("secret.txt");
+    let allowed_module = runtime.join("allowed.dll");
+    let denied_module = denied.join("secret.dll");
+    std::fs::write(&allowed_text, "ALLOW-CONTROL\n")?;
+    std::fs::write(&denied_text, "DENIED-CONTENT\n")?;
+    let system_root = std::env::var_os("SystemRoot").context("resolve SystemRoot")?;
+    let system_module = PathBuf::from(system_root)
+        .join("System32")
+        .join("version.dll");
+    std::fs::copy(&system_module, &allowed_module).with_context(|| {
+        format!(
+            "copy {} to {}",
+            system_module.display(),
+            allowed_module.display()
+        )
+    })?;
+    std::fs::copy(&system_module, &denied_module).with_context(|| {
+        format!(
+            "copy {} to {}",
+            system_module.display(),
+            denied_module.display()
+        )
+    })?;
+
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            "default_permissions = \"managed-deny-test\"\n\
+             \n\
+             [windows]\n\
+             sandbox = \"elevated\"\n\
+             \n\
+             [shell_environment_policy]\n\
+             inherit = \"all\"\n\
+             \n\
+             [permissions.managed-deny-test.filesystem]\n\
+             \":minimal\" = \"read\"\n\
+             \"{}\" = \"read\"\n\
+             \"{}\" = \"write\"\n\
+             \"{}\" = \"deny\"\n\
+             \n\
+             [permissions.managed-deny-test.network]\n\
+             enabled = false\n",
+            escape_toml_path(&fixture_root),
+            escape_toml_path(&work),
+            escape_toml_path(&denied),
+        ),
+    )?;
+
+    for launch in 1..=2 {
+        let output = Command::new(&codex)
+            .current_dir(&work)
+            .env("CODEX_HOME", codex_home.path())
+            .env("CODEX_WINDOWS_ALLOWED_TEXT", &allowed_text)
+            .env("CODEX_WINDOWS_DENIED_TEXT", &denied_text)
+            .env("CODEX_WINDOWS_ALLOWED_MODULE", &allowed_module)
+            .env("CODEX_WINDOWS_DENIED_MODULE", &denied_module)
+            .args(["sandbox", "--permission-profile"])
+            .arg("managed-deny-test")
+            .arg("--cd")
+            .arg(&work)
+            .arg("--")
+            .arg(&probe)
+            .output()?;
+        assert_managed_deny_probe(&output, launch)?;
+    }
+
     Ok(())
 }
 

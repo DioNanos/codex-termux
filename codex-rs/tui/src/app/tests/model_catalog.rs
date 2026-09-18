@@ -293,7 +293,7 @@ fn select_model_availability_nux_returns_none_when_all_models_are_exhausted() {
 #[tokio::test]
 async fn prepare_startup_tooltip_override_persists_model_availability_nux_count() {
     let codex_home = tempdir().expect("temp codex home");
-    let mut config = ConfigBuilder::default()
+    let config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .build()
         .await
@@ -310,12 +310,17 @@ async fn prepare_startup_tooltip_override_persists_model_availability_nux_count(
         message: "gpt-5.4 is available".to_string(),
     });
 
-    let tooltip =
-        prepare_startup_tooltip_override(&mut config, &presets, /*is_first_run*/ false).await;
+    let mut local_settings = crate::local_settings::LocalSettings::from(&config);
+    let tooltip = prepare_startup_tooltip_override(
+        &mut local_settings,
+        &presets,
+        /*is_first_run*/ false,
+    )
+    .await;
 
     assert_eq!(tooltip.as_deref(), Some("gpt-5.4 is available"));
     assert_eq!(
-        config.model_availability_nux.shown_count,
+        local_settings.tui.model_availability_nux.shown_count,
         HashMap::from([("gpt-5.4".to_string(), 1)])
     );
 

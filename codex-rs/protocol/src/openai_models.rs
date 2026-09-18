@@ -34,8 +34,16 @@ use crate::config_types::ServiceTier;
 use crate::config_types::Verbosity;
 use crate::protocol::MultiAgentVersion;
 
+#[path = "openai_models/guardian.rs"]
+mod guardian;
+pub use guardian::GuardianModelPolicy;
+pub use guardian::GuardianReviewMode;
+pub use guardian::GuardianScope;
+
 #[path = "openai_models/guardian_v2.rs"]
 mod guardian_v2;
+#[path = "openai_models/reasoning_effort.rs"]
+mod reasoning_effort;
 
 pub use guardian_v2::GuardianV2ModelConfig;
 pub use guardian_v2::GuardianV2TranscriptModelConfig;
@@ -420,6 +428,11 @@ const fn is_true(value: &bool) -> bool {
 /// Model metadata returned by the Codex backend `/models` endpoint.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelInfo {
+    /// Model-owned approval coverage. Absent preserves legacy settings; an empty map disables
+    /// ordinary Guardian review. Keys are computer_use, shell, code_mode, file_changes, mcp, network,
+    /// and permissions. This does not override mandatory safety or administrator requirements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian: Option<GuardianModelPolicy>,
     pub slug: String,
     pub display_name: String,
     pub description: Option<String>,
@@ -487,6 +500,9 @@ pub struct ModelInfo {
     pub used_fallback_model_metadata: bool,
     #[serde(default)]
     pub supports_search_tool: bool,
+    /// Whether experimental context management may be activated at session startup.
+    #[serde(default)]
+    pub supports_experimental_context: bool,
     #[serde(default)]
     pub use_responses_lite: bool,
     #[serde(default)]
@@ -1013,7 +1029,7 @@ mod tests {
         );
     }
 
-    fn test_model(spec: Option<ModelMessages>) -> ModelInfo {
+    pub(super) fn test_model(spec: Option<ModelMessages>) -> ModelInfo {
         ModelInfo {
             slug: "test-model".to_string(),
             display_name: "Test Model".to_string(),
@@ -1050,7 +1066,9 @@ mod tests {
             input_modalities: default_input_modalities(),
             used_fallback_model_metadata: false,
             supports_search_tool: false,
+            supports_experimental_context: false,
             use_responses_lite: false,
+            guardian: None,
             node_repl_auto_review_required: false,
             node_repl_disabled: false,
             auto_review_model_override: None,
@@ -1060,7 +1078,6 @@ mod tests {
             multi_agent_reasoning_effort: None,
         }
     }
-
     fn personality_variables() -> ModelInstructionsVariables {
         ModelInstructionsVariables {
             personality_default: Some("default".to_string()),
@@ -1881,6 +1898,7 @@ mod tests {
         assert!(!model.supports_image_detail_original);
         assert_eq!(model.web_search_tool_type, WebSearchToolType::Text);
         assert!(!model.supports_search_tool);
+        assert!(!model.supports_experimental_context);
         assert!(!model.use_responses_lite);
         assert!(!model.node_repl_auto_review_required);
         assert!(!model.node_repl_disabled);

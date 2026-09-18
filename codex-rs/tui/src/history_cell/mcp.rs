@@ -120,6 +120,10 @@ impl McpToolCallCell {
         self.result = Some(Err("interrupted".to_string()));
     }
 
+    pub(crate) fn freeze_snapshot(&mut self) {
+        self.animations_enabled = false;
+    }
+
     fn result_kind(&self) -> McpResultKind {
         if is_node_repl_backed_server(&self.invocation.server) && self.invocation.tool == "js" {
             McpResultKind::NodeRepl

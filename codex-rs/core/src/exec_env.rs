@@ -13,6 +13,8 @@ use std::collections::HashMap;
 pub use codex_protocol::shell_environment::CODEX_SESSION_ID_ENV_VAR;
 pub use codex_protocol::shell_environment::CODEX_THREAD_ID_ENV_VAR;
 
+pub(crate) const CODEX_VERSION_ENV_VAR: &str = "CODEX_VERSION";
+
 /// Informational name of the active permission profile. Child processes can
 /// overwrite this value, so it must not be treated as proof of enforcement.
 pub const CODEX_PERMISSION_PROFILE_ENV_VAR: &str = "CODEX_PERMISSION_PROFILE";
@@ -35,9 +37,16 @@ pub fn create_env(
     shell_environment::create_env(policy, thread_id.as_deref())
 }
 
-/// Exposes the shared root-session identity to model-reachable shell commands.
-pub(crate) fn inject_session_id_env(env: &mut HashMap<String, String>, session_id: SessionId) {
+/// Exposes the shared root-session identity and harness version to shell commands.
+pub(crate) fn inject_session_env(env: &mut HashMap<String, String>, session_id: SessionId) {
     env.insert(CODEX_SESSION_ID_ENV_VAR.to_string(), session_id.to_string());
+    if cfg!(windows) {
+        env.retain(|key, _| !key.eq_ignore_ascii_case(CODEX_VERSION_ENV_VAR));
+    }
+    env.insert(
+        CODEX_VERSION_ENV_VAR.to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    );
 }
 
 /// Injects the selected named permission profile into a shell tool's environment.

@@ -4,13 +4,20 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use anyhow::Result;
+use codex_exec_server_protocol::JSONRPCMessage;
 use futures::FutureExt;
+use futures::SinkExt;
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use pretty_assertions::assert_eq;
+use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
+use tokio::io::duplex;
 use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::Message;
 
 use super::ExecServerClient;
 use super::ExecServerReconnectStrategy;
@@ -20,10 +27,21 @@ use super::INITIAL_REGISTRY_REQUEST_TIMEOUT;
 use crate::ExecServerError;
 use crate::NoiseChannelIdentity;
 use crate::NoiseChannelPublicKey;
+use crate::NoiseRendezvousConnectArgs;
 use crate::NoiseRendezvousConnectBundle;
 use crate::NoiseRendezvousConnectProvider;
+use crate::client::NoiseInitializeContext;
 use crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT;
 use crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_INITIALIZE_TIMEOUT;
+use crate::client_api::ExecServerClientConnectOptions;
+use crate::connection::JsonRpcConnection;
+use crate::noise_channel::PendingResponderHandshake;
+use crate::noise_channel::noise_channel_prologue;
+use crate::protocol::INITIALIZE_METHOD;
+use crate::relay::RelayFrameBodyKind;
+use crate::relay::decode_relay_message_frame;
+use crate::relay::encode_relay_message_frame;
+use crate::relay_proto::RelayMessageFrame;
 
 #[derive(Default)]
 struct SequenceNoiseConnectProvider {
@@ -85,7 +103,7 @@ impl SequenceNoiseConnectProvider {
             ),
         )
         .await
-        .map(|(connection, options, _)| (connection, options))
+        .map(|(ready, _)| (ready.connection, ready.options))
     }
 }
 
@@ -130,6 +148,110 @@ fn registry_error(status: http::StatusCode, code: &str) -> ExecServerError {
         code: Some(code.to_string()),
         message: "registry unavailable".to_string(),
     }
+}
+
+#[tokio::test]
+async fn noise_handshake_uses_initialize_timeout() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let websocket_url = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await?;
+        let mut websocket = accept_async(socket).await?;
+        // Drain the frames sent before the harness waits for the responder,
+        // then verify that a timed-out readiness wait closes the socket.
+        assert!(websocket.next().await.is_some());
+        assert!(websocket.next().await.is_some());
+        let closed =
+            tokio::time::timeout(std::time::Duration::from_secs(1), websocket.next()).await?;
+        assert!(
+            matches!(closed, None | Some(Ok(Message::Close(_))) | Some(Err(_))),
+            "timed-out Noise handshake must close its websocket"
+        );
+        anyhow::Ok(())
+    });
+    let initialize_timeout = std::time::Duration::from_millis(1);
+    let opened = ExecServerClient::open_noise_rendezvous_connection(NoiseRendezvousConnectArgs {
+        bundle: NoiseRendezvousConnectBundle {
+            websocket_url,
+            environment_id: "environment".to_string(),
+            executor_registration_id: "registration".to_string(),
+            executor_public_key: NoiseChannelIdentity::generate()?.public_key(),
+            harness_key_authorization: "authorization".to_string(),
+        },
+        harness_identity: NoiseChannelIdentity::generate()?,
+        client_name: "test".to_string(),
+        connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
+        initialize_timeout,
+        resume_session_id: None,
+        http_client_factory: codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ),
+    })
+    .await?;
+
+    let error = ExecServerClient::finish_noise_rendezvous_connection(opened)
+        .await
+        .err()
+        .expect("stalled Noise handshake must time out");
+    assert!(matches!(
+        error,
+        ExecServerError::InitializeTimedOut { timeout } if timeout == initialize_timeout
+    ));
+
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn deferred_initialize_timeout_reports_configured_budget() {
+    let (client_stdin, server_reader) = duplex(1 << 20);
+    let (server_writer, client_stdout) = duplex(1 << 20);
+    let server = tokio::spawn(async move {
+        let _server_writer = server_writer;
+        let mut lines = BufReader::new(server_reader).lines();
+        let line = lines
+            .next_line()
+            .await
+            .expect("initialize read should succeed")
+            .expect("initialize request should arrive");
+        let request: JSONRPCMessage =
+            serde_json::from_str(&line).expect("initialize request should parse");
+        assert!(
+            matches!(
+                request,
+                JSONRPCMessage::Request(ref request) if request.method == INITIALIZE_METHOD
+            ),
+            "expected initialize request, got {request:?}"
+        );
+        futures::future::pending::<()>().await;
+    });
+    let configured_timeout = std::time::Duration::from_secs(10);
+    let error = ExecServerClient::connect_with_recovery_and_noise_context(
+        JsonRpcConnection::from_stdio(
+            client_stdout,
+            client_stdin,
+            "timeout-test-client".to_string(),
+        ),
+        ExecServerClientConnectOptions {
+            client_name: "timeout-test-client".to_string(),
+            initialize_timeout: std::time::Duration::from_millis(1),
+            resume_session_id: None,
+        },
+        /*reconnect_strategy*/ None,
+        NoiseInitializeContext {
+            span: tracing::info_span!("codex.exec_server.request"),
+            timeout_for_error: configured_timeout,
+        },
+    )
+    .await
+    .err()
+    .expect("initialize RPC must time out");
+    assert!(matches!(
+        error,
+        ExecServerError::InitializeTimedOut { timeout } if timeout == configured_timeout
+    ));
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -382,14 +504,40 @@ async fn initial_noise_connection_refreshes_bundle_after_exhausting_initial_retr
     });
     let accepted_listener = TcpListener::bind("127.0.0.1:0").await?;
     let accepted_url = format!("ws://{}", accepted_listener.local_addr()?);
+    let executor_identity = NoiseChannelIdentity::generate()?;
+    let executor_public_key = executor_identity.public_key();
     let accepted_server = tokio::spawn(async move {
         let (socket, _) = accepted_listener.accept().await?;
-        let _websocket = accept_async(socket).await?;
+        let mut websocket = accept_async(socket).await?;
+        let Message::Binary(resume_payload) = websocket.next().await.unwrap()? else {
+            anyhow::bail!("expected Noise relay resume frame");
+        };
+        let resume = decode_relay_message_frame(resume_payload.as_ref())?;
+        assert_eq!(resume.validate()?, RelayFrameBodyKind::Resume);
+        let Message::Binary(handshake_payload) = websocket.next().await.unwrap()? else {
+            anyhow::bail!("expected Noise relay handshake frame");
+        };
+        let handshake = decode_relay_message_frame(handshake_payload.as_ref())?;
+        let stream_id = handshake.stream_id.clone();
+        let prologue = noise_channel_prologue("environment", "registration", &stream_id);
+        let pending = PendingResponderHandshake::read_request(
+            &executor_identity,
+            &prologue,
+            &handshake.into_handshake_payload()?,
+        )?;
+        let (_transport, response) = pending.complete()?;
+        websocket
+            .send(Message::Binary(
+                encode_relay_message_frame(&RelayMessageFrame::handshake(stream_id, response))
+                    .into(),
+            ))
+            .await?;
         anyhow::Ok(())
     });
     let sequence = Arc::new(SequenceNoiseConnectProvider::default());
     let unauthorized_bundle = test_bundle(unauthorized_url.clone())?;
-    let accepted_bundle = test_bundle(accepted_url.clone())?;
+    let mut accepted_bundle = test_bundle(accepted_url.clone())?;
+    accepted_bundle.executor_public_key = executor_public_key;
     sequence.push_response(async {
         tokio::time::pause();
         Err(registry_error(

@@ -114,6 +114,7 @@ def fetch_codex_v8_artifacts(
     checksums = cache_dir / checksums_name
 
     download_file(f"{release_url}/{checksums.name}", checksums)
+    verify_release_checksum_manifest(checksums, version=version)
     expected_checksums = load_checksums(checksums, {archive.name, binding.name})
     for artifact in [archive, binding]:
         ensure_valid_artifact(
@@ -145,6 +146,32 @@ def resolved_v8_crate_version() -> str:
 
 def default_cache_root() -> Path:
     return Path(tempfile.gettempdir()) / "codex-package"
+
+
+def verify_release_checksum_manifest(checksums_path: Path, *, version: str) -> None:
+    version_suffix = version.replace(".", "_")
+    trusted_checksums = (
+        REPO_ROOT
+        / "third_party"
+        / "v8"
+        / f"rusty_v8_{version_suffix}_release_manifests.sha256"
+    )
+
+    for line in trusted_checksums.read_text(encoding="utf-8").splitlines():
+        digest, artifact_name = line.split(maxsplit=1)
+        if artifact_name != checksums_path.name:
+            continue
+        if has_checksum(checksums_path, digest):
+            return
+
+        checksums_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"V8 checksum manifest {checksums_path} does not match its trusted SHA-256."
+        )
+
+    raise RuntimeError(
+        f"V8 checksum manifest {checksums_path.name} has no trusted SHA-256 for {version}."
+    )
 
 
 def load_checksums(checksums_path: Path, artifact_names: set[str]) -> dict[str, str]:

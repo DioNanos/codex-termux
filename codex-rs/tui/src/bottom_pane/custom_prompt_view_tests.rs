@@ -123,6 +123,8 @@ fn vim_prompt_hint_tracks_escape_behavior() {
     view.handle_key_event(KeyEvent::from(KeyCode::Esc));
     insta::assert_snapshot!(rendered_hint(&view, /*width*/ 80), @"Press enter to confirm or esc to go back                           Vim: Normal");
     assert_eq!(vim_color(&view), Some(ratatui::style::Color::Magenta));
+    view.handle_key_event(KeyEvent::from(KeyCode::Char('R')));
+    insta::assert_snapshot!(rendered_hint(&view, /*width*/ 80), @"Press enter to confirm or esc to enter normal mode                Vim: Replace");
 }
 
 #[test]
@@ -195,6 +197,14 @@ fn vim_insert_cursor_tracks_mode_and_normal_mode_commands() {
     assert_eq!(view.textarea.text(), "rename");
 
     view.handle_key_event(KeyEvent::from(KeyCode::Esc));
+    view.handle_key_event(KeyEvent::from(KeyCode::Char('R')));
+    assert!(view.prefer_esc_to_handle_key_event());
+    view.handle_key_event(KeyEvent::from(KeyCode::Char('x')));
+    assert_eq!(view.textarea.text(), "renaxe");
+    view.handle_key_event(KeyEvent::from(KeyCode::Esc));
+    assert!(!view.is_complete());
+    assert!(!view.prefer_esc_to_handle_key_event());
+    assert_eq!(view.textarea.text(), "renaxe");
     view.handle_key_event(KeyEvent::from(KeyCode::Esc));
     assert!(view.is_complete());
     assert_eq!(view.completion(), Some(ViewCompletion::Cancelled));
@@ -284,6 +294,25 @@ fn background_prefill_survives_cursor_movement() {
     assert_eq!(
         (view.textarea.text(), view.context_label.as_deref()),
         ("Generated", Some("Ready"))
+    );
+}
+
+#[test]
+fn background_prefill_preserves_replace_backspace_recovery() {
+    let request_id = Uuid::new_v4();
+    let (view, _submitted_rx) = custom_prompt_view();
+    let mut view = view.with_text_suggestion(request_id, "Loading".into(), "Ready".into());
+    view.enable_vim_in_insert_mode();
+    for code in [KeyCode::Esc, KeyCode::Char('R')] {
+        view.handle_key_event(KeyEvent::from(code));
+    }
+    assert!(view.apply_text_suggestion(request_id, Some("abc")));
+    for code in [KeyCode::Left, KeyCode::Char('X'), KeyCode::Backspace] {
+        view.handle_key_event(KeyEvent::from(code));
+    }
+    assert_eq!(
+        (view.textarea.text(), view.textarea.vim_mode_label()),
+        ("abc", Some("Replace"))
     );
 }
 

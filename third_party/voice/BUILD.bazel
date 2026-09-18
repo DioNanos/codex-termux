@@ -1,4 +1,14 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_foreign_cc//toolchains/native_tools:native_tools_toolchain.bzl", "native_tool_toolchain")
+load(":native.bzl", "native_prefix")
+load(":native_link.bzl", "native_link")
+load(":pkg_config.bzl", "pkg_config")
+load(":runtime.bzl", "native_runtime")
+load(":windows_native.bzl", "windows_build_tools", "windows_native_prefix")
+
 # All native build consumers must receive the same pinned source manifest.
+exports_files(["opus-toolchain.cmake"])
+
 filegroup(
     name = "source_inputs",
     srcs = [
@@ -33,7 +43,354 @@ filegroup(
     srcs = [
         "assemble_package.py",
         "build_native.py",
+        "linux_runtime.py",
+        "macos_runtime.py",
+        "package_runtime.py",
+        "runtime.py",
+        "sdk.py",
+        "windows_build_inputs.py",
+        "windows_runtime.py",
         ":source_inputs",
     ],
     visibility = ["//visibility:public"],
 )
+
+filegroup(
+    name = "native_recipe",
+    srcs = [
+        "build_native.py",
+        "windows_build_inputs.py",
+        ":source_inputs",
+    ],
+)
+
+alias(
+    name = "pkg_config_linker",
+    actual = select({
+        "@platforms//os:macos": "@llvm//tools:ld64.lld",
+        "//conditions:default": "@llvm//tools:ld.lld",
+    }),
+)
+
+# Keep the pinned pkg-config sources, but explicitly use LLVM archive tools.
+# The upstream bootstrap otherwise selects host ar/ranlib on macOS.
+pkg_config(
+    name = "pkg_config_unix",
+    build_data = [
+        ":pkg_config_linker",
+        "@llvm//tools:llvm-ar",
+        "@llvm//tools:llvm-ranlib",
+    ],
+    # foreign_cc normalizes copied source timestamps, preserving the release
+    # configure files when remote execution materializes inputs in a new order.
+    configure_in_place = True,
+    configure_options = [
+        "--with-internal-glib",
+        "--disable-shared",
+        "--enable-define-prefix",
+    ],
+    copts = ["-Wno-int-conversion"],
+    env = {
+        "AR": "$(execpath @llvm//tools:llvm-ar)",
+        "LD": "$(execpath :pkg_config_linker)",
+        "PKG_CONFIG": "/bin/false",
+        "RANLIB": "$(execpath @llvm//tools:llvm-ranlib)",
+    },
+    lib_source = "@pkgconfig_src//:all_srcs",
+    # foreign_cc rewrites *-config files as text. Keep the executable out of
+    # that transformation, which otherwise corrupts its native code signature.
+    out_binaries = ["pkg-config-tool"],
+    out_include_dir = "",
+    out_static_libs = [],
+    postfix_script = 'mv "$$INSTALLDIR/bin/pkg-config" "$$INSTALLDIR/bin/pkg-config-tool"',
+    tags = ["manual"],
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    # Internal GLib needs no pkg-config. Avoid bootstrapping another copy first;
+    # the explicit failing command above forbids falling back to a host copy.
+    toolchain = "@rules_foreign_cc//toolchains:preinstalled_pkgconfig_toolchain",
+    visibility = ["//visibility:public"],
+)
+
+native_tool_toolchain(
+    name = "pkg_config_tool",
+    path = "$(execpath :pkg_config_unix)",
+    tags = ["manual"],
+    target = ":pkg_config_unix",
+)
+
+# Build-script tools select their execution platform, independently of target ABI.
+alias(
+    name = "pkg_config",
+    actual = select({
+        ":windows_x86_64": ":windows_tools_x86_64",
+        ":windows_aarch64": ":windows_tools_aarch64",
+        "//conditions:default": ":pkg_config_unix",
+    }),
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "archives",
+    srcs = [
+        "@voice_archive_glib//file",
+        "@voice_archive_gst_plugins_base//file",
+        "@voice_archive_gst_plugins_good//file",
+        "@voice_archive_gstreamer//file",
+        "@voice_archive_libffi//file",
+        "@voice_archive_meson//file",
+        "@voice_archive_ninja//file",
+        "@voice_archive_opus//file",
+        "@voice_archive_pcre2//file",
+        "@voice_archive_proxy_libintl//file",
+        "@voice_archive_zlib//file",
+    ],
+    tags = ["manual"],
+)
+
+# Configure probes execute target binaries: constrain each action's host too.
+_NATIVE_PLATFORMS = [
+    ("macos", "aarch64", "apple-darwin"),
+    ("macos", "x86_64", "apple-darwin"),
+    ("linux", "aarch64", "unknown-linux-gnu"),
+    ("linux", "x86_64", "unknown-linux-gnu"),
+]
+
+[
+    config_setting(
+        name = os + "_" + cpu,
+        constraint_values = [
+            "@platforms//os:" + os,
+            "@platforms//cpu:" + cpu,
+        ] + (["@llvm//constraints/libc:gnu.2.28"] if os == "linux" else []),
+    )
+    for os, cpu, _ in _NATIVE_PLATFORMS
+]
+
+[
+    native_prefix(
+        name = "native_prefix_" + os + "_" + cpu,
+        archives = [":archives"],
+        exec_compatible_with = [
+            "@platforms//os:" + os,
+            "@platforms//cpu:" + cpu,
+        ],
+        tags = ["manual"],
+        target = cpu + "-" + suffix,
+        target_compatible_with = select({
+            ":" + os + "_" + cpu: [],
+            "//conditions:default": ["@platforms//:incompatible"],
+        }),
+    )
+    for os, cpu, suffix in _NATIVE_PLATFORMS
+]
+
+alias(
+    name = "native_prefix",
+    actual = select({
+        ":" + os + "_" + cpu: ":native_prefix_" + os + "_" + cpu
+        for os, cpu, _ in _NATIVE_PLATFORMS
+    } | {
+        ":windows_" + cpu + "_msvc": ":native_prefix_windows_" + cpu
+        for cpu in ("x86_64", "aarch64")
+    }),
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+[
+    native_runtime(
+        name = "native_runtime_" + os + "_" + cpu,
+        exec_compatible_with = [
+            "@platforms//os:" + os,
+            "@platforms//cpu:" + cpu,
+        ],
+        prefix = ":native_prefix_" + os + "_" + cpu,
+        tags = ["manual"],
+        target = cpu + "-" + suffix,
+        target_compatible_with = select({
+            ":" + os + "_" + cpu: [],
+            "//conditions:default": ["@platforms//:incompatible"],
+        }),
+    )
+    for os, cpu, suffix in _NATIVE_PLATFORMS
+]
+
+alias(
+    name = "native_runtime",
+    actual = select({
+        ":" + os + "_" + cpu: ":native_runtime_" + os + "_" + cpu
+        for os, cpu, _ in _NATIVE_PLATFORMS
+    } | {
+        ":windows_" + cpu + "_msvc": ":native_runtime_windows_" + cpu
+        for cpu in ("x86_64", "aarch64")
+    }),
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "native_sdk",
+    srcs = [":native_runtime"],
+    output_group = "sdk",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+[
+    native_link(
+        name = "native_link_" + os + "_" + cpu,
+        runtime = ":native_runtime_" + os + "_" + cpu,
+        tags = ["manual"],
+        target = cpu + "-" + suffix,
+        target_compatible_with = select({
+            ":" + os + "_" + cpu: [],
+            "//conditions:default": ["@platforms//:incompatible"],
+        }),
+    )
+    for os, cpu, suffix in _NATIVE_PLATFORMS
+]
+
+alias(
+    name = "native_link",
+    actual = select({
+        ":" + os + "_" + cpu: ":native_link_" + os + "_" + cpu
+        for os, cpu, _ in _NATIVE_PLATFORMS
+    } | {
+        ":windows_" + cpu + "_msvc": ":native_link_windows_" + cpu
+        for cpu in ("x86_64", "aarch64")
+    }),
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+# Explicit opt-in inputs: no private downloader is loaded by the public module.
+# CMake and Cygwin use x64 emulation on native ARM64; Python/MSVC/pkgconf do not.
+filegroup(
+    name = "windows_tools_unavailable",
+    srcs = [],
+)
+
+label_flag(
+    name = "windows_installed_tools",
+    build_setting_default = ":windows_tools_unavailable",
+    visibility = ["//visibility:public"],
+)
+
+[
+    config_setting(
+        name = "windows_" + cpu,
+        constraint_values = [
+            "@platforms//os:windows",
+            "@platforms//cpu:" + cpu,
+        ],
+    )
+    for cpu in ("x86_64", "aarch64")
+]
+
+[
+    config_setting(
+        name = "windows_" + cpu + "_msvc",
+        constraint_values = [
+            "@platforms//os:windows",
+            "@platforms//cpu:" + cpu,
+            "@llvm//constraints/windows/abi:msvc",
+        ],
+    )
+    for cpu in ("x86_64", "aarch64")
+]
+
+[
+    windows_build_tools(
+        name = "windows_tools_" + cpu,
+        includes = ["@msvc_runtime//:msvc_include"] + ["@windows_sdk//:winsdk_" + part + "_include" for part in ("ucrt", "shared", "um", "winrt")],
+        installed_tools = ":windows_installed_tools",
+        libraries = ["@msvc_runtime//:msvc_lib_" + arch] + ["@windows_sdk//:winsdk_" + part + "_lib_" + arch for part in ("ucrt", "um")],
+        msvc = "@msvc_runtime//:msvc_tools_" + arch,
+        sdk = "@windows_sdk//:winsdk_tools_" + arch,
+        tags = ["manual"],
+        target = cpu + "-pc-windows-msvc",
+        target_compatible_with = [
+            "@platforms//os:windows",
+            "@platforms//cpu:" + cpu,
+        ],
+    )
+    for cpu, arch in (
+        ("x86_64", "x64"),
+        ("aarch64", "arm64"),
+    )
+]
+
+[
+    windows_native_prefix(
+        name = "native_prefix_windows_" + cpu,
+        archives = [":archives"],
+        build_tools = ":windows_tools_" + cpu,
+        exec_compatible_with = [
+            "@platforms//os:windows",
+            "@platforms//cpu:" + cpu,
+        ],
+        tags = ["manual"],
+        target_compatible_with = select({
+            ":windows_" + cpu + "_msvc": [],
+            "//conditions:default": ["@platforms//:incompatible"],
+        }),
+        visibility = ["//visibility:public"],
+    )
+    for cpu in ("x86_64", "aarch64")
+]
+
+[
+    native_runtime(
+        name = "native_runtime_windows_" + cpu,
+        exec_compatible_with = [
+            "@platforms//os:windows",
+            "@platforms//cpu:" + cpu,
+        ],
+        prefix = ":native_prefix_windows_" + cpu,
+        tags = ["manual"],
+        target = cpu + "-pc-windows-msvc",
+        target_compatible_with = select({
+            ":windows_" + cpu + "_msvc": [],
+            "//conditions:default": ["@platforms//:incompatible"],
+        }),
+        visibility = ["//visibility:public"],
+        windows_tools = ":windows_tools_" + cpu,
+    )
+    for cpu in ("x86_64", "aarch64")
+]
+
+[
+    native_link(
+        name = "native_link_windows_" + cpu,
+        runtime = ":native_runtime_windows_" + cpu,
+        tags = ["manual"],
+        target = cpu + "-pc-windows-msvc",
+        target_compatible_with = select({
+            ":windows_" + cpu + "_msvc": [],
+            "//conditions:default": ["@platforms//:incompatible"],
+        }),
+        visibility = ["//visibility:public"],
+    )
+    for cpu in ("x86_64", "aarch64")
+]
+
+# Link a concrete symbol so CI checks the Windows CcInfo import-library path,
+# not only the native runtime and SDK artifact actions.
+[
+    cc_binary(
+        name = "windows_link_smoke_" + cpu,
+        srcs = ["windows_link_smoke.cc"],
+        tags = ["manual"],
+        target_compatible_with = [
+            "@platforms//os:windows",
+            "@platforms//cpu:" + cpu,
+            "@llvm//constraints/windows/abi:msvc",
+        ],
+        deps = [":native_link_windows_" + cpu],
+    )
+    for cpu in ("x86_64", "aarch64")
+]

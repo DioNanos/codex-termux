@@ -30,11 +30,15 @@ use codex_app_server_protocol::ListMcpServerStatusParams;
 use codex_app_server_protocol::ListMcpServerStatusResponse;
 use codex_app_server_protocol::McpServerOauthLoginCompletedNotification;
 use codex_app_server_protocol::McpServerOauthLoginResponse;
+use codex_app_server_protocol::McpServerToolCallParams;
+use codex_app_server_protocol::McpServerToolCallResponse;
 use codex_app_server_protocol::PluginAuthPolicy;
 use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginInstallParams;
 use codex_app_server_protocol::PluginInstallResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadStartParams;
+use codex_app_server_protocol::ThreadStartResponse;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_http_client::HttpClientBuilder;
 use codex_rmcp_client::McpOAuthCallbackMode;
@@ -2412,6 +2416,12 @@ async fn plugin_install_makes_bundled_mcp_servers_available_to_followup_requests
         .await?;
 
     let request_id = mcp
+        .send_thread_start_request(ThreadStartParams::default())
+        .await?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    let request_id = mcp
         .send_plugin_install_request(PluginInstallParams {
             marketplace_path: Some(marketplace_path),
             remote_marketplace_name: None,
@@ -2424,6 +2434,22 @@ async fn plugin_install_makes_bundled_mcp_servers_available_to_followup_requests
     assert_eq!(response.apps_needing_auth, Vec::<AppSummary>::new());
     let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
     assert!(!config.contains("[mcp_servers.sample-mcp]"));
+
+    let request_id = mcp
+        .send_mcp_server_tool_call_request(McpServerToolCallParams {
+            thread_id: thread.id,
+            server: "sample-mcp".to_string(),
+            tool: "echo".to_string(),
+            arguments: Some(json!({ "message": "installed in the same thread" })),
+            meta: None,
+        })
+        .await?;
+    let response: McpServerToolCallResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(
+        response.structured_content,
+        Some(json!({ "echo": "ECHOING: installed in the same thread", "env": null })),
+    );
 
     let request_id = mcp
         .send_list_mcp_server_status_request(ListMcpServerStatusParams {

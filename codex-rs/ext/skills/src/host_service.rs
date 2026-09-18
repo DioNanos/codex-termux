@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -36,6 +37,13 @@ use crate::loader::HostSkillRootSnapshot;
 use crate::loader::MAX_CONCURRENT_ROOT_SCANS;
 use crate::loader::load_and_merge_host_skill_roots;
 use crate::loader::load_and_merge_host_skill_roots_with_request_snapshots;
+
+const CONFIG_SKILLS_CACHE_CAPACITY: usize = 32;
+
+struct ConfigSkillsCacheEntry {
+    key: ConfigSkillsCacheKey,
+    snapshot: Arc<OnceCell<HostSkillsSnapshot>>,
+}
 
 #[derive(Debug, Clone)]
 pub struct HostSkillsLoadInput {
@@ -77,7 +85,7 @@ pub struct HostSkillsService {
     restriction_product: Option<Product>,
     extra_roots: RwLock<Vec<AbsolutePathBuf>>,
     cache_by_cwd: RwLock<HashMap<AbsolutePathBuf, HostSkillsSnapshot>>,
-    cache_by_config: RwLock<HashMap<ConfigSkillsCacheKey, Arc<OnceCell<HostSkillsSnapshot>>>>,
+    cache_by_config: RwLock<VecDeque<ConfigSkillsCacheEntry>>,
     // Shared across cwds so root scheduling cannot multiply per-root I/O fanout.
     root_scan_slots: Arc<Semaphore>,
 }
@@ -124,7 +132,7 @@ impl HostSkillsService {
             restriction_product,
             extra_roots: RwLock::new(Vec::new()),
             cache_by_cwd: RwLock::new(HashMap::new()),
-            cache_by_config: RwLock::new(HashMap::new()),
+            cache_by_config: RwLock::new(VecDeque::new()),
             root_scan_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
         };
         // The cache is shared by every process using this CODEX_HOME. Disabled services filter
@@ -178,10 +186,6 @@ impl HostSkillsService {
             &skill_config_rules,
             input.plugin_skill_snapshots.as_ref(),
         );
-        if let Some(snapshot) = self.cached_snapshot_for_config(&cache_key) {
-            return snapshot;
-        }
-
         self.snapshot_for_skill_roots(
             input,
             roots,
@@ -310,17 +314,21 @@ impl HostSkillsService {
                 .cache_by_config
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if force_reload {
-                let snapshot_cell = Arc::new(OnceCell::new());
-                cache.insert(cache_key, Arc::clone(&snapshot_cell));
-                snapshot_cell
-            } else {
-                Arc::clone(
-                    cache
-                        .entry(cache_key)
-                        .or_insert_with(|| Arc::new(OnceCell::new())),
-                )
-            }
+            let snapshot_cell = cache
+                .iter()
+                .position(|entry| entry.key == cache_key)
+                .and_then(|index| cache.remove(index))
+                .filter(|_| !force_reload)
+                .map(|entry| entry.snapshot)
+                .unwrap_or_else(|| Arc::new(OnceCell::new()));
+            cache.push_front(ConfigSkillsCacheEntry {
+                key: cache_key,
+                snapshot: Arc::clone(&snapshot_cell),
+            });
+            // Keys retain parsed plugin generations; eviction releases obsolete catalogs while
+            // callers and in-flight loads keep their own snapshots alive.
+            cache.truncate(CONFIG_SKILLS_CACHE_CAPACITY);
+            snapshot_cell
         };
 
         snapshot_cell
@@ -391,23 +399,6 @@ impl HostSkillsService {
         match self.cache_by_cwd.read() {
             Ok(cache) => cache.get(cwd).cloned(),
             Err(err) => err.into_inner().get(cwd).cloned(),
-        }
-    }
-
-    fn cached_snapshot_for_config(
-        &self,
-        cache_key: &ConfigSkillsCacheKey,
-    ) -> Option<HostSkillsSnapshot> {
-        match self.cache_by_config.read() {
-            Ok(cache) => cache
-                .get(cache_key)
-                .and_then(|snapshot| snapshot.get())
-                .cloned(),
-            Err(err) => err
-                .into_inner()
-                .get(cache_key)
-                .and_then(|snapshot| snapshot.get())
-                .cloned(),
         }
     }
 

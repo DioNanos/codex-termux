@@ -135,8 +135,12 @@ pub struct TuiChatKeymap {
     pub previous_permission_mode: Option<KeybindingsSpec>,
     /// Switch to the next available permission mode.
     pub next_permission_mode: Option<KeybindingsSpec>,
-    /// Edit the most recently queued message.
+    /// Move up through pending async questions, then edit the most recently queued message.
     pub edit_queued_message: Option<KeybindingsSpec>,
+    /// Move back through pending async questions toward the composer.
+    pub prompt_stack_back: Option<KeybindingsSpec>,
+    /// Skip the focused question.
+    pub skip_question: Option<KeybindingsSpec>,
 }
 
 /// Composer context keybindings. These override corresponding `global` actions.
@@ -217,6 +221,8 @@ pub struct TuiVimNormalKeymap {
     pub open_line_below: Option<KeybindingsSpec>,
     /// Open a new line above and enter insert mode (`O`).
     pub open_line_above: Option<KeybindingsSpec>,
+    /// Enter replace mode and overwrite characters under the cursor (`R`).
+    pub enter_replace_mode: Option<KeybindingsSpec>,
     /// Move cursor left (`h`).
     pub move_left: Option<KeybindingsSpec>,
     /// Move cursor right (`l`).
@@ -427,6 +433,8 @@ pub struct TuiListKeymap {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiAgentsKeymap {
+    /// Open the session resume picker.
+    pub resume: Option<KeybindingsSpec>,
     /// Search the available agent tasks.
     pub search: Option<KeybindingsSpec>,
     /// Start composing a new agent task.

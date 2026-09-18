@@ -245,6 +245,7 @@ fn populate_merged_regular_fields_with_sources(
         rules: _,
         enforce_residency,
         network,
+        application,
         permissions,
         auto_review,
         models,
@@ -296,6 +297,7 @@ fn populate_merged_regular_fields_with_sources(
     set_sourced!(apps, &["apps"]);
     set_sourced!(enforce_residency, &["enforce_residency"]);
     set_sourced!(network, &["experimental_network"]);
+    set_sourced!(application, &["application"]);
     set_sourced!(permissions, &["permissions"]);
     set_sourced!(models, &["models"]);
     set_sourced!(

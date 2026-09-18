@@ -62,6 +62,7 @@ async fn forwarder_runs_commands_and_transfers_files() -> Result<()> {
         timeout(
             TEST_TIMEOUT,
             client.exec(ExecParams {
+                metadata: Default::default(),
                 process_id: process_id.clone(),
                 argv,
                 cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,

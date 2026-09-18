@@ -30,6 +30,7 @@ impl SectionRegistry {
                     context.transcript.extend(items)
                 }
                 ContextSection::RootConversation { items }
+                | ContextSection::RetainedUserInstructions { items }
                 | ContextSection::TrustedUserAnswers { items } => {
                     context.authorization.extend(items)
                 }

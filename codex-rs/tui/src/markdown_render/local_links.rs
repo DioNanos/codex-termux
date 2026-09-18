@@ -7,6 +7,7 @@
 //! canonical target to avoid duplicate file references.
 //!
 
+use codex_utils_path_uri::PathUri;
 use codex_utils_string::normalize_markdown_hash_location_suffix;
 use regex_lite::Regex;
 use std::path::Path;
@@ -85,21 +86,7 @@ fn comparable_local_link_path(text: &str) -> Option<String> {
     } else {
         std::borrow::Cow::Borrowed(text)
     };
-    let (mut path, _) = parse_local_link_target(&text)?;
-    if text.starts_with("file://") {
-        let url = Url::parse(&text).ok()?;
-        // The display parser's fallback preserves URL escapes on platforms that cannot convert
-        // this URL to a native path. Decode that fallback exactly once for comparison as well.
-        if url.to_file_path().is_err() {
-            path = urlencoding::decode(&path)
-                .unwrap_or(std::borrow::Cow::Borrowed(&path))
-                .into_owned();
-        }
-        // Unix URL conversion retains the slash before a Windows drive; ignore it here only.
-        if matches!(path.as_bytes(), [b'/', drive, b':', b'/', ..] if drive.is_ascii_alphabetic()) {
-            path.remove(0);
-        }
-    }
+    let (path, _) = parse_local_link_target(&text)?;
     Some(normalize_local_link_path_text(&path).to_lowercase())
 }
 
@@ -127,7 +114,9 @@ pub(super) fn render_local_link_target(dest_url: &str, cwd: Option<&Path>) -> Op
 fn parse_local_link_target(dest_url: &str) -> Option<(String, Option<String>)> {
     if dest_url.starts_with("file://") {
         let url = Url::parse(dest_url).ok()?;
-        let path_text = file_url_to_local_path_text(&url)?;
+        // Infer the path's OS from the URI, not the host running the TUI.
+        let path = PathUri::parse(&url[..url::Position::AfterPath]).ok()?;
+        let path_text = normalize_local_link_path_text(&path.inferred_native_path_string());
         let location_suffix = url
             .fragment()
             .and_then(normalize_hash_location_suffix_fragment);
@@ -175,39 +164,11 @@ fn normalize_hash_location_suffix_fragment(fragment: &str) -> Option<String> {
 ///
 /// The suffix must occur at the end of the input; embedded colons elsewhere in the path are left
 /// alone. This is what keeps Windows drive letters like `C:/...` from being misread as locations.
-fn extract_colon_location_suffix(path_text: &str) -> Option<String> {
+pub(super) fn extract_colon_location_suffix(path_text: &str) -> Option<String> {
     COLON_LOCATION_SUFFIX_RE
         .find(path_text)
         .filter(|matched| matched.end() == path_text.len())
         .map(|matched| matched.as_str().to_string())
-}
-
-/// Convert a `file://` URL into the normalized local-path text used for transcript rendering.
-///
-/// This prefers `Url::to_file_path()` for standard file URLs. When that rejects Windows-oriented
-/// encodings, we reconstruct a display path from the host/path parts so UNC paths and drive-letter
-/// URLs still render sensibly.
-fn file_url_to_local_path_text(url: &Url) -> Option<String> {
-    if let Ok(path) = url.to_file_path() {
-        return Some(normalize_local_link_path_text(&path.to_string_lossy()));
-    }
-
-    // Fall back to string reconstruction for cases `to_file_path()` rejects, especially UNC-style
-    // hosts and Windows drive paths encoded in URL form.
-    let mut path_text = url.path().to_string();
-    if let Some(host) = url.host_str()
-        && !host.is_empty()
-        && host != "localhost"
-    {
-        path_text = format!("//{host}{path_text}");
-    } else if matches!(
-        path_text.as_bytes(),
-        [b'/', drive, b':', b'/', ..] if drive.is_ascii_alphabetic()
-    ) {
-        path_text.remove(0);
-    }
-
-    Some(normalize_local_link_path_text(&path_text))
 }
 
 /// Normalize local-path text into the transcript display form.

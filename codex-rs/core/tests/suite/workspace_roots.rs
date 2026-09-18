@@ -1,7 +1,6 @@
 use anyhow::Context;
 use anyhow::Result;
 use codex_core::EnvironmentConfig;
-use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::RemoveOptions;
 use codex_protocol::config_types::WindowsSandboxLevel;
@@ -234,7 +233,8 @@ async fn workspace_roots_allow_file_and_command_writes_in_secondary_root(
             if !owner_resolved_roots {
                 config.workspace_roots.push(secondary_root);
             }
-            config.set_windows_sandbox_enabled(/*value*/ true);
+            // Owner-provided sandbox settings must work independently of thread defaults.
+            config.set_windows_sandbox_enabled(!owner_resolved_roots);
         })
         .with_workspace_setup(|cwd, fs| async move {
             let secondary_root = cwd
@@ -276,7 +276,7 @@ async fn workspace_roots_allow_file_and_command_writes_in_secondary_root(
                         workspace_roots_profile(),
                     ),
                     shell_environment_policy: Default::default(),
-                    windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
+                    windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
                     windows_sandbox_private_desktop: test
                         .config
                         .permissions

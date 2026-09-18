@@ -35,6 +35,7 @@ pub enum SlashCommand {
     Delete,
     Resume,
     Fork,
+    Worktree,
     App,
     Init,
     Compact,
@@ -99,9 +100,10 @@ impl SlashCommand {
             SlashCommand::Delete => "permanently delete this session and exit",
             SlashCommand::Clear => "clear the terminal and start a new chat",
             SlashCommand::Fork => "fork the current chat",
+            SlashCommand::Worktree => "start or continue a conversation in a new worktree",
             SlashCommand::App => "continue this session in the Desktop app",
             SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
-            SlashCommand::Copy => "copy the last response, code block, or quote",
+            SlashCommand::Copy => "copy the last response or part of it",
             SlashCommand::Export => "export the conversation as markdown",
             SlashCommand::Raw => "toggle raw scrollback mode for copy-friendly terminal selection",
             SlashCommand::Diff => "show git diff (including untracked files)",
@@ -210,6 +212,7 @@ impl SlashCommand {
             | SlashCommand::Archive
             | SlashCommand::Delete
             | SlashCommand::Fork
+            | SlashCommand::Worktree
             | SlashCommand::Init
             | SlashCommand::Compact
             | SlashCommand::Recap

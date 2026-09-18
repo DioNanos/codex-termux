@@ -38,6 +38,11 @@ const MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_OAUTH_HTTP_REDIRECTS: usize = 10;
 static NEXT_OAUTH_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 
+tokio::task_local! {
+    /// Bounds provider HTTP work during preparation, excluding credential lock waits and saves.
+    pub(crate) static PROACTIVE_REFRESH_TIMEOUT: Duration;
+}
+
 #[derive(Debug, thiserror::Error)]
 enum OAuthHttpClientAdapterError {
     #[error("unsupported OAuth HTTP redirect policy")]
@@ -324,7 +329,16 @@ fn oauth_redirect_policy(
 
 impl OAuthHttpClient for OAuthHttpClientAdapter {
     fn execute(&self, request: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
-        Box::pin(self.execute_request(request.request, request.redirect_policy, request.timeout))
+        Box::pin(async move {
+            let operation =
+                self.execute_request(request.request, request.redirect_policy, request.timeout);
+            match PROACTIVE_REFRESH_TIMEOUT.try_with(|duration| *duration) {
+                Ok(duration) => tokio::time::timeout(duration, operation)
+                    .await
+                    .map_err(|_| oauth_http_client_error(OAuthHttpClientAdapterError::TimedOut))?,
+                Err(_) => operation.await,
+            }
+        })
     }
 }
 

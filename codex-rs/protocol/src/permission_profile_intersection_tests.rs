@@ -117,14 +117,15 @@ fn effective_workspace_intersection_preserves_network_metadata_and_temp() {
 
     assert_eq!(
         [&root, &project]
-            .map(|path| policy.resolve_access_with_cwd(path.as_path(), root.as_path())),
+            .map(|path| policy
+                .resolve_access_for_local_path_with_cwd(path.as_path(), root.as_path())),
         [Read, Write]
     );
     assert_eq!(result.network_sandbox_policy(), Restricted);
     assert!(policy.entries.contains(&special(Tmpdir, Write)));
     for name in [".git", ".agents", ".codex"] {
         let protected = project.join(name);
-        assert!(!policy.can_write_path_with_cwd(protected.as_path(), root.as_path()));
+        assert!(!policy.can_write_local_path_with_cwd(protected.as_path(), root.as_path()));
         assert!(policy.entries.contains(&skipped(protected.into(), Read)));
     }
     assert!(policy.entries.contains(&skipped(gitdir.into(), Read)));
@@ -177,10 +178,13 @@ fn exact_denies_nested_read_carveouts_and_reopened_writes_are_preserved() {
     let right = PermissionProfile::from_runtime_permissions(&right_policy, Restricted);
     let result = intersection(&left, &right, &root);
     let policy = result.file_system_sandbox_policy();
-    let denies = ReadDenyMatcher::new(&policy, root.as_path()).expect("merged denies");
+    let denies = ReadDenyMatcher::try_new_for_local_paths(&policy, root.as_path())
+        .expect("valid merged deny globs")
+        .expect("merged denies");
     assert_eq!(
         [&root, &shared, &editable]
-            .map(|path| policy.resolve_access_with_cwd(path.as_path(), root.as_path())),
+            .map(|path| policy
+                .resolve_access_for_local_path_with_cwd(path.as_path(), root.as_path())),
         [Write, Read, Write]
     );
     assert_eq!(
@@ -190,7 +194,7 @@ fn exact_denies_nested_read_carveouts_and_reopened_writes_are_preserved() {
             &root.join("credentials.env"),
             &root.join("credentials.token"),
         ]
-        .map(|path| denies.is_read_denied(path.as_path())),
+        .map(|path| denies.is_local_path_read_denied(path.as_path())),
         [true, true, true, true]
     );
     assert_eq!(policy.glob_scan_max_depth, Some(4));
@@ -317,7 +321,7 @@ fn canonical_grants_cannot_escape_through_readable_or_writable_symlinks() {
     let parent = rooted(&root, Write, []);
     let child = rooted(&escaped, Write, []);
     let policy = intersection(&parent, &child, &root).file_system_sandbox_policy();
-    assert!(!policy.can_write_path_with_cwd(outside.as_path(), root.as_path()));
+    assert!(!policy.can_write_local_path_with_cwd(outside.as_path(), root.as_path()));
 
     let parent = managed(vec![entry(root.as_path(), Read)]);
     let child = managed(vec![entry(escaped.as_path(), Read)]);
@@ -329,7 +333,7 @@ fn canonical_grants_cannot_escape_through_readable_or_writable_symlinks() {
     let parent = rooted(&root, Write, []);
     let child = rooted(&internal_alias, Write, []);
     let policy = intersection(&parent, &child, &root).file_system_sandbox_policy();
-    assert!(policy.can_write_path_with_cwd(inside.as_path(), root.as_path()));
+    assert!(policy.can_write_local_path_with_cwd(inside.as_path(), root.as_path()));
     assert!(
         !policy
             .entries
@@ -355,7 +359,7 @@ fn macos_system_path_aliases_share_the_same_physical_permissions() {
         let right = managed(vec![entry(canonical.as_path(), access)]);
         let policy = intersection(&left, &right, &canonical).file_system_sandbox_policy();
         assert_eq!(
-            policy.resolve_access_with_cwd(canonical.as_path(), canonical.as_path()),
+            policy.resolve_access_for_local_path_with_cwd(canonical.as_path(), canonical.as_path()),
             access
         );
     }
@@ -365,5 +369,5 @@ fn macos_system_path_aliases_share_the_same_physical_permissions() {
         &canonical,
     )
     .file_system_sandbox_policy();
-    assert!(policy.can_write_path_with_cwd(canonical.as_path(), canonical.as_path()));
+    assert!(policy.can_write_local_path_with_cwd(canonical.as_path(), canonical.as_path()));
 }

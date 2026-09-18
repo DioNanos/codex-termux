@@ -68,6 +68,19 @@ pub(crate) fn collect_explicit_plugin_mentions(
         return Vec::new();
     }
 
+    // `config_name` stores the full plugin ID, not its display or mention name.
+    let mentioned_plugin_ids = collect_explicit_plugin_ids(input);
+    plugins
+        .iter()
+        .filter(|plugin| mentioned_plugin_ids.contains(plugin.config_name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Collect exact IDs from explicit `plugin://` references, independently of display names.
+///
+/// Host plugins use `<plugin>@<marketplace>` IDs; selected roots may supply opaque IDs.
+pub(crate) fn collect_explicit_plugin_ids(input: &[UserInput]) -> HashSet<String> {
     let messages = input
         .iter()
         .filter_map(|item| match item {
@@ -76,7 +89,7 @@ pub(crate) fn collect_explicit_plugin_mentions(
         })
         .collect::<Vec<String>>();
 
-    let mentioned_config_names: HashSet<String> = input
+    input
         .iter()
         .filter_map(|item| match item {
             UserInput::Mention { path, .. } => Some(path.clone()),
@@ -89,16 +102,6 @@ pub(crate) fn collect_explicit_plugin_mentions(
         )
         .filter(|path| tool_kind_for_path(path.as_str()) == ToolMentionKind::Plugin)
         .filter_map(|path| plugin_config_name_from_path(path.as_str()).map(str::to_string))
-        .collect();
-
-    if mentioned_config_names.is_empty() {
-        return Vec::new();
-    }
-
-    plugins
-        .iter()
-        .filter(|plugin| mentioned_config_names.contains(plugin.config_name.as_str()))
-        .cloned()
         .collect()
 }
 

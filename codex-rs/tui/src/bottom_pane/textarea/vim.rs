@@ -10,6 +10,8 @@ pub(super) enum VimMode {
     Normal,
     /// Insert mode routes input through the regular editor keymap until Escape is pressed.
     Insert,
+    /// Replace mode overwrites existing graphemes through the regular editor keymap.
+    Replace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -69,6 +69,15 @@ impl From<AuthMode> for TelemetryAuthMode {
     }
 }
 
+/// Install externally managed, non-Statsig process-global metrics.
+///
+/// Call this once during single-threaded startup, before any instruments are
+/// registered. Keep the returned handle to flush and shut down the exporter
+/// owned by this installation.
+pub fn install_global_metrics(metrics: MetricsClient) -> MetricsClient {
+    crate::metrics::install_global(metrics)
+}
+
 /// Start a metrics timer using the globally installed metrics client.
 pub fn start_global_timer(name: &str, tags: &[(&str, &str)]) -> MetricsResult<Timer> {
     let Some(metrics) = crate::metrics::global() else {

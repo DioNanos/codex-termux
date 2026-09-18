@@ -1,0 +1,53 @@
+---
+source: tui/src/bottom_pane/feedback_note_view_tests.rs
+expression: "rendered.join(\"\\n\\n\")"
+---
+external (80 columns)
+▌ Tell us more (bug)
+▌
+▌ Your feedback can be used to improve ChatGPT. Learn more.
+▌
+▌ (optional) Write a short description to help us further
+
+Press enter to submit or esc to cancel
+
+external (40 columns)
+▌ Tell us more (bug)
+▌
+▌ Your feedback can be used to improve
+▌ ChatGPT. Learn more.
+▌
+▌ (optional) Write a short description t
+
+Press enter to submit or esc to cancel
+
+employee (80 columns)
+▌ Tell us more (bug)
+▌
+▌ Your data may be used to improve our models and products
+▌ By submitting feedback, you agree that OpenAI can use your feedback for safety
+▌ purposes and internal model training, as explained in more detail here. Please
+▌ avoid sharing tented information under NDA, or privileged, HR-related, or
+▌ sensitive personal information.
+▌
+▌ (optional) Write a short description to help us further
+
+Press enter to submit or esc to cancel
+
+employee (40 columns)
+▌ Tell us more (bug)
+▌
+▌ Your data may be used to improve our
+▌ models and products
+▌ By submitting feedback, you agree that
+▌ OpenAI can use your feedback for
+▌ safety purposes and internal model
+▌ training, as explained in more detail
+▌ here. Please avoid sharing tented
+▌ information under NDA, or privileged,
+▌ HR-related, or sensitive personal
+▌ information.
+▌
+▌ (optional) Write a short description t
+
+Press enter to submit or esc to cancel

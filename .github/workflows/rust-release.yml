@@ -255,6 +255,8 @@ jobs:
             fi
             build_args+=(--bin "$binary")
           done
+          STABLE_GIT_COMMIT="$(git rev-parse HEAD)"
+          export STABLE_GIT_COMMIT
           cargo build --target "$target" --release --timings "${build_args[@]}"
 
       - name: Upload Cargo timings
@@ -1183,6 +1185,58 @@ jobs:
     with:
       publish: true
 
+  stage-npm-packages:
+    name: stage npm packages
+    needs:
+      - build
+      - finalize-macos
+      - build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download target artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: "{aarch64,x86_64}-{apple-darwin{,-app-server},unknown-linux-musl{,-app-server},pc-windows-msvc}"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@a8198c4bff370c8506180b035930dea56dbd5288 # v5
+        with:
+          run_install: false
+
+      - name: Setup Node.js for npm packaging
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Stage npm packages
+        run: |
+          release_version="${GITHUB_REF_NAME#rust-v}"
+          ./scripts/stage_npm_packages.py \
+            --release-version "$release_version" \
+            --artifacts-dir "${GITHUB_WORKSPACE}/dist" \
+            --package codex \
+            --package codex-responses-api-proxy \
+            --package codex-sdk
+
+      - name: Upload staged npm packages
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: npm-packages
+          path: dist/npm/*.tgz
+          if-no-files-found: error
+
   release:
     needs:
       - tag-check
@@ -1190,6 +1244,7 @@ jobs:
       - finalize-macos
       - build-windows
       - argument-comment-lint-release-assets
+      - stage-npm-packages
     if: >-
       ${{
         always() &&
@@ -1197,13 +1252,13 @@ jobs:
         needs.build.result == 'success' &&
         needs.finalize-macos.result == 'success' &&
         needs.build-windows.result == 'success' &&
-        needs.argument-comment-lint-release-assets.result == 'success'
+        needs.argument-comment-lint-release-assets.result == 'success' &&
+        needs.stage-npm-packages.result == 'success'
       }}
     name: release
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      actions: read
     outputs:
       version: ${{ steps.release_name.outputs.name }}
       tag: ${{ github.ref_name }}
@@ -1314,32 +1369,11 @@ jobs:
             echo "npm_tag=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@a8198c4bff370c8506180b035930dea56dbd5288 # v5
+      - name: Download staged npm packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          run_install: false
-
-      - name: Setup Node.js for npm packaging
-        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
-        with:
-          node-version: 22
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Stage npm packages
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ steps.release_name.outputs.name }}
-        run: |
-          workflow_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          ./scripts/stage_npm_packages.py \
-            --release-version "$RELEASE_VERSION" \
-            --workflow-url "$workflow_url" \
-            --artifacts-dir "${GITHUB_WORKSPACE}/dist" \
-            --package codex \
-            --package codex-responses-api-proxy \
-            --package codex-sdk
+          name: npm-packages
+          path: dist/npm
 
       - name: Stage installer scripts
         run: |

@@ -1,15 +1,32 @@
-//! Safety-buffering status and retry UI for active turns.
+//! Safety-buffering status and retry confirmation UI for active turns.
+//! Both views share an ID so response streaming, completion, or buffering updates dismiss either one.
 
 use super::*;
+use crate::wrapping::word_wrap_lines;
 use codex_app_server_protocol::ModelSafetyBufferingUpdatedNotification;
 
 const SAFETY_BUFFERING_PROMPT_VIEW_ID: &str = "safety-buffering-prompt";
 const SAFETY_BUFFERING_LEARN_MORE_URL: &str = "https://help.openai.com/en/articles/20001326";
 
-const SAFETY_BUFFERING_HEADER: &str =
-    "Our systems are thinking a bit more about this request before responding.";
-const SAFETY_BUFFERING_MESSAGE_WITH_RETRY: &str = "Hang tight or retry with a faster model for a quicker response, though it may be less capable of handling complex requests.";
+const SAFETY_BUFFERING_HEADER: &str = "Giving this request a little extra thought";
+const SAFETY_BUFFERING_MESSAGE_WITH_RETRY: &str = "If you'd rather not wait, retry with a faster model. It may be less capable of handling complex requests.";
 const SAFETY_BUFFERING_FOOTER: &str = "No action is required. Codex will keep waiting, and this menu will close when the response is ready.";
+
+struct SafetyBufferingHeader(Vec<Line<'static>>);
+
+impl Renderable for SafetyBufferingHeader {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        Renderable::render(
+            &Paragraph::new(word_wrap_lines(&self.0, usize::from(area.width))),
+            area,
+            buf,
+        );
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        word_wrap_lines(&self.0, usize::from(width)).len() as u16
+    }
+}
 
 #[derive(Debug)]
 struct ActiveSafetyBuffering {
@@ -42,8 +59,13 @@ impl ChatWidget {
     }
 
     pub(super) fn mark_safety_buffering_agent_message_started(&mut self) {
-        if let Some(active) = self.safety_buffering.active.as_mut() {
+        if let Some(active) = self.safety_buffering.active.as_mut()
+            && !active.agent_message_started
+        {
             active.agent_message_started = true;
+            self.bottom_pane
+                .dismiss_view_by_id(SAFETY_BUFFERING_PROMPT_VIEW_ID);
+            self.restore_reasoning_status_header();
         }
     }
 
@@ -93,6 +115,11 @@ impl ChatWidget {
         if matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages))
             || !self.turn_lifecycle.agent_turn_running
             || self.turn_lifecycle.last_turn_id.as_deref() != Some(turn_id.as_str())
+            || self
+                .safety_buffering
+                .active
+                .as_ref()
+                .is_some_and(|active| active.turn_id == turn_id && active.agent_message_started)
         {
             return;
         }
@@ -135,12 +162,10 @@ impl ChatWidget {
             .filter(|active| active.turn_id == turn_id);
         let should_show_prompt =
             previous_active.is_none_or(|active| active.last_prompt_had_retry != can_offer_retry);
-        let agent_message_started =
-            previous_active.is_some_and(|active| active.agent_message_started);
         self.safety_buffering.active = Some(ActiveSafetyBuffering {
             turn_id: turn_id.clone(),
             last_prompt_had_retry: can_offer_retry,
-            agent_message_started,
+            agent_message_started: false,
         });
 
         let status_details = if can_offer_retry {
@@ -162,16 +187,10 @@ impl ChatWidget {
         self.bottom_pane
             .dismiss_view_by_id(SAFETY_BUFFERING_PROMPT_VIEW_ID);
 
-        let mut header = vec![Box::new(
-            Paragraph::new(Line::from(SAFETY_BUFFERING_HEADER).bold()).wrap(Wrap { trim: false }),
-        ) as Box<dyn Renderable>];
+        let mut header = vec![Line::from(SAFETY_BUFFERING_HEADER).bold()];
         if can_offer_retry {
-            header.push(Box::new(
-                Paragraph::new(Line::from(SAFETY_BUFFERING_MESSAGE_WITH_RETRY).dim())
-                    .wrap(Wrap { trim: false }),
-            ));
+            header.push(Line::from(SAFETY_BUFFERING_MESSAGE_WITH_RETRY).dim());
         }
-        let header = ColumnRenderable::with(header);
         let mut items = Vec::new();
         if let (Some(faster_model), Some(turn), Some(prompt), Some(thread_id)) =
             (faster_model, retry_turn, retry_prompt, thread_id)
@@ -179,7 +198,7 @@ impl ChatWidget {
             items.push(SelectionItem {
                 name: "Retry with a faster model".to_string(),
                 actions: vec![Box::new(move |tx| {
-                    tx.send(AppEvent::RetrySafetyBufferedTurn {
+                    tx.send(AppEvent::ConfirmSafetyBufferedRetry {
                         thread_id,
                         turn_id: turn_id.clone(),
                         model: faster_model.clone(),
@@ -209,10 +228,67 @@ impl ChatWidget {
         ]);
         self.bottom_pane.show_selection_view(SelectionViewParams {
             view_id: Some(SAFETY_BUFFERING_PROMPT_VIEW_ID),
-            header: Box::new(header),
+            header: Box::new(SafetyBufferingHeader(header)),
             footer_note: Some(Line::from(SAFETY_BUFFERING_FOOTER).dim()),
             footer_hint: Some(Line::default()),
             items,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn confirm_safety_buffered_retry(
+        &mut self,
+        thread_id: ThreadId,
+        turn_id: String,
+        model: String,
+        turn: AppCommand,
+        prompt: UserMessage,
+    ) {
+        if self.thread_id != Some(thread_id) || !self.can_retry_safety_buffered_turn(&turn_id) {
+            return;
+        }
+
+        let model_name = self
+            .model_catalog
+            .try_list_models()
+            .ok()
+            .and_then(|models| models.into_iter().find(|preset| preset.model == model))
+            .map(|preset| preset.display_name)
+            .unwrap_or_else(|| model.clone());
+        self.bottom_pane
+            .dismiss_view_by_id(SAFETY_BUFFERING_PROMPT_VIEW_ID);
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            view_id: Some(SAFETY_BUFFERING_PROMPT_VIEW_ID),
+            header: Box::new(SafetyBufferingHeader(vec![
+                    "Stop this attempt and retry?".bold().into(),
+                    Line::default(),
+                    "This will stop the current attempt and retry in a new thread. Any file changes or other actions already taken will remain.".dim().into(),
+                    Line::default(),
+                    format!("Your message will be sent again using {model_name}, which may be less capable on complex tasks.").dim().into(),
+                ])),
+            footer_hint: Some(Line::default()),
+            items: vec![
+                SelectionItem {
+                    name: "Keep waiting".to_string(),
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Stop and retry".to_string(),
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::RetrySafetyBufferedTurn {
+                            thread_id,
+                            turn_id: turn_id.clone(),
+                            model: model.clone(),
+                            turn: turn.clone(),
+                            prompt: prompt.clone(),
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    require_explicit_confirmation: true,
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         });
     }

@@ -1,12 +1,9 @@
-use std::path::Component;
-use std::path::Path;
-use std::path::PathBuf;
-
 use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSandboxPolicyContext;
 use codex_protocol::protocol::AskForApproval;
 use codex_sandboxing::get_platform_sandbox;
 use codex_utils_path_uri::PathUri;
@@ -23,13 +20,19 @@ pub enum SafetyCheck {
     Reject { reason: String },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PatchSandboxRoute {
+    ExecutorManaged,
+    Platform(WindowsSandboxLevel),
+}
+
 pub fn assess_patch_safety(
     action: &ApplyPatchAction,
     policy: AskForApproval,
     permission_profile: &PermissionProfile,
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    cwd: &PathUri,
-    windows_sandbox_level: WindowsSandboxLevel,
+    context: &FileSystemSandboxPolicyContext<'_>,
+    sandbox_route: PatchSandboxRoute,
 ) -> SafetyCheck {
     if action.is_empty() {
         return SafetyCheck::Reject {
@@ -53,43 +56,27 @@ pub fn assess_patch_safety(
             policy,
             AskForApproval::Granular(granular_config) if !granular_config.sandbox_approval
         );
+    let sandbox_available = match sandbox_route {
+        PatchSandboxRoute::ExecutorManaged => true,
+        PatchSandboxRoute::Platform(windows_sandbox_level) => {
+            get_platform_sandbox(windows_sandbox_level != WindowsSandboxLevel::Disabled).is_some()
+        }
+    };
 
     // Even though the patch appears to be constrained to writable paths, it is
     // possible that paths in the patch are hard links to files outside the
     // writable roots, so we should still run `apply_patch` in a sandbox in that case.
-    if is_write_patch_constrained_to_writable_paths(action, file_system_sandbox_policy, cwd) {
-        if matches!(
+    // Disabled and External profiles intentionally do not apply an outer sandbox.
+    if is_write_patch_constrained_to_writable_paths(action, file_system_sandbox_policy, context)
+        && (matches!(
             permission_profile,
             PermissionProfile::Disabled | PermissionProfile::External { .. }
-        ) {
-            // Disabled and External profiles intentionally do not apply an
-            // outer Codex filesystem sandbox.
-            SafetyCheck::AutoApprove
-        } else {
-            // Only auto‑approve when we can actually enforce a sandbox. Otherwise
-            // fall back to asking the user because the patch may touch arbitrary
-            // paths outside the project.
-            match get_platform_sandbox(windows_sandbox_level != WindowsSandboxLevel::Disabled) {
-                Some(_) => SafetyCheck::AutoApprove,
-                None => {
-                    if rejects_sandbox_approval {
-                        SafetyCheck::Reject {
-                            reason: patch_rejection_reason(
-                                permission_profile,
-                                file_system_sandbox_policy,
-                                cwd,
-                            )
-                            .to_string(),
-                        }
-                    } else {
-                        SafetyCheck::AskUser
-                    }
-                }
-            }
-        }
+        ) || sandbox_available)
+    {
+        SafetyCheck::AutoApprove
     } else if rejects_sandbox_approval {
         SafetyCheck::Reject {
-            reason: patch_rejection_reason(permission_profile, file_system_sandbox_policy, cwd)
+            reason: patch_rejection_reason(permission_profile, file_system_sandbox_policy, context)
                 .to_string(),
         }
     } else {
@@ -100,14 +87,12 @@ pub fn assess_patch_safety(
 fn patch_rejection_reason(
     permission_profile: &PermissionProfile,
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    cwd: &PathUri,
+    context: &FileSystemSandboxPolicyContext<'_>,
 ) -> &'static str {
-    let has_no_writable_roots = cwd
-        .to_abs_path()
-        .is_ok_and(|cwd| !file_system_sandbox_policy.has_writable_roots_with_cwd(cwd.as_path()));
+    let has_no_writable_roots = !file_system_sandbox_policy.has_configured_writable_roots(context);
     match permission_profile {
         PermissionProfile::Managed { .. }
-            if !file_system_sandbox_policy.has_full_disk_write_access()
+            if !file_system_sandbox_policy.has_full_disk_write_access_with_context(context)
                 && has_no_writable_roots =>
         {
             PATCH_REJECTED_READ_ONLY_REASON
@@ -121,49 +106,15 @@ fn patch_rejection_reason(
 fn is_write_patch_constrained_to_writable_paths(
     action: &ApplyPatchAction,
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    cwd: &PathUri,
+    context: &FileSystemSandboxPolicyContext<'_>,
 ) -> bool {
     // A full-disk policy permits every patch target, so no per-path writable-root check can
     // further constrain the result.
-    if file_system_sandbox_policy.has_full_disk_write_access() {
+    if file_system_sandbox_policy.has_full_disk_write_access_with_context(context) {
         return true;
     }
-    // TODO(anp): Make filesystem sandbox policies operate on PathUri.
-    let Ok(native_cwd) = cwd.to_abs_path() else {
-        return false;
-    };
-    // Normalize a path by removing `.` and resolving `..` without touching the
-    // filesystem (works even if the file does not exist).
-    fn normalize(path: &Path) -> Option<PathBuf> {
-        let mut out = PathBuf::new();
-        for comp in path.components() {
-            match comp {
-                Component::ParentDir => {
-                    out.pop();
-                }
-                Component::CurDir => { /* skip */ }
-                other => out.push(other.as_os_str()),
-            }
-        }
-        Some(out)
-    }
-
-    // Determine whether `path` is inside **any** writable root. Both `path`
-    // and roots are converted to absolute, normalized forms before the
-    // prefix check.
-    let is_path_writable = |path: &PathUri| {
-        // TODO(anp): Make sandbox policy path checks accept PathUri without host projection.
-        let Ok(path) = path.to_abs_path() else {
-            return false;
-        };
-        let abs = path.into_path_buf();
-        let abs = match normalize(&abs) {
-            Some(v) => v,
-            None => return false,
-        };
-
-        file_system_sandbox_policy.can_write_path_with_cwd(&abs, &native_cwd)
-    };
+    let is_path_writable =
+        |path: &PathUri| file_system_sandbox_policy.can_write_path(path, context);
 
     for (path, change) in action.changes() {
         match change {

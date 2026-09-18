@@ -14,5 +14,5 @@ expression: term.backend()
 "tail                                    "
 "───────────────────────────────── 100% ─"
 " ↑/↓ to scroll   pgup/pgdn to page   hom"
-" q to quit   esc to edit prev           "
+" q close   esc to edit prev             "
 "                                        "

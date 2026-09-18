@@ -252,6 +252,7 @@ pub(crate) fn sandbox_override_for_first_attempt(
     exec_approval_requirement: &ExecApprovalRequirement,
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     sandbox_unavailable_by_construction: bool,
+    already_approved: bool,
 ) -> SandboxOverride {
     // Deny-read restrictions are part of the active permission policy. Running
     // without a filesystem sandbox would discard them, even if the command was
@@ -260,15 +261,16 @@ pub(crate) fn sandbox_override_for_first_attempt(
         return SandboxOverride::NoOverride;
     }
 
-    // A NeedsApproval reaching this point has already passed the user dialog:
-    // `request_approval` returned Ok (a denial returns an error and no attempt
-    // runs at all). On a platform that cannot provide a sandbox by
-    // construction, honoring that approval means taking the existing
-    // unsandboxed path instead of sending a sandbox request the executor must
-    // refuse ("filesystem sandbox cannot be enforced on this executor").
-    // Platforms that are expected to have a sandbox never take this branch:
-    // they keep the sandboxed first attempt and stay fail-closed downstream.
+    // The caller attests the real approval-dialog outcome explicitly: a
+    // NeedsApproval must never imply consent by itself. When the user DID
+    // approve on a platform that cannot provide a sandbox by construction,
+    // honoring that approval means taking the existing unsandboxed path
+    // instead of sending a sandbox request the executor must refuse
+    // ("filesystem sandbox cannot be enforced on this executor"). Platforms
+    // that are expected to have a sandbox never take this branch: they keep
+    // the sandboxed first attempt and stay fail-closed downstream.
     if sandbox_unavailable_by_construction
+        && already_approved
         && matches!(
             exec_approval_requirement,
             ExecApprovalRequirement::NeedsApproval { .. }
@@ -552,6 +554,7 @@ impl<'a> SandboxAttempt<'a> {
                 windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
                 windows_sandbox_proxy_settings_mode: None,
                 use_legacy_landlock: self.use_legacy_landlock,
+                sandbox_unavailable_by_construction: cfg!(target_os = "android"),
             });
             exec_request.exec_server_enforce_managed_network = self.enforce_managed_network;
         }

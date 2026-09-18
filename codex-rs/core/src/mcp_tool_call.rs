@@ -1620,7 +1620,7 @@ pub(crate) async fn request_mcp_tool_user_approval(
         .request_user_input(turn_context, call_id.to_string(), args)
         .await;
     normalize_approval_decision_for_mode(
-        parse_mcp_tool_approval_response(response, &question_id),
+        parse_mcp_tool_approval_response(response.map(|accepted| accepted.response), &question_id),
         *approval_mode,
     )
 }

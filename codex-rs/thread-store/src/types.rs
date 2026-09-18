@@ -207,6 +207,9 @@ pub struct RevertThreadParams {
     pub thread_id: ThreadId,
     /// First turn excluded from the retained history.
     pub before_turn_id: String,
+    /// Resolved runtime version to preserve when its turn context is removed.
+    /// When absent, keep the version in the existing session metadata.
+    pub multi_agent_version: Option<MultiAgentVersion>,
 }
 
 /// Frozen source history and model context for a reference-backed fork.
@@ -569,6 +572,9 @@ pub struct ThreadOccurrenceSearchPage {
 /// Store-owned thread metadata used by list/read/resume responses.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredThread {
+    /// Originator recorded at creation, if available from the backing store.
+    #[serde(default)]
+    pub originator: Option<String>,
     /// Thread id.
     pub thread_id: ThreadId,
     /// Optional extra configuration fields for the thread.
@@ -608,6 +614,9 @@ pub struct StoredThread {
     /// Canonical project assignment owned by app-server, if any.
     #[serde(default)]
     pub project_id: Option<String>,
+    /// User-selected Daybreak preference, absent until explicitly set.
+    #[serde(default)]
+    pub daybreak_enabled: Option<bool>,
     /// Working directory captured for the thread.
     pub cwd: PathBuf,
     /// CLI version captured for the thread.
@@ -687,7 +696,7 @@ impl GitInfoPatch {
 
 /// Patch for thread metadata.
 ///
-/// Every field is literal: `None` leaves that field unchanged, while `Some`
+/// Unless noted otherwise, `None` leaves a field unchanged, while `Some`
 /// applies the supplied value. Fields whose value may itself be cleared use an
 /// inner `Option`, where `Some(None)` clears the field.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -724,6 +733,8 @@ pub struct ThreadMetadataPatch {
     pub advance_recency_at: Option<DateTime<Utc>>,
     /// Session source.
     pub source: Option<SessionSource>,
+    /// Recorded creation-time originator. Only fills a missing stored value.
+    pub originator: Option<String>,
     /// Optional analytics source classification.
     #[serde(
         default,
@@ -775,6 +786,8 @@ pub struct ThreadMetadataPatch {
         with = "optional_option"
     )]
     pub project_id: ClearableField<String>,
+    /// User-selected Daybreak preference; omission leaves it unchanged.
+    pub daybreak_enabled: Option<bool>,
 }
 
 impl ThreadMetadataPatch {
@@ -817,6 +830,9 @@ impl ThreadMetadataPatch {
         if next.source.is_some() {
             self.source = next.source;
         }
+        if next.originator.is_some() {
+            self.originator = next.originator;
+        }
         if next.thread_source.is_some() {
             self.thread_source = next.thread_source;
         }
@@ -858,6 +874,9 @@ impl ThreadMetadataPatch {
         if next.project_id.is_some() {
             self.project_id = next.project_id;
         }
+        if next.daybreak_enabled.is_some() {
+            self.daybreak_enabled = next.daybreak_enabled;
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -872,6 +891,7 @@ impl ThreadMetadataPatch {
             && self.updated_at.is_none()
             && self.advance_recency_at.is_none()
             && self.source.is_none()
+            && self.originator.is_none()
             && self.thread_source.is_none()
             && self.agent_nickname.is_none()
             && self.agent_role.is_none()
@@ -885,6 +905,7 @@ impl ThreadMetadataPatch {
             && self.git_info.is_none()
             && self.memory_mode.is_none()
             && self.project_id.is_none()
+            && self.daybreak_enabled.is_none()
     }
 }
 

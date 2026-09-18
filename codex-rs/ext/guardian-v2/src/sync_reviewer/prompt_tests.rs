@@ -104,6 +104,7 @@ async fn prompt_preserves_root_authorization_reasons_and_denied_reads() -> Resul
         authorization_version: GuardianAuthorizationVersion {
             user_message_revision: 1,
             user_input_response_count: 0,
+            retained_context_complete: true,
         },
         messages: vec![
             GuardianRootMessage::User("inspect only public files".to_string()),

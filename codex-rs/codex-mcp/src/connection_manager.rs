@@ -73,8 +73,6 @@ use codex_protocol::protocol::McpStartupFailureReason;
 use codex_protocol::protocol::McpStartupStatus;
 use codex_protocol::protocol::McpStartupUpdateEvent;
 use codex_rmcp_client::determine_streamable_http_auth_status_from_credentials;
-use tokio::sync::Mutex;
-use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::warn;
@@ -171,10 +169,10 @@ impl McpServerView {
     async fn listed_tools(
         &self,
         tool_plugin_provenance: &ToolPluginProvenance,
-    ) -> Option<Vec<ToolInfo>> {
+    ) -> Result<Vec<ToolInfo>, StartupOutcomeError> {
         let tools = self.connection.client.listed_tools().await?;
         let tools = filter_tools(tools, &self.tool_filter);
-        Some(if self.connection.client.is_codex_apps_mcp_server {
+        Ok(if self.connection.client.is_codex_apps_mcp_server {
             prepare_codex_apps_tools_for_model(tools, tool_plugin_provenance)
         } else {
             prepare_regular_mcp_tools_for_model(tools, tool_plugin_provenance)
@@ -190,9 +188,6 @@ pub(crate) struct McpConnectionSet {
     protocol_mode: crate::McpProtocolMode,
     required_servers: Vec<String>,
     optional_startup_deadline: OnceLock<tokio::time::Instant>,
-    tool_catalog_revision: Arc<RwLock<u64>>,
-    codex_apps_tools_override: RwLock<Option<Vec<ToolInfo>>>,
-    codex_apps_refresh_lock: Mutex<()>,
     tool_plugin_provenance: Arc<ToolPluginProvenance>,
     prefix_mcp_tool_names: bool,
     non_prefixed_mcp_tool_servers: Vec<String>,
@@ -553,6 +548,15 @@ impl McpConnectionSet {
                 runtime_auth_provider,
                 client_elicitation_capability.clone(),
                 client_mcp_extensions.clone(),
+                auth_manager
+                    .as_ref()
+                    .filter(|_| {
+                        matches!(
+                            &configured_config.transport,
+                            McpServerTransportConfig::Stdio { .. }
+                        )
+                    })
+                    .map(|manager| manager.auth_change_state_receiver()),
                 protocol_mode,
                 catalog_item_limit,
             );
@@ -711,9 +715,6 @@ impl McpConnectionSet {
             protocol_mode,
             required_servers,
             optional_startup_deadline: OnceLock::new(),
-            tool_catalog_revision: Arc::new(RwLock::new(0)),
-            codex_apps_tools_override: RwLock::new(None),
-            codex_apps_refresh_lock: Mutex::new(()),
             tool_plugin_provenance,
             prefix_mcp_tool_names,
             non_prefixed_mcp_tool_servers,
@@ -773,9 +774,6 @@ impl McpConnectionSet {
             protocol_mode: crate::McpProtocolMode::Legacy,
             required_servers: Vec::new(),
             optional_startup_deadline: OnceLock::new(),
-            tool_catalog_revision: Arc::new(RwLock::new(0)),
-            codex_apps_tools_override: RwLock::new(None),
-            codex_apps_refresh_lock: Mutex::new(()),
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             prefix_mcp_tool_names,
             non_prefixed_mcp_tool_servers: Vec::new(),
@@ -993,4 +991,4 @@ impl McpConnectionSet {
 
 #[cfg(test)]
 #[path = "connection_manager_tests.rs"]
-mod tests;
+pub(crate) mod tests;

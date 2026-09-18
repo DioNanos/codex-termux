@@ -4,10 +4,10 @@ use super::*;
 use codex_config::types::TuiPetAnchor;
 
 pub(super) fn load_ambient_pet(
-    config: &Config,
+    config: &crate::local_settings::LocalSettings,
     frame_requester: FrameRequester,
 ) -> Option<crate::pets::AmbientPet> {
-    let selected_pet = config.tui_pet.as_deref()?;
+    let selected_pet = config.tui.pet.as_deref()?;
     if selected_pet == crate::pets::DISABLED_PET_ID {
         return None;
     }
@@ -16,19 +16,19 @@ pub(super) fn load_ambient_pet(
         Some(selected_pet),
         &config.codex_home,
         frame_requester,
-        config.animations,
+        config.tui.animations,
     )
     .ok()
 }
 
 pub(super) fn start_configured_pet_load_if_needed(
-    config: &Config,
+    config: &crate::local_settings::LocalSettings,
     ambient_pet_missing: bool,
     frame_requester: FrameRequester,
     app_event_tx: AppEventSender,
     pet_http_client: codex_http_client::RouteAwareClientPool,
 ) {
-    let Some(pet_id) = config.tui_pet.clone() else {
+    let Some(pet_id) = config.tui.pet.clone() else {
         return;
     };
     if pet_id == crate::pets::DISABLED_PET_ID || !ambient_pet_missing {
@@ -36,7 +36,7 @@ pub(super) fn start_configured_pet_load_if_needed(
     }
 
     let codex_home = config.codex_home.clone();
-    let animations_enabled = config.animations;
+    let animations_enabled = config.tui.animations;
     let event_pet_id = pet_id.clone();
     spawn_pet_load(
         async move {
@@ -90,7 +90,7 @@ impl ChatWidget {
             return None;
         }
 
-        let anchor_bottom_y = match self.config.tui_pet_anchor {
+        let anchor_bottom_y = match self.local_settings.tui.pet_anchor {
             TuiPetAnchor::Composer => composer_bottom_y,
             TuiPetAnchor::ScreenBottom => area.bottom(),
         };
@@ -146,14 +146,15 @@ impl ChatWidget {
         self.pet_picker_preview_state.clear();
         self.pet_picker_preview_pet = None;
         let params = crate::pets::build_pet_picker_params(
-            self.config.tui_pet.as_deref(),
-            &self.config.codex_home,
+            self.local_settings.tui.pet.as_deref(),
+            &self.local_settings.codex_home,
             self.pet_picker_preview_state.clone(),
         );
         self.bottom_pane.show_selection_view(params);
         let initial_pet_id = self
-            .config
-            .tui_pet
+            .local_settings
+            .tui
+            .pet
             .as_deref()
             .unwrap_or(crate::pets::DEFAULT_PET_ID)
             .to_string();
@@ -193,10 +194,10 @@ impl ChatWidget {
         crate::pets::detect_pet_image_support()
     }
 
-    /// Set the pet preselected by the TUI picker in the widget's config copy.
+    /// Set the pet preselected by the TUI picker in the widget's local settings.
     pub(crate) fn set_tui_pet(&mut self, pet: Option<String>) {
-        self.config.tui_pet = pet;
-        self.ambient_pet = load_ambient_pet(&self.config, self.frame_requester.clone());
+        self.local_settings.tui.pet = pet;
+        self.ambient_pet = load_ambient_pet(&self.local_settings, self.frame_requester.clone());
         self.apply_ambient_pet_image_support_override_for_tests();
         self.request_redraw();
     }
@@ -206,7 +207,7 @@ impl ChatWidget {
         pet: Option<String>,
         ambient_pet: Option<crate::pets::AmbientPet>,
     ) {
-        self.config.tui_pet = pet;
+        self.local_settings.tui.pet = pet;
         self.ambient_pet = ambient_pet;
         self.apply_ambient_pet_image_support_override_for_tests();
         self.request_redraw();
@@ -238,7 +239,7 @@ impl ChatWidget {
         self.pet_picker_preview_state.set_loading();
         self.request_redraw();
 
-        let codex_home = self.config.codex_home.clone();
+        let codex_home = self.local_settings.codex_home.clone();
         let frame_requester = self.frame_requester.clone();
         let tx = self.app_event_tx.clone();
         let pet_http_client = self.pet_http_client.clone();

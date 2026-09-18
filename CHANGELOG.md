@@ -1,3 +1,21 @@
+# [0.154.0] - 2026-09-18
+
+## Codex Termux 0.154.0 — upstream rust-v0.154.0 and sandbox-honest apply_patch
+
+- Merges upstream tag `rust-v0.154.0` into the Termux fork.
+- `apply_patch` on a platform without a filesystem sandbox honours an explicit
+  approval before bypassing it, and pre-verification reads fall back to
+  unsandboxed host reads only where no sandbox can exist and the policy has no
+  denied-read restrictions — fixes #25 (and closes the follow-up to #22).
+- The TUI drains queued input after a local compaction instead of freezing the
+  composer behind an orphan pending-start latch.
+- The launcher postinstall validates `$PREFIX` before rewriting shebangs.
+- The daemon README keeps the upstream exec-server attachment note.
+- Upstream highlights: GPT-6-Astra in the model picker and Bedrock catalogs,
+  experimental worktrees (`--worktree` / `/worktree`), inline asynchronous
+  questions, a shared Windows background app-server daemon, and Vim replace
+  mode with richer `/copy`.
+
 # [0.153.3] - 2026-09-05
 
 ## Codex Termux 0.153.3 — guardrails for model-owned prompts
