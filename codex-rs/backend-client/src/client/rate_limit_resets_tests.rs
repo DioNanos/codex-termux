@@ -1,9 +1,43 @@
+//! Usage permission and earned-reset payloads, including compatibility with older backends.
+
 use super::*;
 use crate::types::ConsumeRateLimitResetCreditCode;
 use crate::types::RateLimitResetCreditDetails;
 use crate::types::RateLimitResetCreditsDetails;
 use crate::types::RateLimitResetCreditsSummary;
 use pretty_assertions::assert_eq;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
+
+#[tokio::test]
+async fn ordinary_usage_permission_comes_from_backend_not_display_percent() {
+    for (allowed, used_percent) in [(Some(true), 100), (Some(false), 0), (None, 0)] {
+        let server = MockServer::start().await;
+        let rate_limit = allowed.map(|allowed| {
+            serde_json::json!({
+                "allowed": allowed, "limit_reached": !allowed,
+                "primary_window": {"used_percent": used_percent, "limit_window_seconds": 300,
+                    "reset_after_seconds": 60, "reset_at": 2000000000}
+            })
+        });
+        Mock::given(method("GET"))
+            .and(path("/api/codex/usage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plan_type": "plus", "rate_limit": rate_limit
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response = test_client(&server.uri(), PathStyle::CodexApi)
+            .get_rate_limits_with_reset_credits()
+            .await
+            .unwrap();
+        assert_eq!(response.ordinary_usage_allowed, allowed);
+    }
+}
 
 #[test]
 fn rate_limit_reset_contract_uses_expected_paths_and_payloads() {

@@ -26,6 +26,8 @@
 //!   [`PasteBurst::on_plain_char_no_hold`] (non-ASCII/IME).
 //! - If the decision indicates buffering, the caller appends to `PasteBurst.buffer` via
 //!   [`PasteBurst::append_char_to_buffer`].
+//! - On Enter, [`PasteBurst::append_newline_if_active`] promotes a held first character into
+//!   the active buffer before appending the newline.
 //! - On a UI tick, call [`PasteBurst::flush_if_due`]. If it returns [`FlushResult::Typed`], insert
 //!   that char as normal typing. If it returns [`FlushResult::Paste`], treat the returned string as
 //!   an explicit paste.
@@ -47,8 +49,8 @@
 //! - `buffer`: accumulated burst text that will eventually flush as a single `Paste(String)`.
 //!   A non-empty buffer is treated as "in burst context" even if `active` has been cleared.
 //! - `pending_first_char`: a single held ASCII char used for flicker suppression. The caller must
-//!   not render this char until it either becomes part of a burst (`BeginBufferFromPending`) or
-//!   flushes as a normal typed char (`FlushResult::Typed`).
+//!   not render this char until it joins a burst through `BeginBufferFromPending` or
+//!   `append_newline_if_active`, or flushes as a normal typed char (`FlushResult::Typed`).
 //! - `last_plain_char_time`/`consecutive_plain_char_burst`: the timing/count heuristic for
 //!   "paste-like" streams.
 //! - `burst_window_until`: the Enter suppression window ("Enter inserts newline") that outlives the
@@ -326,6 +328,10 @@ impl PasteBurst {
     /// false otherwise.
     pub fn append_newline_if_active(&mut self, now: Instant) -> bool {
         if self.is_active() {
+            if let Some((held, _)) = self.pending_first_char.take() {
+                self.buffer.push(held);
+            }
+            self.active = true;
             self.buffer.push('\n');
             self.burst_window_until = Some(now + PASTE_ENTER_SUPPRESS_WINDOW);
             true

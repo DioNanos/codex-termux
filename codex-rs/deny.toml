@@ -231,6 +231,7 @@ deny = [
         "pagable",
         "rmcp",
         "tonic",
+        "webrtc",
         "zbus",
     ], reason = "first-party traits must use native async trait methods with explicit Send bounds" },
     # Migration ratchet: `codex-http-client` is the intended reqwest owner. Remove each temporary

@@ -20,6 +20,7 @@ fn rate_limit_snapshot(
     RateLimitSnapshot {
         limit_id: Some("codex".to_string()),
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent,
             window_duration_mins: Some(300),
@@ -40,6 +41,7 @@ fn rate_limit_snapshot(
 
 fn account_rate_limits_response(snapshot: RateLimitSnapshot) -> GetAccountRateLimitsResponse {
     GetAccountRateLimitsResponse {
+        ordinary_usage_allowed: None,
         account_id: None,
         rate_limit_upsell: None,
         rate_limits: snapshot,
@@ -223,6 +225,12 @@ async fn stale_rate_limit_reads_preserve_newer_workspace_hard_stop_for_every_ori
         ))
         .await?;
 
+        app.chat_widget
+            .on_rate_limit_snapshot(Some(rate_limit_snapshot(
+                /*used_percent*/ 20,
+                /*rate_limit_reached_type*/ None,
+                Some(false),
+            )));
         let origin = match origin_name {
             "startup" => RateLimitRefreshOrigin::StartupPrefetch {
                 reset_hint_request_id: app.chat_widget.start_rate_limit_reset_startup_check(),
@@ -308,8 +316,8 @@ async fn stale_rate_limit_reads_preserve_newer_workspace_hard_stop_for_every_ori
 
         let status = render_status_output(&mut app, &mut app_event_rx);
         assert!(
-            status.contains("5% left"),
-            "expected {origin_name} to preserve rolling limits, got: {status}"
+            status.contains("80% left"),
+            "expected {origin_name} to preserve the last account usage snapshot, got: {status}"
         );
         deliver_usage_limit_error(&mut app);
         let popup = render_bottom_popup(&app.chat_widget, /*width*/ 100);

@@ -14,6 +14,7 @@ use codex_network_proxy::NetworkPolicyDecider;
 use codex_network_proxy::NetworkPolicyRequest;
 use codex_network_proxy::NetworkProxyAuditMetadata;
 use codex_utils_path_uri::PathUri;
+use http::HeaderMap;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::InMemorySpanExporter;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -266,6 +267,7 @@ async fn abandoned_process_start_unregisters_and_cleans_up() {
     let start_process_id = process_id.clone();
     let start = tokio::spawn(async move {
         let params = ExecParams {
+            metadata: Default::default(),
             process_id: start_process_id,
             argv: vec!["true".to_string()],
             cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
@@ -429,6 +431,7 @@ async fn policy_requests_use_process_decider_and_cancel_on_unregister() {
             websocket_url,
             connect_timeout: Duration::from_secs(1),
             initialize_timeout: Duration::from_secs(1),
+            http_headers: HeaderMap::new(),
         },
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     )

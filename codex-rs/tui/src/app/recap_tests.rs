@@ -48,6 +48,7 @@ fn turn(status: TurnStatus) -> Turn {
 fn user_history_cell(message: &str) -> Arc<dyn HistoryCell> {
     Arc::new(UserHistoryCell {
         message: message.to_string(),
+        spoken: false,
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),
         remote_image_urls: Vec::new(),
@@ -397,7 +398,7 @@ async fn auto_recap_opt_out_cancels_scheduling_after_restored_progress() {
     app.schedule_recap_check(thread_id, now);
     tokio::task::yield_now().await;
 
-    app.config.tui_auto_recap = false;
+    app.local_settings.tui.auto_recap = false;
     app.schedule_recap_check(thread_id, now);
     tokio::time::advance(RECAP_DELAY).await;
     tokio::task::yield_now().await;
@@ -658,7 +659,7 @@ async fn auto_recap_opt_out_discards_results_without_retrying() {
         Err("temporary failure".to_string()),
     ] {
         let (request, temporary_thread_id) = track_in_flight_recap(&mut app, thread_id);
-        app.config.tui_auto_recap = false;
+        app.local_settings.tui.auto_recap = false;
 
         assert!(
             app.handle_generated_recap(request, temporary_thread_id, result)

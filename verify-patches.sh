@@ -66,7 +66,7 @@ printf "Patch #2 (Release Profile): "
 if grep -q 'lto = "thin"' codex-rs/Cargo.toml \
   && grep -q 'zip = "2.4.2"' codex-rs/Cargo.toml \
   && grep -q 'CARGO_PROFILE_RELEASE_LTO: "thin"' .github/workflows/termux-npm-build-publish.yml \
-  && grep -q 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"' .github/workflows/termux-npm-build-publish.yml \
+  && grep -q 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "4"' .github/workflows/termux-npm-build-publish.yml \
   && grep -q 'CARGO_PROFILE_RELEASE_PANIC: "abort"' .github/workflows/termux-npm-build-publish.yml \
   && grep -q 'CARGO_PROFILE_RELEASE_STRIP: "symbols"' .github/workflows/termux-npm-build-publish.yml; then
   pass
@@ -517,7 +517,9 @@ printf "Patch #29 (advisory locks degrade where the filesystem lacks them): "
 # one lock site the rule had never been extended to, which took the whole CLI
 # down at startup on the device. Version-agnostic on purpose: this checks the
 # behaviour is wired, not which upstream release introduced the call.
-writer_lock=codex-rs/thread-store/src/local/writer_lock.rs
+# 0.155.0: upstream renamed thread-store/src/local/writer_lock.rs to
+# rollout/src/writer_lock.rs (commit 73a1148c9c); the guard follows the file.
+writer_lock=codex-rs/rollout/src/writer_lock.rs
 if [ -f "$writer_lock" ] \
   && grep -q 'fn is_unsupported_file_lock_error' "$writer_lock" \
   && grep -q 'ErrorKind::Unsupported' "$writer_lock" \

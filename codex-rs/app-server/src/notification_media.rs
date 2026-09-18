@@ -47,6 +47,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
                 | ResponseItem::ToolSearchOutput { .. }
                 | ResponseItem::WebSearchCall { .. }
                 | ResponseItem::Compaction { .. }
+                | ResponseItem::ConfigurationUpdate { .. }
                 | ResponseItem::CompactionTrigger { .. }
                 | ResponseItem::ContextCompaction { .. }
                 | ResponseItem::Other => {}
@@ -63,6 +64,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
         | ServerNotification::ThreadReverted(_)
         | ServerNotification::SkillsChanged(_)
         | ServerNotification::ThreadNameUpdated(_)
+        | ServerNotification::ThreadAttachmentUpdated(_)
         | ServerNotification::ThreadGoalUpdated(_)
         | ServerNotification::ThreadGoalCleared(_)
         | ServerNotification::ThreadQueueChanged(_)

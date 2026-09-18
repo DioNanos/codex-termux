@@ -12,11 +12,9 @@ use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::permissions::ReadDenyMatcher;
 use codex_protocol::permissions::file_system_root;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use std::num::NonZeroUsize;
-use std::path::Path;
 
 pub fn normalize_additional_permissions(
     additional_permissions: AdditionalPermissionProfile,
@@ -81,18 +79,6 @@ pub fn normalize_additional_permissions_with_context(
 /// Resolves cwd-dependent permission entries without filtering their authority.
 ///
 /// Unlike intersection, this preserves narrower grants beneath denied paths.
-pub fn materialize_additional_permissions(
-    additional_permissions: AdditionalPermissionProfile,
-    cwd: &Path,
-) -> Result<AdditionalPermissionProfile, String> {
-    let cwd = AbsolutePathBuf::from_absolute_path(cwd)
-        .map_err(|err| format!("invalid permission cwd: {err}"))?;
-    let cwd = PathUri::from(cwd);
-    with_local_context_for_cwd(&cwd, |context| {
-        materialize_additional_permissions_with_context(additional_permissions, context)
-    })
-}
-
 pub fn materialize_additional_permissions_with_context(
     mut additional_permissions: AdditionalPermissionProfile,
     context: &FileSystemSandboxPolicyContext<'_>,
@@ -156,21 +142,6 @@ pub fn merge_permission_profiles(
         }
         None => Some(permissions.clone()).filter(|permissions| !permissions.is_empty()),
     }
-}
-
-pub fn intersect_permission_profiles(
-    requested: AdditionalPermissionProfile,
-    granted: AdditionalPermissionProfile,
-    cwd: &Path,
-) -> AdditionalPermissionProfile {
-    AbsolutePathBuf::from_absolute_path(cwd)
-        .ok()
-        .map(PathUri::from)
-        .map_or_else(AdditionalPermissionProfile::default, |cwd| {
-            with_local_context_for_cwd(&cwd, |context| {
-                intersect_permission_profiles_with_context(requested, granted, context)
-            })
-        })
 }
 
 pub fn intersect_permission_profiles_with_context(
@@ -246,46 +217,6 @@ pub fn intersect_permission_profiles_with_context(
         network,
         file_system,
     }
-}
-
-fn with_local_context_for_cwd<T>(
-    cwd: &PathUri,
-    evaluate: impl FnOnce(&FileSystemSandboxPolicyContext<'_>) -> T,
-) -> T {
-    let user_home_dir = PathUri::from_host_native_path("~").ok();
-    let local_cwd = std::env::current_dir().ok();
-    let temporary_directory_env_vars: &[&str] = if cfg!(windows) {
-        &["TEMP", "TMP"]
-    } else {
-        &["TMPDIR"]
-    };
-    let normalize_temp_path = |path: std::ffi::OsString| {
-        PathUri::from_host_native_path(&path).ok().or_else(|| {
-            if cfg!(unix) {
-                PathUri::from_host_native_path(local_cwd.as_ref()?.join(path)).ok()
-            } else {
-                None
-            }
-        })
-    };
-    let mut temporary_directories = Vec::new();
-    for name in temporary_directory_env_vars {
-        if let Some(path) = std::env::var_os(name)
-            .filter(|path| !path.is_empty())
-            .filter(|path| cfg!(unix) || Path::new(path).is_absolute())
-            .and_then(&normalize_temp_path)
-            && !temporary_directories.contains(&path)
-        {
-            temporary_directories.push(path);
-        }
-    }
-    let context = FileSystemSandboxPolicyContext {
-        cwd,
-        workspace_roots: std::slice::from_ref(cwd),
-        user_home_dir: user_home_dir.as_ref(),
-        temporary_directories: Some(&temporary_directories),
-    };
-    evaluate(&context)
 }
 
 fn merge_glob_scan_max_depth(

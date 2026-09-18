@@ -1,3 +1,33 @@
+# [0.155.0] - 2026-09-18
+
+## Codex Termux 0.155.0 — upstream rust-v0.155.0 and coordinated rollout writers
+
+- Merges upstream tag `rust-v0.155.0` into the Termux fork.
+- Carries the unsupported-file-lock degradation onto the relocated writer lock:
+  the classifier, its call sites and its regression test now live in the
+  rollout writer-lock module, and the release guard points at the new path.
+- Deny-read policies stay fail-closed: the degradation applies only where the
+  filesystem cannot lock at all, never where reads are denied.
+- The daemon keeps its fork-owned no-updater policy: `daemon update` fails
+  closed with the npm channel message and no updater process is started.
+- The Android release profile builds with codegen-units=4 (upstream default),
+  down from 16 in 0.153.3.
+- The package and npm channel are unchanged from 0.154.0.
+- Upstream highlights: voice conversations behind experimental features with a
+  separate audio host (not built in this package, so `/voice` is unavailable on
+  Termux), Guardian settings and execution moved into dedicated crates, managed
+  daemon thread restore on restart, coordinated rollout compression with active
+  thread writers, WSL interop escape hardening, network approvals bound to their
+  originating execution, and streaming reasoning summaries with completion
+  timestamps in the TUI.
+
+# [0.154.0] - Unreleased
+
+## Codex Termux 0.154.0 — upstream rust-v0.154.0 integration
+
+- Merges upstream tag `rust-v0.154.0` into the Termux fork.
+- Highlights to be completed at release time.
+
 # [0.153.3] - 2026-09-05
 
 ## Codex Termux 0.153.3 — guardrails for model-owned prompts

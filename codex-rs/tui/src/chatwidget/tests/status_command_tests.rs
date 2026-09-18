@@ -52,6 +52,15 @@ async fn status_command_refresh_updates_cached_limits_for_future_status_outputs(
     chat.finish_status_rate_limit_refresh(first_request_id, vec![snapshot(/*percent*/ 92.0)]);
     drain_insert_history(&mut rx);
 
+    chat.dispatch_command(SlashCommand::Copy);
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::CopySelection { text, label, .. })
+            if label == "Whole status" && text.contains("8% left")
+    );
+    assert_matches!(rx.try_recv(), Ok(AppEvent::SettingsSelectionClosed));
+
     chat.dispatch_command(SlashCommand::Status);
     let refreshed = match rx.try_recv() {
         Ok(AppEvent::InsertHistoryCell(cell)) => {
@@ -81,7 +90,7 @@ async fn status_command_renders_immediately_without_rate_limit_refresh() {
 
 #[tokio::test]
 async fn status_command_uses_catalog_default_reasoning_when_config_empty() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.config.model_reasoning_effort = None;
 
     chat.dispatch_command(SlashCommand::Status);
@@ -93,7 +102,7 @@ async fn status_command_uses_catalog_default_reasoning_when_config_empty() {
         other => panic!("expected status output, got {other:?}"),
     };
     assert!(
-        rendered.contains("gpt-5.4 (reasoning medium, summaries auto)"),
+        rendered.contains("gpt-5.5 (reasoning medium, summaries auto)"),
         "expected /status to render the catalog default reasoning effort, got: {rendered}"
     );
 }

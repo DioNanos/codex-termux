@@ -1,7 +1,8 @@
 //! Terminal detection utilities.
 //!
 //! This module feeds terminal metadata into OpenTelemetry user-agent logging and into
-//! terminal-specific configuration choices in the TUI.
+//! terminal-specific configuration choices in the TUI. Detection only reads the
+//! environment; it must not execute helpers selected by an untrusted PATH.
 
 use std::sync::OnceLock;
 
@@ -70,22 +71,6 @@ pub enum Multiplexer {
     },
 }
 
-/// tmux client terminal identification captured via `tmux display-message`.
-///
-/// `termtype` corresponds to `#{client_termtype}` and typically reflects the
-/// underlying terminal program (for example, `ghostty` or `wezterm`) with an
-/// optional version suffix. `termname` comes from `#{client_termname}` and
-/// preserves the TERM capability string exposed by the client (for example,
-/// `xterm-256color`).
-///
-/// This information is only available when running under tmux and lets us
-/// attribute the session to the underlying terminal rather than to tmux itself.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct TmuxClientInfo {
-    termtype: Option<String>,
-    termname: Option<String>,
-}
-
 impl TerminalInfo {
     /// Creates terminal metadata from detected fields.
     fn new(
@@ -118,17 +103,6 @@ impl TerminalInfo {
             /*term*/ None,
             multiplexer,
         )
-    }
-
-    /// Creates terminal metadata from a `TERM_PROGRAM` match plus a `TERM` value.
-    fn from_term_program_and_term(
-        name: TerminalName,
-        term_program: String,
-        version: Option<String>,
-        term: Option<String>,
-        multiplexer: Option<Multiplexer>,
-    ) -> Self {
-        Self::new(name, Some(term_program), version, term, multiplexer)
     }
 
     /// Creates terminal metadata from a known terminal name and optional version.
@@ -238,14 +212,6 @@ trait Environment {
     fn has_non_empty(&self, name: &str) -> bool {
         self.var_non_empty(name).is_some()
     }
-
-    /// Returns tmux client details when available.
-    fn tmux_client_info(&self) -> TmuxClientInfo;
-
-    /// Returns Zellij version details when available.
-    fn zellij_version(&self) -> Option<String> {
-        self.var_non_empty("ZELLIJ_VERSION")
-    }
 }
 
 /// Reads environment variables from the running process.
@@ -261,15 +227,6 @@ impl Environment for ProcessEnvironment {
                 None
             }
         }
-    }
-
-    fn tmux_client_info(&self) -> TmuxClientInfo {
-        tmux_client_info()
-    }
-
-    fn zellij_version(&self) -> Option<String> {
-        self.var_non_empty("ZELLIJ_VERSION")
-            .or_else(zellij_version_from_command)
     }
 }
 
@@ -288,32 +245,24 @@ pub fn terminal_info() -> TerminalInfo {
 /// Detects structured terminal metadata from an injectable environment.
 ///
 /// Detection order favors explicit identifiers before falling back to capability strings:
-/// - If `TERM_PROGRAM=tmux`, the tmux client term type/name are used instead. The client term
-///   type is split on whitespace to extract a program name plus optional version (for example,
-///   `ghostty 1.2.3`), while the client term name becomes the `TERM` capability string.
-/// - Otherwise, `TERM_PROGRAM` (plus `TERM_PROGRAM_VERSION`) drives the detected terminal name.
+/// - `TERM_PROGRAM` (plus `TERM_PROGRAM_VERSION`) drives the detected terminal name,
+///   except when it identifies tmux rather than the underlying terminal.
 ///   This means `TERM_PROGRAM` can mask later probes (for example `WT_SESSION`).
 /// - Next, terminal-specific variables (WEZTERM, iTerm2, Apple Terminal, kitty, etc.) are checked.
 /// - Finally, `TERM` is used as the capability fallback.
-///
-/// tmux client term info is only consulted when a tmux multiplexer is detected, and it is
-/// derived from `tmux display-message` to surface the underlying terminal program instead of
-/// reporting tmux itself.
 fn detect_terminal_info_from_env(env: &dyn Environment) -> TerminalInfo {
     let multiplexer = detect_multiplexer(env);
 
-    if let Some(term_program) = env.var_non_empty("TERM_PROGRAM") {
-        if is_tmux_term_program(&term_program)
-            && matches!(multiplexer, Some(Multiplexer::Tmux { .. }))
-            && let Some(terminal) =
-                terminal_from_tmux_client_info(env.tmux_client_info(), multiplexer.clone())
-        {
-            return terminal;
-        }
-
+    if let Some(term_program) = env.var_non_empty("TERM_PROGRAM")
+        && !is_tmux_term_program(&term_program)
+    {
         let version = env.var_non_empty("TERM_PROGRAM_VERSION");
         let name = terminal_name_from_term_program(&term_program).unwrap_or(TerminalName::Unknown);
         return TerminalInfo::from_term_program(name, term_program, version, multiplexer);
+    }
+
+    if env.has_non_empty("GHOSTTY_RESOURCES_DIR") {
+        return TerminalInfo::from_name(TerminalName::Ghostty, /*version*/ None, multiplexer);
     }
 
     if env.has("WEZTERM_VERSION") {
@@ -400,7 +349,7 @@ fn detect_multiplexer(env: &dyn Environment) -> Option<Multiplexer> {
         || env.has_non_empty("ZELLIJ_VERSION")
     {
         return Some(Multiplexer::Zellij {
-            version: env.zellij_version(),
+            version: env.var_non_empty("ZELLIJ_VERSION"),
         });
     }
 
@@ -411,30 +360,6 @@ fn is_tmux_term_program(value: &str) -> bool {
     value.eq_ignore_ascii_case("tmux")
 }
 
-fn terminal_from_tmux_client_info(
-    client_info: TmuxClientInfo,
-    multiplexer: Option<Multiplexer>,
-) -> Option<TerminalInfo> {
-    let termtype = client_info.termtype.and_then(none_if_whitespace);
-    let termname = client_info.termname.and_then(none_if_whitespace);
-
-    if let Some(termtype) = termtype.as_ref() {
-        let (program, version) = split_term_program_and_version(termtype);
-        let name = terminal_name_from_term_program(&program).unwrap_or(TerminalName::Unknown);
-        return Some(TerminalInfo::from_term_program_and_term(
-            name,
-            program,
-            version,
-            termname,
-            multiplexer,
-        ));
-    }
-
-    termname
-        .as_ref()
-        .map(|termname| TerminalInfo::from_term(termname.to_string(), multiplexer))
-}
-
 fn tmux_version_from_env(env: &dyn Environment) -> Option<String> {
     let term_program = env.var("TERM_PROGRAM")?;
     if !is_tmux_term_program(&term_program) {
@@ -442,60 +367,6 @@ fn tmux_version_from_env(env: &dyn Environment) -> Option<String> {
     }
 
     env.var_non_empty("TERM_PROGRAM_VERSION")
-}
-
-fn split_term_program_and_version(value: &str) -> (String, Option<String>) {
-    let mut parts = value.split_whitespace();
-    let program = parts.next().unwrap_or_default().to_string();
-    let version = parts.next().map(ToString::to_string);
-    (program, version)
-}
-
-fn tmux_client_info() -> TmuxClientInfo {
-    let termtype = tmux_display_message("#{client_termtype}");
-    let termname = tmux_display_message("#{client_termname}");
-
-    TmuxClientInfo { termtype, termname }
-}
-
-fn tmux_display_message(format: &str) -> Option<String> {
-    let output = std::process::Command::new("tmux")
-        .args(["display-message", "-p", format])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let value = String::from_utf8(output.stdout).ok()?;
-    none_if_whitespace(value.trim().to_string())
-}
-
-fn zellij_version_from_command() -> Option<String> {
-    // Best-effort fallback: missing or broken zellij binaries should not affect
-    // terminal detection.
-    let output = std::process::Command::new("zellij")
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    parse_zellij_version(stdout.trim())
-}
-
-fn parse_zellij_version(value: &str) -> Option<String> {
-    let value = none_if_whitespace(value.to_string())?;
-    let mut parts = value.split_whitespace();
-    match (parts.next(), parts.next()) {
-        (Some(command), Some(version)) if command.eq_ignore_ascii_case("zellij") => {
-            Some(version.to_string())
-        }
-        _ => Some(value),
-    }
 }
 
 /// Sanitizes a terminal token for use in User-Agent headers.

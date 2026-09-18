@@ -127,13 +127,13 @@ async fn terminal_title_shows_action_required_while_exec_approval_is_pending() {
     assert!(chat.should_animate_terminal_title_spinner());
 
     for (animations, title_items) in [(false, None), (true, Some(Vec::new()))] {
-        chat.config.animations = true;
-        chat.config.tui_terminal_title = None;
+        chat.local_settings.tui.animations = true;
+        chat.local_settings.tui.terminal_title = None;
         chat.refresh_terminal_title();
         assert!(chat.terminal_title_next_refresh.is_some());
 
-        chat.config.animations = animations;
-        chat.config.tui_terminal_title = title_items;
+        chat.local_settings.tui.animations = animations;
+        chat.local_settings.tui.terminal_title = title_items;
         chat.refresh_terminal_title();
         assert!(chat.terminal_title_next_refresh.is_none());
     }
@@ -142,7 +142,7 @@ async fn terminal_title_shows_action_required_while_exec_approval_is_pending() {
 #[tokio::test]
 async fn terminal_title_action_required_respects_spinner_setting() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.config.tui_terminal_title = Some(vec!["project".to_string()]);
+    chat.local_settings.tui.terminal_title = Some(vec!["project".to_string()]);
     chat.bottom_pane.set_task_running(/*running*/ true);
     chat.refresh_terminal_title();
 
@@ -206,7 +206,7 @@ async fn terminal_title_action_required_blinks_when_animations_are_enabled() {
 #[tokio::test]
 async fn terminal_title_activity_indicators_do_not_animate_when_animations_are_disabled() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.config.animations = false;
+    chat.local_settings.tui.animations = false;
     chat.bottom_pane.set_task_running(/*running*/ true);
     chat.terminal_title_animation_origin = Instant::now() - std::time::Duration::from_millis(1500);
     chat.refresh_terminal_title();
@@ -238,4 +238,126 @@ async fn terminal_title_activity_indicators_do_not_animate_when_animations_are_d
         Some("[ ! ] Action Required | project".to_string())
     );
     assert!(!chat.should_animate_terminal_title_action_required());
+}
+
+#[tokio::test]
+async fn thread_title_progress_renders_names_and_fallbacks_on_both_surfaces() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::from_string("550e8400-e29b-41d4-a716-446655440000").unwrap());
+    chat.local_settings.tui.animations = false;
+    let mut rendered = Vec::new();
+    for (name, pending) in [
+        (None, false),
+        (None, true),
+        (Some("Fix login timeout"), true),
+        (Some("Fix login timeout"), false),
+    ] {
+        chat.thread_name = name.map(str::to_owned);
+        chat.set_thread_title_generation_pending(pending);
+        chat.refresh_status_surfaces();
+        let status = [
+            StatusLineItem::ThreadName,
+            StatusLineItem::ThreadTitle,
+            StatusLineItem::SessionId,
+        ]
+        .into_iter()
+        .map(|item| chat.status_line_value_for_item(item).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(" | ");
+        let title = [
+            TerminalTitleItem::ThreadName,
+            TerminalTitleItem::Thread,
+            TerminalTitleItem::SessionId,
+        ]
+        .into_iter()
+        .map(|item| {
+            chat.terminal_title_value_for_item(item, Instant::now())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+        rendered.push(format!(
+            "name={name:?}, pending={pending}\nstatus: {status}\ntitle: {title}\ndefault title: {}",
+            chat.last_terminal_title.as_deref().unwrap()
+        ));
+    }
+    insta::assert_snapshot!(
+        "thread_title_generation_status_surfaces",
+        rendered.join("\n\n")
+    );
+    chat.thread_name = Some("  ".to_string());
+    assert_eq!(
+        chat.status_line_value_for_item(StatusLineItem::ThreadName),
+        None
+    );
+    assert_eq!(
+        chat.terminal_title_value_for_item(TerminalTitleItem::ThreadName, Instant::now()),
+        None
+    );
+}
+
+#[tokio::test]
+async fn thread_title_progress_animates_when_main_turn_is_idle() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (frame_requester, mut draw_rx) = FrameRequester::test_channel();
+    chat.frame_requester = frame_requester;
+    chat.local_settings.tui.terminal_title = Some(Vec::new());
+    chat.local_settings.tui.status_line = Some(vec!["thread-name".to_string()]);
+    chat.bottom_pane.set_task_running(/*running*/ false);
+    chat.set_thread_title_generation_pending(/*pending*/ true);
+    assert!(chat.terminal_title_next_refresh.is_some());
+    while draw_rx.try_recv().is_ok() {}
+
+    let now = Instant::now();
+    chat.terminal_title_animation_origin = now;
+    assert_eq!(
+        chat.terminal_title_value_for_item(TerminalTitleItem::ThreadName, now),
+        Some("renaming... ⠋".to_string())
+    );
+    assert_eq!(
+        chat.terminal_title_value_for_item(
+            TerminalTitleItem::ThreadName,
+            now + Duration::from_millis(/*millis*/ 100)
+        ),
+        Some("renaming... ⠙".to_string())
+    );
+    chat.refresh_thread_title_progress_for_time_tick();
+    assert!(draw_rx.try_recv().is_ok());
+
+    chat.local_settings.tui.status_line = Some(Vec::new());
+    chat.local_settings.tui.terminal_title = Some(vec!["thread-name".to_string()]);
+    chat.refresh_status_surfaces();
+    assert!(chat.terminal_title_next_refresh.is_some());
+    while draw_rx.try_recv().is_ok() {}
+    chat.refresh_thread_title_progress_for_time_tick();
+    assert!(draw_rx.try_recv().is_err());
+
+    chat.local_settings.tui.animations = false;
+    chat.refresh_status_surfaces();
+    assert!(chat.terminal_title_next_refresh.is_none());
+    assert_eq!(chat.last_terminal_title, Some("renaming... ⠋".to_string()));
+    chat.local_settings.tui.animations = true;
+    chat.set_thread_title_generation_pending(/*pending*/ false);
+    assert_eq!(chat.last_terminal_title, None);
+    assert!(chat.terminal_title_next_refresh.is_none());
+}
+
+#[tokio::test]
+async fn thread_title_progress_preserves_suffix_after_truncation_and_in_default_footer() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.local_settings.tui.animations = false;
+    chat.set_thread_title_generation_pending(/*pending*/ true);
+    chat.show_welcome_banner = false;
+    assert_chatwidget_snapshot!(
+        "default_footer_generating_thread_title",
+        normalize_snapshot_paths(render_bottom_popup(&chat, /*width*/ 100))
+    );
+    chat.thread_name = Some("Long title ".repeat(/*n*/ 12));
+    for item in [TerminalTitleItem::ThreadName, TerminalTitleItem::Thread] {
+        let title = chat
+            .terminal_title_value_for_item(item, Instant::now())
+            .unwrap();
+        assert!(title.ends_with("... ⠋"), "{title}");
+        assert_eq!(title.chars().count(), 50);
+    }
 }

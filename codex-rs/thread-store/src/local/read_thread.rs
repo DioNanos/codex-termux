@@ -36,6 +36,9 @@ pub(super) async fn read_thread(
     let persisted_model_settings = sqlite_metadata
         .as_ref()
         .map(|metadata| (metadata.model.clone(), metadata.reasoning_effort.clone()));
+    let daybreak_enabled = sqlite_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.daybreak_enabled);
     if let Some(metadata) = sqlite_metadata
         && (params.include_archived
             || (metadata.archived_at.is_none()
@@ -70,6 +73,7 @@ pub(super) async fn read_thread(
                 rollout_thread.name = thread.name;
             }
             rollout_thread.project_id = thread.project_id;
+            rollout_thread.daybreak_enabled = thread.daybreak_enabled;
             rollout_thread.model = thread.model;
             rollout_thread.reasoning_effort = thread.reasoning_effort;
             rollout_thread.git_info = thread.git_info;
@@ -97,6 +101,7 @@ pub(super) async fn read_thread(
             })?;
 
     let mut thread = read_thread_from_rollout_path(store, path).await?;
+    thread.daybreak_enabled = daybreak_enabled;
     if let Some((model, reasoning_effort)) = persisted_model_settings {
         thread.model = model;
         thread.reasoning_effort = reasoning_effort;
@@ -151,6 +156,7 @@ pub(super) async fn read_thread_by_rollout_path(
             thread.section_position = metadata.section_position;
             thread.section_entered_at = metadata.section_entered_at;
             thread.project_id = metadata.project_id;
+            thread.daybreak_enabled = metadata.daybreak_enabled;
             thread.model = metadata.model;
             thread.reasoning_effort = metadata.reasoning_effort;
             if !metadata.cwd.as_os_str().is_empty()
@@ -349,6 +355,11 @@ pub(super) async fn stored_thread_from_sqlite_metadata(
         .unwrap_or(metadata.history_mode);
     let name = thread_name_from_metadata(store, &metadata, history_mode).await;
     let mut thread = stored_thread_from_state_metadata(store, metadata, parent_thread_id);
+    thread.originator = thread.originator.or_else(|| {
+        session_meta
+            .map(|meta| meta.originator)
+            .filter(|originator| !originator.is_empty())
+    });
     thread.forked_from_id = forked_from_id;
     thread.history_mode = history_mode;
     thread.name = name;
@@ -395,8 +406,10 @@ pub(super) fn stored_thread_from_state_metadata(
         section_position: metadata.section_position,
         section_entered_at: metadata.section_entered_at,
         project_id: metadata.project_id,
+        daybreak_enabled: metadata.daybreak_enabled,
         cwd: metadata.cwd,
         cli_version: metadata.cli_version,
+        originator: metadata.originator,
         source: parse_session_source(&metadata.source),
         history_mode: metadata.history_mode,
         thread_source: metadata.thread_source,
@@ -494,8 +507,10 @@ fn stored_thread_from_meta_line(
         section_position: None,
         section_entered_at: None,
         project_id: None,
+        daybreak_enabled: None,
         cwd: meta_line.meta.cwd,
         cli_version: meta_line.meta.cli_version,
+        originator: (!meta_line.meta.originator.is_empty()).then_some(meta_line.meta.originator),
         source: meta_line.meta.source,
         history_mode: meta_line.meta.history_mode,
         thread_source: meta_line.meta.thread_source,
@@ -916,6 +931,7 @@ mod tests {
                     thread.first_user_message.as_deref(),
                     thread.model_provider.as_str(),
                     thread.model.as_deref(),
+                    thread.originator.as_deref(),
                 ),
                 (
                     Some("Canonical SQLite name"),
@@ -923,6 +939,7 @@ mod tests {
                     Some("Canonical SQLite first user message"),
                     "Canonical SQLite provider",
                     Some("Canonical SQLite model"),
+                    Some("test_originator"),
                 )
             );
         }
@@ -1193,7 +1210,7 @@ mod tests {
         std::fs::create_dir_all(&day_dir).expect("sessions dir");
         let rollout_path = day_dir.join(format!("rollout-2025-01-03T12-00-00-{uuid}.jsonl"));
         let mut file = std::fs::File::create(&rollout_path).expect("session file");
-        let meta = serde_json::json!({
+        let mut meta = serde_json::json!({
             "timestamp": "2025-01-03T12-00-00",
             "type": "session_meta",
             "payload": {
@@ -1248,9 +1265,28 @@ mod tests {
         assert_eq!(thread.model_provider, "sqlite-provider");
         assert_eq!(thread.cwd, home.path().join("workspace"));
         assert_eq!(thread.cli_version, "sqlite-cli");
+        assert_eq!(thread.originator.as_deref(), Some("test_originator"));
         let history = thread.history.expect("history should load");
         assert_eq!(history.thread_id, thread_id);
         assert_eq!(history.items.len(), 1);
+
+        for (sqlite_originator, rollout_originator, expected_originator) in [
+            (
+                Some("saved_client"),
+                "test_originator",
+                Some("saved_client"),
+            ),
+            (None, "", None),
+        ] {
+            meta["payload"]["originator"] = serde_json::json!(rollout_originator);
+            std::fs::write(&metadata.rollout_path, format!("{meta}\n"))
+                .expect("write session meta");
+            metadata.originator = sqlite_originator.map(str::to_owned);
+            let thread = stored_thread_from_sqlite_metadata(&store, metadata.clone())
+                .await
+                .expect("read SQLite and session metadata");
+            assert_eq!(thread.originator.as_deref(), expected_originator);
+        }
     }
 
     #[tokio::test]

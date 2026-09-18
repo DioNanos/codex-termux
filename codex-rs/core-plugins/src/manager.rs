@@ -564,9 +564,26 @@ struct LoadedPluginsCache {
 }
 
 impl LoadedPluginsCache {
-    fn get(&mut self, key: &PluginLoadCacheKey) -> Option<&LoadedPluginsCacheEntry> {
+    fn get(
+        &mut self,
+        key: &PluginLoadCacheKey,
+        store: &PluginStore,
+    ) -> Option<&LoadedPluginsCacheEntry> {
         let index = self.entries.iter().position(|entry| &entry.key == key)?;
         let entry = self.entries.remove(index)?;
+        // Another process can replace installed versions without invalidating this manager.
+        // Keep the parsed skills paired with the installation whose paths they advertise.
+        if entry.plugins.iter().any(|plugin| {
+            let Ok(plugin_id) = PluginId::parse(&plugin.config_name) else {
+                return false;
+            };
+            let installed_root = store
+                .active_plugin_root(&plugin_id)
+                .unwrap_or_else(|| store.plugin_base_root(&plugin_id));
+            installed_root != plugin.root
+        }) {
+            return None;
+        }
         self.entries.push_front(entry);
         self.entries.front()
     }
@@ -745,7 +762,7 @@ impl PluginsManager {
         self.loaded_plugins_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
+            .get(&key, &self.store)
             .map(|cached| cached.plugin_skill_snapshots.clone())
     }
 
@@ -968,7 +985,7 @@ impl PluginsManager {
         self.loaded_plugins_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(key)
+            .get(key, &self.store)
             .map(|cached| cached.plugins.clone())
     }
 

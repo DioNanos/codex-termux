@@ -218,6 +218,7 @@ fn filesystem_helper_platform_defaults_do_not_grant_applications_directory() {
                 extra_allow_unix_sockets: &[],
             },
             profile,
+            /*allowed_symlinked_codex_home*/ None,
         )
         .expect("build restricted seatbelt command");
 
@@ -297,6 +298,7 @@ fn process_platform_defaults_allow_scratch_without_granting_it_to_filesystem_hel
                 extra_allow_unix_sockets: &[],
             },
             profile,
+            /*allowed_symlinked_codex_home*/ None,
         )
         .expect("build restricted seatbelt command")
     };
@@ -1021,6 +1023,7 @@ fn preferences_access_requires_unrestricted_reads() {
                     extra_allow_unix_sockets: &[],
                 },
                 profile,
+                /*allowed_symlinked_codex_home*/ None,
             )
             .expect("build seatbelt policy");
             let policy = seatbelt_policy_arg(&args);

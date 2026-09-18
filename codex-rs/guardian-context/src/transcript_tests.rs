@@ -41,7 +41,10 @@ fn entry(kind: ConversationTranscriptEntryKind, text: &str) -> ConversationTrans
 
 #[test]
 fn registered_transcript_preserves_shared_roles_and_node_repl_tool_attribution() {
-    let approved_action = format!("{MANUAL_APPROVAL_DEVELOPER_PREFIX}\nApproved action: {{}}");
+    let approved_action = format!(
+        "{MANUAL_APPROVAL_DEVELOPER_PREFIX}\nApproved action: {}",
+        "exact action ".repeat(/*n*/ 1_000)
+    );
     let history = vec![
         ResponseItem::Message {
             id: None,
@@ -98,6 +101,13 @@ fn registered_transcript_preserves_shared_roles_and_node_repl_tool_attribution()
             transcript: &config,
             root_conversation: &[],
             trusted_user_answers: &[],
+            planned_action: None,
+            permissions: None,
+            previous_reviews: None,
+            trusted_tool: None,
+            trusted_skill_paths: &[],
+            images: None,
+            node_repl: None,
         })
         .expect("transcript collection should succeed");
 
@@ -170,6 +180,13 @@ fn excluded_tool_calls_still_attribute_included_results() {
             transcript: &config,
             root_conversation: &[],
             trusted_user_answers: &[],
+            planned_action: None,
+            permissions: None,
+            previous_reviews: None,
+            trusted_tool: None,
+            trusted_skill_paths: &[],
+            images: None,
+            node_repl: None,
         })
         .expect("transcript collection should succeed");
 
@@ -261,6 +278,13 @@ fn outputs_with_call_ids_or_explicit_names_are_retained() {
                     transcript: &config,
                     root_conversation: &[],
                     trusted_user_answers: &[],
+                    planned_action: None,
+                    permissions: None,
+                    previous_reviews: None,
+                    trusted_tool: None,
+                    trusted_skill_paths: &[],
+                    images: None,
+                    node_repl: None,
                 })
                 .expect("transcript collection should succeed");
             let mut expected = vec![
@@ -306,13 +330,20 @@ fn reused_registry_applies_current_history_sources_and_entry_limits() {
                 transcript: &config,
                 root_conversation: &[],
                 trusted_user_answers: &[],
+                planned_action: None,
+                permissions: None,
+                previous_reviews: None,
+                trusted_tool: None,
+                trusted_skill_paths: &[],
+                images: None,
+                node_repl: None,
             })
             .expect("transcript collection should succeed");
         assert_eq!(
             transcript_items(&sections[0]),
             vec![ConversationTranscriptEntry {
                 kind: ConversationTranscriptEntryKind::User,
-                text: truncate_text(&text, message_tokens),
+                text: text.clone(),
                 original_bytes: text.len(),
             }]
         );
@@ -338,11 +369,18 @@ fn reused_registry_applies_current_history_sources_and_entry_limits() {
                 transcript: &config,
                 root_conversation: &[],
                 trusted_user_answers: &[],
+                planned_action: None,
+                permissions: None,
+                previous_reviews: None,
+                trusted_tool: None,
+                trusted_skill_paths: &[],
+                images: None,
+                node_repl: None,
             })
             .expect("transcript collection should succeed");
         let mut expected = vec![ConversationTranscriptEntry {
             kind: ConversationTranscriptEntryKind::User,
-            text: truncate_text(&text, /*max_tokens*/ 60),
+            text: text.clone(),
             original_bytes: text.len(),
         }];
         if include_tool_calls {

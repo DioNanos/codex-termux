@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use codex_analytics::AnalyticsEventsClient;
+use codex_analytics::ThreadHintStatus;
+use codex_analytics::ThreadHintStatusEvent;
 use codex_core::config::Config;
 use codex_extension_api::ConfigContributor;
 use codex_extension_api::ContentItemKind;
@@ -104,6 +107,15 @@ impl ContextContributor for HistoryNotesExtension {
             let Some(identity) = thread_store.get::<HistoryNotesAgentIdentity>() else {
                 return Vec::new();
             };
+            let track_status = |status| {
+                if let Some(analytics) = session_store.get::<AnalyticsEventsClient>() {
+                    analytics.track_thread_hint_status(ThreadHintStatusEvent {
+                        thread_id: thread_store.level_id().to_string(),
+                        status,
+                        occurred_at_ms: codex_analytics::now_unix_millis(),
+                    });
+                }
+            };
             let Ok(result) = config
                 .backend
                 .call(
@@ -115,12 +127,19 @@ impl ContextContributor for HistoryNotesExtension {
                 )
                 .await
             else {
+                track_status(ThreadHintStatus::Failed);
                 return Vec::new();
             };
             let Some(text) = result.get("text").and_then(serde_json::Value::as_str) else {
+                track_status(ThreadHintStatus::Failed);
                 return Vec::new();
             };
-            if text.is_empty() || text.len() > MAX_THREAD_HINT_BYTES {
+            if text.len() > MAX_THREAD_HINT_BYTES {
+                track_status(ThreadHintStatus::Failed);
+                return Vec::new();
+            }
+            track_status(ThreadHintStatus::Succeeded);
+            if text.is_empty() {
                 return Vec::new();
             }
             vec![PromptFragment::new(

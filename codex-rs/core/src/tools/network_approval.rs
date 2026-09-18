@@ -1,4 +1,5 @@
 use crate::config::NetworkProxySpec;
+use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::guardian::GuardianNetworkAccessTrigger;
 use crate::guardian::GuardianReviewContext;
 use crate::network_policy_decision::denied_network_policy_message;
@@ -17,6 +18,8 @@ use codex_network_proxy::NetworkPolicyDecider;
 use codex_network_proxy::NetworkPolicyRequest;
 use codex_network_proxy::NetworkProtocol;
 use codex_network_proxy::NetworkProxy;
+use codex_network_proxy::NetworkRequestCancellation;
+use codex_network_proxy::NetworkRequestCancellationReason;
 use codex_network_proxy::NetworkRequestDisconnect;
 use codex_protocol::approvals::NetworkApprovalContext;
 use codex_protocol::approvals::NetworkApprovalProtocol;
@@ -239,6 +242,7 @@ struct ActiveNetworkApprovalCall {
     command: String,
     environment_id: String,
     permission_profile: PermissionProfile,
+    environments: TurnEnvironmentSnapshot,
     cancellation_token: CancellationToken,
 }
 
@@ -280,6 +284,7 @@ struct PendingHostApprovalOwner<'a> {
     pending: Arc<PendingHostApproval>,
     execution_cancellation: Option<CancellationToken>,
     disconnect: Option<NetworkRequestDisconnect>,
+    cancellation: Option<NetworkRequestCancellation>,
     decision_on_drop: PendingApprovalDecision,
     completed: bool,
 }
@@ -297,6 +302,7 @@ impl<'a> PendingHostApprovalOwner<'a> {
             pending,
             execution_cancellation,
             disconnect: None,
+            cancellation: None,
             decision_on_drop: PendingApprovalDecision::Deny,
             completed: false,
         }
@@ -342,6 +348,17 @@ impl<'a> PendingHostApprovalOwner<'a> {
 impl Drop for PendingHostApprovalOwner<'_> {
     fn drop(&mut self) {
         if !self.completed {
+            if self
+                .cancellation
+                .as_ref()
+                .and_then(NetworkRequestCancellation::reason)
+                == Some(NetworkRequestCancellationReason::ProcessFinished)
+            {
+                // Normal process cleanup is not a new review failure. Any earlier
+                // denial is already recorded in the call outcome.
+                self.publish_and_remove(self.decision_on_drop);
+                return;
+            }
             if matches!(self.decision_on_drop, PendingApprovalDecision::Deny)
                 && let Some(registration_id) = self.key.execution_id.as_deref()
                 && let Some(elapsed) = self
@@ -517,20 +534,27 @@ impl NetworkApprovalService {
     }
 
     fn record_call_outcome(&self, registration_id: &str, outcome: String) {
+        if let Some(cancellation_token) = self.store_call_outcome(registration_id, outcome) {
+            cancellation_token.cancel();
+        }
+    }
+
+    fn store_call_outcome(
+        &self,
+        registration_id: &str,
+        outcome: String,
+    ) -> Option<CancellationToken> {
         let mut calls = self
             .calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(call) = calls.active_calls.get(registration_id).cloned() else {
-            return;
-        };
+        let call = calls.active_calls.get(registration_id)?.clone();
         // Explicit network-review outcomes replace generic blocked-request fallbacks.
         calls
             .call_outcomes
             .insert(registration_id.to_string(), outcome);
 
-        drop(calls);
-        call.cancellation_token.cancel();
+        Some(call.cancellation_token.clone())
     }
 
     fn record_call_outcome_if_absent(&self, registration_id: &str, outcome: String) {
@@ -617,6 +641,12 @@ impl NetworkApprovalService {
         else {
             return NetworkDecision::deny(REASON_NOT_ALLOWED);
         };
+        if owner_call
+            .as_ref()
+            .is_some_and(|call| call.cancellation_token.is_cancelled())
+        {
+            return NetworkDecision::deny(REASON_NOT_ALLOWED);
+        }
         let active_turn = session.active_turn_context_and_strict_auto_review().await;
         let Some(environment_id) = active_environment_id.or_else(|| {
             active_turn
@@ -676,6 +706,7 @@ impl NetworkApprovalService {
                 .map(|call| call.cancellation_token.clone()),
         );
         pending_owner.disconnect = request.disconnect.clone();
+        pending_owner.cancellation = request.cancellation.clone();
 
         let permission_profile = owner_call
             .as_ref()
@@ -697,6 +728,11 @@ impl NetworkApprovalService {
         let review_context = GuardianReviewContext::from_resolved_settings(
             Arc::clone(&turn_context),
             &step_settings,
+            // Review this new request under current settings, in its originating execution's
+            // environments. Completing the original turn does not transfer process ownership.
+            owner_call
+                .as_ref()
+                .map_or(&turn_context.environments, |call| &call.environments),
         );
         if !allows_network_approval_flow(review_context.approval_policy) {
             if let Some(owner_call) = owner_call.as_ref() {
@@ -768,7 +804,22 @@ impl NetworkApprovalService {
             retry_reason: Some(policy_denial_message.clone()),
             network_approval_context: Some(network_approval_context.clone()),
         };
-        let approval_decision = match session.request_approval(action, approval_context).await {
+        let approval = session.request_approval(action, approval_context);
+        let approval_result = if let Some(owner_call) = &owner_call {
+            // A ready review result takes precedence over concurrent cancellation.
+            let Some(result) = owner_call
+                .cancellation_token
+                .run_until_cancelled(approval)
+                .await
+            else {
+                pending_owner.complete(PendingApprovalDecision::Deny);
+                return NetworkDecision::deny(REASON_NOT_ALLOWED);
+            };
+            result
+        } else {
+            approval.await
+        };
+        let approval_decision = match approval_result {
             Ok(decision) => decision,
             Err(ToolError::Rejected(rejection)) => {
                 if let Some(owner_call) = owner_call.as_ref() {
@@ -813,6 +864,18 @@ impl NetworkApprovalService {
                 return NetworkDecision::deny(REASON_NOT_ALLOWED);
             }
         };
+
+        if matches!(
+            &approval_decision,
+            ReviewDecision::NetworkPolicyAmendment { network_policy_amendment }
+                if network_policy_amendment.action == NetworkPolicyRuleAction::Deny
+        ) && let Some(owner_call) = owner_call.as_ref()
+        {
+            // Preserve the denial before waiting for the policy commit. Defer
+            // cancellation until after saving so it cannot interrupt persistence.
+            let _ = self
+                .store_call_outcome(&owner_call.registration_id, "rejected by user".to_string());
+        }
 
         let _session_policy_commit_guard = if matches!(
             &approval_decision,
@@ -1032,6 +1095,7 @@ pub(crate) fn build_network_policy_decider(
 pub(crate) async fn begin_network_approval(
     session: &Arc<Session>,
     turn: &TurnContext,
+    environments: &TurnEnvironmentSnapshot,
     managed_network_active: bool,
     spec: Option<NetworkApprovalSpec>,
 ) -> Result<Option<ActiveNetworkApproval>, ToolError> {
@@ -1146,6 +1210,7 @@ pub(crate) async fn begin_network_approval(
             command,
             environment_id,
             permission_profile,
+            environments: environments.clone(),
             cancellation_token: cancellation_token.clone(),
         })
         .await;

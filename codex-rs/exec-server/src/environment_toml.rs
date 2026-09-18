@@ -4,6 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use http::HeaderMap;
 use serde::Deserialize;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -144,6 +145,7 @@ fn parse_environment_toml(
                 websocket_url: url,
                 connect_timeout,
                 initialize_timeout,
+                http_headers: HeaderMap::new(),
             }
         }
         (None, Some(program)) => {
@@ -620,6 +622,7 @@ mod tests {
             websocket_url,
             connect_timeout,
             initialize_timeout,
+            ..
         } = &provider.environments[0].1
         else {
             panic!("expected websocket transport");

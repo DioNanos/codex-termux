@@ -14,6 +14,7 @@ use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::AppsListResponse;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditParams;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
+use codex_app_server_protocol::GetAccountRateLimitsParams;
 use codex_app_server_protocol::GetAccountTokenUsageParams;
 use codex_app_server_protocol::GetAccountTokenUsageResponse;
 use codex_app_server_protocol::MarketplaceAddParams;
@@ -85,6 +86,7 @@ impl App {
             origin,
             RateLimitRefreshOrigin::Recovery | RateLimitRefreshOrigin::ResetConsume { .. }
         ) {
+            self.chat_widget.invalidate_ordinary_usage_recovery();
             self.chat_widget.hold_rate_limit_recovery();
         }
         let Some((request_id, hard_stop_generation)) = self
@@ -96,9 +98,10 @@ impl App {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            let request = fetch_account_rate_limits(request_handle);
+            let request = fetch_account_rate_limits(request_handle, origin);
             let result = match origin {
                 RateLimitRefreshOrigin::Recovery
+                | RateLimitRefreshOrigin::Periodic
                 | RateLimitRefreshOrigin::ResetConsume { .. }
                 | RateLimitRefreshOrigin::ResetPicker { .. } => {
                     tokio::time::timeout(RATE_LIMIT_RESET_REQUEST_TIMEOUT, request)
@@ -798,15 +801,34 @@ pub(super) async fn fetch_all_mcp_server_statuses(
 
 pub(super) async fn fetch_account_rate_limits(
     request_handle: AppServerRequestHandle,
+    origin: RateLimitRefreshOrigin,
 ) -> Result<GetAccountRateLimitsResponse> {
     let request_id = RequestId::String(format!("account-rate-limits-{}", Uuid::new_v4()));
-    request_handle
+    let result = request_handle
         .request_typed(ClientRequest::GetAccountRateLimits {
-            request_id,
-            params: None,
+            request_id: request_id.clone(),
+            params: Some(GetAccountRateLimitsParams {
+                supports_luna_reserve: true,
+                exclude_reset_credit_details: origin == RateLimitRefreshOrigin::Periodic,
+            }),
         })
-        .await
-        .wrap_err("account/rateLimits/read failed in TUI")
+        .await;
+    // Older remote app servers accept only null params. Keep their usage reads working
+    // without opting them into exposure or pretending that they support the new capability.
+    if matches!(
+        &result,
+        Err(codex_app_server_client::TypedRequestError::Server { source, .. })
+            if matches!(source.code, -32600 | -32602)
+    ) {
+        return request_handle
+            .request_typed(ClientRequest::GetAccountRateLimits {
+                request_id,
+                params: None,
+            })
+            .await
+            .wrap_err("account/rateLimits/read failed in TUI");
+    }
+    result.wrap_err("account/rateLimits/read failed in TUI")
 }
 
 pub(super) async fn fetch_account_token_activity(
@@ -1569,6 +1591,7 @@ mod tests {
     fn mcp_inventory_maps_prefix_tool_names_by_server() {
         let statuses = vec![
             McpServerStatus {
+                tools_error: None,
                 name: "docs".to_string(),
                 runtime_status: None,
                 plugin_id: None,
@@ -1591,6 +1614,7 @@ mod tests {
                 auth_status: codex_app_server_protocol::McpAuthStatus::Unsupported,
             },
             McpServerStatus {
+                tools_error: None,
                 name: "disabled".to_string(),
                 runtime_status: None,
                 plugin_id: None,

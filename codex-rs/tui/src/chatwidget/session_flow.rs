@@ -9,6 +9,8 @@ impl ChatWidget {
         display: SessionConfiguredDisplay,
         fork_parent_title: Option<String>,
     ) {
+        self.invalidate_permission_discovery();
+        self.permission_profiles_menu_opened = false;
         self.transcript.reset_copy_history();
         let history_metadata = session.message_history.unwrap_or_default();
         self.bottom_pane.set_history_metadata(
@@ -22,11 +24,17 @@ impl ChatWidget {
         let connector_scope_changed = previous_thread_id != Some(session.thread_id)
             || self.config.cwd.as_path() != session.cwd.as_path();
         self.thread_id = Some(session.thread_id);
+        self.realtime_conversation_available_for_thread =
+            self.config.features.enabled(Feature::RealtimeConversation)
+                && codex_realtime_webrtc::RealtimeWebrtcSession::is_supported();
+        self.bottom_pane
+            .set_voice_command_enabled(self.realtime_conversation_available_for_thread);
         self.bottom_pane
             .set_queue_submissions(/*queue_submissions*/ false);
         if previous_thread_id != self.thread_id {
             self.backend_banner_notice_model = None;
-            self.pending_automatic_thread_names.clear();
+            self.automatic_model_switch_state =
+                backend_banners::AutomaticModelSwitchState::default();
             self.review.recent_auto_review_denials = RecentAutoReviewDenials::default();
             self.clear_thread_usage_state();
         }
@@ -40,6 +48,7 @@ impl ChatWidget {
         self.current_rollout_path = session.rollout_path.clone();
         self.current_cwd = Some(session.cwd.to_path_buf());
         self.config.cwd = session.cwd.clone();
+        self.config.model_provider_id = session.model_provider_id.clone();
         if connector_scope_changed {
             self.invalidate_connector_scope();
         }
@@ -114,8 +123,22 @@ impl ChatWidget {
             .set_active_reasoning_effort_baseline(effort.as_ref());
         self.refresh_model_display();
         self.refresh_status_surfaces();
+        if previous_thread_id != self.thread_id
+            && self.should_prefetch_rate_limits()
+            && (self.current_model() == crate::model_catalog::LUNA_RESERVE_MODEL
+                || self.backend_banner_fallback().is_some())
+        {
+            // Reconcile this task with retained account state before sending its initial/queued
+            // prompt. Do not wait for the next usage poll after /new, /resume or a thread switch.
+            self.hold_rate_limit_recovery();
+            self.app_event_tx
+                .send(AppEvent::ApplyBackendBannerFallback {
+                    thread_id: session.thread_id,
+                });
+        }
         self.sync_service_tier_commands();
         self.sync_personality_command_enabled();
+        self.sync_worktrees_enabled();
         self.sync_plugins_command_enabled();
         self.sync_goal_command_enabled();
         self.refresh_plugin_mentions();
@@ -129,6 +152,7 @@ impl ChatWidget {
                 .should_show_fast_status(&model_for_header, self.effective_service_tier.as_deref());
             let session_info_cell = history_cell::new_session_info(
                 &self.config,
+                &self.local_settings,
                 &model_for_header,
                 &session,
                 self.show_welcome_banner,
@@ -247,13 +271,7 @@ impl ChatWidget {
         )));
     }
 
-    /// Apply a persisted automatic name immediately and suppress its confirmation.
-    pub(crate) fn expect_automatic_thread_name(&mut self, name: String) {
-        self.thread_name = Some(name.clone());
-        self.pending_automatic_thread_names.insert(name);
-    }
-
-    /// Make a confirmed manual rename visible before its queued server notification arrives.
+    /// Update status surfaces before a confirmed manual rename's server notification arrives.
     pub(crate) fn expect_manual_thread_name(&mut self, thread_id: ThreadId, name: String) {
         if self.thread_id == Some(thread_id) {
             self.thread_name = Some(name);
@@ -262,23 +280,13 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn on_thread_name_updated(
+    /// Update name metadata silently, including late and replayed notifications.
+    pub(crate) fn on_thread_name_updated(
         &mut self,
         thread_id: ThreadId,
         thread_name: Option<String>,
     ) {
         if self.thread_id == Some(thread_id) {
-            let automatic = thread_name
-                .as_ref()
-                .is_some_and(|name| self.pending_automatic_thread_names.remove(name));
-
-            if let Some(name) = thread_name.as_deref()
-                && !automatic
-            {
-                let cell = Self::rename_confirmation_cell(name, self.thread_id);
-                self.add_boxed_history(Box::new(cell));
-            }
-
             self.thread_name = thread_name;
             self.refresh_status_surfaces();
             self.request_redraw();

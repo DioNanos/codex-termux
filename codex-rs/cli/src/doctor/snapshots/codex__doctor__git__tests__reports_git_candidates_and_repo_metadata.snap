@@ -1,0 +1,22 @@
+---
+source: cli/src/doctor/git.rs
+assertion_line: 150
+expression: "super::super::render_human_report(&report, super::super::HumanOutputOptions\n{ show_details: true, show_all: false, ascii: true, color_enabled: false, },)"
+---
+Codex Doctor vtest
+
+Environment
+  [ok] git          git executable found; execution not verified
+      selected git             /usr/bin/git
+      repo detected            true
+      repo root                /repo
+      .git entry               directory
+      PATH entries (2)         /usr/bin/git
+                               /opt/bin/git
+      git execution            not inspected (PATH helpers are not executed)
+
+-------------------------------------------------------------
+1 ok | 0 warn | 0 fail ok
+
+--summary compact output           --all expand truncated lists
+--json redacted report

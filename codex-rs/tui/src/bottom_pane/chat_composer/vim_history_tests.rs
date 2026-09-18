@@ -14,8 +14,11 @@ use super::super::super::chat_composer_history::HistoryEntry;
 use super::super::ChatComposer;
 use super::super::InputResult;
 use super::super::LARGE_PASTE_CHAR_THRESHOLD;
+use super::super::PasteBurst;
 use super::super::tests::new_test_composer;
+use super::super::tests::snapshot_composer_state_with_width;
 use crate::keymap::RuntimeKeymap;
+use crate::slash_command::SlashCommand;
 
 fn vim_composer(text: &str) -> ChatComposer {
     let (mut composer, _receiver) = new_test_composer();
@@ -336,7 +339,11 @@ fn canceled_reverse_history_preview_preserves_vim_undo_and_repeat() {
 #[test]
 fn canceled_history_preview_preserves_active_vim_commands() {
     for query in ["", "archive", "missing"] {
-        for (command, edited) in [("iX", "XYalpha beta"), ("cwX", "XY beta")] {
+        for (command, edited) in [
+            ("iX", "XYalpha beta"),
+            ("cwX", "XY beta"),
+            ("RX", "XYpha beta"),
+        ] {
             let mut composer = vim_composer("alpha beta");
             composer
                 .history
@@ -345,6 +352,11 @@ fn canceled_history_preview_preserves_active_vim_commands() {
             ctrl_r(&mut composer);
             keys(&mut composer, query);
             escape(&mut composer);
+            if command == "RX" {
+                let _ = composer.handle_key_event(KeyEvent::from(KeyCode::Backspace));
+                assert_eq!(composer.current_text(), "alpha beta");
+                keys(&mut composer, "X");
+            }
             keys(&mut composer, "Y");
             escape(&mut composer);
             assert_eq!(composer.current_text(), edited);
@@ -464,6 +476,13 @@ fn undo_and_redo_restore_deleted_image_attachment() {
     composer.attach_image(PathBuf::from("example.png"));
     composer.draft.textarea.set_cursor("alpha ".len());
     let before = composer.draft_snapshot();
+    keys(&mut composer, "RX");
+    ctrl_r(&mut composer);
+    escape(&mut composer);
+    let _ = composer.handle_key_event(KeyEvent::from(KeyCode::Backspace));
+    assert_eq!(composer.draft_snapshot(), before);
+    escape(&mut composer);
+    composer.draft.textarea.set_cursor("alpha ".len());
     keys(&mut composer, "x");
     assert_eq!(composer.current_text(), "alpha ");
     assert!(composer.local_image_paths().is_empty());
@@ -519,4 +538,128 @@ fn find_jump_and_search_navigation_never_snapshot_the_draft() {
     assert!(composer.vim_history.undo.is_empty());
     escape(&mut composer);
     assert_eq!(composer.current_text(), "alpha beta\nalpha gamma");
+}
+
+#[test]
+fn vim_replace_preserves_slash_completion_and_dispatch() {
+    let mut composer = vim_composer("");
+    keys(&mut composer, "R/dif");
+    let _ = composer.handle_key_event(KeyEvent::from(KeyCode::Tab));
+    assert_eq!(composer.current_text(), "/diff ");
+    let (result, _) = composer.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(result, InputResult::Command(SlashCommand::Diff));
+}
+
+#[test]
+fn vim_replace_backspace_restores_characters_in_new_slash_element() {
+    snapshot_composer_state_with_width(
+        "vim_replace_slash_recovery",
+        /*width*/ 100,
+        /*enhanced_keys_supported*/ true,
+        |composer| {
+            composer.set_disable_paste_burst(/*disabled*/ true);
+            composer.set_text_content("abcde tail".into(), Vec::new(), Vec::new());
+            composer.set_vim_enabled(/*enabled*/ true);
+            composer.draft.textarea.set_cursor(/*pos*/ 0);
+            keys(composer, "R/diff");
+            assert_eq!(composer.draft.textarea.element_payloads(), vec!["/diff"]);
+            for expected in [("/dife tail", 4), ("/dide tail", 3)] {
+                let _ = composer.handle_key_event(KeyEvent::from(KeyCode::Backspace));
+                assert_eq!(
+                    (composer.current_text(), composer.current_cursor()),
+                    (expected.0.to_string(), expected.1)
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn vim_editing_modes_use_the_same_large_and_image_paste_handling() {
+    let temporary = tempfile::tempdir().expect("create image directory");
+    let path = temporary.path().join("image.png");
+    image::RgbaImage::new(/*width*/ 1, /*height*/ 1)
+        .save(&path)
+        .expect("write image");
+    for pasted in [
+        "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1),
+        path.to_string_lossy().into_owned(),
+    ] {
+        let mut insert = vim_composer("next");
+        keys(&mut insert, "i");
+        insert.handle_paste(pasted.clone());
+        let mut replace = vim_composer("next");
+        keys(&mut replace, "R");
+        replace.handle_paste(pasted);
+        assert_eq!(replace.draft_snapshot(), insert.draft_snapshot());
+    }
+}
+
+#[test]
+fn vim_replace_paste_bursts_preserve_overwritten_text_and_repeat() {
+    for pasted in ["XYZ", "日\u{3000}語"] {
+        let mut composer = vim_composer("abcd");
+        keys(&mut composer, "R");
+        composer.set_disable_paste_burst(/*disabled*/ false);
+        let now = std::time::Instant::now();
+        for ch in pasted.chars() {
+            let _ = composer.handle_input_basic_with_time(KeyEvent::from(KeyCode::Char(ch)), now);
+        }
+        assert!(composer.is_in_paste_burst());
+        composer.handle_paste_burst_flush(now + PasteBurst::recommended_active_flush_delay());
+        assert_eq!(composer.current_text(), format!("{pasted}d"));
+        escape(&mut composer);
+        keys(&mut composer, "u.");
+        assert_eq!(composer.current_text(), format!("{pasted}d"));
+    }
+}
+
+#[test]
+fn vim_replace_completion_preserves_suffix() {
+    snapshot_composer_state_with_width(
+        "vim_replace_completion_suffix",
+        /*width*/ 100,
+        /*enhanced_keys_supported*/ true,
+        |composer| {
+            composer.set_disable_paste_burst(/*disabled*/ true);
+            for (text, cursor, command, path) in [
+                ("@ma next", 3, "R", "src/main.rs"),
+                ("abc next", 0, "R@ma", "ma"),
+            ] {
+                composer.set_vim_enabled(/*enabled*/ true);
+                composer.set_text_content(text.into(), Vec::new(), Vec::new());
+                composer.draft.textarea.set_cursor(cursor);
+                keys(composer, command);
+                composer.insert_selected_file_path(0.."@ma".len(), path);
+                composer.sync_popups();
+                assert_eq!(
+                    (composer.current_text(), composer.current_cursor()),
+                    (format!("{path}  next"), path.len() + 1)
+                );
+                let _ = composer.handle_key_event(KeyEvent::from(KeyCode::Backspace));
+                assert_eq!(
+                    (composer.current_text(), composer.current_cursor()),
+                    (format!("{path} next"), path.len())
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn external_editor_import_preserves_replace_backspace_recovery() {
+    let mut composer = vim_composer("old");
+    keys(&mut composer, "RX");
+    composer.apply_external_edit("abc".into());
+    composer.draft.textarea.set_cursor(/*pos*/ 1);
+    let _ = composer.handle_key_event(KeyEvent::from(KeyCode::Backspace));
+    assert_eq!(composer.current_text(), "bc");
+    for code in [KeyCode::Char('X'), KeyCode::Backspace] {
+        let _ = composer.handle_key_event(KeyEvent::from(code));
+    }
+    let textarea = &composer.draft.textarea;
+    assert_eq!(
+        (textarea.text(), textarea.vim_mode_label()),
+        ("bc", Some("Replace"))
+    );
 }

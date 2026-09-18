@@ -110,6 +110,26 @@ fn incremental_render_keeps_final_block_mutable_and_matches_full_render() {
 }
 
 #[test]
+fn incremental_file_citations_preserve_metadata_unicode_and_markdown() {
+    let cwd = test_cwd();
+    let rendered_cases = [
+        (
+            "Quarterly Report.xlsx",
+            "- :codex-file-citation{artifact_kind=\"workbook\" ",
+        ),
+        ("Résumé *final* ✨.xlsx", "- :codex-file-citation{"),
+    ]
+    .map(|(filename, prefix)| {
+        let tail = format!("path=\"{}\"}}\n", cwd.join(filename).display());
+        let chunks = ["# Output\n\n", prefix, &tail, "\n", "Continue.\n"];
+        let (_, render) = assert_rich_stream_matches_full_render(&chunks, Some(80));
+
+        render.lines
+    });
+    assert_debug_snapshot!("incremental_file_citations", rendered_cases);
+}
+
+#[test]
 fn growing_single_top_level_blocks_render_and_scan_in_one_pass() {
     let streams: &[&[&str]] = &[
         &[

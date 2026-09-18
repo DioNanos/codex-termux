@@ -1,0 +1,5 @@
+---
+source: core/tests/suite/unified_exec.rs
+expression: rejection
+---
+TTY execution is disabled by config; omit `tty` or set it to false.

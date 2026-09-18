@@ -90,6 +90,7 @@ pub fn parse_rate_limit_for_limit(
     Some(RateLimitSnapshot {
         limit_id: Some(normalized_limit_id),
         limit_name: parsed_limit_name,
+        normal_model_slug: None,
         primary,
         secondary,
         credits,
@@ -156,6 +157,7 @@ pub fn parse_rate_limit_event(payload: &str) -> Option<RateLimitSnapshot> {
     Some(RateLimitSnapshot {
         limit_id: Some(limit_id.unwrap_or_else(|| "codex".to_string())),
         limit_name: None,
+        normal_model_slug: None,
         primary,
         secondary,
         credits,

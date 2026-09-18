@@ -122,8 +122,13 @@ impl HistoryCell for SessionInfoCell {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keep local preferences separate while the legacy Config parameter is still required"
+)]
 pub(crate) fn new_session_info(
     config: &Config,
+    local_settings: &crate::local_settings::LocalSettings,
     requested_model: &str,
     session: &ThreadSessionState,
     is_first_event: bool,
@@ -181,7 +186,7 @@ pub(crate) fn new_session_info(
 
         parts.push(Box::new(PlainHistoryCell { lines: help_lines }));
     } else {
-        if config.show_tooltips
+        if local_settings.tui.show_tooltips
             && let Some(tooltips) = tooltip_override
                 .or_else(|| tooltips::get_tooltip(auth_plan, show_fast_status))
                 .map(|tip| TooltipHistoryCell::new(tip, &config.cwd))
@@ -261,7 +266,7 @@ impl SessionHeaderHistoryCell {
     ) -> Self {
         Self {
             version,
-            model,
+            model: crate::model_catalog::model_display_name(&model).to_string(),
             model_style,
             reasoning_effort,
             show_fast_status,

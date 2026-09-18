@@ -94,7 +94,7 @@ impl NoiseRendezvousConnectProvider for FreshBundleNoiseConnectProvider {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
-async fn pending_noise_environment_connects_and_reconnects_after_ready_report() -> Result<()> {
+async fn failed_noise_environment_recovers_and_reconnects_after_ready_report() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let rendezvous_address = listener.local_addr()?;
     let environment_rendezvous_url =
@@ -194,21 +194,46 @@ async fn pending_noise_environment_connects_and_reconnects_after_ready_report() 
         executor_public_key: registered_executor_public_key(&registry).await?,
         calls: AtomicUsize::new(0),
     });
-    let manager = EnvironmentManager::without_environments(http_client_factory);
+    let manager = Arc::new(EnvironmentManager::without_environments(
+        http_client_factory,
+    ));
     let environment = manager
         .materialize_pending_noise_environment(ENVIRONMENT_ID.to_string(), provider.clone())?;
     let mut connection_state = environment
         .subscribe_connection_state()
         .context("remote environment connection state")?;
 
-    assert_eq!(provider.calls(), 0);
+    let capability_root = TempDir::new()?;
+    let skill_file = capability_root.path().join("SKILL.md");
+    let skill_contents = b"# Recovered capability\n";
+    std::fs::write(&skill_file, skill_contents)?;
     let selected_capability_roots = vec![SelectedCapabilityRoot {
         id: "executor-plugin".to_string(),
         location: CapabilityRootLocation::Environment {
             environment_id: ENVIRONMENT_ID.to_string(),
-            path: PathUri::parse("file:///plugins/executor-plugin")?,
+            path: PathUri::from_host_native_path(capability_root.path())?,
         },
     }];
+    assert!(
+        manager
+            .resolve_selected_capability_roots(&selected_capability_roots, &HashMap::new())
+            .await
+            .is_empty()
+    );
+    assert_eq!(provider.calls(), 0);
+    manager.report_environment_provisioning_status(
+        ENVIRONMENT_ID.to_string(),
+        Err("first provisioning attempt failed".to_string()),
+        provider.clone(),
+    )?;
+    timeout(TEST_TIMEOUT, async {
+        while !environment.startup_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed capability startup should record its completion");
+    assert_eq!(provider.calls(), 0);
     let reported = manager
         .report_environment_provisioning_status(
             ENVIRONMENT_ID.to_string(),
@@ -220,9 +245,15 @@ async fn pending_noise_environment_connects_and_reconnects_after_ready_report() 
         .context("ready report should apply to the pending environment")?;
     assert!(Arc::ptr_eq(&environment, &reported));
     assert_eq!(provider.calls(), 0);
-    let initial_info = tokio::spawn({
-        let environment = Arc::clone(&environment);
-        async move { environment.info().await }
+    // Capability resolution must retry on its own, without an explicit connection call.
+    let resolved_roots = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        let selected_capability_roots = selected_capability_roots.clone();
+        async move {
+            manager
+                .resolve_selected_capability_roots(&selected_capability_roots, &HashMap::new())
+                .await
+        }
     });
     let harness_websocket = accept_websocket(&listener, "harness").await?;
     assert_eq!(
@@ -234,9 +265,31 @@ async fn pending_noise_environment_connects_and_reconnects_after_ready_report() 
         harness_websocket,
         Arc::new(Mutex::new(Vec::new())),
     ));
-    let initial_info = timeout(TEST_TIMEOUT, initial_info)
+    let resolved_roots = timeout(TEST_TIMEOUT, resolved_roots)
         .await
-        .context("pending Noise environment should become ready")???;
+        .context("capability resolution should recover after Ready")??;
+    assert_eq!(
+        resolved_roots
+            .iter()
+            .map(|root| root.selected_root().clone())
+            .collect::<Vec<_>>(),
+        selected_capability_roots
+    );
+    let [resolved_root] = resolved_roots.as_slice() else {
+        anyhow::bail!("the recovered capability root should resolve");
+    };
+    assert!(Arc::ptr_eq(resolved_root.environment(), &environment));
+    let recovered_skill = resolved_root
+        .environment()
+        .get_filesystem()
+        .read_file(
+            &PathUri::from_host_native_path(skill_file)?,
+            Default::default(),
+            /*sandbox*/ None,
+        )
+        .await?;
+    assert_eq!(recovered_skill, skill_contents.to_vec());
+    let initial_info = environment.info().await?;
     assert_eq!(
         environment.selected_capability_roots(),
         selected_capability_roots
@@ -323,6 +376,7 @@ async fn remote_environment_routes_encrypted_exec_server_rpc() -> Result<()> {
     let client = &connection.client;
 
     let exec_params = ExecParams {
+        metadata: Default::default(),
         process_id: ProcessId::from("proc-1"),
         argv: vec!["true".to_string()],
         cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,

@@ -346,6 +346,14 @@ pub struct FileSystemSandboxContext {
     pub windows_sandbox_proxy_settings_mode: Option<WindowsSandboxProxySettingsMode>,
     #[serde(default)]
     pub use_legacy_landlock: bool,
+    /// Whether the executing platform cannot provide any filesystem sandbox
+    /// backend at all (Android/Termux builds). Read-only operations may fall
+    /// back to unsandboxed host reads while this is set and the active policy
+    /// has no denied-read restrictions, which the sandbox is the sole
+    /// mechanism to enforce. Set from the compile-time platform predicate by
+    /// the constructors; tests inject it explicitly.
+    #[serde(default)]
+    pub sandbox_unavailable_by_construction: bool,
 }
 
 impl FileSystemSandboxContext {
@@ -389,6 +397,28 @@ impl FileSystemSandboxContext {
             windows_sandbox_private_desktop: false,
             windows_sandbox_proxy_settings_mode: None,
             use_legacy_landlock: false,
+            sandbox_unavailable_by_construction: cfg!(target_os = "android"),
+        }
+    }
+
+    /// True when read-only operations may fall back to the unsandboxed host
+    /// path instead of the sandboxed backend: only on platforms where no
+    /// sandbox backend can exist, and only while the active policy has no
+    /// denied-read restrictions. Mirrors the defensive conversion of
+    /// [`Self::should_run_in_sandbox`]: a profile that cannot be interpreted
+    /// locally keeps the sandboxed routing.
+    pub fn unsandboxed_read_fallback_allowed(&self) -> bool {
+        self.sandbox_unavailable_by_construction
+            && !Self::policy_has_denied_read_restrictions(&self.permissions)
+    }
+
+    fn policy_has_denied_read_restrictions(permissions: &ExecPermissionProfile) -> bool {
+        match PermissionProfile::try_from(permissions.clone()) {
+            Ok(profile) => profile
+                .file_system_sandbox_policy()
+                .has_denied_read_restrictions(),
+            // An uninterpretable profile must not unlock host reads.
+            Err(_) => true,
         }
     }
 

@@ -1341,9 +1341,9 @@ impl ServerHandler for ToolAppsMcpServer {
             .get("threadId")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
-        let client_capabilities = context.peer.peer_info().map(|request| {
+        let client_capabilities = context.client_capabilities().map(|capabilities| {
             json!({
-                "extensions": request.capabilities.extensions.clone().unwrap_or_default(),
+                "extensions": capabilities.extensions.unwrap_or_default(),
             })
         });
 
@@ -1394,6 +1394,16 @@ impl ServerHandler for ToolAppsMcpServer {
             if matches!(result.action, ElicitationAction::Decline) {
                 return Ok(CallToolResult::error(vec![ContentBlock::text(
                     "Tool execution was declined by Guardian.",
+                )])
+                .into());
+            }
+            if matches!(result.action, ElicitationAction::Cancel) {
+                assert_eq!(
+                    serde_json::to_value(result).expect("cancelled elicitation response"),
+                    json!({ "action": "cancel", "_meta": { "approvals_reviewer": "auto_review" } }),
+                );
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "Tool execution was cancelled by Guardian.",
                 )])
                 .into());
             }

@@ -202,7 +202,7 @@ pub fn build_item_from_guardian_event(
                 plugin_id: assessment.plugin_id.clone(),
                 script_path: assessment.script_path.clone(),
                 command,
-                cwd: cwd.clone().into(),
+                cwd: cwd.clone(),
                 process_id: None,
                 source: CommandExecutionSource::Agent,
                 status,

@@ -1,0 +1,62 @@
+---
+source: tui/src/streaming/render_tests.rs
+expression: rendered_cases
+---
+[
+    [
+        HyperlinkLine {
+            line: Line::from_iter([
+                Span::from("# ").bold().underlined(),
+                Span::from("Output").bold().underlined(),
+            ]),
+            hyperlinks: [],
+        },
+        HyperlinkLine {
+            line: Line::default(),
+            hyperlinks: [],
+        },
+        HyperlinkLine {
+            line: Line::from_iter([
+                Span::from("- "),
+                Span::from("Quarterly Report.xlsx").cyan(),
+            ]),
+            hyperlinks: [],
+        },
+        HyperlinkLine {
+            line: Line::default(),
+            hyperlinks: [],
+        },
+        HyperlinkLine {
+            line: Line::from("Continue."),
+            hyperlinks: [],
+        },
+    ],
+    [
+        HyperlinkLine {
+            line: Line::from_iter([
+                Span::from("# ").bold().underlined(),
+                Span::from("Output").bold().underlined(),
+            ]),
+            hyperlinks: [],
+        },
+        HyperlinkLine {
+            line: Line::default(),
+            hyperlinks: [],
+        },
+        HyperlinkLine {
+            line: Line::from_iter([
+                Span::from("- "),
+                Span::from("Résumé *final* ✨.xlsx").cyan(),
+            ]),
+            hyperlinks: [],
+        },
+        HyperlinkLine {
+            line: Line::default(),
+            hyperlinks: [],
+        },
+        HyperlinkLine {
+            line: Line::from("Continue."),
+            hyperlinks: [],
+        },
+    ],
+]

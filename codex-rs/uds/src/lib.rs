@@ -10,8 +10,10 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::ReadBuf;
 
-/// Creates `socket_dir` if needed and restricts it to the current user where
-/// the platform exposes Unix permissions.
+/// Creates `socket_dir` if needed and restricts it to the current user as
+/// supported by the platform (0700 on Unix, a protected user-only DACL on Windows).
+/// Windows rejects existing directories unless they already have that owner and DACL;
+/// changing permissions cannot revoke access held through preexisting handles.
 pub async fn prepare_private_socket_directory(socket_dir: impl AsRef<Path>) -> IoResult<()> {
     platform::prepare_private_socket_directory(socket_dir.as_ref()).await
 }
@@ -50,6 +52,13 @@ pub struct UnixStream {
 }
 
 impl UnixStream {
+    /// Requires the Windows peer to belong to the current user, with neither
+    /// process elevated. Call before sending any application data.
+    #[cfg(windows)]
+    pub fn ensure_non_elevated_peer(&self) -> IoResult<()> {
+        self.inner.ensure_non_elevated_peer()
+    }
+
     /// Connects to `socket_path`.
     pub async fn connect(socket_path: impl AsRef<Path>) -> IoResult<Self> {
         platform::connect_stream(socket_path.as_ref())
@@ -184,8 +193,18 @@ mod platform {
 
     pub(super) struct Stream(Compat<Async<WindowsUnixStream>>);
 
+    impl Stream {
+        pub(super) fn ensure_non_elevated_peer(&self) -> IoResult<()> {
+            crate::windows_peer::ensure_non_elevated_peer(
+                self.0.get_ref().get_ref().as_raw_socket(),
+            )
+        }
+    }
+
     pub(super) async fn prepare_private_socket_directory(socket_dir: &Path) -> IoResult<()> {
-        tokio::fs::create_dir_all(socket_dir).await
+        let socket_dir = socket_dir.to_path_buf();
+        spawn_blocking_io(move || crate::windows_security::prepare_private_directory(&socket_dir))
+            .await
     }
 
     pub(super) struct Listener(Async<WindowsUnixListener>);
@@ -329,3 +348,14 @@ mod platform {
 
 #[cfg(test)]
 mod lib_tests;
+
+#[cfg(windows)]
+mod windows_security;
+
+#[cfg(windows)]
+mod windows_socket_validation;
+#[cfg(windows)]
+pub use windows_socket_validation::validate_private_socket_path;
+
+#[cfg(windows)]
+mod windows_peer;

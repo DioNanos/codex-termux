@@ -58,9 +58,18 @@ async fn prepare_apply_patch_uses_action_policy_before_turn_policy() {
         .clone();
     environment.config_mut().permission_profile =
         PermissionProfileSnapshot::legacy(permission_profile);
+    let sandbox = environment.sandbox_context(/*additional_permissions*/ None);
+    let context = sandbox.policy_context().expect("local sandbox context");
 
-    let prepared = prepare_apply_patch(&step, &environment, &file_system_policy, action)
-        .expect("issuing action policy should request approval");
+    let prepared = prepare_apply_patch(
+        &step,
+        &environment,
+        &file_system_policy,
+        &context,
+        PatchSandboxRoute::Platform(codex_protocol::config_types::WindowsSandboxLevel::Disabled),
+        action,
+    )
+    .expect("issuing action policy should request approval");
 
     assert!(!prepared.auto_approved);
     assert!(matches!(

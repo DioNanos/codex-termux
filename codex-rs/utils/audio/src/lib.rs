@@ -79,6 +79,7 @@ pub fn prepare_response_items(items: &mut [ResponseItem]) {
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::Compaction { .. }
+            | ResponseItem::ConfigurationUpdate { .. }
             | ResponseItem::CompactionTrigger { .. }
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => {}
@@ -245,6 +246,11 @@ fn prepare_audio(audio_url: &mut String) -> Result<(), AudioPreparationError> {
             .map_err(|_| AudioPreparationError::InvalidDataUrl {
                 reason: "invalid base64 payload",
             })?;
+    if bytes.is_empty() {
+        return Err(AudioPreparationError::InvalidDataUrl {
+            reason: "audio payload is empty",
+        });
+    }
     if bytes.len() > MAX_PROMPT_AUDIO_INPUT_BYTES {
         return Err(AudioPreparationError::AudioTooLarge { size: bytes.len() });
     }

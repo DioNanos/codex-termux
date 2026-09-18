@@ -21,6 +21,8 @@ use ctor::ctor;
 
 pub(crate) mod exec_server;
 
+pub(crate) const TEST_BUILD_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
 pub(crate) const DELAYED_OUTPUT_AFTER_EXIT_PARENT_ARG: &str =
     "--codex-test-delayed-output-after-exit-parent";
 pub(crate) const SYSTEM_PROXY_REQUEST_URL_ENV: &str =
@@ -150,6 +152,8 @@ fn maybe_run_exec_server_from_test_binary(guard: Option<&TestBinaryDispatchGuard
     if command != "exec-server" {
         return;
     }
+    // Initialize in the executor child, just as the real CLI does at startup.
+    codex_build_info::BuildInfo::initialize(TEST_BUILD_COMMIT);
 
     let Some(flag) = args.next() else {
         eprintln!("expected --listen");
@@ -222,13 +226,32 @@ fn maybe_run_exec_server_from_test_binary(guard: Option<&TestBinaryDispatchGuard
             std::process::exit(1);
         }
     };
-    let exit_code = match runtime.block_on(codex_exec_server::run_main_with_telemetry(
-        &listen_url,
-        runtime_paths,
-        ExecServerTelemetry::default(),
-        http_client_factory,
-        request_dispatch_mode,
-    )) {
+    let exit_code = match runtime.block_on(async {
+        #[cfg(target_os = "macos")]
+        let runtime_paths = {
+            let home = codex_utils_home_dir::find_codex_home()?;
+            let config = codex_config::loader::load_config_layers_state(
+                &codex_exec_server::LocalFileSystem::unsandboxed(),
+                home.as_path(),
+                /*cwd*/ None,
+                &[],
+                codex_config::LoaderOverrides::default(),
+                &codex_config::NoopThreadConfigLoader,
+            )
+            .await?;
+            runtime_paths.with_allowed_symlinked_codex_home(
+                codex_config::allowed_symlinked_codex_home(&config, &home),
+            )
+        };
+        codex_exec_server::run_main_with_telemetry(
+            &listen_url,
+            runtime_paths,
+            ExecServerTelemetry::default(),
+            http_client_factory,
+            request_dispatch_mode,
+        )
+        .await
+    }) {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("exec-server failed: {error}");

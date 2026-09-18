@@ -18,7 +18,6 @@ use super::SESSIONS_SUBDIR;
 use super::compression;
 use crate::ResponseItemEnvelope;
 use crate::RolloutItem;
-use crate::RolloutLine;
 
 const MATCH_CONTEXT_BEFORE_CHARS: usize = 48;
 const MATCH_CONTEXT_AFTER_CHARS: usize = 96;
@@ -147,7 +146,16 @@ async fn scan_rollout_matches(
             };
             if rollout_file.is_compressed() {
                 if let Some(snippet) =
-                    first_rollout_content_match_snippet(rollout_file.path(), search_term).await?
+                    first_rollout_content_match_snippet(rollout_file.path(), search_term)
+                        .await
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(
+                                path = %rollout_file.path().display(),
+                                %err,
+                                "Failed to search compressed rollout"
+                            );
+                            None
+                        })
                 {
                     matches.insert(
                         compression::plain_rollout_path(rollout_file.path()),
@@ -222,7 +230,16 @@ async fn scan_compressed_rollout_matches(
                 continue;
             }
             if let Some(snippet) =
-                first_rollout_content_match_snippet(rollout_file.path(), search_term).await?
+                first_rollout_content_match_snippet(rollout_file.path(), search_term)
+                    .await
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(
+                            path = %rollout_file.path().display(),
+                            %err,
+                            "Failed to search compressed rollout"
+                        );
+                        None
+                    })
             {
                 matches.insert(
                     compression::plain_rollout_path(rollout_file.path()),
@@ -248,7 +265,7 @@ fn case_insensitive_literal_regex(search_term: impl AsRef<str>) -> io::Result<Re
 }
 
 fn content_match_snippet(jsonl_line: &str, search_term: &Regex) -> Option<String> {
-    let rollout_line = serde_json::from_str::<RolloutLine>(jsonl_line.trim()).ok()?;
+    let rollout_line = crate::parse_rollout_line(jsonl_line.trim()).ok()?;
     let text = conversation_text_from_item(&rollout_line.item)?;
     excerpt_around_match(text.as_str(), search_term)
 }
@@ -293,6 +310,7 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
         | RolloutItem::RealtimeItem(_)
+        | RolloutItem::RetainedContext(_)
         | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::WorldState(_) => None,

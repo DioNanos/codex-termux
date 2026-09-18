@@ -1,0 +1,41 @@
+[package]
+name = "codex-mxc-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+# This direct dependency pins MXC's transitive ETW dependency for Windows GNU linking.
+[package.metadata.cargo-shear]
+ignored = ["tracelogging"]
+
+[dependencies]
+anyhow = { workspace = true }
+codex-protocol = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
+codex-utils-path-uri = { workspace = true }
+codex-windows-sandbox = { workspace = true }
+thiserror = { workspace = true }
+wxc_common = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+appcontainer_common = { workspace = true }
+learning_mode_windows = { workspace = true }
+# 1.2.4 imports OneCore_apiset, which the GNU Windows toolchain does not ship.
+tracelogging = "=1.2.3"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }

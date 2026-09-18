@@ -39,12 +39,15 @@ pub(super) async fn archive_threads(
         }
     }
     let _writer_guards = store.acquire_writer_locks(&lock_thread_ids).await?;
-    // Already-archived rollouts need no move. Avoid reading the entire archive on every request.
-    let reference_index = RolloutReferenceIndex::scan_unarchived(store.config.codex_home.as_path())
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to scan thread rollout files: {err}"),
-        })?;
+    // Only inspect active files whose names belong to the threads being archived.
+    let reference_index = RolloutReferenceIndex::scan_unarchived_threads(
+        store.config.codex_home.as_path(),
+        &thread_ids,
+    )
+    .await
+    .map_err(|err| ThreadStoreError::Internal {
+        message: format!("failed to scan thread rollout files: {err}"),
+    })?;
 
     let parent_thread_id = thread_ids[0];
     let mut archived_thread_ids = Vec::new();
@@ -240,8 +243,7 @@ mod tests {
             )
             .expect("child session file");
             let _owner_guard = owner
-                .writer_lock_coordinator
-                .acquire(child_thread_id)
+                .acquire_writer_lock(child_thread_id)
                 .expect("acquire child writer lock");
 
             let error = store

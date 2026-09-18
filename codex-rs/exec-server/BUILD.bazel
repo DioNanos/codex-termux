@@ -9,6 +9,10 @@ exports_files(
 codex_rust_crate(
     name = "exec-server",
     crate_name = "codex_exec_server",
+    crate_srcs = glob([
+        "src/**/*.rs",
+        "tests/unit/**/*.rs",
+    ]),
     deps_extra = [
         "@crates//:opentelemetry",
         "@crates//:opentelemetry_sdk",
@@ -36,7 +40,7 @@ exec_server_compat_test(
 
 exec_server_compat_test(
     name = "exec-server-stable-release-test",
-    release = "@codex_release_0.150.1_linux_x86_64",
+    release = "@codex_release_0.153.1_linux_x86_64",
 )
 
 exec_server_compat_test(

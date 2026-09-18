@@ -1,6 +1,7 @@
 use super::*;
 use crate::chatwidget::UserMessage;
 use crate::chatwidget::tests::helpers::normalize_snapshot_paths;
+use crate::chatwidget::tests::helpers::set_fast_mode_test_catalog_for_models;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use pretty_assertions::assert_eq;
@@ -10,9 +11,9 @@ pub(super) fn fallback_response() -> GetAccountRateLimitsResponse {
     serde_json::from_value(json!({
         "accountId": "workspace-a", "rateLimits": {},
         "rateLimitUpsell": {
-            "banner_type": "model_recovery", "model_slug": "gpt-5.4",
-            "blocked_model_slug": "gpt-5.4",
-            "fallback_model_slugs": ["unavailable-model", "gpt-5.4", "gpt-5.2"],
+            "banner_type": "model_recovery", "model_slug": "gpt-5.5",
+            "blocked_model_slug": "gpt-5.5",
+            "fallback_model_slugs": ["unavailable-model", "gpt-5.5", "gpt-5.6-terra"],
             "title": "Selected model usage exhausted",
             "description": "Add credits to use this model again.",
             "presentation": "dismissible",
@@ -24,12 +25,12 @@ pub(super) fn fallback_response() -> GetAccountRateLimitsResponse {
 
 fn configure_fallback_model(app: &mut App) {
     set_chatgpt_auth(&mut app.chat_widget);
-    set_fast_mode_test_catalog(&mut app.chat_widget);
+    set_fast_mode_test_catalog_for_models(&mut app.chat_widget, "gpt-5.5", "gpt-5.6-terra");
     app.model_catalog = app.chat_widget.model_catalog();
-    app.chat_widget.set_model("gpt-5.4");
+    app.chat_widget.set_model("gpt-5.5");
 }
 
-async fn start_fallback_thread(
+pub(super) async fn start_fallback_thread(
     app: &mut App,
 ) -> Result<session_lifecycle_requests::RecordingAppServer> {
     let (mut server, requests, proxy) = session_lifecycle_requests::start_recording_app_server(
@@ -65,7 +66,7 @@ async fn backend_banner_fallback_updates_task_settings_and_keeps_notice() -> Res
             .set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
         let mut expected_mode = app.chat_widget.effective_collaboration_mode();
         assert_eq!(expected_mode.mode, mode_kind);
-        expected_mode.settings.model = "gpt-5.2".into();
+        expected_mode.settings.model = "gpt-5.6-terra".into();
         expected_mode.settings.reasoning_effort = Some(ReasoningEffortConfig::Medium);
         let default_model = app.config.model.clone();
         let default_plan_effort = app.config.plan_mode_reasoning_effort.clone();
@@ -99,7 +100,7 @@ async fn backend_banner_fallback_updates_task_settings_and_keeps_notice() -> Res
             serde_json::from_value::<ThreadSettingsUpdateParams>(sent[0].params.clone().unwrap())?,
             ThreadSettingsUpdateParams {
                 thread_id: thread_id.to_string(),
-                model: Some("gpt-5.2".into()),
+                model: Some("gpt-5.6-terra".into()),
                 effort: Some(ReasoningEffortConfig::Medium),
                 collaboration_mode: Some(expected_mode.clone()),
                 service_tier: Some(Some("default".into())),
@@ -146,7 +147,7 @@ async fn backend_banner_fallback_updates_task_settings_and_keeps_notice() -> Res
         healthy.rate_limit_upsell = None;
         app.chat_widget.update_backend_banner(&healthy);
         app.apply_backend_banner_fallback(&mut server).await;
-        assert_eq!(app.chat_widget.current_model(), "gpt-5.2");
+        assert_eq!(app.chat_widget.current_model(), "gpt-5.6-terra");
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert!(
             !std::iter::from_fn(|| events.try_recv().ok())
@@ -166,7 +167,7 @@ async fn backend_banner_fallback_updates_task_settings_and_keeps_notice() -> Res
         app.chat_widget
             .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_matches!(next_user_turn_op(&mut ops), AppCommand::UserTurn { model, collaboration_mode: Some(mode), .. }
-            if model == "gpt-5.2" && mode == expected_mode);
+            if model == "gpt-5.6-terra" && mode == expected_mode);
         server.shutdown().await?;
         proxy.await??;
     }
@@ -207,7 +208,7 @@ async fn backend_banner_fallback_uses_current_task_and_accepted_generation() -> 
         )
         .await?;
         if generation == read_generation {
-            assert_eq!(app.chat_widget.current_model(), "gpt-5.4");
+            assert_eq!(app.chat_widget.current_model(), "gpt-5.5");
             assert!(requests.lock().unwrap().is_empty());
         }
     }
@@ -217,7 +218,7 @@ async fn backend_banner_fallback_uses_current_task_and_accepted_generation() -> 
         sent[0].params.as_ref().unwrap()["threadId"],
         active_id.to_string()
     );
-    assert_eq!(app.chat_widget.current_model(), "gpt-5.2");
+    assert_eq!(app.chat_widget.current_model(), "gpt-5.6-terra");
     server.shutdown().await?;
     proxy.await??;
     Ok(())
@@ -231,13 +232,13 @@ async fn backend_banner_fallback_keeps_existing_recovery_without_candidate() -> 
     for (replacement, expect_legacy_banner) in [
         (json!([]), true),
         (json!(["unavailable-model"]), false),
-        (json!(["gpt-5.4"]), false),
+        (json!(["gpt-5.5"]), false),
     ] {
         let mut response = fallback_response();
         response.rate_limit_upsell.as_mut().unwrap()["fallback_model_slugs"] = replacement;
         app.chat_widget.update_backend_banner(&response);
         app.apply_backend_banner_fallback(&mut server).await;
-        assert_eq!(app.chat_widget.current_model(), "gpt-5.4");
+        assert_eq!(app.chat_widget.current_model(), "gpt-5.5");
         let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 72);
         assert_eq!(rendered.contains("View usage"), expect_legacy_banner);
         if !expect_legacy_banner {
@@ -247,10 +248,10 @@ async fn backend_banner_fallback_keeps_existing_recovery_without_candidate() -> 
             );
         }
     }
-    app.chat_widget.set_model("gpt-5.2");
+    app.chat_widget.set_model("gpt-5.6-terra");
     app.chat_widget.update_backend_banner(&fallback_response());
     app.apply_backend_banner_fallback(&mut server).await;
-    assert_eq!(app.chat_widget.current_model(), "gpt-5.2");
+    assert_eq!(app.chat_widget.current_model(), "gpt-5.6-terra");
     assert!(
         render_bottom_popup(&app.chat_widget, /*width*/ 72)
             .contains("Selected model usage exhausted")
@@ -268,13 +269,22 @@ async fn backend_banner_fallback_handles_settings_failure_and_queued_manual_sele
     use futures::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
 
-    for error_code in [Some(-32601), Some(-32603), None] {
+    for (use_reserve, error_code) in [false, true]
+        .into_iter()
+        .flat_map(|reserve| [Some(-32601), Some(-32603), None].map(|error| (reserve, error)))
+    {
         let (mut app, mut events, _ops) = make_test_app_with_channels().await;
         let id = ThreadId::new();
         app.active_thread_id = Some(id);
         app.chat_widget
             .handle_thread_session(test_thread_session(id, app.config.cwd.to_path_buf()));
-        configure_fallback_model(&mut app);
+        if use_reserve {
+            app.primary_session_configured =
+                Some(test_thread_session(id, app.config.cwd.to_path_buf()));
+            super::luna_reserve_recovery_tests::configure_reserve_catalog(&mut app);
+        } else {
+            configure_fallback_model(&mut app);
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let websocket_url = format!("ws://{}", listener.local_addr()?);
         let codex_home = app.config.codex_home.display().to_string();
@@ -301,7 +311,7 @@ async fn backend_banner_fallback_handles_settings_failure_and_queued_manual_sele
                     } else {
                         if settings_requests == 1 {
                             // A manual selection arriving while the RPC is pending must win afterward.
-                            manual_selection_tx.send(AppEvent::UpdateModel("gpt-5.4".into()));
+                            manual_selection_tx.send(AppEvent::UpdateModel("gpt-5.5".into()));
                         }
                         json!({"id": request["id"], "result": {}})
                     }
@@ -322,7 +332,25 @@ async fn backend_banner_fallback_handles_settings_failure_and_queued_manual_sele
             crate::app_server_session::ThreadParamsMode::Embedded,
         );
         while events.try_recv().is_ok() {}
-        app.chat_widget.update_backend_banner(&fallback_response());
+        let pending_turn = if use_reserve && error_code.is_some() {
+            app.chat_widget
+                .restore_user_message_to_composer(UserMessage::from("queued before usage reply"));
+            app.chat_widget
+                .handle_key_event(KeyEvent::from(KeyCode::Enter));
+            Some(
+                std::iter::from_fn(|| events.try_recv().ok())
+                    .find(|event| matches!(event, AppEvent::CodexOp(AppCommand::UserTurn { .. })))
+                    .expect("turn already queued before the failed switch"),
+            )
+        } else {
+            None
+        };
+        let response = if use_reserve {
+            super::luna_reserve_recovery_tests::reserve_response()
+        } else {
+            fallback_response()
+        };
+        app.chat_widget.update_backend_banner(&response);
         app.apply_backend_banner_fallback(&mut server).await;
         let queued = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
         let switch_notices = queued
@@ -337,7 +365,14 @@ async fn backend_banner_fallback_handles_settings_failure_and_queued_manual_sele
             .count();
         assert_eq!(switch_notices, usize::from(error_code.is_none()));
         if error_code.is_none() {
-            assert_eq!(app.chat_widget.current_model(), "gpt-5.2");
+            assert_eq!(
+                app.chat_widget.current_model(),
+                if use_reserve {
+                    "gpt-reserve"
+                } else {
+                    "gpt-5.6-terra"
+                }
+            );
             let manual_selection = queued
                 .into_iter()
                 .find(|event| matches!(event, AppEvent::UpdateModel(_)))
@@ -346,8 +381,45 @@ async fn backend_banner_fallback_handles_settings_failure_and_queued_manual_sele
             app.handle_event(&mut tui, &mut server, manual_selection)
                 .await?;
         }
-        assert_eq!(app.chat_widget.current_model(), "gpt-5.4");
+        assert_eq!(app.chat_widget.current_model(), "gpt-5.5");
         assert!(!render_bottom_popup(&app.chat_widget, /*width*/ 72).contains("View usage"));
+        if use_reserve && error_code.is_some() {
+            let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 90);
+            assert!(rendered.contains("Add credits"));
+            assert!(!rendered.contains("You’re now using Luna"));
+            if error_code == Some(-32601) {
+                insta::assert_snapshot!(
+                    "luna_reserve_settings_unavailable",
+                    normalize_snapshot_paths(rendered)
+                );
+            }
+            app.chat_widget
+                .handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+            assert!(
+                std::iter::from_fn(|| events.try_recv().ok())
+                    .any(|event| matches!(event, AppEvent::OpenUrlInBrowser { .. }))
+            );
+            let mut tui = crate::tui::test_support::make_test_tui()?;
+            app.handle_event(&mut tui, &mut server, pending_turn.unwrap())
+                .await?;
+            assert_eq!(
+                app.chat_widget.queued_user_message_texts(),
+                vec!["queued before usage reply"]
+            );
+            app.chat_widget.finish_rate_limit_recovery();
+            app.chat_widget
+                .restore_user_message_to_composer(UserMessage::from("after recovery"));
+            app.chat_widget
+                .handle_key_event(KeyEvent::from(KeyCode::Enter));
+            assert_eq!(
+                app.chat_widget.queued_user_message_texts(),
+                vec!["queued before usage reply", "after recovery"]
+            );
+            assert!(
+                !std::iter::from_fn(|| events.try_recv().ok())
+                    .any(|event| matches!(event, AppEvent::CodexOp(AppCommand::UserTurn { .. })))
+            );
+        }
         server.shutdown().await?;
         fake.await??;
     }
@@ -376,7 +448,7 @@ async fn backend_banner_fallback_preserves_permissions_for_first_eligible_cyber_
     let mut models = app.model_catalog.try_list_models()?;
     let mut cyber_model = models
         .iter()
-        .find(|model| model.model == "gpt-5.2")
+        .find(|model| model.model == "gpt-5.6-terra")
         .unwrap()
         .clone();
     // Like the manual-selection tests, classify a fixture model through catalog metadata.
@@ -394,12 +466,16 @@ async fn backend_banner_fallback_preserves_permissions_for_first_eligible_cyber_
     app.replace_chat_widget(ChatWidget::new_with_app_event(init));
     app.chat_widget
         .handle_thread_session(app.primary_session_configured.clone().unwrap());
-    app.chat_widget.set_model("gpt-5.4");
+    app.chat_widget.set_model("gpt-5.5");
     app.chat_widget
         .set_reasoning_effort(Some(ReasoningEffortConfig::Medium));
     let mut response = fallback_response();
-    response.rate_limit_upsell.as_mut().unwrap()["fallback_model_slugs"] =
-        json!(["unavailable-model", "gpt-5.4", cyber_model.model, "gpt-5.2"]);
+    response.rate_limit_upsell.as_mut().unwrap()["fallback_model_slugs"] = json!([
+        "unavailable-model",
+        "gpt-5.5",
+        cyber_model.model,
+        "gpt-5.6-terra"
+    ]);
     app.chat_widget.update_backend_banner(&response);
     app.apply_backend_banner_fallback(&mut server).await;
     assert_eq!(app.chat_widget.current_model(), cyber_model.model);

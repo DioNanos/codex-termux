@@ -39,6 +39,7 @@ pub(crate) async fn connect(
     tls_config: Option<Arc<ClientConfig>>,
     proxy_route: OutboundProxyRoute,
     tcp_nodelay: TcpNodelay,
+    loopback_direct: bool,
 ) -> Result<(ConnectionInner, Response), WebSocketError> {
     let disable_nagle = tcp_nodelay == TcpNodelay::Enabled;
     let proxy_url = match proxy_route {
@@ -87,11 +88,14 @@ pub(crate) async fn connect(
         None => {
             let host = websocket_host(&request)?;
             let port = websocket_port(&request)?;
-            Box::new(
-                connect_tcp(host_port(host, port), tcp_nodelay)
-                    .await
-                    .map_err(WebSocketError::Io)?,
-            )
+            let address = host_port(host, port);
+            let stream = if loopback_direct {
+                connect_loopback_tcp(address, tcp_nodelay).await
+            } else {
+                connect_tcp(address, tcp_nodelay).await
+            }
+            .map_err(WebSocketError::Io)?;
+            Box::new(stream)
         }
         Some(url) => {
             let proxy = ProxyEndpoint::parse(&url)?;
@@ -194,11 +198,37 @@ fn host_port(host: &str, port: u16) -> String {
 
 async fn connect_tcp(address: String, tcp_nodelay: TcpNodelay) -> io::Result<TcpStream> {
     let addresses = tokio::net::lookup_host(address).await?.collect::<Vec<_>>();
+    connect_resolved_tcp(addresses, tcp_nodelay).await
+}
+
+async fn connect_loopback_tcp(address: String, tcp_nodelay: TcpNodelay) -> io::Result<TcpStream> {
+    let addresses = tokio::net::lookup_host(address).await?.collect::<Vec<_>>();
+    connect_resolved_tcp(loopback_addresses(addresses)?, tcp_nodelay).await
+}
+
+async fn connect_resolved_tcp(
+    addresses: Vec<SocketAddr>,
+    tcp_nodelay: TcpNodelay,
+) -> io::Result<TcpStream> {
     let stream = connect_happy_eyeballs(addresses, TcpStream::connect).await?;
     if tcp_nodelay == TcpNodelay::Enabled {
         stream.set_nodelay(/*nodelay*/ true)?;
     }
     Ok(stream)
+}
+
+fn loopback_addresses(addresses: Vec<SocketAddr>) -> io::Result<Vec<SocketAddr>> {
+    let loopback_addresses = addresses
+        .into_iter()
+        .filter(|address| address.ip().is_loopback())
+        .collect::<Vec<_>>();
+    if loopback_addresses.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "direct WebSocket connections must resolve to a loopback address",
+        ));
+    }
+    Ok(loopback_addresses)
 }
 
 async fn connect_happy_eyeballs<T, F, Fut>(

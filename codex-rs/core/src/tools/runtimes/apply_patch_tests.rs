@@ -1,13 +1,21 @@
 use super::*;
 use crate::config::PermissionProfileSnapshot;
 use crate::environment_selection::EnvironmentConfigOrigin;
+use crate::sandboxing::SandboxPermissions;
 use crate::tools::sandboxing::SandboxAttempt;
+use crate::tools::sandboxing::SandboxOverride;
+use crate::tools::sandboxing::sandbox_override_for_first_attempt;
+use crate::tools::sandboxing::unsandboxed_execution_allowed;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
@@ -357,6 +365,7 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
             windows_sandbox_private_desktop: false,
             windows_sandbox_proxy_settings_mode: None,
             use_legacy_landlock: false,
+            sandbox_unavailable_by_construction: false,
         })
     );
 }
@@ -450,5 +459,304 @@ fn r2_unrelated_failure_after_bypass_is_not_a_sandbox_denial() {
             &attempt, /*failed*/ true, &output
         ),
         "R2: an unrelated failure after an approved bypass must not be classified as a sandbox denial"
+    );
+}
+
+// --- An approved apply_patch must execute without a filesystem sandbox on a
+// platform that cannot provide one (Android/Termux build) ---
+//
+// The chain being pinned, against production code only:
+//   1. the orchestrator reaches the first-attempt decision only after the
+//      approval dialog returned Ok, so it passes that outcome explicitly to
+//      the override (`already_approved`); the platform branch is injected
+//      (`true` = the binary has no sandbox backend at all);
+//   2. honoring the approval means BypassSandboxFirstAttempt, so the
+//      executor-facing attempt starts with sandbox_requested=false;
+//   3. with sandbox_requested=false the runtime hands the executor NO
+//      filesystem sandbox context (file_system_sandbox_context_for_attempt),
+//      so the executor never refuses with "filesystem sandbox cannot be
+//      enforced on this executor".
+#[tokio::test]
+async fn approved_apply_patch_on_sandboxless_platform_executes_without_fs_sandbox() {
+    let path = std::env::temp_dir()
+        .join("apply-patch-approved-bypass.txt")
+        .abs();
+    let req = ApplyPatchRequest {
+        turn_environment: test_turn_environment(codex_exec_server::LOCAL_ENVIRONMENT_ID),
+        action: ApplyPatchAction::new_add_for_test(
+            &PathUri::from_abs_path(&path),
+            "hello".to_string(),
+        ),
+        file_paths: vec![PathUri::from_abs_path(&path)],
+        changes: Arc::new(HashMap::new()),
+        exec_approval_requirement: ExecApprovalRequirement::NeedsApproval {
+            reason: None,
+            proposed_execpolicy_amendment: None,
+        },
+        additional_permissions: None,
+        permissions_preapproved: false,
+    };
+
+    // The same derivation the orchestrator performs on the turn environment.
+    let permissions = PermissionProfile::read_only();
+    let file_system_sandbox_policy = permissions.file_system_sandbox_policy();
+    assert!(
+        unsandboxed_execution_allowed(&file_system_sandbox_policy),
+        "premise: read-only policy has no denied reads, unsandboxed execution is allowed"
+    );
+
+    let sandbox_override = sandbox_override_for_first_attempt(
+        SandboxPermissions::UseDefault,
+        &req.exec_approval_requirement,
+        &file_system_sandbox_policy,
+        /*sandbox_unavailable_by_construction*/ true,
+        /*already_approved*/ true,
+    );
+    assert_eq!(
+        sandbox_override,
+        SandboxOverride::BypassSandboxFirstAttempt,
+        "an approved NeedsApproval on a platform without any sandbox backend must take the unsandboxed path"
+    );
+
+    // The attempt state the orchestrator produces for
+    // BypassSandboxFirstAttempt: no sandbox requested, SandboxType::None.
+    let manager = SandboxManager::new();
+    let cwd_uri = PathUri::from_abs_path(&path);
+    let attempt = SandboxAttempt {
+        sandbox: SandboxType::None,
+        sandbox_requested: false,
+        permissions: &permissions,
+        exec_server_permissions: &permissions,
+        enforce_managed_network: false,
+        manager: &manager,
+        sandbox_cwd: &cwd_uri,
+        workspace_roots: std::slice::from_ref(&cwd_uri),
+        codex_linux_sandbox_exe: None,
+        use_legacy_landlock: false,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+        windows_sandbox_private_desktop: false,
+        network_denial_cancellation_token: None,
+        network_proxy: None,
+    };
+
+    assert_eq!(
+        ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt),
+        None,
+        "with the approved bypass no filesystem sandbox context reaches the executor, so \"filesystem sandbox cannot be enforced on this executor\" cannot be produced"
+    );
+}
+
+// --- Pre-verification reads for Update/Delete under a read-only policy on a
+// platform that cannot provide any filesystem sandbox (Android/Termux
+// builds) ---
+//
+// The platform predicate is INJECTED through the sandbox context's
+// `sandbox_unavailable_by_construction` flag (never `cfg!` in tests): `true`
+// simulates a build where no sandbox backend can exist, `false` every other
+// host. The filesystem is the production LocalFileSystem without a sandbox
+// backend — what such a build provides — and the call is the production
+// verification entry point the apply_patch handler uses BEFORE any execution
+// or approval decision.
+
+fn preverify_context(
+    permissions: PermissionProfile,
+    sandbox_unavailable_by_construction: bool,
+    cwd: &PathUri,
+) -> FileSystemSandboxContext {
+    let mut context =
+        FileSystemSandboxContext::from_permission_profile_with_cwd(permissions, cwd.clone());
+    context.sandbox_unavailable_by_construction = sandbox_unavailable_by_construction;
+    context
+}
+
+fn denied_read_profile(denied: &AbsolutePathBuf) -> PermissionProfile {
+    let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+        path: FileSystemPath::Path {
+            path: PathUri::from_abs_path(denied),
+        },
+        access: FileSystemAccessMode::Deny,
+        missing_path_behavior: None,
+    }]);
+    PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted)
+}
+
+fn parse_patch_body(patch: &str, cwd: &PathUri) -> codex_apply_patch::ApplyPatchArgs {
+    let argv = vec!["apply_patch".to_string(), patch.to_string()];
+    match codex_apply_patch::maybe_parse_apply_patch(&argv, cwd) {
+        codex_apply_patch::MaybeApplyPatch::Body(args) => args,
+        other => panic!("test patch must parse to a body, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn delete_preverification_reads_host_files_when_no_sandbox_can_exist() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("target.txt"), "to be deleted\n").expect("write target");
+    let cwd = PathUri::from_abs_path(&dir.path().to_path_buf().abs());
+    let args = parse_patch_body(
+        "*** Begin Patch\n*** Delete File: target.txt\n*** End Patch",
+        &cwd,
+    );
+    let context = preverify_context(PermissionProfile::read_only(), /*platform*/ true, &cwd);
+    let backend = codex_exec_server::LocalFileSystem::unsandboxed();
+
+    let verified = codex_apply_patch::verify_apply_patch_args_with_mode(
+        args,
+        &cwd,
+        codex_apply_patch::ApplyPatchFileUpdateMode::NormalizeToLf,
+        &backend,
+        Some(&context),
+    )
+    .await;
+
+    let action = match verified {
+        codex_apply_patch::MaybeApplyPatchVerified::Body(action) => action,
+        other => panic!(
+            "Delete pre-verification must read the host file when no sandbox can exist, got: {other:?}"
+        ),
+    };
+    let target_uri = cwd.join("target.txt").expect("valid target uri");
+    match action.changes().get(&target_uri) {
+        Some(codex_apply_patch::ApplyPatchFileChange::Delete { content }) => {
+            assert_eq!(content, "to be deleted\n");
+        }
+        other => panic!("expected a Delete change reading the host file, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn update_preverification_reads_host_files_when_no_sandbox_can_exist() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("source.txt"), "alpha\nbeta\n").expect("write source");
+    let cwd = PathUri::from_abs_path(&dir.path().to_path_buf().abs());
+    let args = parse_patch_body(
+        "*** Begin Patch\n*** Update File: source.txt\n@@\n-alpha\n+ALPHA\n*** End Patch",
+        &cwd,
+    );
+    let context = preverify_context(PermissionProfile::read_only(), /*platform*/ true, &cwd);
+    let backend = codex_exec_server::LocalFileSystem::unsandboxed();
+
+    let verified = codex_apply_patch::verify_apply_patch_args_with_mode(
+        args,
+        &cwd,
+        codex_apply_patch::ApplyPatchFileUpdateMode::NormalizeToLf,
+        &backend,
+        Some(&context),
+    )
+    .await;
+
+    let action = match verified {
+        codex_apply_patch::MaybeApplyPatchVerified::Body(action) => action,
+        other => panic!(
+            "Update pre-verification must read the host file when no sandbox can exist, got: {other:?}"
+        ),
+    };
+    let source_uri = cwd.join("source.txt").expect("valid source uri");
+    match action.changes().get(&source_uri) {
+        Some(codex_apply_patch::ApplyPatchFileChange::Update { new_content, .. }) => {
+            assert_eq!(new_content, "ALPHA\nbeta\n");
+        }
+        other => panic!("expected an Update change reading the host file, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn denied_read_policy_keeps_preverification_fail_closed_when_no_sandbox_can_exist() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let denied = dir.path().join("denied.txt");
+    std::fs::write(&denied, "secret\n").expect("write secret");
+    let cwd = PathUri::from_abs_path(&dir.path().to_path_buf().abs());
+    let args = parse_patch_body(
+        "*** Begin Patch\n*** Delete File: denied.txt\n*** End Patch",
+        &cwd,
+    );
+    // Platform without any sandbox backend, but the policy denies reads: the
+    // host fallback must stay locked so the denial keeps being enforced.
+    let context = preverify_context(
+        denied_read_profile(&denied.abs()),
+        /*platform*/ true,
+        &cwd,
+    );
+    let backend = codex_exec_server::LocalFileSystem::unsandboxed();
+
+    let verified = codex_apply_patch::verify_apply_patch_args_with_mode(
+        args,
+        &cwd,
+        codex_apply_patch::ApplyPatchFileUpdateMode::NormalizeToLf,
+        &backend,
+        Some(&context),
+    )
+    .await;
+
+    match verified {
+        codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(_) => {}
+        other => panic!(
+            "a denied-read policy must keep pre-verification fail-closed even with no sandbox, got: {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn linux_platform_keeps_preverification_on_the_sandboxed_routing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("target.txt"), "to be deleted\n").expect("write target");
+    let cwd = PathUri::from_abs_path(&dir.path().to_path_buf().abs());
+    let args = parse_patch_body(
+        "*** Begin Patch\n*** Delete File: target.txt\n*** End Patch",
+        &cwd,
+    );
+    // Every platform that CAN provide a sandbox keeps the sandboxed routing:
+    // with no sandbox backend configured this must stay an error, exactly as
+    // before the read fallback existed.
+    let context = preverify_context(
+        PermissionProfile::read_only(),
+        /*platform*/ false,
+        &cwd,
+    );
+    let backend = codex_exec_server::LocalFileSystem::unsandboxed();
+
+    let verified = codex_apply_patch::verify_apply_patch_args_with_mode(
+        args,
+        &cwd,
+        codex_apply_patch::ApplyPatchFileUpdateMode::NormalizeToLf,
+        &backend,
+        Some(&context),
+    )
+    .await;
+
+    match verified {
+        codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(_) => {}
+        other => panic!(
+            "sandbox-capable platforms must keep the sandboxed pre-verification routing, got: {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn unapproved_apply_patch_on_sandboxless_platform_still_gets_no_bypass() {
+    // The read fallback unblocks PRE-VERIFICATION only. The execution gate
+    // stays: without an approval the orchestrator must not hand the executor
+    // an unsandboxed attempt on a platform that cannot sandbox anything.
+    let permissions = PermissionProfile::read_only();
+    let file_system_sandbox_policy = permissions.file_system_sandbox_policy();
+    assert!(
+        unsandboxed_execution_allowed(&file_system_sandbox_policy),
+        "premise: read-only policy has no denied reads"
+    );
+
+    let sandbox_override = sandbox_override_for_first_attempt(
+        SandboxPermissions::UseDefault,
+        &ExecApprovalRequirement::NeedsApproval {
+            reason: None,
+            proposed_execpolicy_amendment: None,
+        },
+        &file_system_sandbox_policy,
+        /*sandbox_unavailable_by_construction*/ true,
+        /*already_approved*/ false,
+    );
+    assert_ne!(
+        sandbox_override,
+        SandboxOverride::BypassSandboxFirstAttempt,
+        "without an approval the sandboxless platform must not bypass the sandbox on the first attempt"
     );
 }

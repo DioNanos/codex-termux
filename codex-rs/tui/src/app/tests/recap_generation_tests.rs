@@ -3,6 +3,7 @@ use crate::app::session_lifecycle::ThreadAttachPresentation;
 use crate::app::tests::session_lifecycle_requests::recorded_params;
 use crate::app::tests::session_lifecycle_requests::start_recording_remote_app_server;
 use crate::app_event::RecapTrigger;
+use codex_model_provider_info::ModelProviderInfo;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -38,6 +39,7 @@ fn prepare_eligible_recap(app: &mut App, thread_id: ThreadId) {
     app.transcript_cells
         .push(Arc::new(crate::history_cell::UserHistoryCell {
             message: "Finish the recap implementation".to_string(),
+            spoken: false,
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
             remote_image_urls: Vec::new(),
@@ -193,12 +195,13 @@ stream_max_retries = 0
 #[tokio::test]
 async fn manual_recap_works_when_auto_recap_disabled() -> Result<()> {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-    app.config.tui_auto_recap = false;
+    app.local_settings.tui.auto_recap = false;
     let thread_id = ThreadId::new();
     app.active_thread_id = Some(thread_id);
     app.transcript_cells
         .push(Arc::new(crate::history_cell::UserHistoryCell {
             message: "Summarize this conversation".to_string(),
+            spoken: false,
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
             remote_image_urls: Vec::new(),
@@ -305,7 +308,7 @@ async fn auto_recap_opt_out_blocks_requests_and_cleans_up_pending_start() -> Res
     prepare_eligible_recap(&mut app, thread_id);
     let (mut app_server, requests, proxy) = start_recording_remote_app_server(&app.config).await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    app.config.tui_auto_recap = false;
+    app.local_settings.tui.auto_recap = false;
     app.schedule_recap_check(thread_id, Instant::now());
     app.request_recap(&app_server, thread_id, RecapTrigger::Automatic);
     app.handle_event(
@@ -327,13 +330,13 @@ async fn auto_recap_opt_out_blocks_requests_and_cleans_up_pending_start() -> Res
         .flat_map(|cell| cell.display_lines(/*width*/ 80))
         .collect::<Vec<_>>();
 
-    app.config.tui_auto_recap = true;
+    app.local_settings.tui.auto_recap = true;
     app.request_recap(&app_server, thread_id, RecapTrigger::Automatic);
     let started_event = tokio::time::timeout(Duration::from_secs(/*secs*/ 5), app_event_rx.recv())
         .await?
         .expect("recap start event");
     assert!(matches!(started_event, AppEvent::RecapStarted { .. }));
-    app.config.tui_auto_recap = false;
+    app.local_settings.tui.auto_recap = false;
     app.handle_event(&mut tui, &mut app_server, started_event)
         .await?;
     tokio::time::timeout(Duration::from_secs(/*secs*/ 5), async {
@@ -378,6 +381,7 @@ async fn recap_generation_uses_remote_workspace_cwd() -> Result<()> {
     app.transcript_cells
         .push(Arc::new(crate::history_cell::UserHistoryCell {
             message: "Finish the recap implementation".to_string(),
+            spoken: false,
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
             remote_image_urls: Vec::new(),

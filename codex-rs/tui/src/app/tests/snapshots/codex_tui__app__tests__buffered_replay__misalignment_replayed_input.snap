@@ -1,0 +1,11 @@
+---
+source: tui/src/app/tests/buffered_replay.rs
+expression: "normalize_snapshot_paths(render_bottom_popup(&app.chat_widget, 80))"
+---
+• Queued follow-up inputs
+  ↳ keep queued
+    ⌥ + ↑ edit last queued message
+
+› keep draft
+
+  gpt-5.6-sol default · /tmp/project

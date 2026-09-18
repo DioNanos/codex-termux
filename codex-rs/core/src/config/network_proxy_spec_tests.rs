@@ -44,6 +44,38 @@ fn build_state_with_audit_metadata_threads_metadata_to_state() {
     assert_eq!(state.audit_metadata(), &metadata);
 }
 
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_sandbox_proxy_listeners_preserve_effective_protocol_roles() {
+    let spec = NetworkProxySpec::from_config_and_constraints(
+        NetworkProxyConfig {
+            enabled: true,
+            proxy_url: "http://127.0.0.1:48081".to_string(),
+            socks_url: "socks5h://127.0.0.1:3128".to_string(),
+            allow_local_binding: true,
+            ..NetworkProxyConfig::default()
+        },
+        /*requirements*/ None,
+        &PermissionProfile::workspace_write(),
+    )
+    .expect("effective network configuration should be valid");
+
+    assert_eq!(
+        spec.windows_sandbox_proxy_listeners()
+            .expect("effective proxy listeners should resolve"),
+        (
+            codex_windows_sandbox::WindowsSandboxProvisioningSettings {
+                proxy_ports: vec![3128, 48081],
+                allow_local_binding: true,
+            },
+            codex_windows_sandbox::WindowsSandboxProxyListeners {
+                http_ports: vec![48081],
+                socks_ports: vec![3128],
+            },
+        )
+    );
+}
+
 #[test]
 fn environment_policy_replaces_soft_controller_allowlist_and_preserves_denials() {
     let requirements = NetworkConstraints {

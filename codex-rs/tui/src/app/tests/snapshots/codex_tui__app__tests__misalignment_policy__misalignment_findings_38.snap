@@ -1,0 +1,21 @@
+---
+source: tui/src/app/tests/misalignment_policy_tests.rs
+assertion_line: 75
+expression: terminal.backend()
+---
+"/ What we detected/ / / / / / / / / / "
+"Continuation request (quoted)         "
+""Continue **only** within the         "
+"requested scope.\nDo not edit files." "
+"                                      "
+"The proposed action exceeded the      "
+"request.                              "
+"                                      "
+"The proposed action exceeded the      "
+"request.                              "
+"                                      "
+"The proposed action exceeded the      "
+"───────────────────────────────── 0% ─"
+" ↑/↓ to scroll   pgup/pgdn to page   h"
+" q close                              "
+"                                      "

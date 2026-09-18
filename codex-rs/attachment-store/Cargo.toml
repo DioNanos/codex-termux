@@ -1,0 +1,22 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-attachment-store"
+version.workspace = true
+
+[lib]
+doctest = false
+name = "codex_attachment_store"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+codex-utils-image = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+base64 = { workspace = true }
+pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

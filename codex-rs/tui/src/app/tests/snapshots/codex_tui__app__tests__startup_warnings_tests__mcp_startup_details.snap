@@ -1,0 +1,9 @@
+---
+source: tui/src/app/tests/startup_warnings_tests.rs
+expression: lines_to_single_string(&warnings.transcript_lines(40))
+---
+⚠ MCP alpha: connection unavailable
+⚠ MCP beta: connection unavailable
+⚠ MCP gamma: connection unavailable
+⚠ MCP startup incomplete (failed: alpha,
+  beta, gamma)

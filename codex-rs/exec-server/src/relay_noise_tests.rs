@@ -31,7 +31,10 @@ use crate::noise_channel::NoiseChannelIdentity;
 use crate::noise_channel::NoiseChannelPublicKey;
 use crate::noise_channel::noise_channel_prologue;
 use crate::noise_relay::NoiseHarnessConnectionArgs;
-use crate::noise_relay::noise_harness_connection_from_websocket;
+use crate::noise_relay::noise_harness_connection_from_websocket_with_readiness;
+use crate::noise_relay::stream_handler::NoiseOutboundMessage;
+use crate::noise_relay::stream_handler::NoiseStreamConnection;
+use crate::noise_relay::stream_handler::NoiseStreamHandler;
 use crate::relay::RelayFrameBodyKind;
 use crate::relay::decode_relay_message_frame;
 use crate::relay::encode_relay_message_frame;
@@ -40,6 +43,40 @@ use crate::server::ConnectionProcessor;
 
 const ENVIRONMENT_ID: &str = "environment-1";
 const EXECUTOR_REGISTRATION_ID: &str = "registration-1";
+
+#[derive(Clone)]
+struct ObservedRegistration(
+    ConnectionProcessor,
+    tokio::sync::mpsc::Sender<Option<(String, String)>>,
+);
+
+impl NoiseStreamHandler for ObservedRegistration {
+    type Incoming = JsonRpcConnectionEvent;
+    type Outgoing = JSONRPCMessage;
+
+    fn decode(payload: bytes::Bytes) -> Result<Self::Incoming, ExecServerError> {
+        ConnectionProcessor::decode(payload)
+    }
+    fn encode(message: Self::Outgoing) -> Result<NoiseOutboundMessage, ExecServerError> {
+        ConnectionProcessor::encode(message)
+    }
+    async fn run_connection(
+        self,
+        connection: NoiseStreamConnection<Self::Incoming, Self::Outgoing>,
+    ) {
+        let registration = connection
+            .executor_registration
+            .as_ref()
+            .map(|registration| {
+                (
+                    registration.environment_id.clone(),
+                    registration.executor_registration_id.clone(),
+                )
+            });
+        let _ = self.1.send(registration).await;
+        NoiseStreamHandler::run_connection(self.0, connection).await;
+    }
+}
 
 #[tokio::test]
 async fn missing_pong_disconnects_physical_relay() -> Result<()> {
@@ -145,6 +182,7 @@ impl HarnessKeyValidator for BlockingValidator {
 
 #[tokio::test]
 async fn processor_exit_resets_noise_harness_stream() -> Result<()> {
+    let (registration_tx, mut registration_rx) = tokio::sync::mpsc::channel(1);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let connecting = tokio::spawn(connect_async(format!("ws://{}", listener.local_addr()?)));
     let (socket, _) = listener.accept().await?;
@@ -155,10 +193,13 @@ async fn processor_exit_resets_noise_harness_stream() -> Result<()> {
     release.notify_one();
     let environment_task = AbortOnDropHandle::new(tokio::spawn(run_multiplexed_environment(
         environment_websocket,
-        ConnectionProcessor::new(ExecServerRuntimePaths::new(
-            std::env::current_exe()?,
-            /*codex_linux_sandbox_exe*/ None,
-        )?),
+        ObservedRegistration(
+            ConnectionProcessor::new(ExecServerRuntimePaths::new(
+                std::env::current_exe()?,
+                /*codex_linux_sandbox_exe*/ None,
+            )?),
+            registration_tx,
+        ),
         ENVIRONMENT_ID.to_string(),
         EXECUTOR_REGISTRATION_ID.to_string(),
         identity.clone(),
@@ -167,7 +208,7 @@ async fn processor_exit_resets_noise_harness_stream() -> Result<()> {
             release,
         },
     )));
-    let mut connection = noise_harness_connection_from_websocket(
+    let mut connection = noise_harness_connection_from_websocket_with_readiness(
         harness_websocket,
         NoiseHarnessConnectionArgs {
             connection_label: "processor exit test".to_string(),
@@ -177,7 +218,8 @@ async fn processor_exit_resets_noise_harness_stream() -> Result<()> {
             responder_public_key: identity.public_key(),
             harness_key_authorization: "authorization".to_string(),
         },
-    );
+    )
+    .connection;
     // Valid JSON reaches the processor; an unsolicited response closes it and
     // aborts its writer. The physical relay must still deliver the reset.
     connection
@@ -187,6 +229,13 @@ async fn processor_exit_resets_noise_harness_stream() -> Result<()> {
             result: serde_json::Value::Null,
         }))
         .await?;
+    assert_eq!(
+        timeout(Duration::from_secs(1), registration_rx.recv()).await?,
+        Some(Some((
+            ENVIRONMENT_ID.to_string(),
+            EXECUTOR_REGISTRATION_ID.to_string()
+        ))),
+    );
     assert!(matches!(
         timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?,
         Some(JsonRpcConnectionEvent::Disconnected { reason: Some(reason) })

@@ -18,6 +18,7 @@ use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_utils_absolute_path::AbsolutePathBuf;
+#[cfg(not(target_os = "linux"))]
 use codex_utils_absolute_path::canonicalize_preserving_symlinks;
 use codex_utils_path_uri::PathUri;
 #[cfg(any(windows, test))]
@@ -72,6 +73,7 @@ impl FileSystemSandboxRunner {
         }
     }
 
+    #[tracing::instrument(name = "fs.sandbox_request", skip_all)]
     pub(crate) async fn run(
         &self,
         sandbox: &FileSystemSandboxContext,
@@ -82,6 +84,11 @@ impl FileSystemSandboxRunner {
         run_command(command, request_json).await
     }
 
+    #[tracing::instrument(
+        name = "fs.sandbox_prepare",
+        skip_all,
+        fields(permission_entries = tracing::field::Empty)
+    )]
     pub(crate) fn sandbox_command(
         &self,
         sandbox: &FileSystemSandboxContext,
@@ -100,6 +107,7 @@ impl FileSystemSandboxRunner {
         let native_permissions =
             native_permissions.materialize_project_roots_with_workspace_roots(workspace_roots);
         let mut file_system_policy = native_permissions.file_system_sandbox_policy();
+        tracing::Span::current().record("permission_entries", file_system_policy.entries.len());
         let helper_read_roots = if sandbox.use_legacy_landlock {
             Vec::new()
         } else {
@@ -110,6 +118,9 @@ impl FileSystemSandboxRunner {
             &helper_read_roots,
             cwd.native.as_path(),
         );
+        // Linux resolves aliases in the sandbox helper. Doing it here also probes
+        // unrelated permission roots synchronously on the executor's runtime thread.
+        #[cfg(not(target_os = "linux"))]
         normalize_file_system_policy_root_aliases(&mut file_system_policy);
         let network_policy = NetworkSandboxPolicy::Restricted;
         let permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
@@ -129,6 +140,10 @@ impl FileSystemSandboxRunner {
     ) -> Result<SandboxExecRequest, JSONRPCErrorError> {
         let helper = &self.runtime_paths.codex_self_exe;
         let sandbox_manager = SandboxManager::for_file_system_helpers();
+        #[cfg(target_os = "macos")]
+        let sandbox_manager = sandbox_manager.with_allowed_symlinked_codex_home(
+            self.runtime_paths.allowed_symlinked_codex_home.clone(),
+        );
         let sandbox = sandbox_manager.select_initial(
             permission_profile,
             SandboxablePreference::Require,
@@ -233,7 +248,7 @@ fn add_helper_runtime_permissions(
     }
 
     for helper_read_root in helper_read_roots {
-        if file_system_policy.can_read_path_with_cwd(helper_read_root.as_path(), cwd) {
+        if file_system_policy.can_read_local_path_with_cwd(helper_read_root.as_path(), cwd) {
             continue;
         }
 
@@ -244,6 +259,7 @@ fn add_helper_runtime_permissions(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn normalize_file_system_policy_root_aliases(file_system_policy: &mut FileSystemSandboxPolicy) {
     for entry in &mut file_system_policy.entries {
         // Alias normalization uses this executor's filesystem; leave foreign
@@ -256,6 +272,7 @@ fn normalize_file_system_policy_root_aliases(file_system_policy: &mut FileSystem
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn normalize_top_level_alias(path: AbsolutePathBuf) -> AbsolutePathBuf {
     let raw_path = path.to_path_buf();
     for ancestor in raw_path.ancestors() {
@@ -314,6 +331,7 @@ fn bazel_bwrap_env_key_is_allowed(_key: &str) -> bool {
     false
 }
 
+#[tracing::instrument(name = "fs.sandbox_execute", skip_all)]
 async fn run_command(
     command: SandboxExecRequest,
     request_json: Vec<u8>,
@@ -571,8 +589,8 @@ mod tests {
             cwd.as_path(),
         );
 
-        assert!(policy.can_read_path_with_cwd(readable.as_path(), cwd.as_path()));
-        assert!(policy.can_write_path_with_cwd(writable.as_path(), cwd.as_path()));
+        assert!(policy.can_read_local_path_with_cwd(readable.as_path(), cwd.as_path()));
+        assert!(policy.can_write_local_path_with_cwd(writable.as_path(), cwd.as_path()));
     }
 
     #[test]
@@ -800,10 +818,13 @@ mod tests {
         );
 
         assert!(
-            policy.can_read_path_with_cwd(runtime_paths.codex_self_exe.as_path(), cwd.as_path())
+            policy.can_read_local_path_with_cwd(
+                runtime_paths.codex_self_exe.as_path(),
+                cwd.as_path(),
+            )
         );
-        assert!(!policy.can_read_path_with_cwd(parent.as_path(), cwd.as_path()));
-        assert!(!policy.can_read_path_with_cwd(sibling.as_path(), cwd.as_path()));
+        assert!(!policy.can_read_local_path_with_cwd(parent.as_path(), cwd.as_path()));
+        assert!(!policy.can_read_local_path_with_cwd(sibling.as_path(), cwd.as_path()));
     }
 
     #[test]
@@ -831,11 +852,14 @@ mod tests {
         );
 
         assert!(
-            policy.can_read_path_with_cwd(runtime_paths.codex_self_exe.as_path(), cwd.as_path())
+            policy.can_read_local_path_with_cwd(
+                runtime_paths.codex_self_exe.as_path(),
+                cwd.as_path(),
+            )
         );
-        assert!(policy.can_read_path_with_cwd(alias.as_path(), cwd.as_path()));
-        assert!(!policy.can_read_path_with_cwd(codex_parent.as_path(), cwd.as_path()));
-        assert!(!policy.can_read_path_with_cwd(alias_parent.as_path(), cwd.as_path()));
+        assert!(policy.can_read_local_path_with_cwd(alias.as_path(), cwd.as_path()));
+        assert!(!policy.can_read_local_path_with_cwd(codex_parent.as_path(), cwd.as_path()));
+        assert!(!policy.can_read_local_path_with_cwd(alias_parent.as_path(), cwd.as_path()));
     }
 
     fn restricted_policy(entries: Vec<FileSystemSandboxEntry>) -> FileSystemSandboxPolicy {

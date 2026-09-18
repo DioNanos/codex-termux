@@ -49,6 +49,7 @@ pub(crate) async fn finish_and_track_measurements(
             thread_id: session.thread_id().to_string(),
             turn_id: turn.sub_id.clone(),
             item_id: item_id.to_string(),
+            originator: turn.originator.clone(),
             plugin_id: batch.plugin_id,
             execution_id: batch.execution_id,
             operation: batch.operation,

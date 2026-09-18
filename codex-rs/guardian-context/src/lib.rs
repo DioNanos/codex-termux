@@ -3,8 +3,9 @@
 //! Transcript collection and bounded host-owned history are also available directly,
 //! without section composition.
 //! Contributor failures abort collection without returning partial context.
-//! Sections carry structured transcript evidence without depending on either
-//! consumer's rendering, retention, compaction, or request lifecycle.
+//! Sections preserve source-specific evidence and share prompt framing, while
+//! profiles retain the consumer-specific transcript policy. Hosts own full/delta
+//! cursors, compaction and request lifecycles.
 //! Registered contributors declare their scope once and are collected only for
 //! matching context consumers. History and collection settings are borrowed for
 //! each request so the default registry can be reused without retaining state.
@@ -16,17 +17,18 @@ use codex_protocol::models::ResponseItem;
 
 use authorization::RootConversationSection;
 use authorization::TrustedUserAnswersSection;
+use retained_instructions::RetainedUserInstructionsSection;
 use transcript::ConversationTranscriptSection;
 
+pub use action::ActionPresentation;
+pub use action::PlannedAction;
+pub use action::PlannedActionKind;
 pub use authorization::GuardianRootMessage;
-pub use composition::ComposedContext;
+pub use section::ContextSection;
 
 pub use entry::ConversationTranscriptEntry;
 pub use entry::ConversationTranscriptEntryKind;
 pub use history::TranscriptHistory;
-pub use retention::UserMessageCost;
-pub use retention::UserMessageSelection;
-pub use retention::select_user_messages;
 pub use transcript::ConversationTranscriptConfig;
 pub use transcript::ConversationTranscriptOptions;
 pub use transcript::MANUAL_APPROVAL_DEVELOPER_PREFIX;
@@ -35,11 +37,61 @@ pub use transcript::TranscriptRetentionConfig;
 pub use transcript::collect_transcript;
 pub use truncation::truncate_text;
 
-mod authorization;
+mod verified_answers;
+pub use verified_answers::RenderedVerifiedAnswers;
+pub use verified_answers::render_verified_answer;
+pub use verified_answers::render_verified_answers;
+
+mod retained_instructions;
+
+mod action;
+mod enforcement;
+pub(crate) use enforcement::BudgetPriority;
+pub use enforcement::Budgeted;
+pub use enforcement::HistoryTruncation;
+pub(crate) use enforcement::Retention;
+mod budget;
 mod composition;
+pub use budget::DEFAULT_MAX_INPUT_TOKENS;
+pub use budget::REQUEST_TOKENS_BOUNDARIES;
+pub use budget::REQUEST_TOKENS_METRIC;
+pub use budget::RequestBudget;
+pub use budget::SECTION_COST_BOUNDARIES;
+pub use budget::SECTION_COST_METRIC;
+pub use budget::SectionCost;
+pub use budget::effective_input_token_limit;
+pub use budget::estimate_input_tokens;
+mod profile;
+pub use composition::CollectedContext;
+pub use composition::ComposedContext;
+pub use composition::ContextPresentation;
+pub use composition::RenderedTranscript;
+pub use profile::ContextProfile;
+mod authorization;
 mod entry;
 mod history;
-mod retention;
+mod images;
+mod node_repl;
+pub use node_repl::NodeReplContext;
+pub use node_repl::NodeReplResponse;
+pub use node_repl::NodeReplReviewEvidenceMode;
+pub use node_repl::RenderedNodeReplEvidence;
+mod permissions;
+pub use images::TranscriptImageInput;
+pub use images::TranscriptImages;
+mod trusted_skills;
+mod trusted_tool;
+pub use trusted_skills::TrustedSkills;
+pub use trusted_tool::TrustedTool;
+mod reviews;
+pub use reviews::MAX_PREVIOUS_REVIEWS;
+pub use reviews::PreviousReviews;
+pub use reviews::RenderedReviewEvidence;
+pub use reviews::ReviewEvidence;
+pub use reviews::render_review_evidence;
+pub use truncation::TruncationObservation;
+mod section;
+pub use permissions::PermissionContext;
 mod transcript;
 mod truncation;
 
@@ -85,8 +137,22 @@ pub struct SectionInput<'a> {
     pub transcript: &'a ConversationTranscriptConfig,
     /// Bounded root evidence resolved by the host; empty when not applicable.
     pub root_conversation: &'a [GuardianRootMessage],
-    /// Bounded, role-labeled answers verified and matched to history by the host.
+    /// Bounded, role-labeled answers selected from the host-owned context snapshot.
     pub trusted_user_answers: &'a [String],
+    /// Exact action JSON and reason, already bounded by the requesting host.
+    pub planned_action: Option<&'a PlannedAction>,
+    /// Sync-only restrictions resolved from the parent execution environment.
+    pub permissions: Option<&'a PermissionContext>,
+    /// Size-validated, host-attested reviews selected against the action's authorization snapshot.
+    pub previous_reviews: Option<&'a PreviousReviews>,
+    /// Metadata verified by the host for the exact action being classified.
+    pub trusted_tool: Option<&'a TrustedTool>,
+    /// Current-turn and delegated skill paths verified and bounded by the host.
+    pub trusted_skill_paths: &'a [String],
+    /// Optional consumer image policy; no history images are added implicitly.
+    pub images: Option<TranscriptImageInput<'a>>,
+    /// Sync-only frozen REPL snapshot selected by the host's delivery cursor.
+    pub node_repl: Option<&'a NodeReplContext<'a>>,
 }
 
 /// Supplies repeatable, zero-copy access to a host-owned conversation snapshot.
@@ -97,6 +163,11 @@ pub struct SectionInput<'a> {
 pub trait SectionHistory: Send + Sync {
     /// Returns borrowed response items in their original conversation order.
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_>;
+
+    /// Bounded host-owned facts from the same snapshot as the current items.
+    fn retained_context(&self) -> Option<&codex_history::RetainedContext> {
+        None
+    }
 }
 
 impl SectionHistory for Vec<ResponseItem> {
@@ -136,6 +207,10 @@ pub trait SectionContributor: Send + Sync {
 pub enum SectionError {
     /// Evidence required by this contributor for the current input is missing.
     MissingRequiredEvidence { section: &'static str },
+    /// A section cannot be delivered by the requested consumer.
+    UnsupportedDelivery { section: &'static str },
+    /// Supplied evidence exceeds the section's count or rendered-size limit.
+    EvidenceLimitExceeded { section: &'static str },
 }
 
 impl std::fmt::Display for SectionError {
@@ -143,6 +218,12 @@ impl std::fmt::Display for SectionError {
         match self {
             Self::MissingRequiredEvidence { section } => {
                 write!(formatter, "missing required evidence for section {section}")
+            }
+            Self::UnsupportedDelivery { section } => {
+                write!(formatter, "unsupported delivery for section {section}")
+            }
+            Self::EvidenceLimitExceeded { section } => {
+                write!(formatter, "evidence exceeds limits for section {section}")
             }
         }
     }
@@ -164,9 +245,17 @@ pub struct SectionRegistry {
 pub fn default_registry() -> &'static SectionRegistry {
     static REGISTRY: LazyLock<SectionRegistry> = LazyLock::new(|| {
         let mut registry = SectionRegistry::default();
+        registry.register(reviews::PreviousReviewsSection);
+        registry.register(trusted_tool::TrustedToolSection);
+        registry.register(trusted_skills::TrustedSkillsSection);
         registry.register(RootConversationSection);
+        registry.register(RetainedUserInstructionsSection);
         registry.register(TrustedUserAnswersSection);
         registry.register(ConversationTranscriptSection);
+        registry.register(images::TranscriptImagesSection);
+        registry.register(node_repl::NodeReplEvidenceSection);
+        registry.register(permissions::PermissionContextSection);
+        registry.register(action::PlannedActionSection);
         registry
     });
     &REGISTRY
@@ -176,6 +265,13 @@ impl SectionRegistry {
     /// Adds a contributor to the end of the section collection order.
     pub fn register(&mut self, contributor: impl SectionContributor + 'static) {
         self.contributors.push(Arc::new(contributor));
+    }
+
+    /// Collects evidence for host transcript selection and shared composition.
+    pub fn prepare(&self, input: &SectionInput<'_>) -> Result<CollectedContext, SectionError> {
+        Ok(CollectedContext {
+            sections: self.collect(input)?,
+        })
     }
 
     /// Collects applicable sections in their original registration order.
@@ -189,25 +285,6 @@ impl SectionRegistry {
             .filter_map(|contributor| contributor.contribute(input).transpose())
             .collect()
     }
-}
-
-/// Ordered evidence with a stable section identity and source-specific content.
-///
-/// Variants preserve provenance: transcript entries carry their original roles,
-/// root messages remain line-role-labeled, and answers are host-verified fragments.
-/// All currently supported sections are delivered as user-role evidence. Source
-/// attribution never promotes their contents to developer instructions.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ContextSection {
-    ConversationTranscript {
-        items: Vec<ConversationTranscriptEntry>,
-    },
-    RootConversation {
-        items: Vec<String>,
-    },
-    TrustedUserAnswers {
-        items: Vec<String>,
-    },
 }
 
 #[cfg(test)]

@@ -358,6 +358,7 @@ async fn unsandboxed_intercepted_exec_strips_managed_network_env() -> anyhow::Re
     let workdir = test_sandbox_cwd();
     let network = test_credential_broker_network_proxy().await?;
     let executor = CoreShellCommandExecutor {
+        sandbox_manager: codex_sandboxing::SandboxManager::new(),
         command: Vec::new(),
         cwd: workdir.clone(),
         permission_profile: PermissionProfile::workspace_write(),

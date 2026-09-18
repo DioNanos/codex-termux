@@ -1,9 +1,23 @@
 //! Disconnects preserve editable input but never automatically retry queued submissions.
 
+use super::realtime::RealtimeConversationPhase;
 use super::*;
 
 impl ChatWidget {
     pub(crate) fn pause_for_disconnect(&mut self) {
+        // The app-server transport can fail while the separate WebRTC helper
+        // still sends microphone audio. Retire local media before showing offline UI.
+        if matches!(
+            self.realtime_conversation.phase,
+            RealtimeConversationPhase::Starting | RealtimeConversationPhase::Active
+        ) || self.realtime_retry_cleanup_pending()
+        {
+            self.record_realtime_failure();
+        }
+        let _ = self.reset_realtime_conversation();
+        if let Some(questions) = &mut self.bottom_pane.questions {
+            questions.delivery_enabled = false;
+        }
         self.input_queue.recovered_queue = true;
         self.input_queue.suppress_queue_autosend = true;
         self.set_initial_user_message_submit_suppressed(/*suppressed*/ true);
@@ -27,7 +41,10 @@ impl ChatWidget {
             if input.user_turn_pending_start
                 && let Some(prompt) = input.safety_buffering_prompt.take()
             {
-                input.queued_user_messages.push_front(prompt.into());
+                input.queued_user_messages.push_front(QueuedUserMessage {
+                    source: input.safety_buffering_source,
+                    ..QueuedUserMessage::from(prompt)
+                });
                 input
                     .queued_user_message_history_records
                     .push_front(UserMessageHistoryRecord::UserMessageText);
@@ -51,6 +68,9 @@ impl ChatWidget {
     }
 
     pub(crate) fn pause_unavailable_thread(&mut self) {
+        if let Some(questions) = &mut self.bottom_pane.questions {
+            questions.delivery_enabled = false;
+        }
         self.turn_lifecycle
             .restore_running(/*running*/ false, Instant::now());
         self.update_task_running_state();
@@ -61,6 +81,12 @@ impl ChatWidget {
     }
 
     pub(crate) fn handle_disconnected_key(&mut self, key: KeyEvent) {
+        if self.external_writer_view {
+            return;
+        }
+        if self.handle_question_key(key) {
+            return;
+        }
         if key.kind == KeyEventKind::Press && self.chat_keymap.edit_queued_message.is_pressed(key) {
             if let Some(composer) = self.pop_latest_queued_composer_state() {
                 self.restore_composer_state(composer);

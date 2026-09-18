@@ -20,6 +20,7 @@ use crate::context::GuardianApprovedAction;
 use crate::context::NodeReplReviewEvidence;
 use crate::review_prompts::resolve_review_request;
 use crate::session::spawn_review_thread;
+use crate::state::ReasoningEffortPin;
 use crate::tasks::CompactTask;
 use crate::tasks::UserShellCommandMode;
 use crate::tasks::UserShellCommandTask;
@@ -335,10 +336,18 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         .collect::<Vec<_>>();
     sess.apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
         .await;
+    {
+        let mut state = sess.state.lock().await;
+        // Keep the baseline while startup prewarm is retained for the first turn,
+        // including when its task has not established the pin yet.
+        if state.startup_prewarm.is_none() {
+            state.reasoning_effort_pin = ReasoningEffortPin::Unset;
+        }
+    }
     sess.services
         .thread_extension_data
         .remove::<NodeReplReviewEvidence>();
-    sess.guardian_review_session.invalidate().await;
+    sess.guardian_review_session().invalidate().await;
     sess.services
         .agent_control
         .rollout_budget()
@@ -426,7 +435,7 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
         sess.mcp_refresh.close();
         sess.services.mcp_runtime.shutdown().await;
     }
-    sess.guardian_review_session.shutdown().await;
+    sess.guardian_review_session().shutdown().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
 }
@@ -534,7 +543,11 @@ pub(super) async fn submission_loop(
     // To break out of this loop, send Op::Shutdown.
     let mut shutdown_received = false;
     while let Ok(sub) = rx_sub.recv().await {
-        debug!(?sub, "Submission");
+        if matches!(sub.op, Op::ResolveElicitation { .. }) {
+            debug!(submission_id = %sub.id, operation = sub.op.kind(), "Submission");
+        } else {
+            debug!(?sub, "Submission");
+        }
         let dispatch_span = submission_dispatch_span(&sub);
         let should_exit = async {
             match sub.op {

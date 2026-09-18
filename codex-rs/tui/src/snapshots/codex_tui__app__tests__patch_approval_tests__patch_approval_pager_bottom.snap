@@ -14,7 +14,7 @@ Buffer {
         "  1 -removed                                    ",
         "───────────────────────────────────────── 100% ─",
         " ↑/↓ to scroll   pgup/pgdn to page   home/end to",
-        " q to quit                                      ",
+        " q close                                        ",
         "                                                ",
     ],
     styles: [
@@ -34,6 +34,6 @@ Buffer {
         x: 4, y: 6, fg: Red, bg: Reset, underline: Reset, modifier: NONE,
         x: 12, y: 6, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
         x: 0, y: 7, fg: Reset, bg: Reset, underline: Reset, modifier: DIM,
-        x: 10, y: 9, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+        x: 8, y: 9, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
     ]
 }

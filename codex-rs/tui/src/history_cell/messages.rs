@@ -1,4 +1,5 @@
 //! User, assistant, reasoning, and streaming message history cells.
+//! Completed reasoning is retained in the expanded transcript, not compact scrollback.
 
 use super::markdown_render_cache::MarkdownRenderCache;
 use super::*;
@@ -15,6 +16,7 @@ pub(crate) struct UserHistoryCell {
     #[allow(dead_code)]
     pub local_image_paths: Vec<PathBuf>,
     pub remote_image_urls: Vec<String>,
+    pub(crate) spoken: bool,
 }
 
 /// Remove CSI sequences and control characters, preserving tabs and newlines.
@@ -157,8 +159,14 @@ impl HistoryCell for UserHistoryCell {
     }
 
     fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
-        let message = sanitize_user_text((&self.message).into());
-        let text_elements = if message.as_ref() == self.message {
+        let sanitized_message = sanitize_user_text((&self.message).into());
+        // Speech transcripts can begin with whitespace; the marker already supplies its separator.
+        let message = if self.spoken {
+            sanitized_message.trim_start()
+        } else {
+            sanitized_message.as_ref()
+        };
+        let text_elements = if message == self.message {
             self.text_elements.as_slice()
         } else {
             &[]
@@ -203,7 +211,7 @@ impl HistoryCell for UserHistoryCell {
             } else {
                 adaptive_wrap_lines(
                     build_user_message_lines_with_elements(
-                        message.as_ref(),
+                        message,
                         text_elements,
                         style,
                         element_style,
@@ -262,7 +270,11 @@ impl HistoryCell for UserHistoryCell {
         if let Some(wrapped_message) = wrapped_message {
             lines.extend(prefix_hyperlink_lines(
                 wrapped_message,
-                "› ".bold().dim(),
+                if self.spoken {
+                    "› ".red().bold()
+                } else {
+                    "› ".bold().dim()
+                },
                 "  ".into(),
             ));
         }
@@ -449,6 +461,7 @@ pub(crate) struct AgentMarkdownCell {
     cwd: PathBuf,
     inline_visualization_context: Option<crate::inline_visualization::InlineVisualizationContext>,
     rendered_lines: Option<MarkdownRenderCache>,
+    spoken_artifacts: bool,
 }
 
 impl AgentMarkdownCell {
@@ -481,7 +494,18 @@ impl AgentMarkdownCell {
             cwd: cwd.to_path_buf(),
             inline_visualization_context,
             rendered_lines,
+            spoken_artifacts: false,
         }
+    }
+
+    pub(crate) fn new_spoken(markdown_source: String, cwd: &Path) -> Self {
+        let mut cell = Self::new_with_inline_visualizations(
+            markdown_source,
+            cwd,
+            /*inline_visualization_context*/ None,
+        );
+        cell.spoken_artifacts = true;
+        cell
     }
 }
 
@@ -525,6 +549,13 @@ impl HistoryCell for AgentMarkdownCell {
                 Some(self.cwd.as_path()),
                 self.inline_visualization_context.as_ref(),
             );
+            let lines = if self.spoken_artifacts {
+                let mut lines = lines;
+                super::spoken_artifacts::annotate_spoken_artifacts(&mut lines, &self.cwd);
+                lines
+            } else {
+                lines
+            };
             normalize_whitespace_only_hyperlink_lines(prefix_hyperlink_lines(
                 lines,
                 "• ".dim(),
@@ -618,9 +649,18 @@ pub(crate) fn new_user_prompt(
         text_elements,
         local_image_paths,
         remote_image_urls,
+        spoken: false,
     }
 }
-/// Create the reasoning history cell emitted at the end of a reasoning block.
+
+pub(crate) fn new_spoken_user_prompt(message: String) -> UserHistoryCell {
+    let mut cell = new_user_prompt(message, Vec::new(), Vec::new(), Vec::new());
+    cell.spoken = true;
+    cell
+}
+
+/// Retain a completed reasoning block in the expanded transcript only.
+/// Activity headings belong to the live status row and must not accumulate in scrollback.
 ///
 /// The helper snapshots `cwd` into the returned cell so local file links render the same way they
 /// did while the turn was live, even if rendering happens after other app state has advanced. Part
@@ -631,16 +671,8 @@ pub(crate) fn new_reasoning_summary_block(
     cwd: &Path,
 ) -> Box<dyn HistoryCell> {
     let (header, content) = split_reasoning_summary_parts(&reasoning_parts);
-    let title_only = content
-        .strip_prefix("**")
-        .and_then(|content| content.strip_suffix("**"))
-        .is_some_and(|content| !content.is_empty() && !content.contains("**"));
-    let transcript_only = header.is_empty() && !title_only;
     Box::new(ReasoningSummaryCell::new(
-        header,
-        content,
-        cwd,
-        transcript_only,
+        header, content, cwd, /*transcript_only*/ true,
     ))
 }
 

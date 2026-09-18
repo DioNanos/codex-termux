@@ -21,9 +21,44 @@ struct ConsumeRateLimitResetCreditRequest<'a> {
 
 impl Client {
     pub async fn get_rate_limits_with_reset_credits(&self) -> Result<RateLimitsWithResetCredits> {
-        let payload = self.get_rate_limit_status().await?;
+        self.get_rate_limits_for_usage(/*supports_luna_reserve*/ false)
+            .await
+    }
+
+    /// Opt in only for clients that can apply Reserve, not for passive account usage readers.
+    pub async fn get_rate_limits_with_luna_reserve(&self) -> Result<RateLimitsWithResetCredits> {
+        self.get_rate_limits_for_usage(/*supports_luna_reserve*/ true)
+            .await
+    }
+
+    async fn get_rate_limits_for_usage(
+        &self,
+        supports_luna_reserve: bool,
+    ) -> Result<RateLimitsWithResetCredits> {
+        let payload = self.get_rate_limit_status(supports_luna_reserve).await?;
+        let ordinary_usage_allowed = payload
+            .rate_limits
+            .rate_limit
+            .as_ref()
+            .and_then(|limit| limit.as_deref())
+            .map(|limit| limit.allowed);
+        let mut rate_limits = Self::rate_limit_snapshots_from_payload(payload.rate_limits);
+        let plan_type = rate_limits.first().and_then(|snapshot| snapshot.plan_type);
+        rate_limits.extend(
+            payload
+                .additional_rate_limits
+                .into_iter()
+                .flatten()
+                .map(|limit| {
+                    let mut snapshot =
+                        Self::make_additional_rate_limit_snapshot(limit.details, plan_type);
+                    snapshot.normal_model_slug = limit.normal_model_slug;
+                    snapshot
+                }),
+        );
         Ok(RateLimitsWithResetCredits {
-            rate_limits: Self::rate_limit_snapshots_from_payload(payload.rate_limits),
+            rate_limits,
+            ordinary_usage_allowed,
             rate_limit_reset_credits: payload.rate_limit_reset_credits,
             account_id: payload.account_id,
             user_id: payload.user_id,
@@ -31,9 +66,15 @@ impl Client {
         })
     }
 
-    pub(super) async fn get_rate_limit_status(&self) -> Result<RateLimitStatusWithResetCredits> {
+    async fn get_rate_limit_status(
+        &self,
+        supports_luna_reserve: bool,
+    ) -> Result<RateLimitStatusWithResetCredits> {
         let url = self.rate_limit_status_url();
-        let req = self.request(Method::GET, &url).headers(self.headers());
+        let mut req = self.request(Method::GET, &url).headers(self.headers());
+        if supports_luna_reserve {
+            req = req.header("x-openai-codex-luna-reserve", HeaderValue::from_static("1"));
+        }
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         self.decode_json(&url, &ct, &body)
     }

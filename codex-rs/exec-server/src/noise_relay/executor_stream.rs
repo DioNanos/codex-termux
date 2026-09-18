@@ -23,6 +23,7 @@ use crate::noise_relay::take_next_sequence;
 use crate::relay::encode_relay_message_frame;
 use crate::relay_proto::RelayData;
 use crate::relay_proto::RelayMessageFrame;
+use crate::telemetry::ExecutorRegistration;
 
 /// Identifies one completed virtual-stream instance.
 ///
@@ -91,6 +92,7 @@ pub(crate) fn spawn_noise_virtual_stream<H: NoiseStreamHandler>(
     physical_outgoing_tx: mpsc::Sender<Vec<u8>>,
     closed_stream_tx: mpsc::Sender<ClosedNoiseVirtualStream>,
     transport: NoiseTransport,
+    executor_registration: Option<Arc<ExecutorRegistration>>,
 ) -> NoiseVirtualStream<H> {
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (incoming_tx, incoming_rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -162,6 +164,7 @@ pub(crate) fn spawn_noise_virtual_stream<H: NoiseStreamHandler>(
         incoming_rx,
         disconnected_rx,
         writer_task,
+        executor_registration,
     };
     tokio::spawn(async move {
         handler.run_connection(connection).await;

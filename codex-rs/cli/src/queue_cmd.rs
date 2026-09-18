@@ -23,7 +23,7 @@ pub(crate) struct QueueCommand {
     remote: InteractiveRemoteOptions,
 
     #[clap(flatten)]
-    config_overrides: SessionArchiveConfigOverrides,
+    pub(crate) config_overrides: SessionArchiveConfigOverrides,
 }
 
 pub(crate) async fn run_queue_command(

@@ -78,9 +78,9 @@ impl App {
     pub(super) fn handle_pet_selected(&mut self, tui: &mut tui::Tui, pet_id: String) {
         let request_id = self.chat_widget.show_pet_selection_loading_popup();
         tui.frame_requester().schedule_frame();
-        let codex_home = self.config.codex_home.clone();
+        let codex_home = self.local_settings.codex_home.clone();
         let frame_requester = tui.frame_requester();
-        let animations_enabled = self.config.animations;
+        let animations_enabled = self.local_settings.tui.animations;
         let tx = self.app_event_tx.clone();
         let pet_http_client = self.chat_widget.pet_http_client.clone();
         std::mem::drop(tokio::spawn(async move {
@@ -104,7 +104,7 @@ impl App {
 
     pub(super) async fn handle_pet_disabled(&mut self, tui: &mut tui::Tui) {
         let edit = crate::legacy_core::config::edit::tui_pet_edit(crate::pets::DISABLED_PET_ID);
-        let apply_result = ConfigEditsBuilder::new(&self.config.codex_home)
+        let apply_result = ConfigEditsBuilder::new(&self.local_settings.codex_home)
             .with_edits([edit])
             .apply()
             .await;
@@ -147,13 +147,13 @@ impl App {
         match result {
             Ok(ambient_pet) => {
                 let edit = crate::legacy_core::config::edit::tui_pet_edit(&pet_id);
-                match ConfigEditsBuilder::new(&self.config.codex_home)
+                match ConfigEditsBuilder::new(&self.local_settings.codex_home)
                     .with_edits([edit])
                     .apply()
                     .await
                 {
                     Ok(()) => {
-                        self.config.tui_pet = Some(pet_id.clone());
+                        self.local_settings.tui.pet = Some(pet_id.clone());
                         self.chat_widget
                             .set_tui_pet_loaded(Some(pet_id), ambient_pet);
                     }
@@ -178,7 +178,7 @@ impl App {
         pet_id: String,
         result: Result<Option<crate::pets::AmbientPet>, String>,
     ) {
-        if self.config.tui_pet.as_deref() != Some(pet_id.as_str()) {
+        if self.local_settings.tui.pet.as_deref() != Some(pet_id.as_str()) {
             return;
         }
 

@@ -120,6 +120,195 @@ async fn persistent_async_message_guidance_follows_tool_availability(
     Ok(())
 }
 
+#[test_case(SessionSource::Exec, None, false; "root_without_opt_in")]
+#[test_case(SessionSource::Exec, Some("send_user_message_async"), false; "root_with_legacy_question_tool")]
+#[test_case(SessionSource::Exec, Some("request_user_input_async"), false; "root_with_question_tool")]
+#[test_case(SessionSource::Exec, Some("send_message_to_user_async"), true; "root_with_freeform_tool")]
+#[test_case(SessionSource::SubAgent(SubAgentSource::Other("test".to_string())), Some("send_message_to_user_async"), false; "subagent_with_freeform_tool")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn freeform_async_message_requires_root_and_exact_catalog_opt_in(
+    session_source: SessionSource,
+    catalog_tool: Option<&'static str>,
+    expected: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_model_info_override("gpt-5.2", move |model| {
+            model.tool_mode = Some(ToolMode::CodeModeOnly);
+            model.experimental_supported_tools =
+                catalog_tool.map(str::to_string).into_iter().collect();
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let thread = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            session_source: Some(session_source),
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?
+        .thread;
+    thread
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Report progress.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let body = responses.single_request().body_json();
+    let tools = body["tools"].as_array().expect("request tools");
+    assert_eq!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "send_message_to_user_async"),
+        expected,
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn freeform_async_message_emits_an_item_without_ending_the_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const CALL_ID: &str = "freeform-message";
+    const MESSAGE: &str = "I found a blocker that changes the plan.";
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call_with_namespace(
+                    CALL_ID,
+                    "functions",
+                    "send_message_to_user_async",
+                    &json!({ "message": format!("  {MESSAGE}  ") }).to_string(),
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_function_call_with_namespace(
+                    "blank-message",
+                    "functions",
+                    "send_message_to_user_async",
+                    &json!({ "message": "  " }).to_string(),
+                ),
+                ev_completed("resp-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_assistant_message("final-message", "Finished."),
+                ev_completed("resp-3"),
+            ]),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_model_info_override("gpt-5.2", |model| {
+            model.tool_mode = Some(ToolMode::CodeModeOnly);
+            model.experimental_supported_tools.extend([
+                "send_message_to_user_async".to_string(),
+                "request_user_input_async".to_string(),
+            ]);
+            model
+                .model_messages
+                .as_mut()
+                .expect("model instruction metadata")
+                .tools = Some(ToolMessages {
+                send_user_message_async: Some(ToolMessage {
+                    description: Some("Questions only.".to_string()),
+                }),
+            });
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Keep me updated.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let started = wait_for_event_match(test.codex.as_ref(), |event| match event {
+        EventMsg::ItemStarted(event) if event.item.id() == CALL_ID => Some(event.item.clone()),
+        _ => None,
+    })
+    .await;
+    let completed = wait_for_event_match(test.codex.as_ref(), |event| match event {
+        EventMsg::ItemCompleted(event) if event.item.id() == CALL_ID => Some(event.item.clone()),
+        _ => None,
+    })
+    .await;
+    let expected = serde_json::to_value(TurnItem::AgentMessage(AgentMessageItem {
+        id: CALL_ID.to_string(),
+        content: vec![AgentMessageContent::Text {
+            text: MESSAGE.to_string(),
+        }],
+        phase: Some(MessagePhase::FinalAnswer),
+        memory_citation: None,
+        delivery: Some(AgentMessageDelivery::Async),
+        questions: None,
+    }))?;
+    assert_eq!(serde_json::to_value(started)?, expected);
+    assert_eq!(serde_json::to_value(completed)?, expected);
+    wait_for_event(test.codex.as_ref(), |event| {
+        let item = match event {
+            EventMsg::ItemStarted(event) => Some(&event.item),
+            EventMsg::ItemCompleted(event) => Some(&event.item),
+            _ => None,
+        };
+        assert!(!matches!(item, Some(TurnItem::AgentMessage(message)) if message.delivery == Some(AgentMessageDelivery::Async)));
+        matches!(event, EventMsg::TurnComplete(_))
+    }).await;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 3);
+    let body = requests[0].body_json();
+    let tools = body["tools"].as_array().expect("request tools");
+    let freeform_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "send_message_to_user_async")
+        .expect("freeform tool is directly available");
+    assert_eq!(freeform_tool["parameters"]["required"], json!(["message"]));
+    assert!(
+        freeform_tool["description"]
+            .as_str()
+            .expect("description")
+            .contains("report a critical blocker")
+    );
+    let question_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "request_user_input_async")
+        .expect("question tool is still directly available");
+    assert_eq!(question_tool["description"], "Questions only.");
+    assert_eq!(
+        requests[1].function_call_output_text(CALL_ID),
+        Some(r#"{"accepted":true}"#.to_string())
+    );
+    assert_eq!(
+        requests[2].function_call_output_text("blank-message"),
+        Some("message must not be empty".to_string())
+    );
+    assert!(
+        !requests[1]
+            .input()
+            .into_iter()
+            .any(|item| item["type"] == "message"
+                && item["role"] == "assistant"
+                && item.to_string().contains(MESSAGE))
+    );
+    Ok(())
+}
+
 #[test_case(None, "send_user_message_async"; "fallback_description")]
 #[test_case(None, "request_user_input_async"; "current_catalog_name")]
 #[test_case(Some(ToolMessages { send_user_message_async: None }), "send_user_message_async"; "missing_tool")]

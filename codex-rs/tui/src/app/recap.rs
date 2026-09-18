@@ -179,7 +179,7 @@ pub(super) struct RecapRequest {
 impl App {
     fn recap_trigger_enabled(&self, trigger: RecapTrigger) -> bool {
         match trigger {
-            RecapTrigger::Automatic => self.config.tui_auto_recap,
+            RecapTrigger::Automatic => self.local_settings.tui.auto_recap,
             RecapTrigger::Manual => true,
         }
     }
@@ -189,7 +189,7 @@ impl App {
             task.abort();
         }
 
-        if !self.config.tui_auto_recap {
+        if !self.local_settings.tui.auto_recap {
             return;
         }
         let Some(deadline) = self.recap.next_check_deadline() else {

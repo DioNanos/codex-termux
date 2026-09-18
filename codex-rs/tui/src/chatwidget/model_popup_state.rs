@@ -36,16 +36,22 @@ impl ChatWidget {
         {
             return false;
         }
-        self.model_catalog = Arc::new(ModelCatalog::new(presets.clone()));
+        Arc::make_mut(&mut self.model_catalog).models = presets;
         self.refresh_effective_service_tier();
         self.refresh_model_dependent_surfaces();
+        true
+    }
+
+    /// Keep a present model picker aligned with the active task, including Reserve entry/exit.
+    pub(super) fn refresh_open_model_picker(&mut self) {
         // Refresh an existing parent without reopening it or interrupting its reasoning child.
         match self.model_popup_view_id() {
-            Some(MODEL_SELECTION_VIEW_ID) => self.open_model_popup_with_presets(presets),
+            Some(MODEL_SELECTION_VIEW_ID) => self.open_model_popup_with_presets(
+                self.model_catalog.try_list_models().unwrap_or_default(),
+            ),
             Some(ALL_MODELS_SELECTION_VIEW_ID) => self.open_all_models_popup(),
             _ => {}
         }
-        true
     }
 
     pub(super) fn show_model_selection_view(&mut self, mut params: SelectionViewParams) {

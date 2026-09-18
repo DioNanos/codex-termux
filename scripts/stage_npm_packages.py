@@ -181,7 +181,7 @@ def resolve_workflow_url(version: str, override: str | None) -> tuple[str, str |
 
 
 def install_native_components(
-    workflow_url: str,
+    workflow_url: str | None,
     components: set[str],
     vendor_root: Path,
     artifacts_dir: Path,
@@ -192,16 +192,24 @@ def install_native_components(
     vendor_dir = vendor_root / "vendor"
     vendor_dir.mkdir(parents=True, exist_ok=True)
 
-    workflow_id = workflow_url.rstrip("/").split("/")[-1]
-    print(f"Downloading native artifacts from workflow {workflow_id}...", flush=True)
-    with _gha_group(f"Download native artifacts from workflow {workflow_id}"):
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        install_from_workflow_artifacts(
-            workflow_id,
-            artifacts_dir,
-            sorted(components),
-            vendor_dir,
+    if workflow_url is None:
+        with _gha_group("Install downloaded native artifacts"):
+            install_from_downloaded_artifacts(
+                artifacts_dir, sorted(components), vendor_dir
+            )
+    else:
+        workflow_id = workflow_url.rstrip("/").split("/")[-1]
+        print(
+            f"Downloading native artifacts from workflow {workflow_id}...", flush=True
         )
+        with _gha_group(f"Download native artifacts from workflow {workflow_id}"):
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            install_from_workflow_artifacts(
+                workflow_id,
+                artifacts_dir,
+                sorted(components),
+                vendor_dir,
+            )
     print(f"Installed native dependencies into {vendor_dir}", flush=True)
 
 
@@ -213,6 +221,14 @@ def install_from_workflow_artifacts(
 ) -> None:
     artifacts = select_target_artifacts(workflow_id, components)
     download_artifacts(workflow_id, artifacts_dir, artifacts)
+    install_from_downloaded_artifacts(artifacts_dir, components, vendor_dir)
+
+
+def install_from_downloaded_artifacts(
+    artifacts_dir: Path,
+    components: Sequence[str],
+    vendor_dir: Path,
+) -> None:
     if CODEX_PACKAGE_COMPONENT in components:
         install_codex_package_archives(artifacts_dir, vendor_dir, BINARY_TARGETS)
     install_binary_components(
@@ -507,10 +523,6 @@ def main() -> int:
 
     try:
         if native_component_sets:
-            workflow_url, resolved_head_sha = resolve_workflow_url(
-                args.release_version, args.workflow_url
-            )
-            print(f"Using native artifacts from {workflow_url}", flush=True)
             if args.artifacts_dir is not None:
                 artifacts_temp_root = args.artifacts_dir.resolve()
                 artifacts_temp_root.mkdir(parents=True, exist_ok=True)
@@ -519,6 +531,22 @@ def main() -> int:
                     tempfile.mkdtemp(prefix="npm-native-artifacts-", dir=runner_temp)
                 )
                 remove_artifacts_temp_root = True
+
+            target_artifact_dirs = [
+                artifact_dir_for_target(artifacts_temp_root, target)
+                for target in BINARY_TARGETS
+            ]
+            if args.artifacts_dir is not None and all(
+                artifact_dir.is_dir() and any(artifact_dir.iterdir())
+                for artifact_dir in target_artifact_dirs
+            ):
+                workflow_url = None
+            else:
+                workflow_url, resolved_head_sha = resolve_workflow_url(
+                    args.release_version, args.workflow_url
+                )
+                print(f"Using native artifacts from {workflow_url}", flush=True)
+
             print(f"Using artifact cache at {artifacts_temp_root}", flush=True)
             for components in native_component_sets:
                 vendor_temp_root = Path(

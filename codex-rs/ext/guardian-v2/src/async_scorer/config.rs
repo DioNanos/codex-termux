@@ -5,6 +5,7 @@ use codex_features::GuardianV2TranscriptConfigToml;
 use codex_protocol::openai_models::GuardianV2ModelConfig;
 use codex_protocol::openai_models::ReasoningEffort;
 
+use super::coverage::GuardianPolicy;
 use super::transcript::MAX_MESSAGE_ENTRY_TOKENS;
 use super::transcript::MAX_MESSAGE_TRANSCRIPT_TOKENS;
 use super::transcript::MAX_RECENT_NON_USER_ENTRIES;
@@ -24,12 +25,6 @@ const DEFAULT_MAX_TOOL_CALL_LAG: usize = 2;
 pub(crate) const DEFAULT_CLASSIFIER_INSTRUCTIONS: &str = include_str!("classifier_instructions.md");
 pub(crate) const CLASSIFICATION_OUTPUT_INSTRUCTIONS: &str = "Your first output token is the entire classification: `high` for high risk or `low` for low risk. Output that token immediately and nothing else.";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GuardianV2ReviewScope {
-    Standard { sandboxed_exec_commands: bool },
-    ComputerUseOnly,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct GuardianV2Config {
     local_overrides: GuardianV2ConfigToml,
@@ -43,7 +38,9 @@ pub(crate) struct GuardianV2Config {
     pub(crate) max_classifier_instruction_tokens: Option<usize>,
     pub(crate) reuse_parent_compaction: bool,
     pub(crate) max_parent_compaction_tokens: usize,
-    pub(crate) review_scope: GuardianV2ReviewScope,
+    pub(super) policy: GuardianPolicy,
+    force_synchronous_review: bool,
+    scoring_disabled: bool,
     pub(crate) transcript: TranscriptConfig,
 }
 
@@ -67,7 +64,28 @@ impl GuardianV2Config {
             None => GuardianV2ConfigToml::default(),
         };
 
-        Self::from_overrides(configured)
+        let mut resolved = Self::from_overrides(configured)?;
+        resolved.force_synchronous_review = config
+            .config_layer_stack
+            .requirements()
+            .approvals_reviewer
+            .can_set(&codex_protocol::config_types::ApprovalsReviewer::User)
+            .is_err();
+        resolved.scoring_disabled = !config.features.enabled(codex_features::Feature::GuardianV2);
+        Ok(resolved)
+    }
+
+    pub(super) fn policy_for_model(
+        &self,
+        model: Option<&codex_protocol::openai_models::ModelInfo>,
+    ) -> GuardianPolicy {
+        let mut policy = self.policy.for_model(model);
+        if self.force_synchronous_review
+            || self.scoring_disabled && model.is_none_or(|model| model.guardian.is_none())
+        {
+            policy.disable_scoring();
+        }
+        policy
     }
 
     pub(crate) fn with_model_defaults(
@@ -147,6 +165,9 @@ impl GuardianV2Config {
 
         let mut resolved = Self::from_overrides(configured)?;
         resolved.local_overrides = self.local_overrides.clone();
+        resolved.policy = self.policy.clone();
+        resolved.force_synchronous_review = self.force_synchronous_review;
+        resolved.scoring_disabled = self.scoring_disabled;
         Ok(resolved)
     }
 
@@ -228,6 +249,7 @@ impl GuardianV2Config {
             );
         }
 
+        let policy = GuardianPolicy::from_legacy(configured.review_scope.as_ref());
         Ok(Self {
             local_overrides: configured.clone(),
             persist_scores: configured.persist_scores.unwrap_or(false),
@@ -243,22 +265,9 @@ impl GuardianV2Config {
             max_classifier_instruction_tokens,
             reuse_parent_compaction: configured.reuse_parent_compaction.unwrap_or(true),
             max_parent_compaction_tokens,
-            review_scope: if configured
-                .review_scope
-                .as_ref()
-                .and_then(|review_scope| review_scope.computer_use_only)
-                .unwrap_or(true)
-            {
-                GuardianV2ReviewScope::ComputerUseOnly
-            } else {
-                GuardianV2ReviewScope::Standard {
-                    sandboxed_exec_commands: configured
-                        .review_scope
-                        .as_ref()
-                        .and_then(|review_scope| review_scope.sandboxed_exec_commands)
-                        .unwrap_or(false),
-                }
-            },
+            policy,
+            force_synchronous_review: false,
+            scoring_disabled: false,
             transcript: TranscriptConfig {
                 sources: transcript_config
                     .and_then(|transcript| transcript.sources.clone())

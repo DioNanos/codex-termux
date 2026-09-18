@@ -14,8 +14,9 @@ use tracing::warn;
 
 use crate::elicitation_client_service::ElicitationClientService;
 use crate::http_client_adapter::StreamableHttpClientAdapterError;
-use crate::oauth::OAuthPersistor;
+use crate::oauth::OAuthRuntime;
 
+use super::InitializeContext;
 use super::PendingTransport;
 use super::RmcpClient;
 
@@ -26,12 +27,12 @@ impl RmcpClient {
     pub(super) async fn connect_pending_transport_with_initialize_retries(
         &self,
         initial_transport: PendingTransport,
-        client_service: ElicitationClientService,
-        timeout: Option<Duration>,
+        initialize_context: &InitializeContext,
     ) -> Result<(
         Arc<RunningService<RoleClient, ElicitationClientService>>,
-        Option<OAuthPersistor>,
+        Option<OAuthRuntime>,
     )> {
+        let timeout = initialize_context.timeout;
         let should_retry = match &initial_transport {
             PendingTransport::InProcess { .. } | PendingTransport::Stdio { .. } => false,
             PendingTransport::StreamableHttp { .. }
@@ -63,14 +64,11 @@ impl RmcpClient {
                     }
                 }
             };
-            if let PendingTransport::StreamableHttpWithOAuth {
-                oauth_persistor, ..
-            } = &transport
-            {
+            if let PendingTransport::StreamableHttpWithOAuth { oauth_runtime, .. } = &transport {
                 // OAuth refresh has its own lock and provider request bounds. Exclude it from the
                 // MCP handshake budget, and finish persistence before attempting initialize.
                 let refresh_started_at = Instant::now();
-                oauth_persistor.refresh_if_needed().await?;
+                oauth_runtime.refresh_if_needed().await?;
                 if let Some(deadline) = retry_deadline.as_mut() {
                     *deadline += refresh_started_at.elapsed();
                 }
@@ -78,7 +76,7 @@ impl RmcpClient {
             let attempt_timeout = remaining_initialize_timeout(timeout, retry_deadline)?;
 
             match self
-                .connect_pending_transport(transport, client_service.clone(), attempt_timeout)
+                .connect_pending_transport(transport, initialize_context, attempt_timeout)
                 .await
             {
                 Ok(result) => return Ok(result),

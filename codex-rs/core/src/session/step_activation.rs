@@ -107,11 +107,17 @@ fn check_legacy_model_safety(
     // TurnMetadataState pins both node REPL flags. Guardian prompt/evidence
     // construction also reads node_repl_auto_review_required from the turn.
     if retained_models.iter().any(|model| {
-        model.node_repl_auto_review_required != destination.node_repl_auto_review_required
+        model.computer_use_review_required() != destination.computer_use_review_required()
     }) {
         return Err(
             "the destination changes the admitted node REPL review requirement".to_string(),
         );
+    }
+    if retained_models
+        .iter()
+        .any(|model| model.guardian != destination.guardian)
+    {
+        return Err("the destination changes the admitted Guardian coverage".to_string());
     }
     if retained_models
         .iter()
@@ -130,7 +136,7 @@ fn check_legacy_model_safety(
         return Err("the destination changes the explicit Guardian reviewer model".to_string());
     }
 
-    if admitted_config.features.enabled(Feature::GuardianV2)
+    if (admitted_config.features.enabled(Feature::GuardianV2) || destination.guardian.is_some())
         && admitted_config.features.enabled(Feature::GuardianApproval)
     {
         // GuardianV2Extension::on_tool_start reads the parent ModelInfo from

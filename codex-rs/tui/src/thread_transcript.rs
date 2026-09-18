@@ -48,6 +48,7 @@ pub(crate) async fn load_session_transcript(
             /*turn_cursor*/ None,
             /*item_cursor*/ None,
             /*config*/ None,
+            /*local_settings*/ None,
             HistoryHydrationScope::Complete,
         )
         .await
@@ -119,6 +120,7 @@ pub(crate) fn thread_items_to_transcript_cells(
                         .collect(),
                 };
                 cells.push(Arc::new(UserHistoryCell {
+                    spoken: false,
                     message: item.message(),
                     text_elements: item.text_elements(),
                     local_image_paths: item.local_image_paths(),

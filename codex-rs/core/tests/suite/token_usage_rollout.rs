@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_protocol::SessionId;
 use codex_protocol::protocol::TokenUsageRecord;
 use core_test_support::responses::ev_assistant_message;
@@ -21,7 +20,7 @@ fn token_usage_records(path: &std::path::Path) -> Vec<TokenUsageRecord> {
     std::fs::read_to_string(path)
         .expect("read rollout")
         .lines()
-        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
         .filter_map(|line| match line.item {
             RolloutItem::TokenUsageRecord(record) => Some(record),
             _ => None,

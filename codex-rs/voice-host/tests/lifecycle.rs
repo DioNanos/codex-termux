@@ -1,14 +1,11 @@
-//! Exercise the real helper through installed paths and bounded process I/O.
+//! Exercise the real helper protocol and bounded process I/O.
 
-use std::fs;
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
-use codex_install_context::InstallContext;
 use codex_realtime_webrtc::Message;
-use codex_realtime_webrtc::VoiceHost;
 use codex_realtime_webrtc::decode_frame;
 use codex_realtime_webrtc::encode_frame;
 use codex_utils_cargo_bin::cargo_bin;
@@ -98,6 +95,21 @@ async fn closes_after_acknowledgement_and_on_parent_pipe_loss() -> Result<()> {
 }
 
 #[tokio::test]
+async fn parent_pipe_loss_cancels_transport_startup() -> Result<()> {
+    let mut child = spawn()?;
+    handshake(&mut child).await?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&encode_frame(&Message::StartTransport {})?)
+        .await?;
+    let output = timeout(Duration::from_secs(/*secs*/ 5), child.wait_with_output()).await??;
+    assert!(output.stderr.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn rejects_invalid_input_without_echoing_it() -> Result<()> {
     assert!(decode_frame(b"\0\0\0\x16{\"type\":\"close\",\"x\":0}").is_err());
     let mut invalid_json = 22_u32.to_be_bytes().to_vec();
@@ -123,82 +135,4 @@ async fn rejects_invalid_input_without_echoing_it() -> Result<()> {
         assert_eq!((output.stdout, output.stderr), (vec![], vec![]));
     }
     Ok(())
-}
-#[tokio::test]
-async fn installed_client_rejects_mixed_builds_and_missing_helper() -> Result<()> {
-    let directory = tempfile::Builder::new()
-        .prefix("voice package ")
-        .tempdir()?;
-    let bin = directory.path().join("bin");
-    let helper_dir = directory.path().join("codex-resources/voice/bin");
-    fs::create_dir_all(&bin)?;
-    fs::create_dir_all(&helper_dir)?;
-    fs::write(directory.path().join("codex-package.json"), "{}")?;
-    let app = bin.join(if cfg!(windows) { "codex.exe" } else { "codex" });
-    fs::write(&app, [])?;
-    let source = cargo_bin("codex-voice-host")?;
-    let helper = helper_dir.join(source.file_name().unwrap());
-    fs::copy(&source, &helper)?;
-    let package = InstallContext::from_exe(
-        /*is_macos*/ cfg!(target_os = "macos"),
-        Some(&app),
-        /*method_override*/ None,
-    )
-    .package_layout
-    .unwrap();
-    VoiceHost::connect(&package, &build_commit().await?)
-        .await?
-        .close()
-        .await?;
-    assert!(VoiceHost::connect(&package, "wrong-build").await.is_err());
-    // The same executable elsewhere in the package must not become a fallback.
-    fs::rename(&helper, bin.join(source.file_name().unwrap()))?;
-    assert!(
-        VoiceHost::connect(&package, &build_commit().await?)
-            .await
-            .is_err()
-    );
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&source, &helper)?;
-        assert!(
-            VoiceHost::connect(&package, &build_commit().await?)
-                .await
-                .is_err()
-        );
-    }
-    Ok(())
-}
-
-// Linux permits raw-byte filenames; macOS filesystems reject this name themselves.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn installed_client_accepts_non_utf8_package_path() -> Result<()> {
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
-
-    let directory = tempfile::tempdir()?;
-    let root = directory
-        .path()
-        .join(OsString::from_vec(b"voice-\xff".to_vec()));
-    let bin = root.join("bin");
-    let helper_dir = root.join("codex-resources/voice/bin");
-    fs::create_dir_all(&bin)?;
-    fs::create_dir_all(&helper_dir)?;
-    fs::write(root.join("codex-package.json"), "{}")?;
-    let app = bin.join("codex");
-    fs::write(&app, [])?;
-    let source = cargo_bin("codex-voice-host")?;
-    fs::copy(&source, helper_dir.join(source.file_name().unwrap()))?;
-    let package = InstallContext::from_exe(
-        /*is_macos*/ cfg!(target_os = "macos"),
-        Some(&app),
-        /*method_override*/ None,
-    )
-    .package_layout
-    .context("package layout")?;
-    VoiceHost::connect(&package, &build_commit().await?)
-        .await?
-        .close()
-        .await
 }

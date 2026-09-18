@@ -263,6 +263,7 @@ fn grouped_usage(
 }
 
 fn format_model_display_name(model: &str) -> String {
+    let model = crate::model_catalog::model_display_name(model);
     let Some((prefix, remainder)) = model.split_once('-') else {
         return model.to_string();
     };

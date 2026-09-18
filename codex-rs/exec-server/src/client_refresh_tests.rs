@@ -561,6 +561,7 @@ async fn retirement_rejects_pending_process_start_before_stream_cleanup() -> Res
         let process_id = ProcessId::from("retired-process");
         let call = rpc.client.start_process(
             crate::protocol::ExecParams {
+                metadata: Default::default(),
                 process_id: process_id.clone(),
                 argv: vec!["unused".to_owned()],
                 cwd: "file:///".parse()?,

@@ -2,6 +2,7 @@
 //!
 //! Startup loads a shared bundle from cache or backend, and background refresh
 //! updates both the on-disk cache and the bundle observed by future config loads.
+//! One-shot network loads can disable disk-cache reads and writes.
 
 use crate::backend::BundleClient;
 use crate::backend::BundleRequestError;
@@ -78,6 +79,7 @@ pub(crate) struct CloudConfigBundleService<C> {
     auth_manager: Arc<AuthManager>,
     client: Arc<C>,
     cache: CloudConfigBundleCache,
+    cache_enabled: bool,
     codex_home: AbsolutePathBuf,
     timeout: Duration,
     latest_bundle: OnceCell<Mutex<Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError>>>,
@@ -98,10 +100,16 @@ where
             auth_manager,
             client,
             cache: CloudConfigBundleCache::new(codex_home.clone()),
+            cache_enabled: true,
             codex_home,
             timeout,
             latest_bundle: OnceCell::new(),
         }
+    }
+
+    pub(crate) fn without_cache(mut self) -> Self {
+        self.cache_enabled = false;
+        self
     }
 
     pub(crate) async fn get_latest(
@@ -182,15 +190,17 @@ where
             return Ok(None);
         }
 
-        // Startup prefers a valid, identity-matched cache entry. The backend is
-        // only consulted on cache miss or invalid cache contents.
-        let (chatgpt_user_id, account_id) = auth_identity(&auth);
-        match self
-            .load_valid_cached_bundle(chatgpt_user_id.as_deref(), account_id.as_deref())
-            .await
-        {
-            CachedBundleLookup::Hit(bundle) => return Ok(bundle),
-            CachedBundleLookup::Miss => {}
+        if self.cache_enabled {
+            // Startup prefers a valid, identity-matched cache entry. The backend is
+            // only consulted on cache miss or invalid cache contents.
+            let (chatgpt_user_id, account_id) = auth_identity(&auth);
+            match self
+                .load_valid_cached_bundle(chatgpt_user_id.as_deref(), account_id.as_deref())
+                .await
+            {
+                CachedBundleLookup::Hit(bundle) => return Ok(bundle),
+                CachedBundleLookup::Miss => {}
+            }
         }
 
         self.fetch_remote_bundle_and_update_cache_with_retries(auth, "startup")
@@ -322,10 +332,11 @@ where
         }
 
         let (chatgpt_user_id, account_id) = auth_identity(auth);
-        if let Err(err) = self
-            .cache
-            .save(chatgpt_user_id, account_id, bundle.clone())
-            .await
+        if self.cache_enabled
+            && let Err(err) = self
+                .cache
+                .save(chatgpt_user_id, account_id, bundle.clone())
+                .await
         {
             tracing::warn!(
                 error = %err,

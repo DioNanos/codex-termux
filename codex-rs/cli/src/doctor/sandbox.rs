@@ -4,11 +4,14 @@ use std::fs;
 use std::io;
 
 use codex_arg0::Arg0DispatchPaths;
+use codex_config::RequirementSource;
 use codex_core::config::Config;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 #[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
 #[cfg(target_os = "windows")]
 use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 #[cfg(target_os = "windows")]
@@ -49,6 +52,45 @@ pub(super) fn sandbox_check(config: &Config, arg0_paths: &Arg0DispatchPaths) -> 
     ));
     let file_system_sandbox = config.permissions.file_system_sandbox_policy();
     details.push(format!("filesystem sandbox: {}", file_system_sandbox.kind));
+    let denied_entries = file_system_sandbox
+        .entries
+        .iter()
+        .filter(|entry| entry.access == FileSystemAccessMode::Deny);
+    details.push(format!(
+        "denied-read rules: {}",
+        denied_entries.clone().count()
+    ));
+    details.push(format!(
+        "denied-read glob rules: {}",
+        denied_entries
+            .filter(|entry| matches!(entry.path, FileSystemPath::GlobPattern { .. }))
+            .count()
+    ));
+    details.push(format!(
+        "glob scan max depth: {}",
+        file_system_sandbox
+            .glob_scan_max_depth
+            .map_or_else(|| "unbounded".to_string(), |depth| depth.to_string())
+    ));
+    details.push(format!(
+        "managed filesystem source: {}",
+        match config
+            .config_layer_stack
+            .requirements()
+            .filesystem
+            .as_ref()
+            .map(|value| &value.source)
+        {
+            None => "none",
+            Some(RequirementSource::Unknown) => "unknown",
+            Some(RequirementSource::EnterpriseManaged { .. }) => "cloud",
+            Some(RequirementSource::Composite { .. }) => "multiple layers",
+            Some(RequirementSource::MdmManagedPreferences { .. }) => "MDM",
+            Some(RequirementSource::SystemRequirementsToml { .. }) => "system",
+            Some(RequirementSource::LegacyManagedConfigTomlFromFile { .. }) => "legacy file",
+            Some(RequirementSource::LegacyManagedConfigTomlFromMdm) => "legacy MDM",
+        }
+    ));
     details.push(format!(
         "network sandbox: {}",
         config.permissions.network_sandbox_policy()
@@ -88,10 +130,7 @@ pub(super) fn sandbox_check(config: &Config, arg0_paths: &Arg0DispatchPaths) -> 
         } else {
             configured_backend
         };
-        let denied = !config
-            .permissions
-            .file_system_sandbox_policy()
-            .has_full_disk_read_access();
+        let denied = !file_system_sandbox.has_full_disk_read_access();
 
         check.details.push(format!("sandbox backend: {backend}"));
         check

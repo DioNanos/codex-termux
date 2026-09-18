@@ -167,11 +167,12 @@ impl StartupDraft {
 impl StartupDraftPump {
     /// Refresh the session header and safe editor shortcuts without enabling modal editing.
     pub(crate) fn apply_config(&mut self, config: &Config) {
+        let local_settings = crate::local_settings::LocalSettings::from(config);
         self.header = startup_session_header(Some(config));
         self.bottom_pane
-            .set_disable_paste_burst(config.disable_paste_burst);
+            .set_disable_paste_burst(local_settings.tui.disable_paste_burst.unwrap_or(false));
         self.bottom_pane.request_redraw();
-        if let Ok(keymap) = RuntimeKeymap::from_config(&config.tui_keymap) {
+        if let Ok(keymap) = RuntimeKeymap::from_config(&local_settings.tui.keymap) {
             self.bottom_pane.set_keymap_bindings(&keymap);
         }
     }
@@ -524,4 +525,4 @@ fn startup_draft_bottom_pane(
 
 #[cfg(test)]
 #[path = "startup_draft_tests.rs"]
-mod tests;
+pub(crate) mod tests;

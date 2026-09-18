@@ -30,6 +30,7 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::built_in_model_providers;
+use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
@@ -406,11 +407,28 @@ async fn multi_agent_v2_spawn_fork_turns_all_applies_agent_type_override() {
         .expect("fork_turns=all should apply agent_type overrides");
 }
 
+fn service_tier_test_catalog() -> codex_protocol::openai_models::ModelsResponse {
+    let mut catalog = codex_models_manager::bundled_models_response().expect("bundled models");
+    let mut model = catalog
+        .models
+        .iter()
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("current model")
+        .clone();
+    model.slug = "test-model-without-fast".to_string();
+    model.service_tiers.clear();
+    model.additional_speed_tiers.clear();
+    model.default_service_tier = None;
+    catalog.models.push(model);
+    catalog
+}
+
 #[tokio::test]
 async fn spawn_agent_service_tier_uses_root_preference_when_root_model_cannot_support_it() {
     let (_session, turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
-    config.model = Some("gpt-5.4-mini".to_string());
+    config.model = Some("test-model-without-fast".to_string());
+    config.model_catalog = Some(service_tier_test_catalog());
     config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
     let manager = thread_manager();
     let root = manager
@@ -419,7 +437,7 @@ async fn spawn_agent_service_tier_uses_root_preference_when_root_model_cannot_su
         .expect("root thread should start");
     assert_eq!(root.thread.config_snapshot().await.service_tier, None);
 
-    config.model = Some("gpt-5.4".to_string());
+    config.model = Some("gpt-5.5".to_string());
     apply_spawn_agent_service_tier(root.thread.session.as_ref(), &mut config)
         .await
         .expect("root preference should be resolved against the child model");
@@ -440,9 +458,10 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
     {
         let (mut session, turn) = make_session_and_context().await;
         let mut turn = turn
-            .with_model("gpt-5.4".to_string(), &session.services.models_manager)
+            .with_model("gpt-5.5".to_string(), &session.services.models_manager)
             .await;
         let mut config = (*turn.config).clone();
+        config.model_catalog = Some(service_tier_test_catalog());
         config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
         turn.config = Arc::new(config);
         let manager = thread_manager();
@@ -451,6 +470,10 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
             .await
             .expect("root thread should start");
         session.services.agent_control = root.thread.session.services.agent_control.clone();
+        session.services.models_manager = Arc::new(StaticModelsManager::new(
+            /*auth_manager*/ None,
+            service_tier_test_catalog(),
+        ));
         session.thread_id = root.thread_id;
 
         let output = SpawnAgentHandler::default()
@@ -481,9 +504,10 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
     {
         let (mut session, turn) = make_session_and_context().await;
         let mut turn = turn
-            .with_model("gpt-5.4".to_string(), &session.services.models_manager)
+            .with_model("gpt-5.5".to_string(), &session.services.models_manager)
             .await;
         let mut config = (*turn.config).clone();
+        config.model_catalog = Some(service_tier_test_catalog());
         config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
         turn.config = Arc::new(config);
         let manager = thread_manager();
@@ -492,6 +516,10 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
             .await
             .expect("root thread should start");
         session.services.agent_control = root.thread.session.services.agent_control.clone();
+        session.services.models_manager = Arc::new(StaticModelsManager::new(
+            /*auth_manager*/ None,
+            service_tier_test_catalog(),
+        ));
         session.thread_id = root.thread_id;
 
         let output = SpawnAgentHandler::default()
@@ -501,7 +529,7 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
                 "spawn_agent",
                 function_payload(json!({
                     "message": "inspect this repo",
-                    "model": "gpt-5.4-mini"
+                    "model": "test-model-without-fast"
                 })),
             ))
             .await
@@ -531,7 +559,7 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
             .join("service-tier-role.toml");
         tokio::fs::write(
             &role_config_path,
-            r#"model = "gpt-5.4"
+            r#"model = "gpt-5.5"
 service_tier = "priority"
 "#,
         )
@@ -592,7 +620,7 @@ async fn spawn_agent_role_service_tier_cannot_override_root_preference() {
 
     let (mut session, turn) = make_session_and_context().await;
     let mut turn = turn
-        .with_model("gpt-5.4".to_string(), &session.services.models_manager)
+        .with_model("gpt-5.5".to_string(), &session.services.models_manager)
         .await;
     tokio::fs::create_dir_all(&turn.config.codex_home)
         .await
@@ -600,7 +628,7 @@ async fn spawn_agent_role_service_tier_cannot_override_root_preference() {
     let role_config_path = turn.config.codex_home.as_path().join("tiered-role.toml");
     tokio::fs::write(
         &role_config_path,
-        r#"model = "gpt-5.4"
+        r#"model = "gpt-5.5"
 service_tier = "turbo"
 "#,
     )
@@ -664,7 +692,7 @@ async fn spawn_agent_full_history_fork_inherits_root_service_tier() {
 
     let (mut session, turn) = make_session_and_context().await;
     let mut turn = turn
-        .with_model("gpt-5.4".to_string(), &session.services.models_manager)
+        .with_model("gpt-5.5".to_string(), &session.services.models_manager)
         .await;
     let mut config = (*turn.config).clone();
     config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
@@ -714,7 +742,7 @@ async fn multi_agent_v2_full_history_fork_inherits_root_service_tier() {
 
     let (mut session, turn) = make_session_and_context().await;
     let mut turn = turn
-        .with_model("gpt-5.4".to_string(), &session.services.models_manager)
+        .with_model("gpt-5.5".to_string(), &session.services.models_manager)
         .await;
     let mut config = (*turn.config).clone();
     config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
@@ -4153,6 +4181,7 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        crate::thread_manager::passthrough_image_store(),
         thread_store_from_config(&config, state_db.clone()),
         local_agent_graph_store_from_state_db(state_db.as_ref()),
         "11111111-1111-4111-8111-111111111111".to_string(),
@@ -4370,8 +4399,10 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     assert_eq!(shutdown_report.timed_out, Vec::<ThreadId>::new());
 }
 
+#[test_case::test_case(false; "inactive_parent")]
+#[test_case::test_case(true; "active_parent")]
 #[tokio::test]
-async fn build_agent_spawn_config_uses_turn_context_values() {
+async fn build_agent_spawn_config_uses_turn_context_values(parent_enabled: bool) {
     fn pick_allowed_sandbox_policy(
         permissions: &crate::config::Permissions,
         base: SandboxPolicy,
@@ -4442,8 +4473,26 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         .set(AskForApproval::OnRequest)
         .expect("approval policy set");
 
+    let parent_config = Arc::make_mut(&mut turn.config);
+    parent_config
+        .prepare_token_budget_for_startup()
+        .expect("capture configured token budget");
+    parent_config
+        .features
+        .set_enabled(Feature::TokenBudget, parent_enabled)
+        .expect("set parent experimental context");
+    parent_config
+        .token_budget
+        .get_or_insert_default()
+        .use_history_notes_extension = parent_enabled;
+    let mut expected = parent_config.clone();
+    turn.configured_token_budget = expected.token_budget.clone();
+    Arc::make_mut(&mut turn.config)
+        .token_budget
+        .get_or_insert_default()
+        .guidance_message = Some("Parent model's resolved guidance.".to_string());
+
     let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
-    let mut expected = (*turn.config).clone();
     expected.base_instructions_provenance = base_instructions.provenance.clone();
     expected.base_instructions = Some(base_instructions.text);
     expected.model = Some(turn.model_info().slug.clone());

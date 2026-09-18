@@ -26,7 +26,7 @@ jobs:
       # produced ~520 MiB and was rejected with HTTP 413 Payload Too Large.
       CARGO_PROFILE_RELEASE_OPT_LEVEL: "3"
       CARGO_PROFILE_RELEASE_LTO: "thin"
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "4"
       CARGO_PROFILE_RELEASE_PANIC: "abort"
       CARGO_PROFILE_RELEASE_STRIP: "symbols"
     steps:

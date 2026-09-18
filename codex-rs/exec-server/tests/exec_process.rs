@@ -1,7 +1,7 @@
 mod common;
 
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
@@ -102,6 +102,78 @@ async fn create_process_context(use_remote: bool) -> Result<ProcessContext> {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_home_symlink_opt_out_respects_host_config_and_scope() -> Result<()> {
+    use codex_exec_server::WriteFileOptions;
+    use common::exec_server::exec_server_with_env;
+    use std::os::unix::fs::symlink;
+
+    let workspace = TempDir::new()?;
+    let home = TempDir::new()?;
+    let target = TempDir::new()?;
+    let alias = home.path().join("visualizations");
+    let other_alias = workspace.path().join(".codex/visualizations");
+    std::fs::create_dir(workspace.path().join(".codex"))?;
+    symlink(target.path(), &alias)?;
+    symlink(target.path(), &other_alias)?;
+    std::fs::write(
+        workspace.path().join(".codex/config.toml"),
+        "allow_symlinked_codex_home = true\n",
+    )?;
+
+    for enabled in [None, Some(false), Some(true)] {
+        std::fs::write(
+            home.path().join("config.toml"),
+            enabled.map_or_else(String::new, |enabled| {
+                format!("allow_symlinked_codex_home = {enabled}\n")
+            }),
+        )?;
+        let mut server = exec_server_with_env([("CODEX_HOME", home.path())], &[]).await?;
+        let environment = Environment::create_for_tests(Some(server.websocket_url().to_string()))?;
+        for root in [alias.as_path(), other_alias.as_path(), workspace.path()] {
+            let mut policy = FileSystemSandboxPolicy::read_only();
+            policy.entries.push(FileSystemSandboxEntry::new(
+                PathUri::from_host_native_path(root)?.into(),
+                FileSystemAccessMode::Write,
+            ));
+            let sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
+                PermissionProfile::from_runtime_permissions(
+                    &policy,
+                    NetworkSandboxPolicy::Restricted,
+                ),
+                PathUri::from_host_native_path(workspace.path())?,
+            );
+            let result = environment
+                .get_filesystem()
+                .write_file(
+                    &PathUri::from_host_native_path(root.join("output"))?,
+                    b"written".to_vec(),
+                    WriteFileOptions::default(),
+                    Some(&sandbox),
+                )
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                root == workspace.path() || (enabled == Some(true) && root == alias),
+                "root={root:?}, enabled={enabled:?}: {result:?}"
+            );
+            if let Err(error) = result {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("symlinked writable roots are not supported"),
+                    "{error}"
+                );
+            }
+        }
+        server.shutdown().await?;
+    }
+    assert_eq!(std::fs::read(target.path().join("output"))?, b"written");
+    assert_eq!(std::fs::read(workspace.path().join("output"))?, b"written");
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test_case(false, false, false, false, "bash"; "local_pipe")]
 #[test_case(false, true, false, false, "bash"; "local_tty")]
@@ -109,6 +181,7 @@ async fn create_process_context(use_remote: bool) -> Result<ProcessContext> {
 #[test_case(true, true, false, false, "bash"; "remote_tty")]
 #[test_case(true, false, true, false, "bash"; "remote_sandbox")]
 #[test_case(false, false, false, false, "sh"; "local_sh_pipe")]
+#[test_case(false, false, false, false, "bash-sh"; "local_bash_backed_sh")]
 #[test_case(false, false, false, true, "bash"; "local_bash_env")]
 #[test_case(true, false, false, true, "bash"; "remote_bash_env")]
 #[cfg_attr(
@@ -147,6 +220,7 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
         "bash" if automatic_startup => ("/bin/bash", ".bash-env"),
         "bash" => ("/bin/bash", ".bashrc"),
         "sh" => ("/bin/sh", ".snapshot-env"),
+        "bash-sh" => ("/bin/bash", ".snapshot-env"),
         "zsh" if automatic_startup => ("/bin/zsh", ".zshenv"),
         "zsh" => ("/bin/zsh", ".zshrc"),
         name => anyhow::bail!("unsupported test shell {name}"),
@@ -154,6 +228,14 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
     let profile_path = home.path().join(profile_name);
     let profile_path_entry = home.path().join("profile-bin");
     let runtime_path_entry = home.path().join("runtime-bin");
+    std::fs::create_dir(&profile_path_entry)?;
+    let wc = profile_path_entry.join("wc");
+    std::fs::write(
+        &wc,
+        "#!/bin/sh\nprintf x >> \"$HOME/tool-captures\"\nexec /usr/bin/wc \"$@\"\n",
+    )?;
+    std::fs::set_permissions(&wc, std::fs::Permissions::from_mode(0o755))?;
+    let posix_shell = matches!(shell_name, "sh" | "bash-sh");
     let padding = if !use_remote && !tty && shell_name == "bash" {
         format!(
             "snapshot_padding() {{ printf '%s' '{}'; }}\n",
@@ -162,7 +244,7 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
     } else {
         String::new()
     };
-    let shadowed_builtins = if shell_name == "sh" {
+    let shadowed_builtins = if posix_shell {
         ""
     } else {
         "unset() { exit 41; }\nbuiltin() { :; }\n"
@@ -170,7 +252,7 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
     std::fs::write(
         &profile_path,
         format!(
-            "printf x >> \"$HOME/captures\"\nexport PATH=\"$HOME/profile-bin:/usr/bin:/bin\"\nexport PROFILE_ALLOWED=profile\nexport PROFILE_SECRET=secret\nexport PROFILE_DENIED=denied\nprofile_helper() {{ printf helper; }}\n{shadowed_builtins}{padding}"
+            "printf x >> \"$HOME/captures\"\nexport PATH=\"$HOME/profile-bin:/usr/bin:/bin\"\nexport PROFILE_ALLOWED=profile\nexport PROFILE_SECRET=secret\nexport PROFILE_DENIED=denied\nprofile_helper() {{ printf helper; }}\nif [ -n \"${{BASH_VERSION-}}\" ]; then\n  shopt -s extglob nocasematch\n  eval 'profile_helper() {{ case $1 in @(foo|bar)*) printf helper ;; *) return 1 ;; esac; }}'\nfi\nset -u\n{shadowed_builtins}{padding}"
         ),
     )?;
     if shell_name == "zsh" && automatic_startup {
@@ -183,16 +265,27 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
         "HOME".to_string(),
         home.path().to_string_lossy().into_owned(),
     )]);
-    if shell_name == "sh" {
+    if posix_shell {
         configured_environment.insert(
             "ENV".to_string(),
-            profile_path.to_string_lossy().into_owned(),
+            "${XDG_CONFIG_HOME:-$HOME}/.snapshot-env".to_string(),
         );
+        // Keep coverage for large values alongside the many-small-entry case below.
+        for index in 0..3 {
+            configured_environment.insert(format!("PROFILE_SDK_{index}"), "x".repeat(60 * 1024));
+        }
     }
     if shell_name == "bash" && automatic_startup {
         configured_environment.insert(
             "BASH_ENV".to_string(),
             profile_path.to_string_lossy().into_owned(),
+        );
+    }
+    // Many small entries exercise capture overhead separately from the byte limit above.
+    let many_entries = !use_remote && !tty && !automatic_startup;
+    if many_entries {
+        configured_environment.extend(
+            (0..1_000).map(|index| (format!("PROFILE_ENTRY_{index}"), format!("value-{index}"))),
         );
     }
     let policy = ExecEnvPolicy {
@@ -211,10 +304,15 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
     let (command_prefix, expected_prefix) = if shell_name == "sh" {
         ("", "")
     } else {
-        ("profile_helper; ", "helper")
+        ("profile_helper FOObar; ", "helper")
+    };
+    let entry_check = if many_entries {
+        "[ \"${PROFILE_ENTRY_999-missing}\" = value-999 ] || exit 43; "
+    } else {
+        ""
     };
     let command = format!(
-        "export PATH='{}':\"$PATH\"; {command_prefix}printf '|%s|%s|%s|%s|%s|%s' \"$PROFILE_ALLOWED\" \"${{PROFILE_SECRET-missing}}\" \"${{PROFILE_DENIED-missing}}\" \"$PATH\" \"${{__CODEX_SHELL_SNAPSHOT_STATE_0-missing}}\" \"${{__CODEX_SHELL_SNAPSHOT_STATE_1-missing}}\"",
+        "case $- in *u*) ;; *) exit 42 ;; esac; {entry_check}export PATH='{}':\"$PATH\"; {command_prefix}printf '|%s|%s|%s|%s|%s|%s' \"$PROFILE_ALLOWED\" \"${{PROFILE_SECRET-missing}}\" \"${{PROFILE_DENIED-missing}}\" \"$PATH\" \"${{__CODEX_SHELL_SNAPSHOT_STATE_0-missing}}\" \"${{__CODEX_SHELL_SNAPSHOT_STATE_1-missing}}\"",
         runtime_path_entry.display(),
     );
     let expected_stdout = format!(
@@ -227,6 +325,7 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
         let started = context
             .backend
             .start(ExecParams {
+                metadata: Default::default(),
                 process_id: ProcessId::from(format!("snapshot-{attempt}")),
                 argv: vec![shell_path.to_string(), "-lc".to_string(), command.clone()],
                 cwd: cwd.clone(),
@@ -234,14 +333,14 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
                 shell_snapshot: Some(ShellSnapshotRequest {
                     scope_id: "attachment-1".to_string(),
                     shell: ShellInfo {
-                        name: shell_name.to_string(),
+                        name: if posix_shell { "sh" } else { shell_name }.to_string(),
                         path: shell_path.to_string(),
                     },
                 }),
                 env: HashMap::new(),
                 tty,
                 pipe_stdin: false,
-                arg0: None,
+                arg0: (shell_name == "bash-sh").then(|| "sh".to_string()),
                 sandbox: (use_sandbox && attempt == 0).then(|| {
                     FileSystemSandboxContext::from_permission_profile_with_cwd(
                         PermissionProfile::read_only(),
@@ -262,6 +361,7 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
     }
 
     assert_eq!(std::fs::read_to_string(home.path().join("captures"))?, "x");
+    assert!(!std::fs::read(home.path().join("tool-captures"))?.is_empty());
     if let Some(server) = context._server {
         assert!(!server.codex_home().join("shell_snapshots").exists());
     }
@@ -303,6 +403,7 @@ async fn shell_snapshot_v2_remote_managed_proxy_uses_prepared_execution_context(
         let started = context
             .backend
             .start(ExecParams {
+                metadata: Default::default(),
                 process_id: ProcessId::from(format!("managed-snapshot-{attempt}")),
                 argv: vec![
                     "/bin/bash".to_string(),
@@ -397,6 +498,7 @@ async fn shell_snapshot_v2_capture_failure_falls_back_and_retries(
         include_only: vec!["HOME".to_string(), "PATH".to_string()],
     };
     let mut params = ExecParams {
+        metadata: Default::default(),
         process_id: ProcessId::from("snapshot-first"),
         argv: vec![
             shell_path.to_string(),
@@ -505,6 +607,7 @@ async fn remote_sandboxed_process_preserves_custom_arg0() -> Result<()> {
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-custom-arg0"),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -545,6 +648,7 @@ async fn assert_exec_process_starts_and_exits(use_remote: bool) -> Result<()> {
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-1"),
             argv: vec!["true".to_string()],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
@@ -607,6 +711,7 @@ async fn remote_process_keeps_sandbox_helper_visible_with_restricted_reads() -> 
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-restricted-helper"),
             argv: vec!["/bin/cat".to_string(), file.to_string_lossy().into_owned()],
             cwd,
@@ -677,6 +782,7 @@ async fn remote_tty_process_uses_configured_sandbox_helper_with_hostile_path() -
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-hostile-helper-path"),
             argv: vec!["/bin/cat".to_string(), file.to_string_lossy().into_owned()],
             cwd,
@@ -733,6 +839,7 @@ async fn remote_process_preserves_empty_workspace_roots() -> Result<()> {
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-empty-workspace-roots"),
             argv: vec!["/bin/cat".to_string(), file.to_string_lossy().into_owned()],
             cwd,
@@ -875,6 +982,7 @@ async fn assert_exec_process_streams_output(use_remote: bool) -> Result<()> {
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -911,6 +1019,7 @@ async fn assert_exec_process_pushes_events(use_remote: bool) -> Result<()> {
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -963,6 +1072,7 @@ async fn assert_exec_process_replays_events_after_close(use_remote: bool) -> Res
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -1016,6 +1126,7 @@ async fn assert_exec_process_retains_output_after_exit_until_streams_close(
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 helper_binary.to_string_lossy().into_owned(),
@@ -1091,6 +1202,7 @@ async fn assert_exec_process_write_then_read(use_remote: bool) -> Result<()> {
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 // Use `/bin/sh` instead of Python so this stdin round-trip test
@@ -1136,6 +1248,7 @@ async fn assert_exec_process_write_then_read_without_tty(use_remote: bool) -> Re
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -1182,6 +1295,7 @@ async fn assert_remote_windows_sandbox_process_write() -> Result<()> {
     let session = match context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-windows-sandbox-stdin"),
             argv: vec![
                 r"C:\Windows\System32\cmd.exe".to_string(),
@@ -1234,6 +1348,7 @@ async fn assert_exec_process_rejects_write_without_pipe_stdin(use_remote: bool) 
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -1273,6 +1388,7 @@ async fn assert_exec_process_signal_interrupts_process(use_remote: bool) -> Resu
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -1331,6 +1447,7 @@ async fn assert_exec_process_signal_terminates_on_windows(use_remote: bool) -> R
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-windows-signal"),
             argv: vec![
                 "cmd".to_string(),
@@ -1368,6 +1485,7 @@ async fn assert_exec_process_preserves_queued_events_before_subscribe(
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-queued"),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -1413,6 +1531,7 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
     let emitted_path = temp_dir.path().join("output-emitted");
     let session = backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-recover"),
             argv: vec![
                 "/bin/sh".to_string(),

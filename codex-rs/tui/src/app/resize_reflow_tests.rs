@@ -1,7 +1,6 @@
 use super::*;
 use crate::app::test_support::make_test_app;
 use crate::history_cell::PlainHistoryCell;
-use crate::legacy_core::config::TerminalResizeReflowMaxRows;
 use pretty_assertions::assert_eq;
 
 fn plain_history_cells(count: usize) -> Vec<Arc<dyn HistoryCell>> {
@@ -25,7 +24,7 @@ fn rendered_line_text(line: &HyperlinkLine) -> String {
 #[tokio::test]
 async fn resize_reflow_preserves_configured_scrollback_beyond_the_visible_viewport() {
     let mut app = make_test_app().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(32);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(32);
     app.transcript_cells = plain_history_cells(/*count*/ 64);
     let screen_size = Size::new(/*width*/ 80, /*height*/ 24);
     let chat_height = app.with_chat_widget_frame(screen_size.width, |height, _| height);
@@ -49,7 +48,7 @@ async fn resize_reflow_preserves_configured_scrollback_beyond_the_visible_viewpo
 #[tokio::test]
 async fn initial_resume_replay_retains_scrollback_beyond_the_visible_viewport() -> Result<()> {
     let mut app = make_test_app().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(32);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(32);
     let screen_size = Size::new(/*width*/ 80, /*height*/ 24);
     app.update_visible_history_rows(screen_size);
     let visible_history_rows = app
@@ -99,7 +98,7 @@ async fn initial_resume_replay_retains_scrollback_beyond_the_visible_viewport() 
 #[tokio::test]
 async fn resize_reflow_preserves_configured_scrollback_when_the_terminal_height_changes() {
     let mut app = make_test_app().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(48);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(48);
     app.transcript_cells = plain_history_cells(/*count*/ 64);
 
     app.update_visible_history_rows(Size::new(/*width*/ 80, /*height*/ 24));
@@ -130,7 +129,7 @@ async fn resize_reflow_preserves_configured_scrollback_when_the_terminal_height_
 #[tokio::test]
 async fn resize_reflow_preserves_explicitly_unlimited_history() {
     let mut app = make_test_app().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(0);
     app.transcript_cells = plain_history_cells(/*count*/ 20);
 
     app.update_visible_history_rows(Size::new(/*width*/ 80, /*height*/ 24));
@@ -151,7 +150,7 @@ async fn resize_reflow_preserves_explicitly_unlimited_history() {
 #[tokio::test]
 async fn capped_resize_reflow_prepends_transcript_notice_without_changing_transcript() {
     let mut app = make_test_app().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(8);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(8);
     app.transcript_cells = plain_history_cells(/*count*/ 12);
 
     let rendered = app.render_transcript_lines_for_reflow(/*width*/ 80);
@@ -181,7 +180,7 @@ async fn capped_resize_reflow_prepends_transcript_notice_without_changing_transc
 #[tokio::test]
 async fn capped_resize_reflow_counts_wrapped_notice_rows() {
     let mut app = make_test_app().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(8);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(8);
     app.transcript_cells = plain_history_cells(/*count*/ 12);
 
     let rendered = app.render_transcript_lines_for_reflow(/*width*/ 28);
@@ -210,7 +209,7 @@ async fn capped_resize_reflow_counts_wrapped_notice_rows() {
 #[tokio::test]
 async fn one_row_history_cap_preserves_conversation_instead_of_notice() {
     let mut app = make_test_app().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(1);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(1);
     app.scrollback_has_older_history = true;
     app.transcript_cells = plain_history_cells(/*count*/ 2);
 
@@ -231,7 +230,7 @@ async fn one_row_history_cap_preserves_conversation_instead_of_notice() {
 #[tokio::test]
 async fn paginated_resize_reflow_prepends_transcript_notice_for_unloaded_history() {
     let mut app = make_test_app().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(32);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(32);
     app.scrollback_has_older_history = true;
     app.transcript_cells = plain_history_cells(/*count*/ 2);
 
@@ -256,7 +255,7 @@ async fn paginated_resize_reflow_prepends_transcript_notice_for_unloaded_history
 #[tokio::test]
 async fn scrollback_refill_only_loads_older_pages_for_an_underfilled_row_cap() {
     let mut app = make_test_app().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(32);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(32);
     app.scrollback_has_older_history = true;
 
     assert!(app.scrollback_history_needs_top_up(/*rendered_rows*/ 31));
@@ -266,6 +265,6 @@ async fn scrollback_refill_only_loads_older_pages_for_an_underfilled_row_cap() {
     assert!(!app.scrollback_history_needs_top_up(/*rendered_rows*/ 31));
 
     app.scrollback_has_older_history = true;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(0);
     assert!(!app.scrollback_history_needs_top_up(/*rendered_rows*/ 31));
 }

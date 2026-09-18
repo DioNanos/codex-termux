@@ -29,6 +29,17 @@ use super::*;
 use crate::connection::JsonRpcConnectionEvent;
 use crate::noise_channel::PendingResponderHandshake;
 
+fn noise_harness_connection_from_websocket<T, E>(
+    stream: T,
+    args: NoiseHarnessConnectionArgs,
+) -> JsonRpcConnection
+where
+    T: Sink<Message, Error = E> + Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    noise_harness_connection_from_websocket_with_readiness(stream, args).connection
+}
+
 const ENVIRONMENT_ID: &str = "environment-1";
 const EXECUTOR_REGISTRATION_ID: &str = "registration-1";
 

@@ -14,6 +14,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -225,6 +226,126 @@ async fn fork_context_excludes_items_after_frozen_cutoff() {
     assert_eq!(
         serde_json::to_value(context).expect("serialize fork context"),
         serde_json::to_value(expected).expect("serialize expected fork context")
+    );
+}
+
+#[tokio::test]
+async fn fork_version_stops_before_older_segments_once_resolved() {
+    for stored_version in [None, Some(MultiAgentVersion::Disabled)] {
+        let home = TempDir::new().expect("temp dir");
+        let root_uuid = Uuid::from_u128(/*v*/ 3001);
+        let root_id = ThreadId::from_string(&root_uuid.to_string()).expect("root id");
+        let root_path = write_ordinaled_paginated_rollout(
+            home.path(),
+            "2025-01-03T13-02-00",
+            root_uuid,
+            [user_message("older history")],
+        );
+        let child_uuid = Uuid::from_u128(/*v*/ 3002);
+        let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child id");
+        let child_path =
+            write_ordinaled_paginated_rollout(home.path(), "2025-01-03T13-02-01", child_uuid, []);
+        let mut source_meta = codex_rollout::read_session_meta_line(&child_path)
+            .await
+            .expect("read child metadata");
+        source_meta.meta.multi_agent_version = stored_version;
+        source_meta.meta.history_base = Some(history_position(
+            &root_path, root_id, /*end_ordinal_exclusive*/ 2,
+        ));
+        let head = RolloutLine {
+            timestamp: "2025-01-03T13:02:01Z".to_string(),
+            ordinal: Some(0),
+            item: RolloutItem::SessionMeta(source_meta.clone()),
+        };
+        std::fs::write(
+            &child_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&head).expect("serialize head")
+            ),
+        )
+        .expect("write child metadata");
+        let RolloutItem::TurnContext(mut context) = turn_context(home.path(), "version-turn")
+        else {
+            unreachable!();
+        };
+        context.multi_agent_version = Some(MultiAgentVersion::V2);
+        append_items(
+            &child_path,
+            [
+                RolloutItem::TurnContext(context),
+                turn_context(home.path(), "unset-turn"),
+            ],
+        );
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let lineage = store
+            .resolve_rollout_lineage(child_id)
+            .await
+            .expect("resolve source lineage");
+        // No checkpoint exists. A full model-context read would reach this missing segment.
+        std::fs::remove_file(root_path).expect("remove older segment after resolving lineage");
+
+        let context = load_for_fork(lineage, /*history_base*/ None)
+            .await
+            .expect("resolve version without reading older segments");
+        source_meta.meta.multi_agent_version = stored_version.or(Some(MultiAgentVersion::V2));
+        assert_eq!(
+            serde_json::to_value(context).expect("serialize fork context"),
+            serde_json::to_value(vec![RolloutItem::SessionMeta(source_meta)])
+                .expect("serialize expected context")
+        );
+    }
+}
+
+#[tokio::test]
+async fn fork_version_respects_inherited_segment_cutoffs() {
+    let home = TempDir::new().expect("temp dir");
+    let root_uuid = Uuid::from_u128(/*v*/ 3003);
+    let root_id = ThreadId::from_string(&root_uuid.to_string()).expect("root id");
+    let RolloutItem::TurnContext(mut inherited) = turn_context(home.path(), "inherited") else {
+        unreachable!();
+    };
+    inherited.multi_agent_version = Some(MultiAgentVersion::V2);
+    let mut excluded = inherited.clone();
+    excluded.multi_agent_version = Some(MultiAgentVersion::V1);
+    let root_path = write_ordinaled_paginated_rollout(
+        home.path(),
+        "2025-01-03T13-02-02",
+        root_uuid,
+        [
+            RolloutItem::TurnContext(inherited),
+            RolloutItem::TurnContext(excluded),
+        ],
+    );
+    let child_uuid = Uuid::from_u128(/*v*/ 3004);
+    let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child id");
+    let child_path = write_ordinaled_paginated_rollout(
+        home.path(),
+        "2025-01-03T13-02-03",
+        child_uuid,
+        [turn_context(home.path(), "unset-child")],
+    );
+    set_history_base(
+        &child_path,
+        history_position(&root_path, root_id, /*end_ordinal_exclusive*/ 2),
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let lineage = store
+        .resolve_rollout_lineage(child_id)
+        .await
+        .expect("resolve source lineage");
+    let mut source_meta = codex_rollout::read_session_meta_line(&child_path)
+        .await
+        .expect("read child metadata");
+
+    let context = load_for_fork(lineage, /*history_base*/ None)
+        .await
+        .expect("recover version from inherited prefix");
+    source_meta.meta.multi_agent_version = Some(MultiAgentVersion::V2);
+    assert_eq!(
+        serde_json::to_value(context).expect("serialize fork context"),
+        serde_json::to_value(vec![RolloutItem::SessionMeta(source_meta)])
+            .expect("serialize expected context")
     );
 }
 
@@ -599,8 +720,8 @@ fn rollout_end_byte_offset(path: &Path, end_ordinal_exclusive: u64) -> u64 {
     let contents = std::fs::read(path).expect("read rollout");
     let mut byte_offset = 0_u64;
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let parsed: RolloutLine =
-            serde_json::from_slice(line).expect("parse rollout line for byte offset");
+        let parsed = codex_rollout::parse_rollout_line_bytes(line)
+            .expect("parse rollout line for byte offset");
         if parsed.ordinal == Some(end_ordinal_exclusive) {
             return byte_offset;
         }
@@ -730,6 +851,7 @@ fn turn_context(root: &Path, turn_id: &str) -> RolloutItem {
     RolloutItem::TurnContext(TurnContextItem {
         turn_id: Some(turn_id.to_string()),
         root_turn_id: None,
+        disabled_plugin_ids: None,
         cwd: serde_json::from_value(serde_json::json!(root)).expect("absolute cwd"),
         workspace_roots: None,
         current_date: None,
@@ -759,6 +881,7 @@ fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> R
         message: message.to_string(),
         replacement_history: replacement_history
             .map(|items| items.into_iter().map(Into::into).collect()),
+        retained_context: None,
         guardian_history: None,
         mcp_resource_origins: None,
         window_number: Some(1),

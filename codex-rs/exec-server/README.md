@@ -54,9 +54,44 @@ codex exec-server \
   --environment-id "$ENVIRONMENT_ID"
 ```
 
+AWS-hosted registries can use SigV4 for registry requests and the executor
+WebSocket handshake. Select the transport and authentication with executor
+arguments rather than `config.toml` settings:
+
+```sh
+codex exec-server \
+  --remote https://example.com \
+  --environment-id "$ENVIRONMENT_ID" \
+  --remote-transport direct \
+  --aws-sigv4 \
+  --aws-profile development \
+  --aws-region us-west-2 \
+  --aws-service bedrock-mantle
+```
+
+Noise remains the default transport. Direct requires `--aws-sigv4`, which
+conflicts with `--use-agent-identity-auth` and is not supported for Noise.
+The AWS options require `--aws-sigv4`; Direct forwarding remains unsupported.
+The AWS SDK default credential and region chains are used when `--aws-profile`
+or `--aws-region` is omitted. The signing service defaults to `execute-api`.
+Direct mode registers `direct_jsonrpc_v1` through the AWS-owned
+`/cloud/environment/{environment_id}/direct/register` endpoint and carries plain
+exec-server JSON-RPC over the authenticated WebSocket. The existing Codex Noise
+registration endpoint remains unchanged. Production deployments must use TLS
+(`https`/`wss`).
+
+Direct registration URLs must remain reusable across disconnects and temporary
+connection failures. The executor only refreshes its registration when the
+WebSocket handshake returns `409 Conflict`. Handshake `408`, `429`, and `5xx`
+responses retry with backoff using the current registration; other `4xx` responses
+stop the executor. A backend that issues single-use connection URLs must adapt to
+this contract. If the initial registration or a registration refresh fails, the
+executor returns the error without retrying registration, matching Noise.
+
 Wire framing:
 
 - local websocket: one JSON-RPC message per websocket message
+- direct remote websocket: one JSON-RPC message per websocket message
 - Noise remote websocket: binary protobuf relay frames carrying encrypted payloads
 
 ## Remote Relay Message Format
@@ -157,6 +192,8 @@ Response:
   "sessionId": "00000000-0000-4000-8000-000000000001",
   "environmentInfo": {
     "shell": { "name": "bash", "path": "/bin/bash" },
+    "executorVersion": "1.2.3-alpha.4",
+    "providerId": "sha256:fb4f62da3e84f6864dcec8ede7bc66f1c96ecaeaf55f8a786b85df994057c8ac",
     "cwd": "file:///workspace"
   }
 }
@@ -164,6 +201,14 @@ Response:
 
 `environmentInfo` contains the same executor metadata returned by
 `environment/info`, so clients can use it without a second request.
+
+`executorVersion` is the executor's package release version, or `0.0.0` when unknown.
+
+The executor caches optional `providerId` at startup using
+`codex_build_info::build_id(commit, target)`, which CI can also call for an
+explicit build target. This opaque compatibility key excludes package version
+and requires no manifest. It identifies a standard build configuration, not exact
+executable bytes. Unstamped and legacy executors may omit it.
 
 Rust clients cache this metadata for the client's lifetime, including session
 resumption. If initialization omits it, the first metadata request fetches and

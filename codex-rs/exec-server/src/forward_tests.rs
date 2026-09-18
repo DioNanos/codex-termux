@@ -38,6 +38,7 @@ async fn transport_disconnect_cancels_an_unfinished_websocket_handshake() -> Res
         outgoing_tx,
         disconnected_rx,
         writer_task: tokio::spawn(async {}),
+        executor_registration: None,
     };
     let task = tokio::spawn(forwarder.run_connection(connection));
     let deadline = Duration::from_secs(5);
@@ -64,6 +65,7 @@ async fn destination_close_is_acknowledged() -> Result<()> {
         outgoing_tx,
         disconnected_rx,
         writer_task: tokio::spawn(async {}),
+        executor_registration: None,
     }));
     let deadline = Duration::from_secs(5);
     let (socket, _) = timeout(deadline, listener.accept()).await??;

@@ -681,6 +681,7 @@ fn write_rollout(path: &std::path::Path, thread_id: ThreadId, message: &str) -> 
             parent_thread_id: None,
             timestamp: "2025-01-03T12:00:00Z".to_string(),
             cwd: parent.to_path_buf(),
+            runtime_workspace_roots: None,
             originator: "test".to_string(),
             cli_version: "test".to_string(),
             source: SessionSource::Cli,
@@ -761,5 +762,30 @@ fn set_old_mtime(path: &std::path::Path) -> anyhow::Result<()> {
         .write(true)
         .open(path)?
         .set_times(times)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn worker_compresses_parallel_cold_candidates_without_skipping_other_publications()
+-> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let mut paths = Vec::new();
+    for index in 0..32 {
+        let id = Uuid::from_u128(2000 + index);
+        let path = rollout_path(home.path(), "2025-01-03T12-00-00", id);
+        write_rollout(
+            &path,
+            ThreadId::from_string(&id.to_string()).unwrap(),
+            "cold candidate",
+        )?;
+        set_old_mtime(&path)?;
+        paths.push(path);
+    }
+    worker::run(home.path().to_path_buf()).await?;
+    let representations = paths
+        .iter()
+        .map(|path| (path.exists(), compressed_rollout_path(path).exists()))
+        .collect::<Vec<_>>();
+    assert_eq!(representations, vec![(false, true); paths.len()]);
     Ok(())
 }

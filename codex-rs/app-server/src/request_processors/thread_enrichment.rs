@@ -1,4 +1,4 @@
-use super::apply_live_model_settings;
+use super::apply_live_thread_settings;
 use super::thread_input::can_accept_direct_input;
 use crate::thread_status::ThreadWatchManager;
 use crate::thread_status::resolve_thread_status;
@@ -44,7 +44,7 @@ pub(super) async fn enrich_loaded_threads<T>(
                 return;
             };
             let config_snapshot = loaded_thread.config_snapshot().await;
-            apply_live_model_settings(thread, &config_snapshot);
+            apply_live_thread_settings(thread, &config_snapshot);
             if !matches!(
                 &thread.source,
                 SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })

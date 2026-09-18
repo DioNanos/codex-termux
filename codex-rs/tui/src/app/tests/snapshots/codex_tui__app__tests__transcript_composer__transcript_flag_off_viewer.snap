@@ -1,0 +1,15 @@
+---
+source: tui/src/app/tests/transcript_composer.rs
+expression: text
+---
+/ T R A N S C R I P T / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / /
+
+› first
+
+
+
+› second
+
+───────────────────────────────────────────────────────────────────────────────────────────── 100% ─
+ ↑/↓ to scroll   pgup/pgdn to page   home/end to jump
+ q close   esc to edit prev

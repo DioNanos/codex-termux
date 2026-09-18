@@ -1,0 +1,15 @@
+---
+source: tui/src/app/tests/model_defaults_tests.rs
+expression: messages
+---
+⚠ Saved default model and reasoning effort, but a higher-priority configuration
+  layer overrides the saved value.
+• Model changed to gpt-5.5 high
+⚠ Saved Plan mode reasoning effort, but a higher-priority configuration layer
+  overrides the saved value.
+⚠ Saved default service tier, but a higher-priority configuration layer
+  overrides the saved value.
+• Service tier set to priority
+⚠ Saved default model and reasoning effort, but a higher-priority configuration
+  layer overrides the saved value.
+• Model changed to gpt-5.5 ultra for this conversation

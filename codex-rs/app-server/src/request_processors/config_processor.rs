@@ -63,14 +63,17 @@ const BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE: &str =
     "background_paginated_rollout_migration";
 
 const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
+    "api_key_model_discovery",
     "auth_elicitation",
     BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE,
+    "codex_apps_mcp_2026_07_28",
     "mcp_2026_07_28",
     "memories",
     "mentions_v2",
     "remote_control",
     "remote_plugin",
     "tool_suggest",
+    "windows_sandbox_service",
 ];
 
 #[derive(Clone)]
@@ -162,12 +165,12 @@ impl ConfigRequestProcessor {
                         | "personality"
                 )
             });
-        let reload_user_config = params.reload_user_config;
+        let should_reload = params.reload_user_config;
         let response = self.batch_write_inner(params).await?;
         if !session_defaults_only {
             self.handle_config_mutation().await;
-            if reload_user_config {
-                self.reload_user_config().await;
+            if should_reload {
+                reload_user_config(&self.config_manager, &self.thread_manager).await;
             }
         }
         Ok(ClientResponsePayload::ConfigBatchWrite(response))
@@ -182,7 +185,7 @@ impl ConfigRequestProcessor {
             .handle_config_mutation_result(self.set_experimental_feature_enablement(params).await)
             .await?;
         if !response.enablement.is_empty() {
-            self.reload_user_config().await;
+            reload_user_config(&self.config_manager, &self.thread_manager).await;
         }
         self.outgoing
             .send_response_as(
@@ -313,43 +316,16 @@ impl ConfigRequestProcessor {
             .map_err(|_| internal_error("failed to update feature enablement"))?;
 
         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        self.thread_manager
+            .get_models_manager()
+            .set_api_key_model_discovery_enabled(
+                config.features.enabled(Feature::ApiKeyModelDiscovery),
+            );
         if should_start_background_rollout_migration && config.features.enabled(feature) {
             self.thread_manager.start_background_rollout_migration();
         }
 
         Ok(ExperimentalFeatureEnablementSetResponse { enablement })
-    }
-
-    async fn reload_user_config(&self) {
-        match self.load_latest_config(/*fallback_cwd*/ None).await {
-            Ok(_) => {}
-            Err(err) => {
-                tracing::warn!(
-                    "failed to rebuild user config for runtime refresh: {}",
-                    err.message
-                );
-                return;
-            }
-        };
-        let thread_ids = self.thread_manager.list_thread_ids().await;
-        for thread_id in thread_ids {
-            let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
-                continue;
-            };
-            let current_config = thread.config().await;
-            let next_config = match self
-                .config_manager
-                .load_latest_config_for_thread(current_config.as_ref())
-                .await
-            {
-                Ok(config) => config,
-                Err(err) => {
-                    tracing::warn!(%thread_id, %err, "failed to reload thread configuration");
-                    continue;
-                }
-            };
-            thread.refresh_runtime_config(next_config).await;
-        }
     }
 
     async fn emit_plugin_toggle_events(
@@ -373,6 +349,38 @@ impl ConfigRequestProcessor {
     }
 }
 
+pub(super) async fn reload_user_config(
+    config_manager: &ConfigManager,
+    thread_manager: &ThreadManager,
+) {
+    if let Err(err) = config_manager
+        .load_latest_config(/*fallback_cwd*/ None)
+        .await
+    {
+        tracing::warn!("failed to rebuild user config for runtime refresh: {err}");
+        return;
+    }
+    let thread_ids = thread_manager.list_thread_ids().await;
+    for thread_id in thread_ids {
+        let Ok(thread) = thread_manager.get_thread(thread_id).await else {
+            continue;
+        };
+        let current_config = thread.config().await;
+        let next_config = match config_manager
+            .load_latest_config_for_thread(current_config.as_ref())
+            .await
+        {
+            Ok(config) => config,
+            Err(err) => {
+                tracing::warn!(%thread_id, %err, "failed to reload thread configuration");
+                continue;
+            }
+        };
+        // Keep runtime refresh state off the request dispatcher's stack.
+        Box::pin(thread.refresh_runtime_config(next_config)).await;
+    }
+}
+
 fn map_requirements_toml_to_api(requirements: ConfigRequirementsToml) -> ConfigRequirements {
     let windows_sandbox_private_desktop = requirements
         .windows
@@ -380,6 +388,22 @@ fn map_requirements_toml_to_api(requirements: ConfigRequirementsToml) -> ConfigR
         .and_then(|windows| windows.sandbox_private_desktop);
 
     ConfigRequirements {
+        application: requirements.application.map(|application| {
+            codex_app_server_protocol::ApplicationRequirements {
+                network: application.network.map(|network| {
+                    codex_app_server_protocol::ApplicationNetworkRequirements {
+                        enabled: network.enabled,
+                        domains: network
+                            .domains
+                            .into_iter()
+                            .map(|(domain, permission)| {
+                                (domain, map_network_domain_permission_to_api(permission))
+                            })
+                            .collect(),
+                    }
+                }),
+            }
+        }),
         cli_auth_credentials_store: requirements.cli_auth_credentials_store.map(
             |mode| match mode {
                 codex_config::types::AuthCredentialsStoreMode::File => {
@@ -544,6 +568,7 @@ fn map_browser_use_requirements_to_api(
     browser_use: codex_config::BrowserUseRequirementsToml,
 ) -> BrowserUseRequirements {
     BrowserUseRequirements {
+        allow_webmcp: browser_use.allow_webmcp,
         allow_history_access: browser_use.allow_history_access,
         disable_auto_review: browser_use.disable_auto_review,
         allow_global_persistent_approval: browser_use.allow_global_persistent_approval,
@@ -923,6 +948,7 @@ mod tests {
         let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
             allow_browser_and_computer_use: Some(false),
             browser_use: Some(BrowserUseRequirementsToml {
+                allow_webmcp: Some(true),
                 allow_history_access: Some(false),
                 disable_auto_review: Some(true),
                 allow_global_persistent_approval: Some(false),
@@ -980,6 +1006,7 @@ mod tests {
         assert_eq!(
             mapped.browser_use,
             Some(BrowserUseRequirements {
+                allow_webmcp: Some(true),
                 allow_history_access: Some(false),
                 disable_auto_review: Some(true),
                 allow_global_persistent_approval: Some(false),

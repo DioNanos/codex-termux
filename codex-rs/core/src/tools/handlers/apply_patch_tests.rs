@@ -1,10 +1,13 @@
 use super::*;
 use codex_apply_patch::MaybeApplyPatchVerified;
 use codex_exec_server::LOCAL_FS;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSandboxPolicyContext;
 use codex_protocol::protocol::FileChange;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
@@ -14,6 +17,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
+
+fn local_context(cwd: &PathUri) -> FileSystemSandboxPolicyContext<'_> {
+    FileSystemSandboxPolicyContext {
+        cwd,
+        workspace_roots: std::slice::from_ref(cwd),
+        user_home_dir: None,
+        temporary_directories: None,
+    }
+}
 
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
@@ -281,7 +293,12 @@ fn write_permissions_for_paths_skip_dirs_already_writable_under_workspace_root()
         /*exclude_slash_tmp*/ false,
     );
 
-    let permissions = write_permissions_for_paths(&[file_path], &sandbox_policy, &cwd);
+    let permissions = write_permissions_for_paths(
+        &[file_path.into()],
+        &sandbox_policy,
+        &local_context(&cwd.into()),
+        PatchSandboxRoute::Platform(WindowsSandboxLevel::Disabled),
+    );
 
     assert_eq!(permissions, None);
 }
@@ -302,7 +319,12 @@ fn write_permissions_for_paths_keep_dirs_outside_workspace_root() {
         /*exclude_slash_tmp*/ true,
     );
 
-    let permissions = write_permissions_for_paths(&[file_path], &sandbox_policy, &cwd_abs);
+    let permissions = write_permissions_for_paths(
+        &[file_path.into()],
+        &sandbox_policy,
+        &local_context(&cwd_abs.into()),
+        PatchSandboxRoute::Platform(WindowsSandboxLevel::Disabled),
+    );
     let expected_outside = outside.abs();
 
     assert_eq!(
@@ -324,9 +346,12 @@ fn write_permissions_for_paths_do_not_widen_workspace_root_target() {
         /*exclude_tmpdir_env_var*/ true,
         /*exclude_slash_tmp*/ true,
     );
-
-    let permissions =
-        write_permissions_for_paths(std::slice::from_ref(&cwd), &sandbox_policy, &cwd);
+    let permissions = write_permissions_for_paths(
+        &[cwd.clone().into()],
+        &sandbox_policy,
+        &local_context(&cwd.into()),
+        PatchSandboxRoute::Platform(WindowsSandboxLevel::Disabled),
+    );
 
     assert_eq!(permissions, None);
 }
@@ -341,7 +366,41 @@ fn write_permissions_for_paths_do_not_regrant_an_already_writable_parent() {
         FileSystemSandboxEntry::new(file_path.clone().into(), FileSystemAccessMode::Read),
     ]);
 
-    let permissions = write_permissions_for_paths(&[file_path], &sandbox_policy, &cwd);
+    let permissions = write_permissions_for_paths(
+        &[file_path.into()],
+        &sandbox_policy,
+        &local_context(&cwd.into()),
+        PatchSandboxRoute::Platform(WindowsSandboxLevel::Disabled),
+    );
 
     assert_eq!(permissions, None);
+}
+
+#[test]
+fn write_permissions_for_windows_paths_uses_executor_uris() {
+    let cwd = PathUri::parse("file:///C:/workspace").expect("Windows cwd");
+    let context = local_context(&cwd);
+    let policy = FileSystemSandboxPolicy::workspace_write(
+        &[],
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    );
+    let outside = PathUri::parse("file:///C:/outside/out.txt").expect("outside");
+
+    assert_eq!(
+        write_permissions_for_paths(
+            &[outside],
+            &policy,
+            &context,
+            PatchSandboxRoute::ExecutorManaged,
+        )
+        .and_then(|profile| profile.file_system)
+        .map(|permissions| permissions.entries),
+        Some(vec![FileSystemSandboxEntry::new(
+            PathUri::parse("file:///C:/outside")
+                .expect("outside parent")
+                .into(),
+            FileSystemAccessMode::Write,
+        )]),
+    );
 }

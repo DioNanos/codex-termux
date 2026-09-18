@@ -9,7 +9,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use crate::ExecServerError;
 
 pub(crate) use harness::NoiseHarnessConnectionArgs;
-pub(crate) use harness::noise_harness_connection_from_websocket;
+pub(crate) use harness::noise_harness_connection_from_websocket_with_readiness;
 
 pub(crate) const NOISE_RELAY_RESET_REASON: &str = "noise_relay_protocol_error";
 

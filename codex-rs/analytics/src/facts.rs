@@ -434,7 +434,6 @@ pub enum CompactionReason {
 pub enum CompactionImplementation {
     Responses,
     ResponsesCompactionV2,
-    ResponsesCompact,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -566,6 +565,7 @@ pub(crate) enum CustomAnalyticsFact {
     SubAgentThreadStarted(SubAgentThreadStartedInput),
     Compaction(Box<CodexCompactionEvent>),
     Goal(Box<CodexGoalEvent>),
+    ThreadHintStatus(Box<crate::thread_hint::ThreadHintStatusEvent>),
     GuardianReview(Box<GuardianReviewEventParams>),
     GuardianV2(Box<GuardianV2Event>),
     TurnResolvedConfig(Box<TurnResolvedConfigFact>),
@@ -603,6 +603,7 @@ pub struct PluginMeasurementsInput {
     pub thread_id: String,
     pub turn_id: String,
     pub item_id: String,
+    pub originator: String,
     pub plugin_id: String,
     pub execution_id: String,
     pub operation: String,

@@ -105,6 +105,33 @@ impl LocalFileSystem {
             Ok((&self.unsandboxed, sandbox))
         }
     }
+
+    /// Read-only routing: like [`Self::file_system_for`], but a context whose
+    /// platform cannot provide any sandbox backend and whose policy has no
+    /// denied-read restrictions reads through the unsandboxed host path
+    /// instead of failing on a backend that can never be configured there.
+    fn read_file_system_for<'a>(
+        &'a self,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> io::Result<(
+        &'a dyn ExecutorFileSystem,
+        Option<&'a FileSystemSandboxContext>,
+    )> {
+        if sandbox.is_some_and(|context| {
+            context.should_run_in_sandbox() && !context.unsandboxed_read_fallback_allowed()
+        }) {
+            Ok((self.sandboxed()?, sandbox))
+        } else if sandbox.is_some_and(|context| {
+            context.should_run_in_sandbox() && context.unsandboxed_read_fallback_allowed()
+        }) {
+            // Host read fallback: the unsandboxed backend rejects a context
+            // that demands the platform sandbox, so the read runs without
+            // it — exactly the read this policy already permits.
+            Ok((&self.unsandboxed, /*sandbox*/ None))
+        } else {
+            Ok((&self.unsandboxed, sandbox))
+        }
+    }
 }
 
 impl LocalFileSystem {
@@ -113,8 +140,18 @@ impl LocalFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<tokio::fs::File> {
-        if sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox) {
+        if sandbox.is_some_and(|context| {
+            context.should_run_in_sandbox() && !context.unsandboxed_read_fallback_allowed()
+        }) {
             return self.sandboxed()?.open_file_for_read(path, sandbox).await;
+        }
+        if sandbox.is_some_and(|context| {
+            context.should_run_in_sandbox() && context.unsandboxed_read_fallback_allowed()
+        }) {
+            return self
+                .unsandboxed
+                .open_file_for_read(path, /*sandbox*/ None)
+                .await;
         }
         self.unsandboxed.open_file_for_read(path, sandbox).await
     }
@@ -128,13 +165,18 @@ impl LocalFileSystem {
         file_system.canonicalize(path, sandbox).await
     }
 
+    #[tracing::instrument(
+        name = "fs.read_file",
+        skip_all,
+        fields(sandboxed = sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox))
+    )]
     async fn read_file(
         &self,
         path: &PathUri,
         options: ReadFileOptions,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Vec<u8>> {
-        let (file_system, sandbox) = self.file_system_for(sandbox)?;
+        let (file_system, sandbox) = self.read_file_system_for(sandbox)?;
         file_system.read_file(path, options, sandbox).await
     }
 
@@ -143,7 +185,7 @@ impl LocalFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<FileSystemReadStream> {
-        let (file_system, sandbox) = self.file_system_for(sandbox)?;
+        let (file_system, sandbox) = self.read_file_system_for(sandbox)?;
         file_system.read_file_stream(path, sandbox).await
     }
 
@@ -170,6 +212,11 @@ impl LocalFileSystem {
         file_system.create_directory(path, options, sandbox).await
     }
 
+    #[tracing::instrument(
+        name = "fs.get_metadata",
+        skip_all,
+        fields(sandboxed = sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox))
+    )]
     async fn get_metadata(
         &self,
         path: &PathUri,

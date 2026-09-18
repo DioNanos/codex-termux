@@ -143,6 +143,7 @@ fn mark_exec_global_args(cmd: clap::Command) -> clap::Command {
             arg.global(true)
         })
         .mut_arg("bypass_hook_trust", |arg| arg.global(true))
+        .mut_arg("worktree", |arg| arg.global(true))
 }
 
 #[derive(Debug, clap::Subcommand)]

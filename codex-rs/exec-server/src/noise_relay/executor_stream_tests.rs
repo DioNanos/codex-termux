@@ -99,6 +99,7 @@ async fn processor_exit_reports_closed_virtual_stream() -> Result<()> {
         physical_outgoing_tx,
         closed_stream_tx,
         executor_transport,
+        /*executor_registration*/ None,
     );
 
     let message = JSONRPCMessage::Response(JSONRPCResponse {

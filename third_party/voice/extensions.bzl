@@ -1,6 +1,6 @@
 """Use standard Bazel archives for the standalone builder's pinned sources."""
 
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
 
 _BUILD_FILE = """
 filegroup(
@@ -13,6 +13,12 @@ filegroup(
 def _voice_sources_impl(module_ctx):
     manifest = json.decode(module_ctx.read(Label("//third_party/voice:sources.json")))
     for source in manifest["sources"]:
+        http_file(
+            name = "voice_archive_" + source["name"].replace("-", "_"),
+            urls = [source["url"]],
+            sha256 = source["sha256"],
+            downloaded_file_path = source["archive"],
+        )
         http_archive(
             name = "voice_" + source["name"].replace("-", "_"),
             urls = [source["url"]],

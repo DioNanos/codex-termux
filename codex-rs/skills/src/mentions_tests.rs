@@ -78,3 +78,28 @@ fn handles_many_sigils_without_looping() {
     let prefix = "$".repeat(256);
     assert_mentions(&format!("{prefix} not-a-mention"), &[], &[]);
 }
+
+#[test]
+fn plugin_config_names_ignore_mention_query_parameters() {
+    let paths = [
+        "plugin://sample@test",
+        "plugin://sample@test?app=com.example.editor",
+        "plugin://sample@test?browserFamily=chrome",
+    ];
+
+    assert_eq!(
+        paths.map(plugin_config_name_from_path),
+        [Some("sample@test"); 3],
+    );
+}
+
+#[test]
+fn plugin_config_names_require_a_plugin_identity() {
+    let paths = [
+        "plugin://",
+        "plugin://?app=com.example.editor",
+        "app://sample@test?app=com.example.editor",
+    ];
+
+    assert_eq!(paths.map(plugin_config_name_from_path), [None; 3]);
+}

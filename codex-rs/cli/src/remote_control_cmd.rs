@@ -131,7 +131,7 @@ async fn run_foreground_remote_control(
         ..Default::default()
     };
     let (stop_rx, stop_signal_task) = foreground_stop_signal();
-    let mut app_server_task = tokio::spawn(codex_app_server::run_main_with_transport_options(
+    let app_server = codex_app_server::run_main_with_transport_options(
         arg0_paths,
         root_config_overrides,
         LoaderOverrides::default(),
@@ -141,7 +141,8 @@ async fn run_foreground_remote_control(
         SessionSource::VSCode,
         AppServerWebsocketAuthSettings::default(),
         runtime_options,
-    ));
+    );
+    let mut app_server_task = tokio::spawn(async move { app_server.await.map(|_| ()) });
 
     let summary = match wait_for_foreground_remote_control_start(
         &mut app_server_task,

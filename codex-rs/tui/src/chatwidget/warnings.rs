@@ -6,6 +6,8 @@ const FALLBACK_MODEL_METADATA_WARNING_SUFFIX: &str =
 
 #[derive(Default)]
 pub(super) struct WarningDisplayState {
+    /// Completed resume history does not end startup; active work does.
+    pub(super) startup_complete: bool,
     fallback_model_metadata_slugs: HashSet<String>,
 }
 

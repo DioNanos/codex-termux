@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -31,6 +32,8 @@ use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::SandboxMode;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::StrictReviewRequiredNotification;
+use codex_app_server_protocol::ThreadCompactStartParams;
+use codex_app_server_protocol::ThreadCompactStartResponse;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
@@ -74,16 +77,29 @@ use super::mcp_tool::TEST_TOOL_NAME;
 use super::mcp_tool::start_mcp_server;
 use super::mcp_tool::start_mcp_server_with_tools;
 
+#[path = "guardian_sync_session_tests.rs"]
+mod sync_sessions;
+
 #[path = "guardian_v2_history_tests.rs"]
 mod history;
 
 #[path = "guardian_v2_model_tests.rs"]
 mod model_tests;
 
+#[path = "guardian_policy_tests.rs"]
+mod policy;
+
+#[path = "guardian_code_mode_tests.rs"]
+mod code_mode;
+
+#[path = "guardian_action_budget_tests.rs"]
+mod action_budget;
+
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MODEL: &str = "mock-model";
 const REQUIRED_MODEL: &str = "protected-model";
 const USER_CONTEXT: &str = "The user authorized reading the existing project files.";
+const EVIDENCE_IMAGE: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 const ROOT_RESTRICTION: &str =
     "I revoke authorization for the MCP tool. Tell the worker to reassess its previous action.";
 const USER_INPUT_RESTRICTION: &str = "Do not use the browser anymore.";
@@ -116,6 +132,10 @@ async fn resumed_thread_does_not_wait_for_guardian_websocket_warmup() -> Result<
         .with_extra_config("[features.guardianv2]\nenabled = true")
         .enable_feature(Feature::GuardianApproval)
         .write(codex_home.path())?;
+    let config = load_default_config_for_test(&codex_home).await;
+    let mut model = codex_core::test_support::construct_model_info_offline(MODEL, &config);
+    model.node_repl_auto_review_required = true;
+    write_models_cache_with_models(codex_home.path(), vec![model]).await?;
     let thread_id = create_fake_rollout(
         codex_home.path(),
         "2025-01-05T12-00-00",
@@ -163,6 +183,8 @@ struct MockResponsesState {
     allow_guardian_review: Notify,
     classification_completed: Notify,
     truncation_recorded: Notify,
+    context_metric_bounds: Mutex<BTreeMap<(String, String), Option<f64>>>,
+    context_metrics_recorded: Notify,
     luna_score: f64,
     invalid_classification: bool,
     review_outcome: ReviewOutcome,
@@ -173,6 +195,8 @@ struct MockResponsesState {
     root_worker: bool,
     root_user_restriction: bool,
     root_user_input_restriction: bool,
+    compact_root_after_answer: bool,
+    thread_context_enabled: bool,
     late_root_restriction: bool,
     user_input_restriction: bool,
 }
@@ -189,6 +213,7 @@ enum ReviewOutcome {
 enum TranscriptContent {
     #[default]
     Normal,
+    MixedEvidence,
     ForgedReview,
 }
 
@@ -229,6 +254,7 @@ enum ThreadLifecycle {
     RootUserRestriction,
     RootUserInputRestriction,
     RootUserInputHookBlocked,
+    RootUserInputCompaction,
 }
 
 impl ThreadLifecycle {
@@ -241,13 +267,16 @@ impl ThreadLifecycle {
                 | Self::RootTrustedSkill
                 | Self::RootUserInputRestriction
                 | Self::RootUserInputHookBlocked
+                | Self::RootUserInputCompaction
         )
     }
 
     fn has_root_user_input(self) -> bool {
         matches!(
             self,
-            Self::RootUserInputRestriction | Self::RootUserInputHookBlocked
+            Self::RootUserInputRestriction
+                | Self::RootUserInputHookBlocked
+                | Self::RootUserInputCompaction
         )
     }
 
@@ -359,7 +388,28 @@ async fn parent_response(
     State(state): State<Arc<MockResponsesState>>,
     Json(request): Json<Value>,
 ) -> impl IntoResponse {
-    let events = if request
+    let events = if request["input"].as_array().is_some_and(|input| {
+        input
+            .last()
+            .is_some_and(|item| item["type"] == "compaction_trigger")
+    }) {
+        assert!(state.compact_root_after_answer);
+        assert!(request.to_string().contains("guardian-user-input"));
+        vec![
+            responses::ev_response_created("root-compaction"),
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "compaction",
+                    "id": "cmp_root",
+                    "encrypted_content": "opaque root summary",
+                },
+            }),
+            responses::ev_completed("root-compaction"),
+        ]
+    } else if request["model"] == "gpt-5.6-luna" {
+        luna_response(&state, request).await
+    } else if request
         .pointer("/client_metadata/x-openai-subagent")
         .and_then(Value::as_str)
         == Some("guardian")
@@ -400,9 +450,27 @@ async fn parent_response(
             .is_none()
     {
         let root_request = state.root_requests.fetch_add(1, Ordering::SeqCst);
+        if state.compact_root_after_answer && root_request == 4 {
+            let input = request["input"].as_array().expect("root model input");
+            assert!(input.iter().any(|item| item["id"] == "cmp_root"));
+            assert!(
+                !input
+                    .iter()
+                    .any(|item| item["call_id"] == "guardian-user-input")
+            );
+        }
         match root_request {
             1 if state.root_user_input_restriction => user_input_request_events(),
-            0 | 2 if root_request == 0 || !state.late_root_restriction => {
+            0 | 2 | 4
+                if root_request == 0
+                    || !state.late_root_restriction
+                        && root_request
+                            == if state.compact_root_after_answer {
+                                4
+                            } else {
+                                2
+                            } =>
+            {
                 let (call_id, tool_name, arguments) = if root_request == 0 {
                     (
                         "guardian-spawn-worker",
@@ -440,6 +508,23 @@ async fn parent_response(
                 .contains("Completed synchronous Guardian review.")
         );
         let request_number = state.parent_requests.fetch_add(1, Ordering::SeqCst);
+        if state.thread_context_enabled && state.late_root_restriction && request_number == 1 {
+            let output = request["input"]
+                .as_array()
+                .expect("worker model input")
+                .iter()
+                .find(|item| {
+                    item["call_id"] == "guardian-action-0" && item["type"] == "function_call_output"
+                })
+                .expect("first tool result after root revocation");
+            assert!(
+                output.to_string().contains("user cancelled MCP tool call")
+                    || output
+                        .to_string()
+                        .contains("Tool execution was cancelled by Guardian."),
+                "a stale sync allow must not execute the first tool: {output}"
+            );
+        }
         if request["model"] == REQUIRED_MODEL && request_number == 3 {
             vec![
                 responses::ev_response_created("required-model-command"),
@@ -503,6 +588,39 @@ async fn parent_response(
     )
 }
 
+async fn luna_response(state: &MockResponsesState, request: Value) -> Vec<Value> {
+    let is_root_sample = state.root_worker
+        && state
+            .root_thread_id
+            .lock()
+            .expect("root thread lock should not be poisoned")
+            .as_ref()
+            .is_some_and(|thread_id| {
+                request["prompt_cache_key"] == format!("guardian-v2:{thread_id}")
+            });
+    if !is_root_sample {
+        state
+            .luna_requests
+            .lock()
+            .expect("Luna request lock should not be poisoned")
+            .push(request);
+        state.allow_luna.notified().await;
+    }
+    let classification = if state.invalid_classification {
+        "invalid"
+    } else if state.luna_score < 0.5 {
+        "low"
+    } else {
+        "high"
+    };
+    vec![
+        responses::ev_response_created("luna-score"),
+        responses::ev_output_text_delta(classification),
+        responses::ev_assistant_message("luna-score-message", classification),
+        responses::ev_completed("luna-score"),
+    ]
+}
+
 async fn luna_websocket(
     State(state): State<Arc<MockResponsesState>>,
     websocket: WebSocketUpgrade,
@@ -514,36 +632,7 @@ async fn luna_websocket(
                 continue;
             };
             let request: Value = serde_json::from_str(&text).expect("valid Luna request");
-            let is_root_sample = state.root_worker
-                && state
-                    .root_thread_id
-                    .lock()
-                    .expect("root thread lock should not be poisoned")
-                    .as_ref()
-                    .is_some_and(|thread_id| {
-                        request["prompt_cache_key"] == format!("guardian-v2:{thread_id}")
-                    });
-            if !is_root_sample {
-                state
-                    .luna_requests
-                    .lock()
-                    .expect("Luna request lock should not be poisoned")
-                    .push(request);
-                state.allow_luna.notified().await;
-            }
-            let classification = if state.invalid_classification {
-                "invalid"
-            } else if state.luna_score < 0.5 {
-                "low"
-            } else {
-                "high"
-            };
-            for event in [
-                responses::ev_response_created("luna-score"),
-                responses::ev_output_text_delta(classification),
-                responses::ev_assistant_message("luna-score-message", classification),
-                responses::ev_completed("luna-score"),
-            ] {
+            for event in luna_response(&state, request).await {
                 if socket
                     .send(Message::Text(event.to_string().into()))
                     .await
@@ -571,10 +660,15 @@ async fn guardian_v2_routes_tool_approvals(
         transcript_content,
         GuardianToolScope::AllTools,
         /*sensitive_action*/ None,
+        /*thread_context_enabled*/ false,
     )
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The shared fixture varies independent review and context-mode test dimensions."
+)]
 async fn guardian_v2_routes_scoped_tool_approvals(
     risk: GuardianRisk,
     lifecycle: ThreadLifecycle,
@@ -583,6 +677,7 @@ async fn guardian_v2_routes_scoped_tool_approvals(
     transcript_content: TranscriptContent,
     scope: GuardianToolScope,
     sensitive_action: Option<bool>,
+    thread_context_enabled: bool,
 ) -> Result<()> {
     let server_name = match scope {
         GuardianToolScope::AllTools => TEST_SERVER_NAME,
@@ -629,6 +724,8 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         root_worker: lifecycle.uses_root_worker(),
         root_user_restriction: matches!(lifecycle, ThreadLifecycle::RootUserRestriction),
         root_user_input_restriction: lifecycle.has_root_user_input(),
+        thread_context_enabled,
+        compact_root_after_answer: matches!(lifecycle, ThreadLifecycle::RootUserInputCompaction),
         late_root_restriction,
         user_input_restriction: lifecycle.has_user_input(),
         ..Default::default()
@@ -641,6 +738,58 @@ async fn guardian_v2_routes_scoped_tool_approvals(
             "/metrics",
             post(
                 |State(state): State<Arc<MockResponsesState>>, body: String| async move {
+                    if matches!(state.transcript_content, TranscriptContent::MixedEvidence) {
+                        let payload: Value = serde_json::from_str(&body).expect("OTLP JSON");
+                        for metric in payload["resourceMetrics"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .flat_map(|resource| {
+                                resource["scopeMetrics"].as_array().into_iter().flatten()
+                            })
+                            .flat_map(|scope| scope["metrics"].as_array().into_iter().flatten())
+                            .filter(|metric| {
+                                matches!(
+                                    metric["name"].as_str(),
+                                    Some(
+                                        "codex.guardian.context.request_tokens"
+                                            | "codex.guardian.context.section_cost"
+                                    )
+                                )
+                            })
+                        {
+                            let name = metric["name"].as_str().expect("context metric name");
+                            for point in metric["histogram"]["dataPoints"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                            {
+                                let attributes =
+                                    point["attributes"].as_array().expect("metric attributes");
+                                for target in ["sync", "async"] {
+                                    if attributes.iter().any(|attr| {
+                                        attr["key"] == "target"
+                                            && attr["value"]["stringValue"] == target
+                                    }) {
+                                        let mut bounds = state
+                                            .context_metric_bounds
+                                            .lock()
+                                            .expect("context metric bounds");
+                                        bounds.insert(
+                                            (name.to_owned(), target.to_owned()),
+                                            point["explicitBounds"]
+                                                .as_array()
+                                                .and_then(|bounds| bounds.last())
+                                                .and_then(Value::as_f64),
+                                        );
+                                        if bounds.len() == 4 {
+                                            state.context_metrics_recorded.notify_one();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if body.contains("codex.guardian_v2.classification") {
                         state.classification_completed.notify_one();
                     }
@@ -661,7 +810,8 @@ async fn guardian_v2_routes_scoped_tool_approvals(
     let codex_home = TempDir::new()?;
     let analytics_server = responses::start_mock_server().await;
     mount_analytics_capture(&analytics_server, codex_home.path()).await?;
-    let root_skill = if matches!(lifecycle, ThreadLifecycle::RootTrustedSkill) {
+    let mixed_evidence = matches!(transcript_content, TranscriptContent::MixedEvidence);
+    let root_skill = if matches!(lifecycle, ThreadLifecycle::RootTrustedSkill) || mixed_evidence {
         let path = codex_home.path().join("skills/root-trusted/SKILL.md");
         std::fs::create_dir_all(path.parent().expect("root skill parent"))?;
         std::fs::write(
@@ -715,9 +865,9 @@ async fn guardian_v2_routes_scoped_tool_approvals(
     };
     let guardian_scope_config = match scope {
         GuardianToolScope::AllTools => {
-            "\n\n[features.guardianv2]\nenabled = true\n\n[features.guardianv2.review_scope]\ncomputer_use_only = false"
+            "\n\n[features.guardianv2.review_scope]\ncomputer_use_only = false"
         }
-        GuardianToolScope::ComputerUseOnly { .. } => "\n\n[features.guardianv2]\nenabled = true",
+        GuardianToolScope::ComputerUseOnly { .. } => "",
     };
     let tool_approval_mode = if node_repl_review_required {
         "auto"
@@ -733,7 +883,7 @@ async fn guardian_v2_routes_scoped_tool_approvals(
             analytics_server.uri(),
         ))
         .with_extra_config(&format!(
-            "[mcp_servers.{server_name}]\nurl = \"{mcp_server_url}/mcp\"\ndefault_tools_approval_mode = \"{tool_approval_mode}\"\n\n[analytics]\nenabled = true\n\n[otel]\nmetrics_exporter = {{ otlp-http = {{ endpoint = \"{responses_url}/metrics\", protocol = \"json\" }} }}{guardian_scope_config}"
+            "[mcp_servers.{server_name}]\nurl = \"{mcp_server_url}/mcp\"\ndefault_tools_approval_mode = \"{tool_approval_mode}\"\n\n[analytics]\nenabled = true\n\n[otel]\nmetrics_exporter = {{ otlp-http = {{ endpoint = \"{responses_url}/metrics\", protocol = \"json\" }} }}\n\n[features.guardianv2]\nenabled = true\nthread_context = {thread_context_enabled}{guardian_scope_config}"
         ))
         .enable_feature(Feature::GuardianApproval);
     if lifecycle.has_user_input() || lifecycle.has_root_user_input() {
@@ -744,12 +894,18 @@ async fn guardian_v2_routes_scoped_tool_approvals(
             .enable_feature(Feature::Collab)
             .enable_feature(Feature::MultiAgentV2);
     }
+    if matches!(lifecycle, ThreadLifecycle::RootUserInputCompaction) {
+        mock_config = mock_config
+            .with_provider_name("OpenAI")
+            .disable_feature(Feature::TokenBudget)
+            .disable_feature(Feature::EnableRequestCompression);
+    }
     mock_config.write(codex_home.path())?;
     if node_repl_review_required {
         let config = load_default_config_for_test(&codex_home).await;
         let mut model_info = codex_core::test_support::construct_model_info_offline(MODEL, &config);
         model_info.node_repl_auto_review_required = true;
-        write_models_cache_with_models(codex_home.path(), vec![model_info])?;
+        write_models_cache_with_models(codex_home.path(), vec![model_info]).await?;
     }
     let original_thread_id = match lifecycle {
         ThreadLifecycle::New
@@ -764,7 +920,8 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         | ThreadLifecycle::RootTrustedSkill
         | ThreadLifecycle::RootUserRestriction
         | ThreadLifecycle::RootUserInputRestriction
-        | ThreadLifecycle::RootUserInputHookBlocked => None,
+        | ThreadLifecycle::RootUserInputHookBlocked
+        | ThreadLifecycle::RootUserInputCompaction => None,
         ThreadLifecycle::Resume | ThreadLifecycle::Fork => {
             let thread_id = create_fake_rollout(
                 codex_home.path(),
@@ -812,7 +969,8 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         | ThreadLifecycle::RootTrustedSkill
         | ThreadLifecycle::RootUserRestriction
         | ThreadLifecycle::RootUserInputRestriction
-        | ThreadLifecycle::RootUserInputHookBlocked => {
+        | ThreadLifecycle::RootUserInputHookBlocked
+        | ThreadLifecycle::RootUserInputCompaction => {
             let started = app_server
                 .start_thread(ThreadStartParams {
                     approval_policy: Some(AskForApproval::OnRequest),
@@ -865,13 +1023,25 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         .lock()
         .expect("root thread lock should not be poisoned") = Some(thread_id.clone());
     let mut turn_input = vec![UserInput::Text {
-        text: USER_CONTEXT.to_owned(),
+        text: if matches!(lifecycle, ThreadLifecycle::RootUserInputCompaction) {
+            // Exceed the full-text storage cap; the bounded root excerpt must survive
+            // after compaction removes the original from the live model window.
+            format!("{USER_CONTEXT}\n{}", "Context detail. ".repeat(1_200))
+        } else {
+            USER_CONTEXT.to_owned()
+        },
         text_elements: Vec::new(),
     }];
     if let Some(skill_path) = root_skill.as_ref() {
         turn_input.push(UserInput::Skill {
             name: "root-trusted".to_owned(),
             path: skill_path.clone(),
+        });
+    }
+    if mixed_evidence {
+        turn_input.push(UserInput::Image {
+            url: EVIDENCE_IMAGE.to_owned(),
+            detail: None,
         });
     }
     let turn_request_id = app_server
@@ -915,7 +1085,7 @@ async fn guardian_v2_routes_scoped_tool_approvals(
                             == json!(["guardian.trusted_skills"])
                 })
                 .and_then(|item| item["content"][0]["text"].as_str())
-                .expect("delegated workers should inherit invoked root-user skills");
+                .expect("invoked user-owned skills should retain trusted developer delivery");
             let (_, evidence) = trusted_message
                 .split_once('\n')
                 .expect("trusted skill message should contain JSON evidence");
@@ -929,7 +1099,11 @@ async fn guardian_v2_routes_scoped_tool_approvals(
                 .as_array()
                 .expect("Luna input should be an array")
                 .iter()
-                .filter(|item| item["role"] == "developer")
+                .filter(|item| {
+                    item["role"] == "developer"
+                        && item["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+                            == json!(["guardian.trusted_tool"])
+                })
                 .filter_map(|item| item["content"].as_array())
                 .flatten()
                 .filter_map(|entry| entry["text"].as_str())
@@ -1005,6 +1179,48 @@ async fn guardian_v2_routes_scoped_tool_approvals(
             submit_user_input_response(&mut app_server, answers).await?;
         }
         let second_sample = wait_for_luna_request(responses_state.as_ref(), /*index*/ 1).await?;
+        if mixed_evidence {
+            let input = second_sample["input"].as_array().expect("Luna input");
+            assert_eq!(
+                input
+                    .iter()
+                    .map(|item| json!([
+                        item["type"],
+                        item["role"],
+                        item["internal_chat_message_metadata_passthrough"]["content_item_kinds"],
+                    ]))
+                    .collect::<Vec<_>>(),
+                vec![
+                    json!(["additional_tools", "developer", null]),
+                    json!(["message", "developer", null]),
+                    json!(["message", "developer", null]),
+                    json!(["message", "developer", ["guardian.trusted_tool"]]),
+                    json!(["message", "developer", ["guardian.trusted_skills"]]),
+                    json!(["message", "user", null]),
+                ],
+            );
+            let content = input[5]["content"].as_array().expect("untrusted evidence");
+            let texts = content
+                .iter()
+                .filter_map(|item| item["text"].as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(texts.first().copied(), Some(">>> TRANSCRIPT START\n"));
+            assert!(texts.iter().any(|text| text.contains(USER_CONTEXT)));
+            assert!(texts.iter().any(|text| text.contains("guardian-0")));
+            assert_eq!(texts.last().copied(), Some(">>> APPROVAL REQUEST END\n"));
+            assert!(
+                content[..content.len() - 1]
+                    .iter()
+                    .all(|item| item["type"] == "input_text")
+            );
+            let image = content
+                .last()
+                .expect("transcript image follows planned action");
+            assert_eq!(
+                json!([image["type"], image["image_url"], image["detail"]]),
+                json!(["input_image", EVIDENCE_IMAGE, null]),
+            );
+        }
         let reviews = sync_review_fragments(&second_sample);
         if lifecycle.has_user_answer() {
             let answer_items = second_sample["input"]
@@ -1145,6 +1361,62 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         responses_state.guardian_reviews.load(Ordering::SeqCst),
         expected_guardian_reviews
     );
+    if mixed_evidence {
+        let reviews = responses_state
+            .guardian_requests
+            .lock()
+            .expect("Guardian requests");
+        assert_eq!(
+            reviews[0]["client_metadata"]["thread_id"],
+            reviews[1]["client_metadata"]["thread_id"]
+        );
+        for (review, start, end) in [
+            (&reviews[0], ">>> TRANSCRIPT START", ">>> TRANSCRIPT END"),
+            (
+                &reviews[1],
+                ">>> TRANSCRIPT DELTA START",
+                ">>> TRANSCRIPT DELTA END",
+            ),
+        ] {
+            let message = review["input"]
+                .as_array()
+                .expect("sync input")
+                .iter()
+                .rfind(|item| item["role"] == "user")
+                .expect("latest review input");
+            let text = message["content"]
+                .as_array()
+                .expect("review content")
+                .iter()
+                .filter_map(|item| item["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(start));
+            assert!(text.contains(end));
+            assert!(text.find(start) < text.find(end));
+            assert!(text.contains("Planned action JSON:"));
+        }
+    }
+    if mixed_evidence {
+        timeout(TIMEOUT, responses_state.context_metrics_recorded.notified())
+            .await
+            .expect("sync and async request/section metrics should all be exported");
+        let bounds = responses_state
+            .context_metric_bounds
+            .lock()
+            .expect("context metric bounds");
+        for ((metric, target), bound) in bounds.iter() {
+            assert_eq!(
+                *bound,
+                Some(if metric == "codex.guardian.context.request_tokens" {
+                    2_000_000.0
+                } else {
+                    16_777_216.0
+                }),
+                "{metric} ({target}) must export its context metric buckets"
+            );
+        }
+    }
     if lifecycle.has_user_answer() {
         let reviews = responses_state
             .guardian_requests
@@ -1304,11 +1576,56 @@ async fn guardian_v2_routes_scoped_tool_approvals(
                 &mut app_server,
                 json!({
                     "browser_authorization": {
-                        "answers": ["Stop"]
+                        "answers": [if matches!(lifecycle, ThreadLifecycle::RootUserInputCompaction) { "Continue" } else { "Stop" }]
                     }
                 }),
             )
             .await?;
+            if matches!(lifecycle, ThreadLifecycle::RootUserInputCompaction) {
+                loop {
+                    let completed: TurnCompletedNotification =
+                        timeout(TIMEOUT, app_server.read_notification("turn/completed")).await??;
+                    if completed.thread_id == thread_id {
+                        break;
+                    }
+                }
+                let id = app_server
+                    .send_turn_start_request(TurnStartParams {
+                        thread_id: thread_id.clone(),
+                        input: vec![UserInput::Text {
+                            text: ROOT_RESTRICTION.to_owned(),
+                            text_elements: Vec::new(),
+                        }],
+                        ..Default::default()
+                    })
+                    .await?;
+                let _: TurnStartResponse = timeout(TIMEOUT, app_server.read_response(id)).await??;
+                let completed: TurnCompletedNotification =
+                    timeout(TIMEOUT, app_server.read_notification("turn/completed")).await??;
+                assert_eq!(completed.thread_id, thread_id);
+                let id = app_server
+                    .send_thread_compact_start_request(ThreadCompactStartParams {
+                        thread_id: thread_id.clone(),
+                    })
+                    .await?;
+                let _: ThreadCompactStartResponse =
+                    timeout(TIMEOUT, app_server.read_response(id)).await??;
+                let completed: TurnCompletedNotification =
+                    timeout(TIMEOUT, app_server.read_notification("turn/completed")).await??;
+                assert_eq!(completed.thread_id, thread_id);
+                let id = app_server
+                    .send_turn_start_request(TurnStartParams {
+                        thread_id: thread_id.clone(),
+                        input: vec![UserInput::Text {
+                            text: "Ask the worker to check again under the current restrictions."
+                                .to_owned(),
+                            text_elements: Vec::new(),
+                        }],
+                        ..Default::default()
+                    })
+                    .await?;
+                let _: TurnStartResponse = timeout(TIMEOUT, app_server.read_response(id)).await??;
+            }
         } else {
             let followup_id = app_server
                 .send_turn_start_request(TurnStartParams {
@@ -1359,8 +1676,11 @@ async fn guardian_v2_routes_scoped_tool_approvals(
                 | ThreadLifecycle::RootUserRestriction
                 | ThreadLifecycle::RootUserInputRestriction
                 | ThreadLifecycle::RootUserInputHookBlocked
+                | ThreadLifecycle::RootUserInputCompaction
         ) {
-            let restriction = if lifecycle.has_root_user_input() {
+            let restriction = if matches!(lifecycle, ThreadLifecycle::RootUserInputCompaction) {
+                ROOT_RESTRICTION
+            } else if lifecycle.has_root_user_input() {
                 "assistant: Can I keep using the browser?\nassistant: Stop: Stop using the browser.\nuser: Stop\n"
             } else {
                 ROOT_RESTRICTION
@@ -1382,6 +1702,40 @@ async fn guardian_v2_routes_scoped_tool_approvals(
             wait_for_guardian_reviews(responses_state.as_ref(), expected_guardian_reviews + 1)
                 .await?;
         }
+        if matches!(lifecycle, ThreadLifecycle::RootUserInputCompaction) {
+            wait_for_guardian_reviews(responses_state.as_ref(), expected_guardian_reviews + 1)
+                .await?;
+            let reviews = responses_state
+                .guardian_requests
+                .lock()
+                .expect("review log");
+            for request in [
+                post_authorization_change_sample.clone(),
+                reviews.last().expect("post-compaction review").clone(),
+            ] {
+                let text = request.to_string();
+                assert!(
+                    text.find("user: Continue").expect("retained grant")
+                        < text.find(ROOT_RESTRICTION).expect("later revocation")
+                );
+                assert!(text.contains("does not grant general child permission"));
+                let (_, root_conversation) = text
+                    .split_once(">>> ROOT CONVERSATION START")
+                    .expect("root conversation start");
+                let (root_conversation, _) = root_conversation
+                    .split_once(">>> ROOT CONVERSATION END")
+                    .expect("root conversation end");
+                assert!(root_conversation.contains(&format!("user: {USER_CONTEXT}")));
+                assert!(!root_conversation.contains("some root user instructions are unavailable"));
+            }
+            assert!(
+                !reviews
+                    .last()
+                    .expect("fresh reviewer session")
+                    .to_string()
+                    .contains("TRANSCRIPT DELTA START")
+            );
+        }
         responses_state.allow_luna.notify_one();
     }
 
@@ -1400,15 +1754,14 @@ async fn guardian_v2_routes_scoped_tool_approvals(
             })
             .await?;
         }
+        let turn = wait_for_matching_analytics_event(&analytics_server, TIMEOUT, |event| {
+            event["event_type"] == "codex_turn_event"
+                && event["event_params"]["thread_id"] == reviewed_thread_id
+        })
+        .await?;
         timeout(TIMEOUT, app_server.shutdown_gracefully()).await??;
         let events = captured_analytics_events(&analytics_server).await;
-        let turn = &events
-            .iter()
-            .find(|event| {
-                event["event_type"] == "codex_turn_event"
-                    && event["event_params"]["thread_id"] == reviewed_thread_id
-            })
-            .expect("parent turn analytics")["event_params"];
+        let turn = &turn["event_params"];
         assert_eq!(turn["guardian_v2_enabled"], classifier_in_scope);
         let classification = events.iter().find(|event| {
             event["event_type"] == "codex_guardian_v2_classification"
@@ -1709,6 +2062,7 @@ async fn guardian_v2_inherits_root_user_skills_for_delegated_workers() -> Result
             server_name: "node_repl",
         },
         /*sensitive_action*/ None,
+        /*thread_context_enabled*/ false,
     )
     .await
 }
@@ -1731,6 +2085,7 @@ async fn guardian_v2_computer_use_only_scopes_classification_and_fast_reviews(
         TranscriptContent::Normal,
         GuardianToolScope::ComputerUseOnly { server_name },
         /*sensitive_action*/ None,
+        /*thread_context_enabled*/ false,
     )
     .await
 }
@@ -1779,7 +2134,7 @@ async fn first_cua_review_does_not_wait_for_initial_score(
     let config = load_default_config_for_test(&codex_home).await;
     let mut model_info = codex_core::test_support::construct_model_info_offline(MODEL, &config);
     model_info.node_repl_auto_review_required = true;
-    write_models_cache_with_models(codex_home.path(), vec![model_info])?;
+    write_models_cache_with_models(codex_home.path(), vec![model_info]).await?;
     let mut app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .build_initialized_with_timeout(TIMEOUT)
@@ -1865,7 +2220,7 @@ async fn user_approval_skips_async_guardian_without_changing_other_modes() -> Re
     let config = load_default_config_for_test(&codex_home).await;
     let mut model_info = codex_core::test_support::construct_model_info_offline(MODEL, &config);
     model_info.node_repl_auto_review_required = true;
-    write_models_cache_with_models(codex_home.path(), vec![model_info])?;
+    write_models_cache_with_models(codex_home.path(), vec![model_info]).await?;
     let mut app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .build_initialized_with_timeout(TIMEOUT)
@@ -2028,6 +2383,7 @@ async fn guardian_v2_required_model_computer_use_preserves_strict_approval(
         TranscriptContent::Normal,
         GuardianToolScope::ComputerUseOnly { server_name },
         sensitive_action,
+        /*thread_context_enabled*/ false,
     )
     .await
 }
@@ -2049,6 +2405,7 @@ async fn guardian_v2_discards_sync_reviews_after_user_input_answer(
             server_name: "node_repl",
         },
         /*sensitive_action*/ None,
+        /*thread_context_enabled*/ false,
     )
     .await
 }
@@ -2071,15 +2428,20 @@ async fn guardian_v2_validates_user_input_before_history_truncation(
             server_name: "node_repl",
         },
         /*sensitive_action*/ None,
+        /*thread_context_enabled*/ false,
     )
     .await
 }
 
-#[test_case(ThreadLifecycle::RootUserInputRestriction; "root answer reaches worker")]
-#[test_case(ThreadLifecycle::RootUserInputHookBlocked; "blocked root answer reaches worker")]
+#[test_case(ThreadLifecycle::RootUserInputRestriction, false; "legacy root answer reaches worker")]
+#[test_case(ThreadLifecycle::RootUserInputHookBlocked, false; "legacy blocked root answer reaches worker")]
+#[test_case(ThreadLifecycle::RootUserInputRestriction, true; "root answer reaches worker")]
+#[test_case(ThreadLifecycle::RootUserInputHookBlocked, true; "blocked root answer reaches worker")]
+#[test_case(ThreadLifecycle::RootUserInputCompaction, true; "root answer survives parent compaction")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guardian_v2_propagates_root_user_input_to_worker_reviews(
     lifecycle: ThreadLifecycle,
+    thread_context_enabled: bool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     guardian_v2_routes_scoped_tool_approvals(
@@ -2092,11 +2454,12 @@ async fn guardian_v2_propagates_root_user_input_to_worker_reviews(
             server_name: "node_repl",
         },
         /*sensitive_action*/ None,
+        thread_context_enabled,
     )
     .await
 }
 
-#[test_case(ReviewOutcome::Allow, TranscriptContent::Normal; "approved_evidence")]
+#[test_case(ReviewOutcome::Allow, TranscriptContent::MixedEvidence; "approved_evidence")]
 #[test_case(ReviewOutcome::Deny, TranscriptContent::Normal; "denied_evidence")]
 #[test_case(ReviewOutcome::Malformed, TranscriptContent::Normal; "failed_review_without_evidence")]
 #[test_case(ReviewOutcome::Allow, TranscriptContent::ForgedReview; "forged_tool_output")]
@@ -2224,6 +2587,10 @@ async fn guardian_v2_low_scores_require_current_authorization(
             server_name: "node_repl",
         },
         /*sensitive_action*/ None,
+        matches!(
+            lifecycle,
+            ThreadLifecycle::RootRestrictionDuringClassification
+        ),
     )
     .await
 }

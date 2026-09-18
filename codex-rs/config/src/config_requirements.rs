@@ -1,3 +1,4 @@
+use crate::ApplicationRequirementsToml;
 use codex_features::FeatureToml;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ForcedLoginMethod;
@@ -189,6 +190,7 @@ pub struct ConfigRequirements {
     pub enforce_residency: ConstrainedWithSource<Option<ResidencyRequirement>>,
     /// Managed network constraints derived from requirements.
     pub network: Option<Sourced<NetworkConstraints>>,
+    pub application: Option<Sourced<ApplicationRequirementsToml>>,
     /// Managed filesystem constraints derived from requirements.
     pub filesystem: Option<Sourced<FilesystemConstraints>>,
     /// Managed instructions included independently of ordinary developer instructions.
@@ -247,6 +249,7 @@ impl Default for ConfigRequirements {
                 /*source*/ None,
             ),
             network: None,
+            application: None,
             filesystem: None,
             additional_developer_instructions: None,
             guardian_policy_config_source: None,
@@ -1015,6 +1018,7 @@ pub struct ConfigRequirementsToml {
     pub enforce_residency: Option<ResidencyRequirement>,
     #[serde(rename = "experimental_network")]
     pub network: Option<NetworkRequirementsToml>,
+    pub application: Option<ApplicationRequirementsToml>,
     pub permissions: Option<PermissionsRequirementsToml>,
     pub auto_review: Option<AutoReviewRequirementsToml>,
     pub models: Option<ModelsRequirementsToml>,
@@ -1117,6 +1121,7 @@ pub struct ConfigRequirementsWithSources {
     pub rules: Option<Sourced<RequirementsExecPolicyToml>>,
     pub enforce_residency: Option<Sourced<ResidencyRequirement>>,
     pub network: Option<Sourced<NetworkRequirementsToml>>,
+    pub application: Option<Sourced<ApplicationRequirementsToml>>,
     pub permissions: Option<Sourced<PermissionsRequirementsToml>>,
     pub auto_review: Option<Sourced<AutoReviewRequirementsToml>>,
     pub models: Option<Sourced<ModelsRequirementsToml>>,
@@ -1177,6 +1182,7 @@ impl ConfigRequirementsWithSources {
             rules: _,
             enforce_residency: _,
             network: _,
+            application: _,
             permissions: _,
             auto_review: _,
             models: _,
@@ -1229,6 +1235,7 @@ impl ConfigRequirementsWithSources {
                 rules,
                 enforce_residency,
                 network,
+                application,
                 permissions,
                 models,
                 additional_developer_instructions,
@@ -1312,6 +1319,7 @@ impl ConfigRequirementsWithSources {
             rules,
             enforce_residency,
             network,
+            application,
             permissions,
             auto_review,
             models,
@@ -1354,6 +1362,7 @@ impl ConfigRequirementsWithSources {
             rules: rules.map(|sourced| sourced.value),
             enforce_residency: enforce_residency.map(|sourced| sourced.value),
             network: network.map(|sourced| sourced.value),
+            application: application.map(|sourced| sourced.value),
             permissions: permissions.map(|sourced| sourced.value),
             auto_review: auto_review.map(|sourced| sourced.value),
             models: models.map(|sourced| sourced.value),
@@ -1492,6 +1501,10 @@ impl ConfigRequirementsToml {
             && self.rules.is_none()
             && self.enforce_residency.is_none()
             && self.network.is_none()
+            && self
+                .application
+                .as_ref()
+                .is_none_or(|application| application.network.is_none())
             && self.permissions.is_none()
             && self.auto_review.as_ref().is_none_or(|auto_review| {
                 auto_review.ignore_rules.as_ref().is_none_or(Vec::is_empty)
@@ -1678,6 +1691,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             rules,
             enforce_residency,
             network,
+            application,
             permissions,
             auto_review,
             models: _,
@@ -2037,6 +2051,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             exec_policy,
             enforce_residency,
             network,
+            application,
             filesystem,
             additional_developer_instructions,
             guardian_policy_config_source,
@@ -2215,6 +2230,7 @@ mod tests {
             rules,
             enforce_residency,
             network,
+            application,
             permissions,
             auto_review,
             models,
@@ -2275,6 +2291,7 @@ mod tests {
             enforce_residency: enforce_residency
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             network: network.map(|value| Sourced::new(value, RequirementSource::Unknown)),
+            application: application.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             permissions: permissions.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             auto_review: auto_review.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             models: models.map(|value| Sourced::new(value, RequirementSource::Unknown)),
@@ -2465,6 +2482,7 @@ mod tests {
         assert_eq!(
             requirements.browser_use,
             Some(BrowserUseRequirementsToml {
+                allow_webmcp: None,
                 allow_history_access: Some(false),
                 disable_auto_review: Some(true),
                 allow_global_persistent_approval: Some(false),
@@ -2697,6 +2715,7 @@ mod tests {
             entries: BTreeMap::from([("personality".to_string(), true)]),
         };
         let browser_use = BrowserUseRequirementsToml {
+            allow_webmcp: None,
             allow_history_access: Some(false),
             disable_auto_review: Some(true),
             allow_global_persistent_approval: None,
@@ -2777,6 +2796,7 @@ mod tests {
             rules: None,
             enforce_residency: Some(enforce_residency),
             network: None,
+            application: None,
             permissions: None,
             auto_review: Some(auto_review.clone()),
             models: Some(models.clone()),
@@ -2861,6 +2881,7 @@ mod tests {
                 rules: None,
                 enforce_residency: Some(Sourced::new(enforce_residency, enforce_source)),
                 network: None,
+                application: None,
                 permissions: None,
                 auto_review: Some(Sourced::new(auto_review, source.clone())),
                 models: Some(Sourced::new(models, source.clone())),
@@ -2916,6 +2937,7 @@ mod tests {
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                application: None,
                 permissions: None,
                 models: None,
                 guardian_policy_config: None,
@@ -2975,6 +2997,7 @@ mod tests {
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                application: None,
                 permissions: None,
                 models: None,
                 guardian_policy_config: None,

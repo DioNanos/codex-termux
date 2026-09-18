@@ -11,6 +11,7 @@ use app_test_support::create_fake_rollout_with_text_elements;
 use app_test_support::create_fake_rollout_with_token_usage;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_repeating_assistant;
+use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::rollout_path;
 use app_test_support::test_absolute_path;
@@ -71,6 +72,7 @@ use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_app_server_protocol::ThreadTurnsListParams;
 use codex_app_server_protocol::ThreadTurnsListResponse;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
+use codex_app_server_protocol::TurnEnvironmentParams;
 use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
@@ -78,6 +80,7 @@ use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
+use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_features::Feature;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_protocol::ThreadId;
@@ -173,7 +176,6 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
         /*git_info*/ None,
     )?;
     let path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
-    let startup_cwd = read_session_meta_line(&path).await?.meta.cwd;
     let settings: ThreadSettingsAppliedEvent = serde_json::from_value(json!({
         "thread_id": conversation_id,
         "thread_settings": {
@@ -196,6 +198,7 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
         &RolloutItem::Compacted(CompactedItem {
             message: "compacted history".to_string(),
             replacement_history: Some(Vec::new()),
+            retained_context: None,
             guardian_history: None,
             mcp_resource_origins: None,
             window_number: Some(1),
@@ -264,9 +267,9 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
         cwd,
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, secondary.read_response(resume_id)).await??;
-    // The completed turn now permits a bounded replay ending at the compaction,
-    // so the earlier settings snapshot is outside the normal resume window.
-    assert_eq!(cwd.as_path(), startup_cwd);
+    // The resume checkpoint keeps the effective cwd inside the bounded replay,
+    // even after the original settings snapshot falls outside its window.
+    assert_eq!(cwd.as_path(), saved_cwd);
     assert_eq!(resumed.preview, "Saved user message");
     assert!(resumed.turns.is_empty());
 
@@ -618,58 +621,71 @@ async fn thread_resume_running_thread_uses_cached_instruction_sources() -> Resul
 }
 
 #[tokio::test]
-async fn turn_start_updates_runtime_workspace_roots_for_loaded_thread() -> Result<()> {
+async fn thread_resume_restores_startup_and_updated_runtime_workspace_roots() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(codex_home.path())?;
 
-    let extra_root_tmp = TempDir::new()?;
-    let extra_root = extra_root_tmp.path().join("extra-root");
-    std::fs::create_dir_all(&extra_root)?;
+    let initial_workspace = TempDir::new()?;
+    let initial_cwd = normalized_existing_path(initial_workspace.path())?.abs();
+    let extra_workspace = TempDir::new()?;
+    let extra_root = extra_workspace.path();
+    let initial_roots = vec![initial_cwd.clone(), extra_root.abs()];
+    let explicit_workspace = TempDir::new()?;
+    let explicit_cwd = normalized_existing_path(explicit_workspace.path())?.abs();
+    let explicit_environments = vec![TurnEnvironmentParams {
+        environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+        cwd: explicit_cwd.clone().into(),
+        runtime_workspace_roots: Some(vec![explicit_cwd.clone().into()]),
+    }];
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        // These compatibility parameters carry host-native paths, not foreign environment paths.
+        .without_auto_env()
         .build_initialized()
         .await?;
 
     let start_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+        .send_thread_start_request(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
+            cwd: Some(initial_cwd.to_string_lossy().into_owned()),
+            runtime_workspace_roots: Some(initial_roots.clone()),
+            environments: Some(explicit_environments.clone()),
             ..Default::default()
         })
         .await?;
     let ThreadStartResponse { thread, .. } =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
 
-    let turn_id = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id.clone(),
-            client_user_message_id: None,
-            input: vec![UserInput::Text {
-                text: "Hello".to_string(),
-                text_elements: Vec::new(),
-            }],
-            runtime_workspace_roots: Some(vec![
-                AbsolutePathBuf::from_absolute_path(&extra_root)?,
-                AbsolutePathBuf::from_absolute_path(extra_root.join("."))?,
-            ]),
-            ..Default::default()
-        })
-        .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
-    )
-    .await??;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
+    let updated_roots = vec![initial_cwd.clone(), explicit_cwd.clone(), extra_root.abs()];
+    let mut roots_with_duplicate = updated_roots.clone();
+    roots_with_duplicate.push(extra_root.abs());
+    for (environments, roots) in [
+        // Materialize the rollout before settings updates begin emitting persisted snapshots.
+        (None, None),
+        (None, Some(roots_with_duplicate)),
+        // Explicit environments own their live roots; the top-level list is ignored.
+        (Some(explicit_environments), Some(initial_roots.clone())),
+    ] {
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.start_turn_and_wait_for_completion(TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![UserInput::Text {
+                    text: "update workspace selection".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                environments,
+                runtime_workspace_roots: roots,
+                ..Default::default()
+            }),
+        )
+        .await??;
+    }
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
-            thread_id: thread.id,
+            thread_id: thread.id.clone(),
             exclude_turns: true,
             ..Default::default()
         })
@@ -678,12 +694,278 @@ async fn turn_start_updates_runtime_workspace_roots_for_loaded_thread() -> Resul
         runtime_workspace_roots,
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    assert_eq!(runtime_workspace_roots, vec![explicit_cwd.clone()]);
 
+    // A cwd-only update must retain the fallback's additional folder, not the live roots.
+    mcp.clear_message_buffer();
+    let update_id = mcp
+        .send_thread_settings_update_request(ThreadSettingsUpdateParams {
+            thread_id: thread.id.clone(),
+            cwd: Some(initial_cwd.to_path_buf()),
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadSettingsUpdateResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(update_id)).await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/settings/updated"),
+    )
+    .await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+
+    // The header preserves the startup fallback selection, not the explicit environment's roots.
+    let startup = read_session_meta_line(thread.path.as_ref().expect("rollout path")).await?;
     assert_eq!(
-        runtime_workspace_roots,
-        vec![AbsolutePathBuf::from_absolute_path(extra_root)?]
+        startup.meta.runtime_workspace_roots,
+        Some(
+            initial_roots
+                .iter()
+                .map(AbsolutePathBuf::to_path_buf)
+                .collect()
+        )
+    );
+    // Check both input deduplication and cwd retargeting before resume can normalize roots.
+    let expected_roots = vec![initial_cwd.clone(), extra_root.abs()];
+    let (items, _, _) =
+        RolloutRecorder::load_rollout_items(thread.path.as_ref().expect("rollout path")).await?;
+    let snapshot_roots: Vec<_> = items
+        .into_iter()
+        .rev()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+                Some(event.thread_settings.runtime_workspace_roots)
+            }
+            _ => None,
+        })
+        .take(/*n*/ 3)
+        .collect();
+    assert_eq!(
+        snapshot_roots,
+        vec![
+            Some(expected_roots.clone()),
+            Some(vec![explicit_cwd, extra_root.abs()]),
+            Some(updated_roots),
+        ]
     );
 
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        cwd,
+        runtime_workspace_roots,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    assert_eq!(
+        (cwd, runtime_workspace_roots),
+        (initial_cwd.clone(), expected_roots)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cold_resume_workspace_roots_honor_owned_snapshot_and_caller_overrides() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+    let saved_cwd = normalized_existing_path(codex_home.path())?.abs();
+    let new_workspace = TempDir::new()?;
+    let new_cwd = normalized_existing_path(new_workspace.path())?.abs();
+    let extra_workspace = TempDir::new()?;
+    let extra_root = extra_workspace.path().abs();
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved workspace selection",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &thread_id);
+    let owned: ThreadSettingsAppliedEvent = serde_json::from_value(json!({
+        "thread_id": thread_id,
+        "thread_settings": {
+            "model": "gpt-5.4",
+            "model_provider_id": "mock_provider",
+            "cwd": saved_cwd,
+            "runtime_workspace_roots": [saved_cwd, new_cwd, extra_root],
+            "approval_policy": "never",
+            "approvals_reviewer": "user",
+            "permission_profile": PermissionProfile::read_only(),
+            "collaboration_mode": { "mode": "default", "settings": { "model": "gpt-5.4" } },
+        },
+    }))?;
+    let mut foreign = owned.clone();
+    foreign.thread_id = Some(ThreadId::new());
+    foreign.thread_settings.runtime_workspace_roots = Some(vec![extra_root.clone()]);
+    for settings in [owned, foreign] {
+        append_rollout_item_to_path(
+            &path,
+            &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings)),
+        )
+        .await?;
+    }
+
+    // Every iteration is a cold resume; the final one must retain the preceding explicit clear.
+    for (cwd_override, roots_override, expected_cwd, expected_roots) in [
+        (
+            Some(&new_cwd),
+            None,
+            &new_cwd,
+            vec![new_cwd.clone(), extra_root.clone()],
+        ),
+        (
+            Some(&saved_cwd),
+            Some(vec![new_cwd.clone()]),
+            &saved_cwd,
+            vec![new_cwd.clone()],
+        ),
+        (None, Some(Vec::new()), &saved_cwd, Vec::new()),
+        (None, None, &saved_cwd, Vec::new()),
+    ] {
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .without_auto_env()
+            .build_initialized()
+            .await?;
+        let resume_id = mcp
+            .send_thread_resume_request(ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                cwd: cwd_override.map(|cwd| cwd.to_string_lossy().into_owned()),
+                runtime_workspace_roots: roots_override,
+                ..Default::default()
+            })
+            .await?;
+        let resumed: ThreadResumeResponse =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+        assert_eq!(
+            (resumed.cwd, resumed.runtime_workspace_roots),
+            (expected_cwd.clone(), expected_roots.clone())
+        );
+
+        // Inspect persistence before shutdown or another resume can hide a missing checkpoint.
+        let expected_thread_id = ThreadId::from_string(&thread_id)?;
+        let (items, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
+        let persisted = items.into_iter().rev().find_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+                if event.thread_id == Some(expected_thread_id) =>
+            {
+                Some((
+                    event.thread_settings.cwd,
+                    event.thread_settings.runtime_workspace_roots,
+                ))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            persisted,
+            Some((expected_cwd.clone(), Some(expected_roots)))
+        );
+        timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cold_resume_workspace_roots_validate_foreign_startup_paths() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+    let local_cwd = normalized_existing_path(codex_home.path())?.abs();
+    let extra_workspace = TempDir::new()?;
+    let extra_root = normalized_existing_path(extra_workspace.path())?.abs();
+    let extra_root_string = extra_root.to_string_lossy();
+    let unnormalized_extra_root = extra_root
+        .as_path()
+        .join("child")
+        .join("..")
+        .to_string_lossy()
+        .into_owned();
+    let (foreign_cwd, foreign_extra) = if cfg!(windows) {
+        ("/foreign/project", "/foreign/extra")
+    } else {
+        (r"C:\foreign\project", r"C:\foreign\extra")
+    };
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        // Startup metadata uses the app-server host's paths, not executor paths.
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    for (saved_roots, roots_override, expected_roots) in [
+        (
+            vec![
+                foreign_cwd,
+                extra_root_string.as_ref(),
+                unnormalized_extra_root.as_str(),
+            ],
+            None,
+            Some(vec![local_cwd.clone(), extra_root.clone()]),
+        ),
+        (vec![foreign_cwd, foreign_extra], None, None),
+        (
+            vec![foreign_cwd, foreign_extra],
+            Some(Vec::new()),
+            Some(Vec::new()),
+        ),
+    ] {
+        let thread_id = create_fake_rollout(
+            codex_home.path(),
+            "2025-01-05T12-00-00",
+            "2025-01-05T12:00:00Z",
+            "Foreign startup paths",
+            Some("mock_provider"),
+            /*git_info*/ None,
+        )?;
+        let path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &thread_id);
+        let contents = std::fs::read_to_string(&path)?;
+        let (meta, history) = contents.split_once('\n').expect("rollout metadata line");
+        let mut meta: serde_json::Value = serde_json::from_str(meta)?;
+        meta["payload"]["cwd"] = json!(foreign_cwd);
+        meta["payload"]["runtime_workspace_roots"] = json!(saved_roots);
+        std::fs::write(&path, format!("{meta}\n{history}"))?;
+
+        let resume_id = mcp
+            .send_thread_resume_request(ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                cwd: Some(local_cwd.to_string_lossy().into_owned()),
+                runtime_workspace_roots: roots_override,
+                ..Default::default()
+            })
+            .await?;
+        if let Some(expected_roots) = expected_roots {
+            let ThreadResumeResponse {
+                thread,
+                cwd,
+                runtime_workspace_roots,
+                ..
+            } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+            assert_eq!(
+                (thread.id, cwd, runtime_workspace_roots),
+                (thread_id, local_cwd.clone(), expected_roots)
+            );
+        } else {
+            let error = timeout(
+                DEFAULT_READ_TIMEOUT,
+                mcp.read_stream_until_error_message(RequestId::Integer(resume_id)),
+            )
+            .await??;
+            assert_eq!(error.error.code, -32602);
+            assert!(error.error.message.contains(foreign_extra));
+            assert!(error.error.message.contains("runtimeWorkspaceRoots"));
+        }
+    }
     Ok(())
 }
 
@@ -1159,7 +1441,7 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
     assert_eq!(model, "gpt-5.2-codex");
     assert_eq!(reasoning_effort, Some(ReasoningEffort::Ultra));
     assert_eq!(approvals_reviewer, ApprovalsReviewer::AutoReview);
-    assert_eq!(thread.cwd.as_path(), persisted_cwd);
+    assert_eq!(thread.cwd.as_path(), live_cwd);
     assert_eq!(cwd.as_path(), live_cwd);
 
     let update_id = mcp
@@ -1221,7 +1503,15 @@ async fn cold_resume_reresolves_persisted_active_permission_profile() -> Result<
     for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
         let codex_home = TempDir::new()?;
         let previous_workspace_root = TempDir::new()?;
+        let profile_workspace = TempDir::new()?;
         write_dev_permission_config(&server.uri(), codex_home.path(), ":workspace")?;
+        let profile_root = serde_json::to_string(profile_workspace.path())?;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(codex_home.path().join("config.toml"))?,
+            "\n[permissions.dev.workspace_roots]\n{profile_root} = true"
+        )?;
         let thread_id = {
             let mut mcp = TestAppServer::builder()
                 .with_codex_home(codex_home.path())
@@ -1274,10 +1564,9 @@ async fn cold_resume_reresolves_persisted_active_permission_profile() -> Result<
                 extends: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
             })
         );
-        assert!(
-            !runtime_workspace_roots.contains(&AbsolutePathBuf::from_absolute_path(
-                previous_workspace_root.path(),
-            )?)
+        assert_eq!(
+            runtime_workspace_roots,
+            vec![previous_workspace_root.path().abs()]
         );
     }
     Ok(())
@@ -2164,7 +2453,7 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
     assert_eq!(thread.preview, preview);
     assert_eq!(thread.model_provider, "mock_provider");
     assert!(thread.path.as_ref().expect("thread path").is_absolute());
-    assert_eq!(thread.cwd.as_path(), saved_cwd);
+    assert_eq!(thread.cwd.as_path(), cwd.as_path());
     assert_eq!(cwd, test_absolute_path("/"));
     assert_eq!(thread.cli_version, "0.0.0");
     assert_eq!(thread.source, SessionSource::Cli);
@@ -2606,8 +2895,25 @@ async fn thread_resume_rejects_archived_session_by_id() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
+async fn thread_resume_keeps_tool_paused_goal_paused() -> Result<()> {
+    let server = create_mock_responses_server_sequence(vec![
+        responses::sse(vec![
+            responses::ev_response_created("create-goal"),
+            responses::ev_function_call(
+                "create-goal-call",
+                "create_goal",
+                r#"{"objective":"keep polishing"}"#,
+            ),
+            responses::ev_completed("create-goal"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("pause-goal"),
+            responses::ev_function_call("pause-goal-call", "update_goal", r#"{"status":"paused"}"#),
+            responses::ev_completed("pause-goal"),
+        ]),
+        create_final_assistant_message_sse_response("The goal is paused.")?,
+    ])
+    .await;
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(codex_home.path())?;
     let config_path = codex_home.path().join("config.toml");
@@ -2637,7 +2943,7 @@ async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
             thread_id: thread.id.clone(),
             client_user_message_id: None,
             input: vec![UserInput::Text {
-                text: "materialize this thread".to_string(),
+                text: "Create a goal to keep polishing, then pause it.".to_string(),
                 text_elements: Vec::new(),
             }],
             ..Default::default()
@@ -2655,22 +2961,14 @@ async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
     .await??;
 
     let goal_id = mcp
-        .send_raw_request(
-            "thread/goal/set",
-            Some(json!({
-                "threadId": thread.id,
-                "objective": "keep polishing",
-                "status": "paused",
-            })),
-        )
+        .send_raw_request("thread/goal/get", Some(json!({ "threadId": thread.id })))
         .await?;
-    let _goal: ThreadGoalSetResponse =
+    let goal: ThreadGoalGetResponse =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(goal_id)).await??;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/goal/updated"),
-    )
-    .await??;
+    assert_eq!(
+        goal.goal.expect("goal should exist").status,
+        ThreadGoalStatus::Paused
+    );
     mcp.clear_message_buffer();
 
     let resume_id = mcp
@@ -3273,11 +3571,11 @@ async fn thread_goal_keeps_original_root_until_external_objective_edit() -> Resu
     );
     responses::assert_root_turn(&reopened_request, Some(original_turn.turn.id.as_str()))?;
     let continuation_request = serde_json::from_slice::<serde_json::Value>(&requests[7])?;
-    assert_ne!(
-        continuation_request["client_metadata"]["turn_id"].as_str(),
-        Some(edited_turn_id)
-    );
-    responses::assert_root_turn(&continuation_request, /*expected*/ None)?;
+    let continuation_turn_id = continuation_request["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("independent continuation turn ID");
+    assert_ne!(continuation_turn_id, edited_turn_id);
+    responses::assert_root_turn(&continuation_request, Some(continuation_turn_id))?;
     responses::assert_parent_turn(&continuation_request, /*expected*/ None)?;
 
     server.shutdown().await;
@@ -3445,7 +3743,7 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
         goal_request_body["client_metadata"]["turn_id"],
         causal_turn_id
     );
-    responses::assert_root_turn(&goal_request_body, /*expected*/ None)?;
+    responses::assert_root_turn(&goal_request_body, Some(causal_turn_id))?;
     responses::assert_parent_turn(&goal_request_body, /*expected*/ None)?;
 
     let clear_id = mcp
@@ -4089,6 +4387,7 @@ async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Res
         parent_thread_id: None,
         timestamp: "2025-01-05T12:00:00Z".to_string(),
         cwd: repo_path.clone(),
+        runtime_workspace_roots: None,
         originator: "codex".to_string(),
         cli_version: "0.0.0".to_string(),
         source: RolloutSessionSource::Cli,
@@ -4161,6 +4460,7 @@ async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Res
         .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
             thread_id: thread_id.clone(),
             project_id: None,
+            daybreak_enabled: None,
             git_info: Some(ThreadMetadataGitInfoUpdateParams {
                 sha: None,
                 branch: Some(Some("feature/pr-branch".to_string())),
@@ -4302,7 +4602,7 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
 }
 
 #[tokio::test]
-async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
+async fn thread_resume_checkpoints_settings_without_advancing_recency() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     let rollout = setup_rollout_fixture(codex_home.path(), &server.uri()).await?;
@@ -4333,12 +4633,16 @@ async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
     let ThreadResumeResponse { thread, .. } =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
 
-    assert_eq!(thread.updated_at, before_resume.updated_at);
     assert_eq!(thread.recency_at, before_resume.recency_at);
     assert_eq!(thread.status, ThreadStatus::Idle);
 
-    let after_modified = std::fs::metadata(&rollout.rollout_file_path)?.modified()?;
-    assert_eq!(after_modified, rollout.before_modified);
+    let expected_thread_id = ThreadId::from_string(&thread_id)?;
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout.rollout_file_path).await?;
+    assert!(items.iter().any(|item| matches!(
+        item,
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+            if event.thread_id == Some(expected_thread_id)
+    )));
 
     let unsubscribe_id = mcp
         .send_thread_unsubscribe_request(ThreadUnsubscribeParams {
@@ -4401,9 +4705,6 @@ async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
-
-    let after_turn_modified = std::fs::metadata(&rollout.rollout_file_path)?.modified()?;
-    assert!(after_turn_modified > rollout.before_modified);
 
     Ok(())
 }
@@ -5361,7 +5662,7 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
 }
 
 #[tokio::test]
-async fn thread_resume_with_overrides_defers_updated_at_until_turn_start() -> Result<()> {
+async fn thread_resume_with_overrides_preserves_recency_and_checkpoints_model() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(codex_home.path())?;
@@ -5370,11 +5671,8 @@ async fn thread_resume_with_overrides_defers_updated_at_until_turn_start() -> Re
         mut mcp,
         thread_id,
         rollout_file_path,
-        updated_at,
+        recency_at,
     } = start_materialized_thread_and_restart(codex_home.path(), "materialize").await?;
-    let expected_updated_at_rfc3339 = "2025-01-07T00:00:00Z";
-    set_rollout_mtime(rollout_file_path.as_path(), expected_updated_at_rfc3339)?;
-    let before_modified = std::fs::metadata(&rollout_file_path)?.modified()?;
 
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
@@ -5388,11 +5686,19 @@ async fn thread_resume_with_overrides_defers_updated_at_until_turn_start() -> Re
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
 
-    assert_eq!(resumed_thread.updated_at, updated_at);
+    assert_eq!(resumed_thread.recency_at, recency_at);
     assert_eq!(resumed_thread.status, ThreadStatus::Idle);
-
-    let after_resume_modified = std::fs::metadata(&rollout_file_path)?.modified()?;
-    assert_eq!(after_resume_modified, before_modified);
+    let expected_thread_id = ThreadId::from_string(&resumed_thread.id)?;
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_file_path).await?;
+    let persisted_model = items.iter().rev().find_map(|item| match item {
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+            if event.thread_id == Some(expected_thread_id) =>
+        {
+            Some(event.thread_settings.model.as_str())
+        }
+        _ => None,
+    });
+    assert_eq!(persisted_model, Some("mock-model"));
 
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
@@ -5415,9 +5721,6 @@ async fn thread_resume_with_overrides_defers_updated_at_until_turn_start() -> Re
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
-
-    let after_turn_modified = std::fs::metadata(&rollout_file_path)?.modified()?;
-    assert!(after_turn_modified > before_modified);
 
     Ok(())
 }
@@ -5677,7 +5980,7 @@ struct RestartedThreadFixture {
     mcp: TestAppServer,
     thread_id: String,
     rollout_file_path: PathBuf,
-    updated_at: i64,
+    recency_at: Option<i64>,
 }
 
 async fn start_materialized_thread_and_restart(
@@ -5733,7 +6036,7 @@ async fn start_materialized_thread_and_restart(
     let rollout_file_path = thread
         .path
         .ok_or_else(|| anyhow::anyhow!("thread path missing from thread/start response"))?;
-    let updated_at = thread.updated_at;
+    let recency_at = thread.recency_at;
 
     drop(first_mcp);
 
@@ -5746,7 +6049,7 @@ async fn start_materialized_thread_and_restart(
         mcp: second_mcp,
         thread_id,
         rollout_file_path: rollout_file_path.to_path_buf(),
-        updated_at,
+        recency_at,
     })
 }
 
@@ -5887,7 +6190,6 @@ fn set_rollout_mtime(path: &Path, updated_at_rfc3339: &str) -> Result<()> {
 struct RolloutFixture {
     conversation_id: String,
     rollout_file_path: PathBuf,
-    before_modified: std::time::SystemTime,
 }
 
 async fn setup_rollout_fixture(codex_home: &Path, server_uri: &str) -> Result<RolloutFixture> {
@@ -5912,10 +6214,8 @@ async fn setup_rollout_fixture(codex_home: &Path, server_uri: &str) -> Result<Ro
     append_rollout_item_to_path(&rollout_file_path, &RolloutItem::SessionMeta(session_meta))
         .await?;
     set_rollout_mtime(rollout_file_path.as_path(), expected_updated_at_rfc3339)?;
-    let before_modified = std::fs::metadata(&rollout_file_path)?.modified()?;
     Ok(RolloutFixture {
         conversation_id,
         rollout_file_path,
-        before_modified,
     })
 }

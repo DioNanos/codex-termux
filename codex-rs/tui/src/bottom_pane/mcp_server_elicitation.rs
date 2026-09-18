@@ -1513,6 +1513,10 @@ impl Renderable for McpServerElicitationOverlay {
 }
 
 impl BottomPaneView for McpServerElicitationOverlay {
+    fn next_frame_delay(&self) -> Option<std::time::Duration> {
+        self.composer.footer_flash_delay()
+    }
+
     fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
         if self.current_field_is_select() {
             crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
@@ -1712,44 +1716,12 @@ impl BottomPaneView for McpServerElicitationOverlay {
 }
 
 fn wrap_footer_tips(width: u16, tips: Vec<FooterTip>) -> Vec<Vec<FooterTip>> {
-    let max_width = width.max(1) as usize;
-    let separator_width = UnicodeWidthStr::width(FOOTER_SEPARATOR);
-    if tips.is_empty() {
-        return vec![Vec::new()];
-    }
-
-    let mut lines = Vec::new();
-    let mut current = Vec::new();
-    let mut used = 0usize;
-
-    for tip in tips {
-        let tip_width = UnicodeWidthStr::width(tip.text.as_str()).min(max_width);
-        let extra = if current.is_empty() {
-            tip_width
-        } else {
-            separator_width.saturating_add(tip_width)
-        };
-        if !current.is_empty() && used.saturating_add(extra) > max_width {
-            lines.push(current);
-            current = Vec::new();
-            used = 0;
-        }
-        if current.is_empty() {
-            used = tip_width;
-        } else {
-            used = used
-                .saturating_add(separator_width)
-                .saturating_add(tip_width);
-        }
-        current.push(tip);
-    }
-
-    if current.is_empty() {
-        lines.push(Vec::new());
-    } else {
-        lines.push(current);
-    }
-    lines
+    crate::footer_hint::wrap_hint_rows(
+        tips,
+        width,
+        UnicodeWidthStr::width(FOOTER_SEPARATOR),
+        |tip| UnicodeWidthStr::width(tip.text.as_str()),
+    )
 }
 
 #[cfg(test)]
@@ -2263,6 +2235,34 @@ mod tests {
                 .iter()
                 .all(|tip| !tip.text.contains("submit"))
         );
+    }
+
+    #[test]
+    fn switching_fields_clears_length_validation_flash() {
+        let (tx, _rx) = test_sender();
+        let request = from_form_request(
+            ThreadId::default(),
+            form_request(
+                "Two fields",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+                    "required": ["a", "b"],
+                }),
+                /*meta*/ None,
+            ),
+        )
+        .expect("supported form");
+        let mut overlay = McpServerElicitationOverlay::new(
+            request, tx, /*has_input_focus*/ true, /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ true,
+        );
+        overlay.handle_paste("x".repeat(codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS + 1));
+        overlay.handle_key_event(KeyCode::Enter.into());
+        assert!(overlay.next_frame_delay().is_some());
+        overlay.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(overlay.next_frame_delay(), None);
+        assert!(overlay.composer.current_text().is_empty());
     }
 
     #[test]

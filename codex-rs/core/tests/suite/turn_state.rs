@@ -125,6 +125,12 @@ async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<
     let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
     // Phase 1: startup prewarm uses the connection without generating a response.
+    // Wait before submitting a turn, which changes the session's sandbox policy.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(/*secs*/ 10),
+        server.wait_for_request(/*connection_index*/ 0, /*request_index*/ 0),
+    )
+    .await?;
     // Phase 2: the first turn mints state for its same-turn tool follow-up.
     test.submit_turn("run the echo command").await?;
     // Phase 3: the follow-up replays that state on the same physical connection.

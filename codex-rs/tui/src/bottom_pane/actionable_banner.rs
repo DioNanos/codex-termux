@@ -11,6 +11,8 @@ use super::list_selection_view::ListSelectionView;
 use crate::render::Insets;
 use crate::render::RectExt;
 use crate::render::renderable::Renderable;
+use crate::terminal_palette::best_color;
+use crate::terminal_palette::default_fg;
 use crate::wrapping::word_wrap_lines;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -18,6 +20,7 @@ use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
@@ -122,7 +125,9 @@ impl BannerContent {
 impl Renderable for BannerContent {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let lines = self.wrapped_lines(area.width);
-        Widget::render(Paragraph::new(lines), area, buf);
+        // Explicit foreground avoids a terminal's separate bold color washing out the title.
+        let foreground = default_fg().map(best_color).unwrap_or(Color::Reset);
+        Widget::render(Paragraph::new(lines).fg(foreground), area, buf);
     }
 
     fn desired_height(&self, width: u16) -> u16 {
@@ -140,7 +145,7 @@ impl From<ActionableBanner> for SelectionViewParams {
                 banner
                     .description
                     .lines()
-                    .map(|line| Line::from(line.to_owned().dim())),
+                    .map(|line| Line::from(line.to_owned())),
             )
             .collect();
         Self {
@@ -164,6 +169,7 @@ impl BottomPane {
             let dismissal = banner.dismissal;
             let has_actions = !banner.actions.is_empty();
             let mut params: SelectionViewParams = banner.into();
+            params.header_gap = 0;
             params.allow_cancel = dismissal == BannerDismissal::Dismissible;
             for item in &mut params.items {
                 item.dismiss_on_select = false;

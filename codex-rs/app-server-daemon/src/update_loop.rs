@@ -1,6 +1,4 @@
 #[cfg(unix)]
-use std::process::Command as StdCommand;
-#[cfg(unix)]
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -10,8 +8,6 @@ use anyhow::Result;
 use anyhow::bail;
 #[cfg(unix)]
 use futures::FutureExt;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 use tokio::signal::unix::Signal;
 #[cfg(unix)]
@@ -27,8 +23,6 @@ use crate::Daemon;
 use crate::RestartIfRunningOutcome;
 #[cfg(unix)]
 use crate::RestartMode;
-#[cfg(unix)]
-use crate::UpdaterRefreshMode;
 #[cfg(unix)]
 use crate::managed_install::ExecutableIdentity;
 #[cfg(unix)]
@@ -91,15 +85,14 @@ async fn update_once(
     let daemon = Daemon::from_environment()?;
     let managed_codex_bin = resolved_managed_codex_bin(&daemon.managed_codex_bin).await?;
     let managed_identity = executable_identity(&managed_codex_bin).await?;
-    let (restart_mode, updater_refresh_mode) =
-        update_modes_for_identities(running_updater_identity, &managed_identity);
+    let restart_mode = update_modes_for_identities(running_updater_identity, &managed_identity);
 
     loop {
         if terminate.recv().now_or_never().flatten().is_some() {
             return Ok(UpdateLoopControl::Stop);
         }
         match daemon
-            .try_restart_if_running(restart_mode, updater_refresh_mode, &managed_codex_bin)
+            .try_restart_if_running(restart_mode, &managed_codex_bin)
             .await?
         {
             RestartIfRunningOutcome::Busy => {
@@ -123,28 +116,12 @@ async fn current_updater_identity() -> Result<ExecutableIdentity> {
 fn update_modes_for_identities(
     running_updater_identity: &ExecutableIdentity,
     managed_identity: &ExecutableIdentity,
-) -> (RestartMode, UpdaterRefreshMode) {
+) -> RestartMode {
     if running_updater_identity == managed_identity {
-        (RestartMode::IfVersionChanged, UpdaterRefreshMode::None)
+        RestartMode::IfVersionChanged
     } else {
-        (
-            RestartMode::Always,
-            UpdaterRefreshMode::ReexecIfManagedBinaryChanged,
-        )
+        RestartMode::Always
     }
-}
-
-#[cfg(unix)]
-pub(crate) fn reexec_managed_updater(managed_codex_bin: &std::path::Path) -> Result<()> {
-    let err = StdCommand::new(managed_codex_bin)
-        .args(["app-server", "daemon", "pid-update-loop"])
-        .exec();
-    Err(err).with_context(|| {
-        format!(
-            "failed to replace updater with managed Codex binary {}",
-            managed_codex_bin.display()
-        )
-    })
 }
 
 #[cfg(unix)]

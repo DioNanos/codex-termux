@@ -1,4 +1,5 @@
 use crate::reasons::REASON_POLICY_DENIED;
+use crate::request_cancellation::NetworkRequestCancellation;
 use crate::request_disconnect::NetworkRequestDisconnect;
 use crate::runtime::HostBlockDecision;
 use crate::runtime::HostBlockReason;
@@ -109,6 +110,8 @@ pub struct NetworkPolicyRequest {
     pub execution_id: Option<String>,
     /// Present only when the local HTTP transport can identify an abandoned request.
     pub disconnect: Option<NetworkRequestDisconnect>,
+    /// Controller-owned cause, published before an abandoned decision future is dropped.
+    pub cancellation: Option<NetworkRequestCancellation>,
 }
 
 pub struct NetworkPolicyRequestArgs {
@@ -145,6 +148,7 @@ impl NetworkPolicyRequest {
             exec_policy_hint,
             execution_id: None,
             disconnect: None,
+            cancellation: None,
         }
     }
 }
@@ -260,22 +264,41 @@ struct PolicyAuditEventArgs<'a> {
 }
 
 fn emit_policy_audit_event(state: &NetworkProxyState, args: PolicyAuditEventArgs<'_>) {
-    let metadata = state.audit_metadata();
+    let audit_metadata = state.audit_metadata();
+    let process_log_metadata = &state.process_log_metadata;
+    let conversation_id = process_log_metadata
+        .thread_id
+        .as_deref()
+        .or(audit_metadata.conversation_id.as_deref());
     let timestamp = audit_timestamp();
+    let launch_trace_id = state
+        .launch_span_context
+        .as_ref()
+        .map(|context| context.trace_id().to_string());
+    let launch_span_id = state
+        .launch_span_context
+        .as_ref()
+        .map(|context| context.span_id().to_string());
+    let executor_identity = process_log_metadata.executor_identity.as_ref();
     tracing::event!(
         target: AUDIT_TARGET,
         tracing::Level::INFO,
         event.name = POLICY_DECISION_EVENT_NAME,
         event.timestamp = %timestamp,
-        conversation.id = metadata.conversation_id.as_deref(),
-        app.version = metadata.app_version.as_deref(),
-        auth_mode = metadata.auth_mode.as_deref(),
-        originator = metadata.originator.as_deref(),
-        user.account_id = metadata.user_account_id.as_deref(),
-        user.email = metadata.user_email.as_deref(),
-        terminal.type = metadata.terminal_type.as_deref(),
-        model = metadata.model.as_deref(),
-        slug = metadata.slug.as_deref(),
+        launch.trace_id = launch_trace_id.as_deref(),
+        launch.span_id = launch_span_id.as_deref(),
+        conversation.id = conversation_id,
+        tool.call_id = process_log_metadata.tool_call_id.as_deref(),
+        executor.environment_id = executor_identity.map(|identity| identity.environment_id.as_str()),
+        executor.registration_id = executor_identity.map(|identity| identity.registration_id.as_str()),
+        app.version = audit_metadata.app_version.as_deref(),
+        auth_mode = audit_metadata.auth_mode.as_deref(),
+        originator = audit_metadata.originator.as_deref(),
+        user.account_id = audit_metadata.user_account_id.as_deref(),
+        user.email = audit_metadata.user_email.as_deref(),
+        terminal.type = audit_metadata.terminal_type.as_deref(),
+        model = audit_metadata.model.as_deref(),
+        slug = audit_metadata.slug.as_deref(),
         network.policy.scope = args.scope,
         network.policy.decision = args.decision,
         network.policy.source = args.source,
@@ -601,6 +624,8 @@ mod tests {
     use super::test_support::capture_events;
     use super::test_support::find_event_by_name;
     use super::*;
+    use crate::ExecutorLogIdentity;
+    use crate::NetworkProxyProcessLogMetadata;
     use crate::config::NetworkMode;
     use crate::config::NetworkProxyConfig;
     use crate::reasons::REASON_DENIED;
@@ -937,7 +962,7 @@ mod tests {
             model: Some("gpt-5.3-codex".to_string()),
             slug: Some("gpt-5.3-codex".to_string()),
         };
-        let state = state_with_metadata(metadata);
+        let mut state = state_with_metadata(metadata);
         let request = NetworkPolicyRequest::new(NetworkPolicyRequestArgs {
             protocol: NetworkProtocol::Http,
             host: "example.com".to_string(),
@@ -949,24 +974,50 @@ mod tests {
             exec_policy_hint: None,
         });
 
-        let (_decision, events) = capture_events(|| async {
-            evaluate_host_policy(&state, /*decider*/ None, &request)
-                .await
-                .unwrap()
-        })
-        .await;
+        for (thread_id, expected_conversation_id) in [
+            (None, "conversation-1"),
+            (Some("process-thread-1"), "process-thread-1"),
+            (None, "conversation-1"),
+        ] {
+            state.set_process_log_metadata(NetworkProxyProcessLogMetadata {
+                thread_id: thread_id.map(str::to_string),
+                tool_call_id: Some("call-1".to_string()),
+                executor_identity: Some(ExecutorLogIdentity {
+                    environment_id: "environment-1".to_string(),
+                    registration_id: "registration-1".to_string(),
+                }),
+            });
+            let (_decision, events) = capture_events(|| async {
+                evaluate_host_policy(&state, /*decider*/ None, &request)
+                    .await
+                    .unwrap()
+            })
+            .await;
 
-        let event = find_event_by_name(&events, POLICY_DECISION_EVENT_NAME)
-            .expect("expected policy decision audit event");
-        assert_eq!(event.field("conversation.id"), Some("conversation-1"));
-        assert_eq!(event.field("app.version"), Some("1.2.3"));
-        assert_eq!(event.field("auth_mode"), Some("Chatgpt"));
-        assert_eq!(event.field("originator"), Some("codex_cli_rs"));
-        assert_eq!(event.field("user.account_id"), Some("acct-1"));
-        assert_eq!(event.field("user.email"), Some("test@example.com"));
-        assert_eq!(event.field("terminal.type"), Some("iTerm.app/3.6.5"));
-        assert_eq!(event.field("model"), Some("gpt-5.3-codex"));
-        assert_eq!(event.field("slug"), Some("gpt-5.3-codex"));
+            let event = find_event_by_name(&events, POLICY_DECISION_EVENT_NAME)
+                .expect("expected policy decision audit event");
+            assert_eq!(
+                event.field("conversation.id"),
+                Some(expected_conversation_id)
+            );
+            assert_eq!(event.field("tool.call_id"), Some("call-1"));
+            assert_eq!(
+                event.field("executor.environment_id"),
+                Some("environment-1")
+            );
+            assert_eq!(
+                event.field("executor.registration_id"),
+                Some("registration-1")
+            );
+            assert_eq!(event.field("app.version"), Some("1.2.3"));
+            assert_eq!(event.field("auth_mode"), Some("Chatgpt"));
+            assert_eq!(event.field("originator"), Some("codex_cli_rs"));
+            assert_eq!(event.field("user.account_id"), Some("acct-1"));
+            assert_eq!(event.field("user.email"), Some("test@example.com"));
+            assert_eq!(event.field("terminal.type"), Some("iTerm.app/3.6.5"));
+            assert_eq!(event.field("model"), Some("gpt-5.3-codex"));
+            assert_eq!(event.field("slug"), Some("gpt-5.3-codex"));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

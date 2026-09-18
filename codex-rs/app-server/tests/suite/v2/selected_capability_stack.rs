@@ -5,12 +5,15 @@ use anyhow::Context;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::TestAppServer;
+use app_test_support::create_final_assistant_message_sse_response;
+use app_test_support::create_request_user_input_sse_response;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
 use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::CapabilityRootLocation;
 use codex_app_server_protocol::EnvironmentAddResponse;
+use codex_app_server_protocol::EnvironmentInfoResponse;
 use codex_app_server_protocol::ListMcpServerStatusParams;
 use codex_app_server_protocol::ListMcpServerStatusResponse;
 use codex_app_server_protocol::RequestId;
@@ -22,6 +25,9 @@ use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnEnvironmentParams;
 use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnSteerParams;
+use codex_app_server_protocol::TurnSteerResponse;
 use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
@@ -63,6 +69,122 @@ const NO_SELECTED_SKILLS_MESSAGE: &str = "No selected-environment skills are cur
 const MCP_SERVER_NAME: &str = "executor_probe";
 const MCP_CALL_ID: &str = "selected-executor-mcp-call";
 const CONNECTOR_ID: &str = "calendar";
+
+#[derive(Clone, Copy)]
+enum PluginMention {
+    Unmentioned,
+    Link,
+    Structured,
+}
+
+#[test_case(PluginMention::Unmentioned, false; "optional direct")]
+#[test_case(PluginMention::Unmentioned, true; "optional batched")]
+#[test_case(PluginMention::Link, false; "plugin link direct")]
+#[test_case(PluginMention::Link, true; "plugin link batched")]
+#[test_case(PluginMention::Structured, false; "structured mention direct")]
+#[test_case(PluginMention::Structured, true; "structured mention batched")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_plugin_mcp_startup_respects_explicit_mentions(
+    mention: PluginMention,
+    executor_capability_discovery: bool,
+) -> Result<()> {
+    let explicitly_mentioned = !matches!(mention, PluginMention::Unmentioned);
+    let responses_server = responses::start_mock_server().await;
+    let (apps_url, apps_server_handle) =
+        start_apps_server_with_delays(Vec::new(), Vec::new(), Duration::ZERO, Duration::ZERO)
+            .await?;
+    let fixture = selected_capability_fixture(&responses_server.uri(), &apps_url)?;
+    let config_path = fixture.codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?.replace(
+        "executor_capability_discovery = true",
+        &format!("executor_capability_discovery = {executor_capability_discovery}"),
+    );
+    std::fs::write(config_path, config)?;
+    let initialize_barrier = fixture.block_mcp_startup()?;
+    let response_mock = responses::mount_sse_once(
+        &responses_server,
+        create_final_assistant_message_sse_response("Done")?,
+    )
+    .await;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(fixture.codex_home.path())
+        // This fixture owns environments.toml and selects its environments explicitly.
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(READ_TIMEOUT, app_server.initialize()).await??;
+    let thread_id = start_thread(
+        &mut app_server,
+        fixture.selected_root,
+        fixture.environment_cwd.clone(),
+    )
+    .await?;
+    let mut exec_server =
+        spawn_exec_server(fixture.codex_home.path(), &fixture.exec_server_url).await?;
+    add_environment(&mut app_server, &fixture.exec_server_url).await?;
+
+    let text_input = |text| UserInput::Text {
+        text,
+        text_elements: Vec::new(),
+    };
+    let input = match mention {
+        PluginMention::Unmentioned => text_input("Answer without using tools".to_string()),
+        PluginMention::Link => {
+            text_input(format!("Use [@executor-demo](plugin://{PLUGIN_ID}) now"))
+        }
+        PluginMention::Structured => UserInput::Mention {
+            name: PLUGIN_DISPLAY_NAME.to_string(),
+            path: format!("plugin://{PLUGIN_ID}?app=com.example.editor"),
+        },
+    };
+    let request_id = app_server
+        .send_turn_start_request(TurnStartParams {
+            thread_id,
+            input: vec![input],
+            environments: Some(vec![TurnEnvironmentParams {
+                environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+                cwd: fixture.environment_cwd.into(),
+                runtime_workspace_roots: None,
+            }]),
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        READ_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    wait_for_pid_file(&fixture.pid_file).await?;
+    if explicitly_mentioned {
+        // An explicit mention must outwait the optional one-second grace.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(response_mock.requests().is_empty());
+        std::fs::write(&initialize_barrier, "ready")?;
+    }
+    let turn_timeout = if explicitly_mentioned {
+        READ_TIMEOUT
+    } else {
+        Duration::from_secs(5)
+    };
+    timeout(
+        turn_timeout,
+        app_server.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let request = response_mock.single_request();
+    assert_selected_skill_catalog_available(&request);
+    assert_eq!(
+        request
+            .tool_by_name(&format!("mcp__{MCP_SERVER_NAME}"), "echo")
+            .is_some(),
+        explicitly_mentioned,
+    );
+
+    exec_server.kill().await?;
+    apps_server_handle.abort();
+    let _ = apps_server_handle.await;
+    Ok(())
+}
 
 #[test_case(false; "direct selected root discovery")]
 #[test_case(true; "batched executor capability discovery")]
@@ -257,10 +379,11 @@ async fn selected_capability_stack_tracks_environment_availability_and_resume() 
     add_environment(&mut app_server, &fixture.exec_server_url).await?;
     wait_for_selected_mcp_server(&mut app_server, &thread_id).await?;
 
+    // A skill mention alone does not wait for MCP startup.
     run_turn(
         &mut app_server,
         &thread_id,
-        &format!("Use ${SKILL_NAME} and call its selected executor MCP"),
+        &format!("Use ${SKILL_NAME} and call [${MCP_SERVER_NAME}](mcp://{MCP_SERVER_NAME})"),
         fixture.environment_cwd.clone(),
     )
     .await?;
@@ -322,7 +445,9 @@ async fn selected_capability_stack_tracks_environment_availability_and_resume() 
     run_turn(
         &mut app_server,
         &thread_id,
-        &format!("Use ${SKILL_NAME} after reattaching the selected executor"),
+        &format!(
+            "Use ${SKILL_NAME} with [${MCP_SERVER_NAME}](mcp://{MCP_SERVER_NAME}) after reattaching the selected executor"
+        ),
         fixture.environment_cwd,
     )
     .await?;
@@ -352,10 +477,44 @@ async fn selected_capability_stack_tracks_environment_availability_and_resume() 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn selected_capabilities_become_available_between_samples_in_one_turn() -> Result<()> {
-    const USER_INPUT_CALL_ID: &str = "pause-for-environment";
+#[derive(Clone, Copy)]
+enum MentionTiming {
+    Unmentioned,
+    Initial,
+    InitialBeforeRestart,
+    Steered,
+}
 
+#[derive(Clone, Copy)]
+enum MentionTarget {
+    Plugin,
+    Server,
+}
+
+#[test_case(MentionTiming::Unmentioned, MentionTarget::Plugin; "without a mention")]
+#[test_case(MentionTiming::Initial, MentionTarget::Plugin; "with an initial plugin mention")]
+#[test_case(MentionTiming::InitialBeforeRestart, MentionTarget::Plugin; "with an initial plugin mention across a restart")]
+#[test_case(MentionTiming::Steered, MentionTarget::Plugin; "with a steered plugin mention")]
+#[test_case(MentionTiming::Initial, MentionTarget::Server; "with an initial server mention")]
+#[test_case(MentionTiming::Steered, MentionTarget::Server; "with a steered server mention")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_capabilities_become_available_between_samples_in_one_turn(
+    mention_timing: MentionTiming,
+    mention_target: MentionTarget,
+) -> Result<()> {
+    const USER_INPUT_CALL_ID: &str = "pause-for-environment";
+    const MCP_USER_INPUT_CALL_ID: &str = "pause-for-mcp";
+
+    let mention_link = match mention_target {
+        MentionTarget::Plugin => format!("[@executor-demo](plugin://{PLUGIN_ID})"),
+        MentionTarget::Server => format!("[${MCP_SERVER_NAME}](mcp://{MCP_SERVER_NAME})"),
+    };
+    let samples_before_attach = if matches!(mention_timing, MentionTiming::Steered) {
+        2
+    } else {
+        1
+    };
+    let continue_answers = json!({ "answers": { "confirm_path": { "answers": ["yes"] } } });
     let responses_server = responses::start_mock_server().await;
     let (apps_url, apps_server_handle) = start_apps_server_with_delays(
         vec![AppInfo {
@@ -381,33 +540,43 @@ async fn selected_capabilities_become_available_between_samples_in_one_turn() ->
     )
     .await?;
     let fixture = selected_capability_fixture(&responses_server.uri(), &apps_url)?;
+    let initialize_barrier = fixture.block_mcp_startup()?;
+    let stop_hook_barrier = if matches!(mention_timing, MentionTiming::InitialBeforeRestart) {
+        let barrier = fixture.codex_home.path().join("allow-stop-hook");
+        let hook_path = fixture.codex_home.path().join("wait-for-stop.py");
+        std::fs::write(
+            &hook_path,
+            "import json\nimport sys\nimport time\nfrom pathlib import Path\n\n\
+             json.load(sys.stdin)\nwhile not Path(sys.argv[1]).exists():\n    time.sleep(0.01)\n",
+        )?;
+        let command = toml::Value::String(format!(
+            "python3 \"{}\" \"{}\"",
+            hook_path.display(),
+            barrier.display()
+        ));
+        std::fs::write(
+            fixture.codex_home.path().join("requirements.toml"),
+            format!(
+                "[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = 'command'\ncommand = {command}\ntimeout = 60\n"
+            ),
+        )?;
+        let config_path = fixture.codex_home.path().join("config.toml");
+        let config = std::fs::read_to_string(&config_path)?
+            .replace("[features]\n", "[features]\nhooks = true\n");
+        std::fs::write(config_path, config)?;
+        Some(barrier)
+    } else {
+        None
+    };
     let response_mock = responses::mount_sse_sequence(
         &responses_server,
         vec![
-            responses::sse(vec![
-                responses::ev_response_created("environment-pending"),
-                responses::ev_function_call(
-                    USER_INPUT_CALL_ID,
-                    "request_user_input",
-                    &json!({
-                        "questions": [{
-                            "id": "continue",
-                            "header": "Continue",
-                            "question": "Continue after the executor is attached?",
-                            "options": [{
-                                "label": "Yes (Recommended)",
-                                "description": "Continue the same turn."
-                            }, {
-                                "label": "No",
-                                "description": "Stop here."
-                            }]
-                        }],
-                        "autoResolutionMs": 60_000
-                    })
-                    .to_string(),
-                ),
-                responses::ev_completed("environment-pending"),
-            ]),
+            if stop_hook_barrier.is_some() {
+                create_final_assistant_message_sse_response("Waiting for the executor")?
+            } else {
+                create_request_user_input_sse_response(USER_INPUT_CALL_ID)?
+            },
+            create_request_user_input_sse_response(MCP_USER_INPUT_CALL_ID)?,
             responses::sse(vec![
                 responses::ev_response_created("environment-ready-call"),
                 responses::ev_function_call_with_namespace(
@@ -446,9 +615,16 @@ async fn selected_capabilities_become_available_between_samples_in_one_turn() ->
     .await?;
     let turn_start_id = app_server
         .send_turn_start_request(TurnStartParams {
-            thread_id,
+            thread_id: thread_id.clone(),
             input: vec![UserInput::Text {
-                text: "Use the executor when it becomes ready.".to_string(),
+                text: match mention_timing {
+                    MentionTiming::Unmentioned | MentionTiming::Steered => {
+                        "Use the executor when it becomes ready.".to_string()
+                    }
+                    MentionTiming::Initial | MentionTiming::InitialBeforeRestart => {
+                        format!("Use {mention_link} when its executor becomes ready.")
+                    }
+                },
                 text_elements: Vec::new(),
             }],
             environments: Some(vec![TurnEnvironmentParams {
@@ -467,34 +643,145 @@ async fn selected_capabilities_become_available_between_samples_in_one_turn() ->
             ..Default::default()
         })
         .await?;
-    timeout(
+    let response = timeout(
         READ_TIMEOUT,
         app_server.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
     )
     .await??;
+    let TurnStartResponse { turn } = to_response(response)?;
 
-    let request = timeout(READ_TIMEOUT, app_server.read_stream_until_request_message()).await??;
-    let ServerRequest::ToolRequestUserInput { request_id, .. } = request else {
-        panic!("expected request_user_input, got {request:?}");
+    let request_id = if stop_hook_barrier.is_some() {
+        // Steering during a successful Stop hook restarts run_turn in the same RegularTask.
+        timeout(
+            READ_TIMEOUT,
+            app_server.read_stream_until_matching_notification(
+                "Stop hook started",
+                |notification| {
+                    notification.method == "hook/started"
+                        && notification.params.as_ref().is_some_and(|params| {
+                            params["turnId"] == turn.id && params["run"]["eventName"] == "stop"
+                        })
+                },
+            ),
+        )
+        .await??;
+        None
+    } else {
+        let request =
+            timeout(READ_TIMEOUT, app_server.read_stream_until_request_message()).await??;
+        let ServerRequest::ToolRequestUserInput { request_id, .. } = request else {
+            panic!("expected request_user_input, got {request:?}");
+        };
+        Some(request_id)
     };
     let requests = response_mock.requests();
     assert_eq!(1, requests.len());
     assert_selected_capabilities_absent(&requests[0]);
 
+    if !matches!(mention_timing, MentionTiming::Unmentioned) {
+        let steer_request_id = app_server
+            .send_turn_steer_request(TurnSteerParams {
+                thread_id,
+                input: vec![UserInput::Text {
+                    text: if matches!(mention_timing, MentionTiming::Steered) {
+                        format!("Use {mention_link} now.")
+                    } else {
+                        "Continue with the requested tool when it becomes available.".to_string()
+                    },
+                    text_elements: Vec::new(),
+                }],
+                expected_turn_id: turn.id.clone(),
+                ..Default::default()
+            })
+            .await?;
+        let response = timeout(
+            READ_TIMEOUT,
+            app_server.read_stream_until_response_message(RequestId::Integer(steer_request_id)),
+        )
+        .await??;
+        let response: TurnSteerResponse = to_response(response)?;
+        assert_eq!(response, TurnSteerResponse { turn_id: turn.id });
+    }
+    let request_id = if matches!(mention_timing, MentionTiming::Steered) {
+        // Consume the mention while the executor is absent, then sample once more.
+        app_server
+            .send_response(
+                request_id.expect("steering pauses before attaching the executor"),
+                continue_answers.clone(),
+            )
+            .await?;
+        let request =
+            timeout(READ_TIMEOUT, app_server.read_stream_until_request_message()).await??;
+        let ServerRequest::ToolRequestUserInput { request_id, .. } = request else {
+            panic!("expected request_user_input, got {request:?}");
+        };
+        let requests = response_mock.requests();
+        assert_eq!(2, requests.len());
+        assert_selected_capabilities_absent(&requests[1]);
+        Some(request_id)
+    } else {
+        request_id
+    };
     let mut exec_server =
         spawn_exec_server(fixture.codex_home.path(), &fixture.exec_server_url).await?;
     add_environment(&mut app_server, &fixture.exec_server_url).await?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    app_server
-        .send_response(
-            request_id,
-            json!({
-                "answers": {
-                    "continue": { "answers": ["yes"] }
-                }
-            }),
-        )
-        .await?;
+    if let Some(request_id) = request_id {
+        app_server
+            .send_response(request_id, continue_answers.clone())
+            .await?;
+    }
+    if let Some(stop_hook_barrier) = stop_hook_barrier {
+        std::fs::write(stop_hook_barrier, "ready")?;
+    }
+    let mcp_pid = wait_for_pid_file(&fixture.pid_file).await?;
+    if !matches!(mention_timing, MentionTiming::Unmentioned) {
+        // An explicit mention must still require startup after the executor attaches.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            response_mock.requests().len(),
+            samples_before_attach,
+            "the explicit mention must keep later samples waiting for MCP startup"
+        );
+        std::fs::write(&initialize_barrier, "ready")?;
+    }
+    let request_id = if matches!(mention_timing, MentionTiming::Steered) {
+        None
+    } else {
+        let request =
+            timeout(READ_TIMEOUT, app_server.read_stream_until_request_message()).await??;
+        let ServerRequest::ToolRequestUserInput { request_id, .. } = request else {
+            panic!("expected request_user_input, got {request:?}");
+        };
+        let requests = response_mock.requests();
+        assert_eq!(2, requests.len());
+        assert_selected_skill_catalog_available(&requests[1]);
+        if matches!(mention_timing, MentionTiming::Unmentioned) {
+            assert!(
+                requests[1]
+                    .tool_by_name(&format!("mcp__{MCP_SERVER_NAME}"), "echo")
+                    .is_none()
+            );
+            std::fs::write(&initialize_barrier, "ready")?;
+        } else {
+            assert_selected_plugin_tools(&requests[1]);
+        }
+        Some(request_id)
+    };
+    timeout(
+        READ_TIMEOUT,
+        app_server.read_stream_until_matching_notification("selected MCP ready", |notification| {
+            notification.method == "mcpServer/startupStatus/updated"
+                && notification.params.as_ref().is_some_and(|params| {
+                    params["name"] == MCP_SERVER_NAME && params["status"] == "ready"
+                })
+        }),
+    )
+    .await??;
+    if let Some(request_id) = request_id {
+        app_server
+            .send_response(request_id, continue_answers)
+            .await?;
+    }
     timeout(
         READ_TIMEOUT,
         app_server.read_stream_until_notification_message("turn/completed"),
@@ -502,19 +789,21 @@ async fn selected_capabilities_become_available_between_samples_in_one_turn() ->
     .await??;
 
     let requests = response_mock.requests();
-    assert_eq!(3, requests.len());
-    assert_selected_skill_catalog_available(&requests[1]);
-    assert_selected_plugin_tools(&requests[1]);
-    assert_plugin_guidance_count(&requests[1], /*expected_count*/ 0);
-    assert_selected_plugin_tools(&requests[2]);
-    assert_plugin_guidance_count(&requests[2], /*expected_count*/ 0);
-    let output = requests[2].function_call_output(MCP_CALL_ID);
+    assert_eq!(4, requests.len());
+    for request in &requests[samples_before_attach..] {
+        assert_selected_skill_catalog_available(request);
+        assert_plugin_guidance_count(request, /*expected_count*/ 0);
+    }
+    for request in &requests[2..] {
+        assert_selected_plugin_tools(request);
+    }
+    let output = requests[3].function_call_output(MCP_CALL_ID);
     let output = output["output"]
         .as_str()
         .expect("MCP function output should be text");
     assert!(output.contains("ECHOING: same turn"));
     assert!(output.contains(EXECUTOR_ENV_VALUE));
-    wait_for_pid_file(&fixture.pid_file).await?;
+    assert_eq!(mcp_pid, wait_for_pid_file(&fixture.pid_file).await?);
 
     exec_server.kill().await?;
     apps_server_handle.abort();
@@ -529,6 +818,20 @@ struct SelectedCapabilityFixture {
     exec_server_url: String,
     selected_root: SelectedCapabilityRoot,
     environment_cwd: AbsolutePathBuf,
+}
+
+impl SelectedCapabilityFixture {
+    fn block_mcp_startup(&self) -> Result<std::path::PathBuf> {
+        let initialize_barrier = self._plugin.path().join("allow-mcp-initialize");
+        let mcp_config_path = self._plugin.path().join(".mcp.json");
+        let mut mcp_config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&mcp_config_path)?)?;
+        mcp_config["mcpServers"][MCP_SERVER_NAME]["env"]["MCP_TEST_INITIALIZE_BARRIER_FILE"] =
+            json!(initialize_barrier);
+        mcp_config["mcpServers"][MCP_SERVER_NAME]["startup_timeout_sec"] = json!(30);
+        std::fs::write(mcp_config_path, serde_json::to_vec(&mcp_config)?)?;
+        Ok(initialize_barrier)
+    }
 }
 
 fn selected_capability_fixture(
@@ -799,6 +1102,19 @@ async fn add_environment(app_server: &mut TestAppServer, exec_server_url: &str) 
     )
     .await??;
     let _: EnvironmentAddResponse = to_response(response)?;
+    // Wait for executor attachment, independently of plugin MCP startup.
+    let request_id = app_server
+        .send_raw_request(
+            "environment/info",
+            Some(json!({ "environmentId": EXECUTOR_ID })),
+        )
+        .await?;
+    let response = timeout(
+        READ_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let _: EnvironmentInfoResponse = to_response(response)?;
     Ok(())
 }
 

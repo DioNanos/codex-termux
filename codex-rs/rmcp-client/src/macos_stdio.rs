@@ -1,11 +1,11 @@
-//! Native spawning for relative macOS MCP executables, without rewriting script paths.
+//! Native spawning for macOS MCP executables, without rewriting script paths.
 //!
 //! Rust falls back to fork for a historical relative-path/cwd bug in Apple's
 //! `posix_spawnp`. Calling `posix_spawn` directly avoids that wrapper. This module only
 //! accepts the launcher's cleared-environment command shape, with piped stdio,
-//! a new process group, and default `argv[0]`. PATH lookup and executable files
-//! without shebangs retain the existing launcher. Each native child owns its PID
-//! until it has been reaped.
+//! a new process group, and default `argv[0]`. Bare commands search the child's
+//! PATH. Unsuccessful searches and executable files without shebangs retain the
+//! existing launcher. Each native child owns its PID until it has been reaped.
 
 use std::ffi::CString;
 use std::ffi::OsStr;
@@ -42,12 +42,12 @@ enum ChildKind {
 }
 
 impl LocalChild {
-    /// Uses native spawning for relative paths, retaining Tokio's fallback for
-    /// PATH lookup and executable text without a shebang.
+    /// Uses native spawning for relative paths and bare names, retaining Tokio's
+    /// fallback for unsuccessful PATH searches and executable text without a shebang.
     pub(super) fn spawn(mut command: Command) -> io::Result<Self> {
         let program = command.as_std().get_program();
         if Path::new(program).is_relative()
-            && program.as_bytes().contains(&b'/')
+            && !program.is_empty()
             && let Some((child, stdin, stdout, stderr)) = NativeChild::spawn(command.as_std())?
         {
             return Ok(Self {
@@ -115,6 +115,7 @@ impl NativeChild {
         command: &std::process::Command,
     ) -> io::Result<Option<(Self, ChildStdin, ChildStdout, ChildStderr)>> {
         let program = c_string(command.get_program())?;
+        let search_path = !program.as_bytes().contains(&b'/');
         let args = std::iter::once(command.get_program())
             .chain(command.get_args())
             .map(c_string)
@@ -193,18 +194,56 @@ impl NativeChild {
                 &mut attrs.0,
                 (libc::POSIX_SPAWN_SETPGROUP | libc::POSIX_SPAWN_SETSIGDEF) as _,
             ))?;
-            libc::posix_spawn(
-                &mut pid,
-                program.as_ptr(),
-                &actions.0,
-                &attrs.0,
-                argv.as_ptr(),
-                envp.as_ptr(),
-            )
+            let mut spawn = |executable: &CString| {
+                libc::posix_spawn(
+                    &mut pid,
+                    executable.as_ptr(),
+                    &actions.0,
+                    &attrs.0,
+                    argv.as_ptr(),
+                    envp.as_ptr(),
+                )
+            };
+            if !search_path {
+                spawn(&program)
+            } else {
+                // posix_spawnp searches the parent's PATH, not envp. Search the
+                // child's PATH ourselves, using Apple's default when it is unset.
+                let path = command
+                    .get_envs()
+                    .find(|(key, _)| *key == "PATH")
+                    .and_then(|(_, value)| value)
+                    .unwrap_or(OsStr::new("/usr/bin:/bin"));
+                let mut result = libc::ENOENT;
+                for directory in std::env::split_paths(path) {
+                    let mut executable = directory.into_os_string();
+                    if executable.is_empty() {
+                        executable.push(".");
+                    }
+                    // Preserve the spelling execvp would pass to a shebang
+                    // interpreter, including empty entries and trailing slashes.
+                    executable.push("/");
+                    executable.push(command.get_program());
+                    if executable.as_bytes().len() >= libc::PATH_MAX as usize {
+                        return Ok(None);
+                    }
+                    result = spawn(&c_string(&executable)?);
+                    if !matches!(
+                        result,
+                        libc::ENOENT
+                            | libc::ENOTDIR
+                            | libc::EACCES
+                            | libc::ELOOP
+                            | libc::ENAMETOOLONG
+                    ) {
+                        break;
+                    }
+                }
+                result
+            }
         };
-        // execvp also supports executable text files without a shebang. Leave
-        // that compatibility behavior to the existing Command-based launcher.
-        if result == libc::ENOEXEC {
+        // Retain Command's shell fallback and exact PATH search errors.
+        if result == libc::ENOEXEC || (search_path && result != 0) {
             return Ok(None);
         }
         cvt(result)?;

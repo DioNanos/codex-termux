@@ -30,7 +30,10 @@ Use this as the maintainer flow for a version bump:
    matching checksum manifest and generated checksums as described below.
 3. Publish a release-candidate PR and validate that `v8-canary` passes.
 4. If the canary is green, publish the release tag and release build.
-5. Once the release build completes, rerun the build on the candidate branch
+5. Independently verify the published Codex-built checksum manifests and record
+   their SHA-256 digests in
+   `third_party/v8/rusty_v8_<version>_release_manifests.sha256`.
+6. Once the release build completes, rerun the build on the candidate branch
    and verify that the final artifact builds and tests pass.
 
 When changing the remaining prebuilt `rusty_v8` `http_file` inputs, keep the

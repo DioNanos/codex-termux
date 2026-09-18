@@ -416,7 +416,7 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let access_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
@@ -499,7 +499,7 @@ async fn account_read_refresh_token_is_noop_in_external_mode() -> Result<()> {
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let access_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
@@ -611,7 +611,7 @@ async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let success_sse = responses::sse(vec![
         responses::ev_response_created("resp-turn"),
@@ -726,7 +726,7 @@ async fn external_auth_refresh_error_fails_turn() -> Result<()> {
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let unauthorized = ResponseTemplate::new(401).set_body_json(json!({
         "error": { "message": "unauthorized" }
@@ -837,7 +837,7 @@ async fn external_auth_refresh_mismatched_workspace_fails_turn() -> Result<()> {
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let unauthorized = ResponseTemplate::new(401).set_body_json(json!({
         "error": { "message": "unauthorized" }
@@ -953,7 +953,7 @@ async fn external_auth_refresh_invalid_access_token_fails_turn() -> Result<()> {
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let unauthorized = ResponseTemplate::new(401).set_body_json(json!({
         "error": { "message": "unauthorized" }
@@ -2003,7 +2003,7 @@ async fn login_account_chatgpt_device_code_returns_error_when_disabled() -> Resu
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
     mock_device_code_usercode_failure(&mock_server, /*status*/ 404).await;
 
     let issuer = mock_server.uri();
@@ -2059,7 +2059,7 @@ async fn login_account_chatgpt_device_code_succeeds_and_notifies() -> Result<()>
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     mock_device_code_usercode(&mock_server, /*interval_seconds*/ 0).await;
     mock_device_code_token_success(&mock_server).await;
@@ -2139,7 +2139,7 @@ async fn login_account_chatgpt_device_code_failure_notifies_without_account_upda
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     mock_device_code_usercode(&mock_server, /*interval_seconds*/ 0).await;
     mock_device_code_token_failure(&mock_server, /*status*/ 500).await;
@@ -2210,7 +2210,7 @@ async fn login_account_chatgpt_device_code_can_be_cancelled() -> Result<()> {
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     mock_device_code_usercode(&mock_server, /*interval_seconds*/ 1).await;
     mock_device_code_token_failure(&mock_server, /*status*/ 404).await;
@@ -2337,16 +2337,27 @@ async fn login_account_chatgpt_start_can_be_cancelled() -> Result<()> {
 #[tokio::test]
 // Serialize tests that launch the login server since it binds to a fixed port.
 #[serial(login_port)]
-async fn login_account_chatgpt_uses_debug_oauth_overrides() -> Result<()> {
+async fn login_account_chatgpt_uses_oauth_overrides() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
+    let mock_server = MockServer::start().await;
+    let id_token = encode_id_token(
+        &ChatGptIdTokenClaims::new()
+            .email("staging@example.com")
+            .plan_type("pro")
+            .chatgpt_account_id(WORKSPACE_ID_EMBEDDED),
+    )?;
+    mock_oauth_token(&mock_server, &id_token).await;
+    let issuer = mock_server.uri();
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
+        // Exercise packaged-build behavior without the debug-only startup flag.
+        .with_plugin_startup_tasks()
         .with_env_overrides(&[
             (CLIENT_ID_OVERRIDE_ENV_VAR, Some("staging-client")),
-            (LOGIN_ISSUER_ENV_VAR, Some("https://auth.example.com")),
+            (LOGIN_ISSUER_ENV_VAR, Some(issuer.as_str())),
         ])
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
@@ -2358,10 +2369,7 @@ async fn login_account_chatgpt_uses_debug_oauth_overrides() -> Result<()> {
         bail!("unexpected login response: {login:?}");
     };
     let auth_url = Url::parse(&auth_url)?;
-    assert_eq!(
-        auth_url.origin().ascii_serialization(),
-        "https://auth.example.com"
-    );
+    assert_eq!(auth_url.origin().ascii_serialization(), issuer);
     assert_eq!(
         auth_url
             .query_pairs()
@@ -2369,11 +2377,67 @@ async fn login_account_chatgpt_uses_debug_oauth_overrides() -> Result<()> {
         Some("staging-client".to_string())
     );
 
-    let cancel_id = mcp
-        .send_cancel_login_account_request(CancelLoginAccountParams { login_id })
-        .await?;
-    let _: CancelLoginAccountResponse =
-        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(cancel_id)).await??;
+    let callback_url = auth_url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "redirect_uri").then_some(value.into_owned()))
+        .ok_or_else(|| anyhow::anyhow!("missing redirect_uri"))?;
+    let state = auth_url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then_some(value.into_owned()))
+        .ok_or_else(|| anyhow::anyhow!("missing state"))?;
+    let mut callback_url = Url::parse(&callback_url)?;
+    callback_url
+        .query_pairs_mut()
+        .append_pair("code", "test-code")
+        .append_pair("state", &state);
+    let client = HttpClientBuilder::new()
+        .without_redirects()
+        .build_direct()?;
+    let response = client.get(callback_url.clone()).send().await?;
+    assert_eq!(response.status(), 302);
+    let success_url = Url::parse(response.headers()["location"].to_str()?)?;
+    assert_eq!(success_url.origin(), callback_url.origin());
+    let response = client.get(success_url).send().await?;
+    assert_eq!(response.status(), 200);
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("failed to read OAuth requests"))?;
+    let token_request = requests
+        .iter()
+        .find(|request| {
+            request.url.path() == "/oauth/token"
+                && url::form_urlencoded::parse(&request.body)
+                    .any(|(key, value)| key == "grant_type" && value == "authorization_code")
+        })
+        .ok_or_else(|| anyhow::anyhow!("missing authorization-code token exchange"))?;
+    let token_form: std::collections::HashMap<_, _> =
+        url::form_urlencoded::parse(&token_request.body)
+            .into_owned()
+            .collect();
+    assert_eq!(
+        token_form.get("client_id").map(String::as_str),
+        Some("staging-client")
+    );
+
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("account/login/completed"),
+    )
+    .await??;
+    let ServerNotification::AccountLoginCompleted(payload) = notification.try_into()? else {
+        bail!("unexpected notification")
+    };
+    assert_eq!(
+        payload,
+        AccountLoginCompletedNotification {
+            login_id: Some(login_id),
+            success: true,
+            error: None,
+            onboarding_entrypoint: None,
+        }
+    );
     Ok(())
 }
 

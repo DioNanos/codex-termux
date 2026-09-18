@@ -929,6 +929,13 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                             needs_redraw: &mut bool|
      -> anyhow::Result<()> {
         if *needs_redraw {
+            if let Some(delay) = app
+                .new_task
+                .as_ref()
+                .and_then(|page| page.composer.footer_flash_delay())
+            {
+                let _ = frame_tx.send(Instant::now() + delay);
+            }
             terminal.draw(|f| ui::draw(f, app))?;
             *needs_redraw = false;
         }
@@ -941,7 +948,8 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
             Some(()) = redraw_rx.recv() => {
                 // Micro‑flush pending first key held by paste‑burst.
                 if let Some(page) = app.new_task.as_mut() {
-                    if page.composer.flush_paste_burst_if_due() { needs_redraw = true; }
+                    needs_redraw = true;
+                    page.composer.flush_paste_burst_if_due();
                     if page.composer.is_in_paste_burst() {
                         let _ = frame_tx
                             .send(Instant::now() + codex_tui::ComposerInput::recommended_flush_delay());

@@ -39,7 +39,7 @@ pub(super) fn parse_legacy_rollout_value(mut value: Value) -> Result<Option<Roll
     normalize_legacy_rate_limit_resets(&mut value);
     normalize_legacy_review_entry(&mut value);
     normalize_legacy_command_cwd(&mut value)?;
-    serde_json::from_value(value)
+    codex_rollout::decode_rollout_line(value)
         .map(Some)
         .map_err(|error| error.to_string())
 }

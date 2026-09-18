@@ -1,12 +1,14 @@
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout::RolloutItem;
+use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -72,6 +74,7 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         .revert_thread(RevertThreadParams {
             thread_id,
             before_turn_id: "turn-2".to_string(),
+            multi_agent_version: None,
         })
         .await
         .expect("revert before second turn");
@@ -92,12 +95,17 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         .meta;
     assert_eq!(replacement_meta.id, thread_id);
     assert_eq!(replacement_meta.memory_mode, None);
+    assert_eq!(
+        replacement_meta.runtime_workspace_roots,
+        Some(vec![home.path().join("workspace")])
+    );
     assert_eq!(turn_ids(&store, thread_id).await, vec!["turn-1"]);
 
     store
         .revert_thread(RevertThreadParams {
             thread_id,
             before_turn_id: "turn-1".to_string(),
+            multi_agent_version: None,
         })
         .await
         .expect("revert before first turn");
@@ -134,6 +142,80 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
     }
 }
 
+#[tokio::test]
+async fn revert_preserves_resolved_multi_agent_version_in_session_metadata() {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let state_db = codex_state::StateRuntime::init(
+        config.sqlite.clone(),
+        config.default_model_provider_id.clone(),
+    )
+    .await
+    .expect("initialize state database");
+    let store = LocalThreadStore::new(config, Some(state_db.clone()));
+
+    for version in [
+        MultiAgentVersion::V1,
+        MultiAgentVersion::V2,
+        MultiAgentVersion::Disabled,
+    ] {
+        let thread_id = ThreadId::new();
+        create_paginated_thread(&store, thread_id).await;
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: vec![
+                    turn_started("turn-1"),
+                    turn_completed("turn-1"),
+                    turn_started("turn-2"),
+                    turn_completed("turn-2"),
+                ],
+            })
+            .await
+            .expect("append turns");
+        let path = store
+            .live_rollout_path(thread_id)
+            .await
+            .expect("source rollout path");
+        store
+            .shutdown_thread(thread_id)
+            .await
+            .expect("close source writer");
+        codex_rollout::state_db::reconcile_rollout(
+            Some(state_db.as_ref()),
+            path.as_path(),
+            "test-provider",
+            /*builder*/ None,
+            &[],
+            /*archived_only*/ Some(false),
+            /*new_thread_memory_mode*/ None,
+        )
+        .await;
+
+        // The second revert has no live version to supply and must keep the persisted one.
+        for (before_turn_id, multi_agent_version) in [("turn-2", Some(version)), ("turn-1", None)] {
+            store
+                .revert_thread(RevertThreadParams {
+                    thread_id,
+                    before_turn_id: before_turn_id.to_string(),
+                    multi_agent_version,
+                })
+                .await
+                .expect("revert thread");
+            let path = state_db
+                .get_thread(thread_id)
+                .await
+                .expect("read metadata")
+                .expect("thread metadata")
+                .rollout_path;
+            let meta = codex_rollout::read_session_meta_line(&path)
+                .await
+                .expect("read replacement metadata");
+            assert_eq!(meta.meta.multi_agent_version, Some(version));
+        }
+    }
+}
+
 async fn rollout_paths_for_thread(
     home: &std::path::Path,
     thread_id: ThreadId,
@@ -165,6 +247,7 @@ async fn create_paginated_thread(store: &LocalThreadStore, thread_id: ThreadId) 
             history_base: None,
             subagent_history_start_ordinal: None,
             initial_window_id: "window-1".to_string(),
+            runtime_workspace_roots: Some(vec![store.config.codex_home.join("workspace").abs()]),
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(std::env::current_dir().expect("cwd")),
                 model_provider: "test-provider".to_string(),

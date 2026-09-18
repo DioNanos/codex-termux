@@ -3,7 +3,6 @@ use pretty_assertions::assert_eq;
 use super::install_latest_standalone;
 use super::update_modes_for_identities;
 use crate::RestartMode;
-use crate::UpdaterRefreshMode;
 use crate::managed_install::executable_identity_from_bytes;
 
 #[test]
@@ -13,7 +12,7 @@ fn unchanged_updater_uses_version_based_restart() {
             &executable_identity_from_bytes(b"same"),
             &executable_identity_from_bytes(b"same"),
         ),
-        (RestartMode::IfVersionChanged, UpdaterRefreshMode::None)
+        RestartMode::IfVersionChanged
     );
 }
 
@@ -24,10 +23,7 @@ fn changed_updater_forces_refresh_even_when_version_may_match() {
             &executable_identity_from_bytes(b"old"),
             &executable_identity_from_bytes(b"new"),
         ),
-        (
-            RestartMode::Always,
-            UpdaterRefreshMode::ReexecIfManagedBinaryChanged,
-        )
+        RestartMode::Always
     );
 }
 
@@ -38,4 +34,25 @@ async fn standalone_installer_is_intentionally_a_noop() {
     install_latest_standalone()
         .await
         .expect("Termux standalone updater must fail closed as a no-op");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn powershell_installer_is_noninteractive_and_reports_script_failure() {
+    let valid = FakeInstallerHttp::new(InstallerResponse::Success(
+        br#"
+function Test-Installer {
+    if ($env:CODEX_NON_INTERACTIVE -ne '1') { throw 'interactive installer' }
+}
+Test-Installer
+"#
+        .to_vec(),
+    ));
+    super::install_latest_standalone(&valid)
+        .await
+        .expect("installer succeeds");
+    let failing = FakeInstallerHttp::new(InstallerResponse::Success(
+        b"throw 'installer failed'".to_vec(),
+    ));
+    assert!(super::install_latest_standalone(&failing).await.is_err());
 }

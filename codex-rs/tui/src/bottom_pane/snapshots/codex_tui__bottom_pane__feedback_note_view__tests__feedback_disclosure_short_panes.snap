@@ -1,0 +1,75 @@
+---
+source: tui/src/bottom_pane/feedback_note_view_tests.rs
+expression: "rendered.join(\"\\n\\n\")"
+---
+40x12 initial
+▌ Tell us more (bug)
+▌
+▌ Your data may be used to improve our
+▌ models and products
+▌ By submitting feedback, you agree that
+▌ OpenAI can use your feedback for
+▌ safety purposes and internal model
+▌ training, as explained in more detail
+▌
+▌ A visible note.
+pgup/pgdn scroll disclosure
+Press enter to submit or esc to cancel
+
+40x12 scrolled
+▌ By submitting feedback, you agree that
+▌ OpenAI can use your feedback for
+▌ safety purposes and internal model
+▌ training, as explained in more detail
+▌ here. Please avoid sharing tented
+▌ information under NDA, or privileged,
+▌ HR-related, or sensitive personal
+▌ information.
+▌
+▌ A visible note.
+pgup/pgdn scroll disclosure
+Press enter to submit or esc to cancel
+
+40x12 restored
+▌ Tell us more (bug)
+▌
+▌ Your data may be used to improve our
+▌ models and products
+▌ By submitting feedback, you agree that
+▌ OpenAI can use your feedback for
+▌ safety purposes and internal model
+▌ training, as explained in more detail
+▌
+▌ A visible note.
+pgup/pgdn scroll disclosure
+Press enter to submit or esc to cancel
+
+80x8 initial
+▌ Tell us more (bug)
+▌
+▌ Your data may be used to improve our models and products
+▌ By submitting feedback, you agree that OpenAI can use your feedback for safety
+▌
+▌ A visible note.
+pgup/pgdn scroll disclosure
+Press enter to submit or esc to cancel
+
+80x8 scrolled
+▌ By submitting feedback, you agree that OpenAI can use your feedback for safety
+▌ purposes and internal model training, as explained in more detail here. Please
+▌ avoid sharing tented information under NDA, or privileged, HR-related, or
+▌ sensitive personal information.
+▌
+▌ A visible note.
+pgup/pgdn scroll disclosure
+Press enter to submit or esc to cancel
+
+80x8 restored
+▌ Tell us more (bug)
+▌
+▌ Your data may be used to improve our models and products
+▌ By submitting feedback, you agree that OpenAI can use your feedback for safety
+▌
+▌ A visible note.
+pgup/pgdn scroll disclosure
+Press enter to submit or esc to cancel

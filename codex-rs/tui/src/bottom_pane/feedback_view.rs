@@ -4,264 +4,28 @@ use codex_feedback::DOCTOR_REPORT_ATTACHMENT_FILENAME;
 use codex_feedback::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
 use codex_feedback::FeedbackDiagnostics;
 use codex_feedback::WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME;
-use crossterm::event::KeyCode;
-use crossterm::event::KeyEvent;
-use crossterm::event::KeyModifiers;
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
-use ratatui::text::Span;
-use ratatui::widgets::Clear;
-use ratatui::widgets::Paragraph;
-use ratatui::widgets::StatefulWidgetRef;
-use ratatui::widgets::Widget;
-use std::cell::RefCell;
 
 use crate::app_event::AppEvent;
 use crate::app_event::FeedbackCategory;
 use crate::app_event_sender::AppEventSender;
 use crate::history_cell;
-use crate::render::renderable::Renderable;
 
-use super::CancellationEvent;
-use super::bottom_pane_view::BottomPaneView;
 use super::popup_consts::standard_popup_hint_line;
-use super::textarea::TextArea;
-use super::textarea::TextAreaState;
 
 const BASE_CLI_BUG_ISSUE_URL: &str =
     "https://github.com/DioNanos/codex-termux/issues/new?template=3-cli.yml";
 /// Internal routing link for employee feedback follow-ups. This must not be shown to external users.
 const CODEX_FEEDBACK_INTERNAL_URL: &str = "http://go/codex-feedback-internal";
 
-/// The target audience for feedback follow-up instructions.
+/// The target audience for feedback disclosure and follow-up instructions.
 ///
-/// This is used strictly for messaging/links after feedback upload completes. It
-/// must not change feedback upload behavior itself.
+/// This controls displayed copy and links, not feedback upload behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FeedbackAudience {
     OpenAiEmployee,
     External,
-}
-
-/// Minimal input overlay to collect an optional feedback note, then submit it
-/// through the app-server-managed feedback flow.
-pub(crate) struct FeedbackNoteView {
-    category: FeedbackCategory,
-    turn_id: Option<String>,
-    app_event_tx: AppEventSender,
-    include_logs: bool,
-
-    // UI state
-    textarea: TextArea,
-    textarea_state: RefCell<TextAreaState>,
-    complete: bool,
-}
-
-impl FeedbackNoteView {
-    pub(crate) fn new(
-        category: FeedbackCategory,
-        turn_id: Option<String>,
-        app_event_tx: AppEventSender,
-        include_logs: bool,
-    ) -> Self {
-        Self {
-            category,
-            turn_id,
-            app_event_tx,
-            include_logs,
-            textarea: TextArea::new(),
-            textarea_state: RefCell::new(TextAreaState::default()),
-            complete: false,
-        }
-    }
-
-    fn submit(&mut self) {
-        let note = self.textarea.text().trim().to_string();
-        let reason = if note.is_empty() { None } else { Some(note) };
-        self.app_event_tx.send(AppEvent::SubmitFeedback {
-            category: self.category,
-            reason,
-            turn_id: self.turn_id.clone(),
-            include_logs: self.include_logs,
-        });
-        self.complete = true;
-    }
-}
-
-impl BottomPaneView for FeedbackNoteView {
-    fn handle_key_event(&mut self, key_event: KeyEvent) {
-        match key_event {
-            KeyEvent {
-                code: KeyCode::Esc, ..
-            } => {
-                self.on_ctrl_c();
-            }
-            KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => {
-                self.submit();
-            }
-            KeyEvent {
-                code: KeyCode::Enter,
-                ..
-            } => {
-                self.textarea.input(key_event);
-            }
-            other => {
-                self.textarea.input(other);
-            }
-        }
-    }
-
-    fn on_ctrl_c(&mut self) -> CancellationEvent {
-        self.complete = true;
-        CancellationEvent::Handled
-    }
-
-    fn is_complete(&self) -> bool {
-        self.complete
-    }
-
-    fn handle_paste(&mut self, pasted: String) -> bool {
-        if pasted.is_empty() {
-            return false;
-        }
-        self.textarea.insert_str(&pasted);
-        true
-    }
-}
-
-impl Renderable for FeedbackNoteView {
-    fn desired_height(&self, width: u16) -> u16 {
-        self.intro_lines(width).len() as u16 + self.input_height(width) + 2u16
-    }
-
-    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        if area.height < 2 || area.width <= 2 {
-            return None;
-        }
-        let intro_height = self.intro_lines(area.width).len() as u16;
-        let text_area_height = self.input_height(area.width).saturating_sub(1);
-        if text_area_height == 0 {
-            return None;
-        }
-        let textarea_rect = Rect {
-            x: area.x.saturating_add(2),
-            y: area.y.saturating_add(intro_height).saturating_add(1),
-            width: area.width.saturating_sub(2),
-            height: text_area_height,
-        };
-        let state = *self.textarea_state.borrow();
-        self.textarea.cursor_pos_with_state(textarea_rect, state)
-    }
-
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 || area.width == 0 {
-            return;
-        }
-
-        let intro_lines = self.intro_lines(area.width);
-        let (_, placeholder) = feedback_title_and_placeholder(self.category);
-        let input_height = self.input_height(area.width);
-
-        for (offset, line) in intro_lines.iter().enumerate() {
-            Paragraph::new(line.clone()).render(
-                Rect {
-                    x: area.x,
-                    y: area.y.saturating_add(offset as u16),
-                    width: area.width,
-                    height: 1,
-                },
-                buf,
-            );
-        }
-
-        // Input line
-        let input_area = Rect {
-            x: area.x,
-            y: area.y.saturating_add(intro_lines.len() as u16),
-            width: area.width,
-            height: input_height,
-        };
-        if input_area.width >= 2 {
-            for row in 0..input_area.height {
-                Paragraph::new(Line::from(vec![gutter()])).render(
-                    Rect {
-                        x: input_area.x,
-                        y: input_area.y.saturating_add(row),
-                        width: 2,
-                        height: 1,
-                    },
-                    buf,
-                );
-            }
-
-            let text_area_height = input_area.height.saturating_sub(1);
-            if text_area_height > 0 {
-                if input_area.width > 2 {
-                    let blank_rect = Rect {
-                        x: input_area.x.saturating_add(2),
-                        y: input_area.y,
-                        width: input_area.width.saturating_sub(2),
-                        height: 1,
-                    };
-                    Clear.render(blank_rect, buf);
-                }
-                let textarea_rect = Rect {
-                    x: input_area.x.saturating_add(2),
-                    y: input_area.y.saturating_add(1),
-                    width: input_area.width.saturating_sub(2),
-                    height: text_area_height,
-                };
-                let mut state = self.textarea_state.borrow_mut();
-                StatefulWidgetRef::render_ref(&(&self.textarea), textarea_rect, buf, &mut state);
-                if self.textarea.text().is_empty() {
-                    Paragraph::new(Line::from(placeholder.dim())).render(textarea_rect, buf);
-                }
-            }
-        }
-
-        let hint_blank_y = input_area.y.saturating_add(input_height);
-        if hint_blank_y < area.y.saturating_add(area.height) {
-            let blank_area = Rect {
-                x: area.x,
-                y: hint_blank_y,
-                width: area.width,
-                height: 1,
-            };
-            Clear.render(blank_area, buf);
-        }
-
-        let hint_y = hint_blank_y.saturating_add(1);
-        if hint_y < area.y.saturating_add(area.height) {
-            Paragraph::new(standard_popup_hint_line()).render(
-                Rect {
-                    x: area.x,
-                    y: hint_y,
-                    width: area.width,
-                    height: 1,
-                },
-                buf,
-            );
-        }
-    }
-}
-
-impl FeedbackNoteView {
-    fn input_height(&self, width: u16) -> u16 {
-        let usable_width = width.saturating_sub(2);
-        let text_height = self.textarea.desired_height(usable_width).clamp(1, 8);
-        text_height.saturating_add(1).min(9)
-    }
-
-    fn intro_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let (title, _) = feedback_title_and_placeholder(self.category);
-        vec![Line::from(vec![gutter(), title.bold()])]
-    }
 }
 
 pub(crate) fn should_show_feedback_connectivity_details(
@@ -269,35 +33,6 @@ pub(crate) fn should_show_feedback_connectivity_details(
     diagnostics: &FeedbackDiagnostics,
 ) -> bool {
     category != FeedbackCategory::GoodResult && !diagnostics.is_empty()
-}
-
-fn gutter() -> Span<'static> {
-    "▌ ".cyan()
-}
-
-fn feedback_title_and_placeholder(category: FeedbackCategory) -> (String, String) {
-    match category {
-        FeedbackCategory::BadResult => (
-            "Tell us more (bad result)".to_string(),
-            "(optional) Write a short description to help us further".to_string(),
-        ),
-        FeedbackCategory::GoodResult => (
-            "Tell us more (good result)".to_string(),
-            "(optional) Write a short description to help us further".to_string(),
-        ),
-        FeedbackCategory::Bug => (
-            "Tell us more (bug)".to_string(),
-            "(optional) Write a short description to help us further".to_string(),
-        ),
-        FeedbackCategory::SafetyCheck => (
-            "Tell us more (safety check)".to_string(),
-            "(optional) Share what was refused and why it should have been allowed".to_string(),
-        ),
-        FeedbackCategory::Other => (
-            "Tell us more (other)".to_string(),
-            "(optional) Write a short description to help us further".to_string(),
-        ),
-    }
 }
 
 pub(crate) fn feedback_classification(category: FeedbackCategory) -> &'static str {
@@ -324,7 +59,7 @@ pub(crate) fn feedback_success_cell(
     let issue_url = issue_url_for_category(category, thread_id, feedback_audience);
     let mut lines = vec![Line::from(match issue_url.as_ref() {
         Some(_) if feedback_audience == FeedbackAudience::OpenAiEmployee => {
-            format!("{prefix} Please report this in #codex-feedback:")
+            format!("{prefix} You can share this in #codex-feedback:")
         }
         Some(_) => format!("{prefix} Please open an issue using the following URL:"),
         None => format!("{prefix} Thanks for the feedback!"),
@@ -335,10 +70,15 @@ pub(crate) fn feedback_success_cell(
                 "".into(),
                 Line::from(vec!["  ".into(), url.cyan().underlined()]),
                 "".into(),
-                Line::from("  Share this and add some info about your problem:"),
                 Line::from(vec![
-                    "    ".into(),
-                    format!("https://go/codex-feedback/{thread_id}").bold(),
+                    "  Sentry Feedback ID: ".into(),
+                    thread_id.to_string().bold(),
+                ]),
+                Line::from(vec![
+                    "  Sentry URL: ".into(),
+                    format!("https://go/codex-feedback/{thread_id}")
+                        .cyan()
+                        .underlined(),
                 ]),
             ]);
         }
@@ -593,16 +333,11 @@ mod tests {
     use super::*;
     use crate::app_event::AppEvent;
     use crate::app_event_sender::AppEventSender;
+    use crate::render::renderable::Renderable;
     use codex_feedback::FeedbackDiagnostic;
     use pretty_assertions::assert_eq;
-
-    fn render(view: &FeedbackNoteView, width: u16) -> String {
-        let height = view.desired_height(width);
-        let area = Rect::new(0, 0, width, height);
-        let mut buf = Buffer::empty(area);
-        view.render(area, &mut buf);
-        render_buffer(area, &buf)
-    }
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
 
     fn render_renderable(renderable: &dyn Renderable, width: u16) -> String {
         let height = renderable.desired_height(width);
@@ -621,7 +356,7 @@ mod tests {
                     if symbol.is_empty() {
                         line.push(' ');
                     } else {
-                        line.push_str(symbol);
+                        line.push_str(&crate::terminal_hyperlinks::strip_osc8(symbol));
                     }
                 }
                 line.trim_end().to_string()
@@ -650,64 +385,6 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    fn make_view(category: FeedbackCategory) -> FeedbackNoteView {
-        let (tx_raw, _rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        FeedbackNoteView::new(
-            category, /*turn_id*/ None, tx, /*include_logs*/ true,
-        )
-    }
-
-    #[test]
-    fn feedback_view_bad_result() {
-        let view = make_view(FeedbackCategory::BadResult);
-        let rendered = render(&view, /*width*/ 60);
-        insta::assert_snapshot!("feedback_view_bad_result", rendered);
-    }
-
-    #[test]
-    fn feedback_view_good_result() {
-        let view = make_view(FeedbackCategory::GoodResult);
-        let rendered = render(&view, /*width*/ 60);
-        insta::assert_snapshot!("feedback_view_good_result", rendered);
-    }
-
-    #[test]
-    fn feedback_view_bug() {
-        let view = make_view(FeedbackCategory::Bug);
-        let rendered = render(&view, /*width*/ 60);
-        insta::assert_snapshot!("feedback_view_bug", rendered);
-    }
-
-    #[test]
-    fn feedback_view_other() {
-        let view = make_view(FeedbackCategory::Other);
-        let rendered = render(&view, /*width*/ 60);
-        insta::assert_snapshot!("feedback_view_other", rendered);
-    }
-
-    #[test]
-    fn feedback_view_safety_check() {
-        let view = make_view(FeedbackCategory::SafetyCheck);
-        let rendered = render(&view, /*width*/ 60);
-        insta::assert_snapshot!("feedback_view_safety_check", rendered);
-    }
-
-    #[test]
-    fn feedback_view_with_connectivity_diagnostics() {
-        let (tx_raw, _rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let view = FeedbackNoteView::new(
-            FeedbackCategory::Bug,
-            /*turn_id*/ None,
-            tx,
-            /*include_logs*/ false,
-        );
-        let rendered = render(&view, /*width*/ 60);
-
-        insta::assert_snapshot!("feedback_view_with_connectivity_diagnostics", rendered);
     }
 
     #[test]
@@ -747,58 +424,6 @@ mod tests {
             "feedback_upload_consent_lists_windows_sandbox_log_when_included",
             rendered
         );
-    }
-
-    #[test]
-    fn submit_feedback_emits_submit_event_with_trimmed_note() {
-        let (tx_raw, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let mut view = FeedbackNoteView::new(
-            FeedbackCategory::Bug,
-            Some("turn-123".to_string()),
-            tx,
-            /*include_logs*/ true,
-        );
-        view.textarea.insert_str("  something broke  ");
-
-        view.submit();
-
-        let event = rx.try_recv().expect("submit feedback event");
-        assert!(matches!(
-            event,
-            AppEvent::SubmitFeedback {
-                category: FeedbackCategory::Bug,
-                reason: Some(reason),
-                turn_id: Some(turn_id),
-                include_logs: true,
-            } if reason == "something broke" && turn_id == "turn-123"
-        ));
-        assert_eq!(view.is_complete(), true);
-    }
-
-    #[test]
-    fn submit_feedback_omits_empty_note() {
-        let (tx_raw, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let mut view = FeedbackNoteView::new(
-            FeedbackCategory::GoodResult,
-            /*turn_id*/ None,
-            tx,
-            /*include_logs*/ false,
-        );
-
-        view.submit();
-
-        let event = rx.try_recv().expect("submit feedback event");
-        assert!(matches!(
-            event,
-            AppEvent::SubmitFeedback {
-                category: FeedbackCategory::GoodResult,
-                reason: None,
-                turn_id: None,
-                include_logs: false,
-            }
-        ));
     }
 
     #[test]
@@ -899,10 +524,7 @@ mod tests {
             ),
             /*width*/ 120,
         );
-        assert_eq!(
-            rendered,
-            "• Feedback uploaded. Please report this in #codex-feedback:\n\n  http://go/codex-feedback-internal\n\n  Share this and add some info about your problem:\n    https://go/codex-feedback/thread-2"
-        );
+        insta::assert_snapshot!("feedback_success_employee", rendered);
     }
 
     #[test]

@@ -27,7 +27,6 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_rollout::RolloutItem;
-use codex_rollout::RolloutLine;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
@@ -334,7 +333,7 @@ fn replace_attribution_fragment_with_legacy(
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            let mut line = serde_json::from_str::<RolloutLine>(line)?;
+            let mut line = codex_rollout::parse_rollout_line(line)?;
             if let RolloutItem::ResponseItem(response_item) = &mut line.item
                 && let ResponseItem::Message { role, content, .. } = &mut response_item.item
                 && role == "developer"

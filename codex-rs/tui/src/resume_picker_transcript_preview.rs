@@ -22,7 +22,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
 use codex_rollout::ReverseJsonlScanner;
 use codex_rollout::RolloutItem;
-use codex_rollout::RolloutLine;
 use codex_rollout::ScanOutcome;
 
 const MAX_TRANSCRIPT_PREVIEW_LINES: usize = 6;
@@ -77,6 +76,7 @@ pub(crate) async fn load_transcript_preview(
                     /*turn_cursor*/ None,
                     /*item_cursor*/ None,
                     /*config*/ None,
+                    /*local_settings*/ None,
                     HistoryHydrationScope::Initial,
                 )
                 .await
@@ -161,7 +161,7 @@ fn scan_legacy_transcript_preview(
     )?
     .with_max_record_bytes(MAX_LEGACY_TRANSCRIPT_PREVIEW_SCAN_BYTES);
     loop {
-        let outcome = match scanner.scan_next::<RolloutLine>() {
+        let outcome = match scanner.scan_next_rollout_line() {
             Ok(Some(outcome)) => outcome,
             Ok(None) => break,
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),

@@ -51,6 +51,7 @@ use codex_protocol::mcp_policy::McpServerIdentity;
 use codex_protocol::mcp_policy::McpServerRequirement;
 use codex_protocol::mcp_policy::PluginMcpRequirements;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ImageDetail;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::PermissionProfileSnapshot;
 use codex_protocol::models::ResponseItem;
@@ -79,6 +80,9 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
+use codex_protocol::protocol::TurnSettingsUpdate;
+use codex_protocol::protocol::TurnSettingsUpdateOutcome;
+use codex_protocol::turn_input::TurnInput;
 use codex_protocol::user_input::UserInput;
 use codex_utils_cargo_bin::cargo_bin;
 use codex_utils_path_uri::PathUri;
@@ -1427,7 +1431,28 @@ async fn interrupt_during_mcp_startup_preserves_user_input_in_history(
     let pending_mcp_url = format!("http://{}/mcp", pending_mcp_listener.local_addr()?);
 
     let fixture = test_codex()
+        .with_model_info_override("gpt-5.4", |model| {
+            model.use_responses_lite = false;
+            model.supports_image_detail_original = false;
+        })
         .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::StepModelSwitching)
+                .expect("enable step model switching");
+            config
+                .features
+                .enable(Feature::UnifiedImageBudget)
+                .expect("enable unified image budget");
+            let models = &mut config.model_catalog.as_mut().expect("model catalog").models;
+            let mut current_model = models
+                .iter()
+                .find(|model| model.slug == "gpt-5.4")
+                .expect("initial model")
+                .clone();
+            current_model.slug = "startup-image-model".to_string();
+            current_model.supports_image_detail_original = true;
+            models.push(current_model);
             config.model_provider.supports_websockets =
                 matches!(startup_phase, InterruptedMcpStartupPhase::StartupPrewarm);
             if matches!(
@@ -1457,14 +1482,36 @@ async fn interrupt_during_mcp_startup_preserves_user_input_in_history(
             .await
             .context("MCP startup should connect before the turn is interrupted")??;
     let prompt = "keep this interrupted prompt in conversation history";
-    fixture
-        .codex
-        .start_or_steer_turn(read_only_user_turn(&fixture, prompt))
-        .await?;
-    wait_for_event(&fixture.codex, |event| {
-        matches!(event, EventMsg::TurnStarted(_))
+    let mut input = read_only_user_turn(&fixture, prompt);
+    let TurnInput::UserInput { content, .. } = &mut input.input else {
+        unreachable!("read_only_user_turn creates user input");
+    };
+    content.push(UserInput::Image {
+        image_url: OPENAI_PNG.to_string(),
+        detail: Some(ImageDetail::High),
+    });
+    fixture.codex.start_or_steer_turn(input).await?;
+    let turn_id = core_test_support::wait_for_event_match(&fixture.codex, |event| match event {
+        EventMsg::TurnStarted(started) => Some(started.turn_id.clone()),
+        _ => None,
     })
     .await;
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    fixture
+        .codex
+        .submit(Op::TurnSettings {
+            turn_id,
+            update: TurnSettingsUpdate {
+                model: Some("startup-image-model".to_string()),
+                ..Default::default()
+            },
+            reply,
+        })
+        .await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(/*secs*/ 10), outcome).await??,
+        TurnSettingsUpdateOutcome::Applied
+    );
 
     fixture.codex.submit(Op::Interrupt).await?;
     wait_for_event(&fixture.codex, |event| {
@@ -1494,6 +1541,19 @@ async fn interrupt_during_mcp_startup_preserves_user_input_in_history(
             )
         })
         .expect("an interrupted turn should retain its submitted user prompt");
+    let RolloutItem::ResponseItem(envelope) = &history.items[user_prompt_index] else {
+        unreachable!("found the user prompt");
+    };
+    let ResponseItem::Message { content, .. } = &envelope.item else {
+        unreachable!("found the user message");
+    };
+    assert!(
+        content.contains(&ContentItem::InputImage {
+            image_url: OPENAI_PNG.to_string(),
+            detail: Some(ImageDetail::Original),
+        }),
+        "interrupted input must use the current model's unified image budget"
+    );
     let interruption_marker_index = history
         .items
         .iter()
@@ -1689,7 +1749,7 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
     let model = models
         .models
         .iter_mut()
-        .find(|model| model.slug == "gpt-5.4")
+        .find(|model| model.slug == "gpt-5.5")
         .expect("bundled model should exist");
     model.node_repl_auto_review_required = node_repl_auto_review_required;
     model.node_repl_disabled = node_repl_disabled;
@@ -1743,7 +1803,7 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
     let rmcp_test_server_bin = remote_aware_stdio_server_bin()?;
     let fixture = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_config(move |config| {
             insert_mcp_server(
                 config,
@@ -2770,7 +2830,9 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                 input_modalities: vec![InputModality::Text],
                 used_fallback_model_metadata: false,
                 supports_search_tool: false,
+                supports_experimental_context: false,
                 use_responses_lite: false,
+                guardian: None,
                 node_repl_auto_review_required: false,
                 node_repl_disabled: false,
                 auto_review_model_override: None,
@@ -3774,7 +3836,8 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         "expired-access-token",
         refresh_token,
         OAuthCredentialExpiry::Expired,
-    )?;
+    )
+    .await?;
     let discovered_credential_name =
         credential_config.oauth_credential_name(discovered_server_name);
     write_fallback_oauth_tokens(
@@ -3784,7 +3847,8 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         expected_token,
         refresh_token,
         OAuthCredentialExpiry::Valid,
-    )?;
+    )
+    .await?;
 
     // Phase 4: configure Codex with the OAuth-backed Streamable HTTP MCP
     // server and build the fixture in the active local or remote-aware mode.
@@ -3792,6 +3856,10 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
         .with_home(temp_home.clone())
         .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::McpOAuthRefreshCoordination)
+                .expect("test config should allow coordinated MCP OAuth refresh");
             config.mcp_oauth_credentials_store_mode = OAuthCredentialsStoreMode::Auto;
             insert_mcp_server(
                 config,
@@ -3957,12 +4025,15 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
     .await
     .context("the newly discovered OAuth server did not recover after its store was unlocked")??;
 
-    assert!(codex_rmcp_client::delete_oauth_tokens(
-        discovered_credential_name.as_ref(),
-        http_server.url(),
-        OAuthCredentialsStoreMode::File,
-        codex_config::types::AuthKeyringBackendKind::default(),
-    )?);
+    assert!(
+        codex_rmcp_client::delete_oauth_tokens(
+            discovered_credential_name.as_ref(),
+            http_server.url(),
+            OAuthCredentialsStoreMode::File,
+            codex_config::types::AuthKeyringBackendKind::default(),
+        )
+        .await?
+    );
     fixture.codex.refresh_runtime_config(refreshed_config).await;
     let logged_out_startup = tokio::time::timeout(
         Duration::from_secs(5),
@@ -3990,7 +4061,8 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         expected_token,
         refresh_token,
         OAuthCredentialExpiry::Valid,
-    )?;
+    )
+    .await?;
 
     // Phase 6: submit the user turn that should invoke the OAuth-backed tool.
     fixture
@@ -4431,7 +4503,7 @@ enum OAuthCredentialExpiry {
     Expired,
 }
 
-fn write_fallback_oauth_tokens(
+async fn write_fallback_oauth_tokens(
     server_name: &str,
     server_url: &str,
     client_id: &str,
@@ -4468,6 +4540,7 @@ fn write_fallback_oauth_tokens(
         OAuthCredentialsStoreMode::File,
         codex_config::types::AuthKeyringBackendKind::default(),
     )
+    .await
 }
 
 struct EnvVarGuard {

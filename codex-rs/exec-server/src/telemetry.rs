@@ -6,6 +6,27 @@ use std::time::Instant;
 use codex_otel::MetricsClient;
 use tracing::warn;
 
+/// Registry-issued identity captured from the executor's authenticated relay connection.
+pub(crate) struct ExecutorRegistration {
+    pub(crate) environment_id: String,
+    pub(crate) executor_registration_id: String,
+}
+
+impl ExecutorRegistration {
+    pub(crate) fn new(environment_id: String, executor_registration_id: String) -> Option<Self> {
+        if [&environment_id, &executor_registration_id]
+            .iter()
+            .any(|id| id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control))
+        {
+            return None;
+        }
+        Some(Self {
+            environment_id,
+            executor_registration_id,
+        })
+    }
+}
+
 const CONNECTIONS_ACTIVE_METRIC: &str = "exec_server_connections_active";
 const CONNECTIONS_ACTIVE_DESCRIPTION: &str = "Number of active exec-server connections.";
 const CONNECTIONS_TOTAL_METRIC: &str = "exec_server_connections_total";
@@ -14,6 +35,8 @@ const REQUESTS_TOTAL_METRIC: &str = "exec_server_requests_total";
 const REQUESTS_TOTAL_DESCRIPTION: &str = "Total number of exec-server requests.";
 const REQUEST_DURATION_METRIC: &str = "exec_server_request_duration_seconds";
 const REQUEST_DURATION_DESCRIPTION: &str = "Duration of exec-server requests in seconds.";
+const REQUEST_TOTAL_DURATION_METRIC: &str = "exec_server_request_total_duration_seconds";
+const REQUEST_TOTAL_DURATION_DESCRIPTION: &str = "Total exec-server request duration in seconds, including queueing, from decoded receipt until response enqueue or disconnection.";
 const REQUEST_QUEUE_DURATION_METRIC: &str = "exec_server_request_queue_duration_seconds";
 const REQUEST_QUEUE_DURATION_DESCRIPTION: &str =
     "Time exec-server requests spend queued before execution in seconds.";
@@ -136,6 +159,7 @@ impl ExecServerTelemetry {
         method: &'static str,
         result: &'static str,
         duration: Duration,
+        total_duration: Duration,
     ) {
         self.with_inner(|inner| {
             let tags = [("method", method), ("result", result)];
@@ -144,6 +168,12 @@ impl ExecServerTelemetry {
                 REQUEST_DURATION_METRIC,
                 REQUEST_DURATION_DESCRIPTION,
                 duration,
+                &tags,
+            );
+            inner.duration(
+                REQUEST_TOTAL_DURATION_METRIC,
+                REQUEST_TOTAL_DURATION_DESCRIPTION,
+                total_duration,
                 &tags,
             );
         });
@@ -165,6 +195,7 @@ impl ExecServerTelemetry {
         &self,
         duration: Duration,
         result: Result<(), &'static str>,
+        capture_tags: &[(&str, &str)],
     ) {
         // Local execution has no exec-server telemetry owner. Use the host's
         // configured metrics client while preserving an explicit server client.
@@ -178,10 +209,11 @@ impl ExecServerTelemetry {
         };
         let success = if result.is_ok() { "true" } else { "false" };
         let mut tags = vec![("version", "v2"), ("success", success)];
-        let _ = metrics.record_duration("codex.shell_snapshot.duration_ms", duration, &tags);
+        tags.extend_from_slice(capture_tags);
         if let Err(failure_reason) = result {
             tags.push(("failure_reason", failure_reason));
         }
+        let _ = metrics.record_duration("codex.shell_snapshot.duration_ms", duration, &tags);
         let _ = metrics.counter("codex.shell_snapshot", /*inc*/ 1, &tags);
     }
 

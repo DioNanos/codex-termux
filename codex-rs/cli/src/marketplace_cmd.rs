@@ -3,6 +3,7 @@ use anyhow::Result;
 use anyhow::bail;
 use clap::Parser;
 use codex_core::config::Config;
+use codex_core::config::ConfigOverrides;
 use codex_core::config::LoaderOverrides;
 use codex_core::plugins_manager_for_config;
 use codex_core_plugins::PluginMarketplaceUpgradeOutcome;
@@ -128,8 +129,12 @@ impl MarketplaceCli {
             subcommand,
         } = self;
 
-        let builder =
-            cloud_config::config_builder(&config_overrides, LoaderOverrides::default()).await?;
+        let builder = cloud_config::config_builder(
+            &config_overrides,
+            LoaderOverrides::default(),
+            ConfigOverrides::default(),
+        )
+        .await?;
         let config = builder.clone().build().await?;
 
         match subcommand {

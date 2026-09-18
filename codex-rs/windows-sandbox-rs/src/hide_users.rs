@@ -5,6 +5,9 @@ use anyhow::anyhow;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
+use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
+use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SYSTEM;
@@ -13,11 +16,14 @@ use windows_sys::Win32::Storage::FileSystem::INVALID_FILE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::SetFileAttributesW;
 use windows_sys::Win32::System::Registry::HKEY;
 use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+use windows_sys::Win32::System::Registry::KEY_SET_VALUE;
 use windows_sys::Win32::System::Registry::KEY_WRITE;
 use windows_sys::Win32::System::Registry::REG_DWORD;
 use windows_sys::Win32::System::Registry::REG_OPTION_NON_VOLATILE;
 use windows_sys::Win32::System::Registry::RegCloseKey;
 use windows_sys::Win32::System::Registry::RegCreateKeyExW;
+use windows_sys::Win32::System::Registry::RegDeleteValueW;
+use windows_sys::Win32::System::Registry::RegOpenKeyExW;
 use windows_sys::Win32::System::Registry::RegSetValueExW;
 
 const USERLIST_KEY_PATH: &str =
@@ -32,6 +38,40 @@ pub fn hide_newly_created_users(usernames: &[String], log_base: &Path) {
             &format!("hide users: failed to update Winlogon UserList: {err}"),
             Some(log_base),
         );
+    }
+}
+
+pub(crate) fn unhide_sandbox_users(usernames: &[&str]) -> anyhow::Result<()> {
+    let mut key: HKEY = 0;
+    match unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            to_wide(USERLIST_KEY_PATH).as_ptr(),
+            /*uloptions*/ 0,
+            KEY_SET_VALUE,
+            &mut key,
+        )
+    } {
+        ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => return Ok(()),
+        ERROR_SUCCESS => {}
+        error => return Err(anyhow!("open sandbox hidden-user registry key: {error}")),
+    }
+
+    let mut errors = Vec::new();
+    for username in usernames {
+        let status = unsafe { RegDeleteValueW(key, to_wide(username).as_ptr()) };
+        match status {
+            ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => {}
+            error => errors.push(format!("remove hidden sandbox user {username}: {error}")),
+        }
+    }
+    unsafe {
+        RegCloseKey(key);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(errors.join("; ")))
     }
 }
 

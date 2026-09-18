@@ -490,11 +490,12 @@ fn transform_linux_seccomp_uses_helper_alias_when_launcher_is_not_helper_path() 
 
 #[cfg(target_os = "windows")]
 #[test]
-fn transform_for_direct_spawn_windows_preserves_only_wrapper_setup_identity() {
+fn transform_for_direct_spawn_windows_preserves_only_wrapper_setup_environment() {
     let mut env = HashMap::from([
         ("Path".to_string(), r"C:\Windows\System32".to_string()),
         ("username".to_string(), "wrong-user".to_string()),
         ("UserProfile".to_string(), r"C:\wrong".to_string()),
+        ("SYSTEMROOT".to_string(), r"C:\wrong".to_string()),
     ]);
 
     super::add_windows_sandbox_wrapper_setup_env_from_vars(
@@ -502,7 +503,9 @@ fn transform_for_direct_spawn_windows_preserves_only_wrapper_setup_identity() {
         [
             ("USERNAME", "alice"),
             ("USERPROFILE", r"C:\Users\alice"),
+            ("SystemRoot", r"C:\Windows"),
             ("OPENAI_API_KEY", "secret"),
+            ("HTTP_PROXY", "http://127.0.0.1:7890"),
         ]
         .map(|(key, value)| {
             (
@@ -518,6 +521,7 @@ fn transform_for_direct_spawn_windows_preserves_only_wrapper_setup_identity() {
             ("Path".to_string(), r"C:\Windows\System32".to_string()),
             ("USERNAME".to_string(), "alice".to_string()),
             ("USERPROFILE".to_string(), r"C:\Users\alice".to_string()),
+            ("SystemRoot".to_string(), r"C:\Windows".to_string()),
         ])
     );
 }
@@ -595,6 +599,17 @@ fn transform_for_direct_spawn_windows_materializes_inner_helper() {
             codex_home.path(),
         )
         .expect("transform for direct spawn");
+
+    let inner_env_json = exec_request
+        .command
+        .windows(2)
+        .find(|args| args[0] == "--env-json")
+        .expect("inner command environment");
+    assert_eq!(
+        serde_json::from_str::<HashMap<String, String>>(&inner_env_json[1])
+            .expect("decode inner command environment"),
+        HashMap::from([("Path".to_string(), r"C:\Windows\System32".to_string())])
+    );
 
     let separator_index = exec_request
         .command

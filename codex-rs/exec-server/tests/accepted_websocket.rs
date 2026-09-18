@@ -1,4 +1,7 @@
+mod common;
+
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -8,19 +11,29 @@ use axum::extract::State;
 use axum::extract::WebSocketUpgrade;
 use axum::response::IntoResponse;
 use axum::routing::any;
+use codex_api::AuthProvider;
+#[cfg(unix)]
+use codex_exec_server::EnvironmentConnectionState;
 use codex_exec_server::EnvironmentInfo;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::EnvironmentObservedStatus;
 use codex_exec_server::EnvironmentStatus;
 use codex_exec_server::EnvironmentStatusKind;
 use codex_exec_server::ExecParams;
+#[cfg(unix)]
+use codex_exec_server::ExecProcessEvent;
 use codex_exec_server::ExecResponse;
 use codex_exec_server::ExecServerClientConnectOptions;
+use codex_exec_server::ExecServerRuntimePaths;
 use codex_exec_server::InitializeParams;
 use codex_exec_server::InitializeResponse;
 use codex_exec_server::ProcessId;
 use codex_exec_server::ReadParams;
 use codex_exec_server::ReadResponse;
+use codex_exec_server::RemoteEnvironmentConfig;
+use codex_exec_server::RemoteEnvironmentTransport;
+#[cfg(unix)]
+use codex_exec_server::WriteStatus;
 use codex_exec_server_protocol::JSONRPCError;
 use codex_exec_server_protocol::JSONRPCErrorError;
 use codex_exec_server_protocol::JSONRPCMessage;
@@ -30,8 +43,11 @@ use codex_exec_server_protocol::JSONRPCResponse;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_utils_path_uri::PathUri;
+use common::exec_server::DisconnectableWebSocketProxy;
 use futures::SinkExt;
 use futures::StreamExt;
+use http::HeaderMap;
+use http::HeaderValue;
 use pretty_assertions::assert_eq;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -41,11 +57,30 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::task::AbortOnDropHandle;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::header;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 type AcceptedSocket = axum::extract::ws::WebSocket;
 const SESSION_ALREADY_ATTACHED_ERROR_CODE: i64 = -32010;
+
+#[derive(Debug)]
+struct DirectExecutorAuth;
+
+impl AuthProvider for DirectExecutorAuth {
+    fn add_auth_headers(&self, headers: &mut HeaderMap) {
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("AWS4-HMAC-SHA256 test-signature"),
+        );
+    }
+}
 
 #[tokio::test]
 async fn accepted_websocket_rejects_initial_resume_session_id() -> Result<()> {
@@ -92,6 +127,284 @@ async fn accepted_websocket_environment_info_uses_initialization_metadata() -> R
         EnvironmentInfo::local()
     );
 
+    server_task.abort();
+    let _ = server_task.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn accepted_websocket_interoperates_and_recovers_with_real_direct_executor() -> Result<()> {
+    let (websocket_url, mut accepted_sockets, server_task) = start_acceptor().await?;
+    let proxy = DisconnectableWebSocketProxy::new(&websocket_url).await?;
+    let registry = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/cloud/environment/environment-1/direct/register"))
+        .and(header("authorization", "AWS4-HMAC-SHA256 test-signature"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "environment_id": "environment-1",
+            "transport": "direct_jsonrpc_v1",
+            "registration_id": "registration-1",
+            "url": proxy.websocket_url(),
+        })))
+        .expect(1)
+        .mount(&registry)
+        .await;
+
+    let http_client_factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+    let config = RemoteEnvironmentConfig::new_with_transport(
+        registry.uri(),
+        "environment-1".to_string(),
+        RemoteEnvironmentTransport::Direct,
+        Arc::new(DirectExecutorAuth),
+        http_client_factory.clone(),
+    )?;
+    let (codex_exe, codex_linux_sandbox_exe) = common::current_test_binary_helper_paths()?;
+    let runtime_paths = ExecServerRuntimePaths::new(codex_exe, codex_linux_sandbox_exe)?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let executor_task = AbortOnDropHandle::new(tokio::spawn(
+        codex_exec_server::run_remote_environment_until_shutdown(
+            config,
+            runtime_paths,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ),
+    ));
+    let accepted_websocket = timeout(TEST_TIMEOUT, accepted_sockets.recv())
+        .await?
+        .context("direct executor websocket should be accepted")?;
+    let manager = timeout(
+        TEST_TIMEOUT,
+        EnvironmentManager::from_accepted_websocket(
+            "environment-1".to_string(),
+            accepted_websocket,
+            accepted_options(),
+            http_client_factory,
+        ),
+    )
+    .await??;
+    let environment = manager
+        .default_environment()
+        .context("direct executor environment should be installed")?;
+
+    assert_eq!(
+        timeout(TEST_TIMEOUT, environment.force_info()).await??,
+        EnvironmentInfo::local()
+    );
+    let files = tempfile::tempdir()?;
+    let large_file_path = files.path().join("large-response.bin");
+    let large_file_contents = vec![0x5a; 128 * 1024];
+    tokio::fs::write(&large_file_path, &large_file_contents).await?;
+    assert_eq!(
+        timeout(
+            TEST_TIMEOUT,
+            environment.get_filesystem().read_file(
+                &PathUri::from_host_native_path(&large_file_path)?,
+                Default::default(),
+                /*sandbox*/ None,
+            )
+        )
+        .await??,
+        large_file_contents,
+    );
+
+    // The process fixture uses a POSIX shell; metadata and shutdown remain tested on all platforms.
+    #[cfg(unix)]
+    {
+        let mut proxy = proxy;
+        let backend = environment.get_exec_backend();
+        let temp_dir = tempfile::TempDir::new()?;
+        let gate_path = temp_dir.path().join("release-output");
+        let emitted_path = temp_dir.path().join("output-emitted");
+        let session = timeout(
+            TEST_TIMEOUT,
+            backend.start(ExecParams {
+                metadata: Default::default(),
+                process_id: ProcessId::from("proc-recover"),
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    concat!(
+                        "printf 'ready:%s\\n' \"$$\"; ",
+                        "while [ ! -f \"$GATE\" ]; do /bin/sleep 0.01; done; ",
+                        "printf 'during:%s\\n' \"$$\"; ",
+                        ": > \"$EMITTED\"; ",
+                        "IFS= read -r line; ",
+                        "printf 'after:%s:%s\\n' \"$$\" \"$line\"; ",
+                        "exit 7",
+                    )
+                    .to_string(),
+                ],
+                cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+                shell_snapshot: None,
+                env_policy: /*env_policy*/ None,
+                env: HashMap::from([
+                    (
+                        "GATE".to_string(),
+                        gate_path.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "EMITTED".to_string(),
+                        emitted_path.to_string_lossy().into_owned(),
+                    ),
+                ]),
+                tty: false,
+                pipe_stdin: true,
+                arg0: None,
+                sandbox: None,
+                enforce_managed_network: false,
+                managed_network: None,
+                network_proxy: None,
+            }),
+        )
+        .await??;
+
+        let process = Arc::clone(&session.process);
+        let mut events = process.subscribe_events();
+        let mut output = Vec::new();
+        let mut last_seq = 0;
+        while !output.ends_with(b"\n") {
+            match timeout(Duration::from_secs(5), events.recv()).await?? {
+                ExecProcessEvent::Output(chunk) => {
+                    assert_eq!(chunk.seq, last_seq + 1);
+                    last_seq = chunk.seq;
+                    output.extend_from_slice(&chunk.chunk.into_inner());
+                }
+                event => anyhow::bail!("expected ready output before disconnect, got {event:?}"),
+            }
+        }
+        let ready = String::from_utf8(output.clone())?;
+        let pid = ready
+            .strip_prefix("ready:")
+            .and_then(|line| line.strip_suffix('\n'))
+            .context("ready output should contain the process id")?
+            .to_string();
+
+        let mut connection_state = environment
+            .subscribe_connection_state()
+            .context("direct environment connection state")?;
+        assert_eq!(
+            *connection_state.borrow_and_update(),
+            EnvironmentConnectionState::Connected
+        );
+        proxy.pause_and_disconnect().await?;
+        timeout(
+            TEST_TIMEOUT,
+            connection_state.wait_for(|state| *state == EnvironmentConnectionState::Disconnected),
+        )
+        .await??;
+        tokio::fs::write(&gate_path, b"").await?;
+        timeout(Duration::from_secs(5), async {
+            while tokio::fs::metadata(&emitted_path).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("process did not emit output while disconnected")?;
+
+        let process_for_read = Arc::clone(&process);
+        let mut pending_read = tokio::spawn(async move {
+            process_for_read
+                .read(
+                    /*after_seq*/ Some(last_seq),
+                    /*max_bytes*/ None,
+                    /*wait_ms*/ Some(0),
+                )
+                .await
+        });
+        assert!(
+            timeout(Duration::from_millis(200), &mut pending_read)
+                .await
+                .is_err(),
+            "process reads should wait while recovery is in progress"
+        );
+        proxy.resume()?;
+        let replacement = timeout(TEST_TIMEOUT, accepted_sockets.recv())
+            .await?
+            .context("real Direct executor should reconnect")?;
+        timeout(
+            TEST_TIMEOUT,
+            manager.replace_accepted_websocket("environment-1", replacement),
+        )
+        .await??;
+        timeout(
+            TEST_TIMEOUT,
+            connection_state.wait_for(|state| *state == EnvironmentConnectionState::Connected),
+        )
+        .await??;
+        assert!(Arc::ptr_eq(
+            &environment,
+            &manager
+                .default_environment()
+                .context("same environment should remain installed")?,
+        ));
+        assert_eq!(
+            timeout(TEST_TIMEOUT, environment.force_info()).await??,
+            EnvironmentInfo::local()
+        );
+
+        let recovered_read = timeout(Duration::from_secs(5), pending_read)
+            .await
+            .context("timed out waiting for a read after recovery")??;
+        let recovered_read = recovered_read?;
+        assert_eq!(recovered_read.failure, None);
+        let recovered_output = recovered_read
+            .chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.chunk.into_inner())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            String::from_utf8(recovered_output)?,
+            format!("during:{pid}\n")
+        );
+
+        let write = timeout(Duration::from_secs(5), process.write(b"hello\n".to_vec()))
+            .await
+            .context("timed out waiting for a write after recovery")??;
+        assert_eq!(write.status, WriteStatus::Accepted);
+
+        let mut saw_exit = false;
+        loop {
+            match timeout(Duration::from_secs(5), events.recv()).await?? {
+                ExecProcessEvent::Output(chunk) => {
+                    assert_eq!(chunk.seq, last_seq + 1);
+                    last_seq = chunk.seq;
+                    output.extend_from_slice(&chunk.chunk.into_inner());
+                }
+                ExecProcessEvent::Exited { seq, exit_code, .. } => {
+                    assert_eq!(seq, last_seq + 1);
+                    assert_eq!(exit_code, 7);
+                    last_seq = seq;
+                    saw_exit = true;
+                }
+                ExecProcessEvent::Closed { seq } => {
+                    assert!(saw_exit, "closed must be delivered after exit");
+                    assert_eq!(seq, last_seq + 1);
+                    break;
+                }
+                ExecProcessEvent::Failed(message) => {
+                    anyhow::bail!("process recovery failed: {message}");
+                }
+            }
+        }
+        assert_eq!(
+            String::from_utf8(output)?,
+            format!("ready:{pid}\nduring:{pid}\nafter:{pid}:hello\n")
+        );
+    }
+
+    registry.verify().await;
+    let registrations = registry
+        .received_requests()
+        .await
+        .context("registration requests")?;
+    assert_eq!(
+        registrations[0].body,
+        br#"{"transport":"direct_jsonrpc_v1"}"#
+    );
+
+    let _ = shutdown_tx.send(());
+    timeout(TEST_TIMEOUT, executor_task).await???;
     server_task.abort();
     let _ = server_task.await;
     Ok(())
@@ -214,6 +527,7 @@ async fn accepted_websocket_reconnect_recovers_running_process_and_output() -> R
         async move {
             backend
                 .start(ExecParams {
+                    metadata: Default::default(),
                     process_id,
                     argv: vec!["test-command".to_string()],
                     cwd: PathUri::parse("file:///workspace")?,

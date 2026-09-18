@@ -14,7 +14,8 @@ const read = (relativePath) =>
 test('Termux postinstall rewrites both npm entrypoint interpreters', () => {
   const postinstall = read('scripts/postinstall_termux_launcher.js');
   assert.match(postinstall, /Termux has no \/usr\/bin\/env/);
-  assert.match(postinstall, /process\.platform !== 'android'/);
+  assert.match(postinstall, /platform !== 'android'/);
+  assert.match(postinstall, /env\.PREFIX/);
   assert.match(postinstall, /bin\/codex\.js/);
   assert.match(postinstall, /bin\/codex-exec\.js/);
   assert.match(postinstall, /bin\/codex', shellInterpreter/);

@@ -12,10 +12,12 @@ fn inbound_fallback_records_only_variant_names() {
         AppEvent::CopySelection {
             text: Arc::from("private plan without parentheses"),
             label: "private label".to_string(),
+            format: crate::clipboard_copy::CopyFormat::Markdown,
         },
         AppEvent::CopySelection {
             text: Arc::from("private code(with parentheses)"),
             label: "private label".to_string(),
+            format: crate::clipboard_copy::CopyFormat::PlainText,
         },
         AppEvent::ConsolidateProposedPlan("private tuple payload".to_string()),
         AppEvent::SettingsSelectionClosed,

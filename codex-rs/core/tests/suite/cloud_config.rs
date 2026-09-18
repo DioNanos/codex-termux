@@ -121,7 +121,7 @@ async fn managed_deny_read_requirements_follow_thread_permission_updates() -> Re
         !snapshot
             .permission_profile
             .file_system_sandbox_policy()
-            .can_read_path_with_cwd(nested_root.as_path(), snapshot.cwd().as_path()),
+            .can_read_local_path_with_cwd(nested_root.as_path(), snapshot.cwd().as_path()),
         "a live permission change must preserve managed deny-read rules"
     );
 

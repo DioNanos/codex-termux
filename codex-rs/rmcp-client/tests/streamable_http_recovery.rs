@@ -14,7 +14,11 @@ use codex_exec_server::HttpResponseBodyStream;
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use pretty_assertions::assert_eq;
+use rmcp::model::CallToolResult;
+use rmcp::model::ContentBlock;
+use rmcp::model::MetaObject;
 use serde_json::Value;
+use serde_json::json;
 
 use streamable_http_test_support::arm_initialize_post_failure;
 use streamable_http_test_support::arm_initialize_post_json_rpc_failure;
@@ -298,6 +302,42 @@ async fn streamable_http_401_does_not_trigger_recovery() -> anyhow::Result<()> {
         .unwrap_err();
     assert!(second_error.to_string().contains("401"));
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn streamable_http_401_challenge_is_a_tool_error_without_replay() -> anyhow::Result<()> {
+    let challenge = r#"Bearer error="invalid_token", resource_metadata="https://example.com/.well-known/oauth-protected-resource""#;
+    for challenges in [
+        vec![challenge],
+        vec![r#"Basic realm="proxy, login""#, challenge],
+    ] {
+        let (_server, base_url) = spawn_streamable_http_server().await?;
+        let client = create_client(&base_url).await?;
+
+        arm_session_post_failure(
+            &base_url,
+            /*status*/ 401,
+            /*remaining*/ 1,
+            &challenges,
+        )
+        .await?;
+
+        let result = call_echo_tool(&client, "rejected").await?;
+        let mut expected =
+            CallToolResult::error(vec![ContentBlock::text("Authentication required")]);
+        expected.meta = Some(MetaObject::from(serde_json::Map::from_iter([(
+            "mcp/www_authenticate".to_string(),
+            json!([challenges.join(", ")]),
+        )])));
+        assert_eq!(result, expected);
+
+        // A retry inside the failed call would consume the single rejection and return success.
+        assert_eq!(
+            call_echo_tool(&client, "next-user-call").await?,
+            expected_echo_result("next-user-call"),
+        );
+    }
     Ok(())
 }
 

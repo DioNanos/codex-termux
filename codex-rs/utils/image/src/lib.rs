@@ -70,6 +70,19 @@ pub struct PromptImageResizeLimits {
     pub max_patches: usize,
 }
 
+impl PromptImageMode {
+    /// Resize policy for high-detail prompt images.
+    pub const HIGH_DETAIL: Self = Self::ResizeWithLimits(PromptImageResizeLimits {
+        max_dimension: 2048,
+        max_patches: 2_500,
+    });
+    /// Resize policy for original-detail prompt images.
+    pub const ORIGINAL_DETAIL: Self = Self::ResizeWithLimits(PromptImageResizeLimits {
+        max_dimension: 6000,
+        max_patches: 10_000,
+    });
+}
+
 struct ImageMetadata {
     icc_profile: Option<Vec<u8>>,
     exif: Option<Vec<u8>>,
