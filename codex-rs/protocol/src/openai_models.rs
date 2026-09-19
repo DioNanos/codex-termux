@@ -551,6 +551,29 @@ pub fn validate_model_infos(models: &[ModelInfo]) -> Result<(), ModelMessageText
     models.iter().try_for_each(validate_model_messages)
 }
 
+/// Divide un catalogo GIA' analizzato in due: i modelli che passano il controllo
+/// sulla dimensione dei messaggi e quelli che non lo passano.
+///
+/// Il controllo resta dov'e' — e' una protezione contro un campo fuori misura —
+/// ma smette di decidere per TUTTA la risposta. Prima viveva dentro la
+/// deserializzazione: un solo modello con un messaggio troppo lungo rendeva
+/// illeggibile l'intero catalogo, il chiamante ripiegava sull'elenco compilato
+/// nel binario e i modelli NUOVI sparivano dal selettore mentre i vecchi
+/// restavano. Una voce malformata deve nascondere SE STESSA, non le altre.
+pub fn partition_model_infos(
+    models: Vec<ModelInfo>,
+) -> (Vec<ModelInfo>, Vec<ModelMessageTextTooLong>) {
+    let mut valid = Vec::with_capacity(models.len());
+    let mut invalid = Vec::new();
+    for model in models {
+        match validate_model_messages(&model) {
+            Ok(()) => valid.push(model),
+            Err(error) => invalid.push(error),
+        }
+    }
+    (valid, invalid)
+}
+
 impl ModelInfo {
     pub fn resolved_context_window(&self) -> Option<i64> {
         self.context_window.or(self.max_context_window)
@@ -911,7 +934,6 @@ where
                      `model_messages.instructions_template`"
                 )));
             }
-            validate_model_messages(&model).map_err(|error| D::Error::custom(error.to_string()))?;
             Ok(model)
         })
         .collect()

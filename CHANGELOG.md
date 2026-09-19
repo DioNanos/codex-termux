@@ -1,3 +1,16 @@
+# [0.155.1] - 2026-09-19
+
+## Codex Termux 0.155.1 — upstream rust-v0.155.1
+
+- Merges upstream tag `rust-v0.155.1` into the Termux fork.
+- A model with an oversized message no longer hides the whole model list: the
+  size check still runs, but it drops the single model that fails and says which
+  one, instead of making the entire catalog unreadable and letting the client
+  fall back to the list compiled into the binary — where the new models are
+  missing. The same rule applies to the on-disk model cache, which is the
+  fallback when the network does not answer.
+- `rustls` moves to 0.23.45 (RUSTSEC-2026-0285).
+
 # [0.155.0] - 2026-09-18
 
 ## Codex Termux 0.155.0 — upstream rust-v0.155.0 and coordinated rollout writers
