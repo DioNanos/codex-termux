@@ -736,6 +736,7 @@ async fn psp_feature_configures_first_party_routing() -> Result<()> {
     assert_eq!(
         config.http_client_factory(),
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+            .with_system_proxy_fallback()
             .with_chatgpt_cookies([HeaderValue::from_static("oai-chat-psp=true")])
     );
     assert_eq!(
@@ -915,6 +916,7 @@ async fn write_value_supports_nested_app_paths() -> Result<()> {
             value: serde_json::json!({
                 "app1": {
                     "enabled": false,
+                    "omit_tools_from": ["deferred"],
                 },
             }),
             merge_strategy: MergeStrategy::Replace,
@@ -950,6 +952,9 @@ async fn write_value_supports_nested_app_paths() -> Result<()> {
                 "app1".to_string(),
                 AppConfig {
                     enabled: false,
+                    omit_tools_from: Some(vec![
+                        codex_protocol::config_types::ToolExposureSurface::Deferred
+                    ]),
                     approvals_reviewer: None,
                     destructive_enabled: None,
                     open_world_enabled: None,
@@ -1344,7 +1349,9 @@ async fn managed_auth_policy_survives_unusable_requirements_file_changes() -> Re
     )?;
     for refreshed in [
         service.load_latest_config(/*fallback_cwd*/ None).await?,
-        service.load_latest_config_for_thread(&startup).await?,
+        service
+            .load_latest_config_with_session_layers(&startup.config_layer_stack, &startup.cwd)
+            .await?,
     ] {
         assert_eq!(refreshed.forced_login_method, None);
         assert_eq!(refreshed.forced_chatgpt_workspace_id, None);
@@ -1535,7 +1542,7 @@ async fn write_value_rejects_feature_requirement_conflict() {
         CloudConfigBundleFixture::loader_with_enterprise_requirement(
             r#"
 [features]
-personality = true
+fast_mode = true
 "#,
         ),
     );
@@ -1543,7 +1550,7 @@ personality = true
     let error = service
         .write_value(ConfigValueWriteParams {
             file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
-            key_path: "features.personality".to_string(),
+            key_path: "features.fast_mode".to_string(),
             value: serde_json::json!(false),
             merge_strategy: MergeStrategy::Replace,
             expected_version: None,
@@ -1558,7 +1565,7 @@ personality = true
     assert!(
         error
             .to_string()
-            .contains("invalid value for `features`: `features.personality=false`"),
+            .contains("invalid value for `features`: `features.fast_mode=false`"),
         "{error}"
     );
     assert_eq!(
@@ -1690,7 +1697,7 @@ async fn read_materializes_default_allow_login_shell() {
 }
 
 #[tokio::test]
-async fn write_value_allows_unmanaged_sibling_of_exact_requirement() {
+async fn write_value_allows_unmanaged_setting_with_exact_requirement() {
     let tmp = tempdir().expect("tempdir");
     let path = tmp.path().join(CONFIG_TOML_FILE);
     std::fs::write(&path, "").unwrap();
@@ -1701,8 +1708,7 @@ async fn write_value_allows_unmanaged_sibling_of_exact_requirement() {
         LoaderOverrides::without_managed_config_for_tests(),
         CloudConfigBundleFixture::loader_with_enterprise_requirement(
             r#"
-[windows]
-sandbox_private_desktop = false
+allow_login_shell = false
 "#,
         ),
     );
@@ -1716,7 +1722,7 @@ sandbox_private_desktop = false
             expected_version: None,
         })
         .await
-        .expect("unmanaged sibling should remain writable");
+        .expect("unmanaged setting should remain writable");
 
     assert!(
         std::fs::read_to_string(path)
@@ -2628,5 +2634,125 @@ exclude = ["AWS_*"]
             .await?;
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn allowed_login_methods_follow_current_forced_workspaces() -> Result<()> {
+    use codex_protocol::config_types::ForcedLoginMethod;
+
+    let tmp = tempdir()?;
+    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "")?;
+    std::fs::write(
+        tmp.path().join("requirements.toml"),
+        "allowed_chatgpt_workspaces = ['managed']",
+    )?;
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml")),
+        CloudConfigBundleLoader::default(),
+    );
+    let config = service.load_latest_config(/*fallback_cwd*/ None).await?;
+    let auth = codex_login::AuthManager::shared_from_config(
+        &config, /*enable_codex_api_key_env*/ false,
+    )
+    .await?;
+    for (workspaces, expected) in [
+        (
+            Some(vec!["managed".to_string()]),
+            vec![ForcedLoginMethod::Api, ForcedLoginMethod::Chatgpt],
+        ),
+        (
+            Some(vec!["other".to_string()]),
+            vec![ForcedLoginMethod::Api],
+        ),
+        (Some(Vec::new()), vec![ForcedLoginMethod::Api]),
+        (
+            None,
+            vec![ForcedLoginMethod::Api, ForcedLoginMethod::Chatgpt],
+        ),
+    ] {
+        auth.set_forced_chatgpt_workspace_id(workspaces);
+        assert_eq!(auth.allowed_login_methods(), expected);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn permission_config_reload_merges_session_layers() -> Result<()> {
+    use codex_config::ConfigLayerEntry;
+    use codex_config::ConfigLayerSource;
+    use codex_config::ConfigLayerStack;
+    let tmp = tempdir()?;
+    let wrapper_dir = tmp.path().join("tmp/arg0/session");
+    std::fs::create_dir_all(&wrapper_dir)?;
+    let wrapper = wrapper_dir.join("codex-execve-wrapper");
+    std::fs::write(&wrapper, "")?;
+    let service = ConfigManager::new(
+        tmp.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
+        /*strict_config*/ false,
+        CloudConfigBundleLoader::default(),
+        codex_arg0::Arg0DispatchPaths {
+            main_execve_wrapper_exe: Some(wrapper),
+            ..Default::default()
+        },
+        std::sync::Arc::new(codex_config::NoopThreadConfigLoader),
+    );
+
+    let mut config = service
+        .load_with_overrides(
+            /*request_overrides*/ None,
+            codex_core::config::ConfigOverrides {
+                cwd: Some(tmp.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let mut layers = config
+        .config_layer_stack
+        .all_layers_low_to_high()
+        .cloned()
+        .collect::<Vec<_>>();
+    for contents in [
+        "[permissions.first.filesystem]\n",
+        "[permissions.second]\nextends = ':workspace'\n",
+    ] {
+        layers.push(ConfigLayerEntry::new(
+            ConfigLayerSource::SessionFlags,
+            toml::from_str(contents)?,
+        ));
+    }
+    layers.push(ConfigLayerEntry::new_disabled(
+        ConfigLayerSource::SessionFlags,
+        toml::from_str("[permissions.disabled]\nextends = ':read-only'\n")?,
+        "disabled for test",
+    ));
+    config.config_layer_stack =
+        ConfigLayerStack::new(layers, Default::default(), Default::default())?;
+    let loaded = service
+        .load_permission_config_for_thread(&config, config.cwd.clone(), "first".to_string())
+        .await?;
+    assert_eq!(
+        loaded
+            .custom_permission_profiles
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"]
+    );
+    let policy = loaded.permissions.file_system_sandbox_policy();
+    assert_eq!(
+        (
+            policy.can_read_local_path_with_cwd(&wrapper_dir, loaded.cwd.as_path()),
+            policy.can_read_local_path_with_cwd(
+                &tmp.path().join("tmp/arg0/other"),
+                loaded.cwd.as_path()
+            ),
+        ),
+        (true, false),
+    );
     Ok(())
 }

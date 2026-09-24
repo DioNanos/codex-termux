@@ -23,7 +23,6 @@ use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::config_types::ApprovalsReviewer;
-use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
@@ -31,6 +30,7 @@ use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ApplyPatchToolType;
@@ -40,12 +40,12 @@ use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ConfirmationPolicies;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
-use codex_protocol::openai_models::ModelInstructionsVariables;
 use codex_protocol::openai_models::ModelTokenBudgetConfig;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::MultiAgentMessages;
 use codex_protocol::openai_models::MultiAgentModeMessages;
 use codex_protocol::openai_models::MultiAgentRoleMessages;
+use codex_protocol::openai_models::MultiAgentToolMessages;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::openai_models::ToolMessage;
@@ -58,6 +58,7 @@ use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SafetyBufferingEvent;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnSettingsUpdate;
 use codex_protocol::protocol::TurnSettingsUpdateOutcome;
@@ -65,6 +66,7 @@ use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
+use codex_tools::ConversationHistory;
 use codex_tools::JsonToolOutput;
 use codex_tools::ToolCall;
 use codex_tools::ToolExecutor;
@@ -88,6 +90,7 @@ use core_test_support::responses::mount_models_once;
 use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
+use core_test_support::responses::namespace_child_tool;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_completed;
 use core_test_support::responses::sse_response;
@@ -106,10 +109,16 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use test_case::test_case;
 
 use super::rmcp_client::remote_aware_environment_id;
 use super::rmcp_client::remote_aware_stdio_server_bin;
+
+#[path = "step_settings/agent_spawn_tests.rs"]
+mod agent_spawn;
+mod code_mode_notifications;
+mod environment_selection;
 
 const MODEL_A: &str = "step-settings-a";
 const MODEL_B: &str = "step-settings-b";
@@ -167,14 +176,6 @@ fn direct_tool_settings_test() -> TestCodexBuilder {
                 (model.slug != MODEL_A).then_some(ApplyPatchToolType::Freeform);
         }
     })
-}
-
-fn advertises_apply_patch(request: &Value) -> bool {
-    request["tools"]
-        .as_array()
-        .expect("provider tools")
-        .iter()
-        .any(|tool| tool["type"] == "custom" && tool["name"] == "apply_patch")
 }
 
 fn paused_response(response_id: &str, call_id: &str) -> String {
@@ -286,6 +287,15 @@ fn request_turn_id(request: &ResponsesRequest) -> String {
         .as_str()
         .expect("request should include turn_id")
         .to_string()
+}
+
+fn request_turn_metadata(request: &ResponsesRequest) -> Value {
+    serde_json::from_str(
+        request.body_json()["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("request should include turn metadata"),
+    )
+    .expect("valid turn metadata")
 }
 
 // Dynamic tools return the original payload, so handler truncation cannot hide a recorder bug.
@@ -1048,13 +1058,8 @@ async fn active_model_switch_updates_core_context_from_captured_settings(
                 .expect("enable token-budget feature");
             config
                 .features
-                .enable(Feature::Personality)
-                .expect("enable personality");
-            config
-                .features
                 .enable(Feature::MultiAgentV2)
                 .expect("enable multi-agent V2");
-            config.personality = Some(Personality::Pragmatic);
             if context_window_model.is_some() {
                 config.model_context_window = None;
             }
@@ -1071,14 +1076,8 @@ async fn active_model_switch_updates_core_context_from_captured_settings(
                     model.max_context_window = None;
                 }
                 let messages = model.model_messages.as_mut().expect("model messages");
-                messages.instructions_template = Some(format!(
-                    "Instructions for {slug}. {{{{ personality }}}}"
-                ));
-                messages.instructions_variables = Some(ModelInstructionsVariables {
-                    personality_default: Some(format!("Default {slug} personality.")),
-                    personality_friendly: Some(format!("Friendly {slug} personality.")),
-                    personality_pragmatic: Some(format!("Pragmatic {slug} personality.")),
-                });
+                messages.instructions_template = Some(format!("Instructions for {slug}."));
+                messages.instructions_variables = None;
                 messages.collaboration_modes = Some(CollaborationModeMessages {
                     default: Some(format!("Default collaboration for {slug}.")),
                     plan: None,
@@ -1162,8 +1161,7 @@ async fn active_model_switch_updates_core_context_from_captured_settings(
             .collect::<Vec<_>>(),
         vec![json!(MODEL_A), json!(MODEL_B), json!(MODEL_B)]
     );
-    let initial_instructions =
-        format!("Instructions for {MODEL_A}. Pragmatic {MODEL_A} personality.");
+    let initial_instructions = format!("Instructions for {MODEL_A}.");
     assert_eq!(requests[0].instructions_text(), initial_instructions);
     assert!(!requests[0].body_contains_text("<model_switch>"));
     for text in [
@@ -1191,12 +1189,10 @@ async fn active_model_switch_updates_core_context_from_captured_settings(
             .filter(|text| text.contains("<model_switch>"))
             .collect::<Vec<_>>();
         assert_eq!(switches.len(), 1);
-        assert!(switches[0].contains(&format!(
-            "Instructions for {MODEL_B}. Pragmatic {MODEL_B} personality."
-        )));
+        assert!(switches[0].contains(&format!("Instructions for {MODEL_B}.")));
         assert!(
             !request.body_contains_text("<personality_spec>"),
-            "personality is included in the model-switch instructions"
+            "model-switch instructions should not contain a personality update"
         );
         for text in [
             format!("Default collaboration for {MODEL_B}."),
@@ -1583,7 +1579,9 @@ async fn captured_model_replans_tools_and_retains_the_issuing_request_router() -
             for feature in [Feature::ShellTool, Feature::UnifiedExec] {
                 config.features.enable(feature).expect("enable shell tools");
             }
+            config.tool_registry.turn_metadata_includes_tool_info = true;
             for model in &mut config.model_catalog.as_mut().expect("models").models {
+                model.use_responses_lite = true;
                 model.shell_type = if model.slug == MODEL_B {
                     ConfigShellToolType::Disabled
                 } else {
@@ -1649,7 +1647,35 @@ async fn captured_model_replans_tools_and_retains_the_issuing_request_router() -
     assert_eq!(
         requests
             .iter()
-            .map(advertises_apply_patch)
+            .map(|request| {
+                core_test_support::responses::namespace_child_tool(
+                    &request["input"][0],
+                    "functions",
+                    "apply_patch",
+                )
+                .is_some()
+            })
+            .collect::<Vec<_>>(),
+        vec![false, true, false],
+    );
+    let metadata = requests
+        .iter()
+        .map(|request| {
+            serde_json::from_str::<Value>(
+                request["client_metadata"]["x-codex-turn-metadata"]
+                    .as_str()
+                    .expect("request metadata"),
+            )
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(
+        metadata
+            .iter()
+            .map(|metadata| {
+                metadata["tool_namespaces_info"]["functions"]["functions"]
+                    .get("apply_patch")
+                    .is_some()
+            })
             .collect::<Vec<_>>(),
         vec![false, true, false],
     );
@@ -1657,12 +1683,16 @@ async fn captured_model_replans_tools_and_retains_the_issuing_request_router() -
         requests
             .iter()
             .map(|request| {
-                request["tools"]
-                    .as_array()
-                    .expect("provider tools")
-                    .iter()
-                    .filter_map(|tool| tool["name"].as_str())
-                    .filter(|name| matches!(*name, "exec_command" | "write_stdin"))
+                ["exec_command", "write_stdin"]
+                    .into_iter()
+                    .filter(|name| {
+                        core_test_support::responses::namespace_child_tool(
+                            &request["input"][0],
+                            "functions",
+                            name,
+                        )
+                        .is_some()
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>(),
@@ -1793,7 +1823,7 @@ async fn captured_model_enables_and_executes_code_mode() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn response_metadata_uses_the_captured_model_after_a_turn_update() -> Result<()> {
+async fn response_metadata_uses_the_captured_step_after_a_turn_update() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -1814,15 +1844,19 @@ async fn response_metadata_uses_the_captured_model_after_a_turn_update() -> Resu
     .await;
     let test = step_settings_test().build_with_auto_env(&server).await?;
     let request = start_paused_turn(&test.codex).await?;
-    apply_turn_settings(
-        &test.codex,
-        &request.turn_id,
-        TurnSettingsUpdate {
-            model: Some(MODEL_B.to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    assert_eq!(
+        submit_turn_settings(
+            &test.codex,
+            &request.turn_id,
+            TurnSettingsUpdate {
+                model: Some(MODEL_B.to_string()),
+                effort: Some(Some(ReasoningEffort::High)),
+                ..Default::default()
+            },
+        )
+        .await?,
+        TurnSettingsUpdateOutcome::Applied
+    );
     answer_paused_turn(&test.codex, &request.turn_id).await?;
 
     let mut reroutes = Vec::new();
@@ -1849,6 +1883,29 @@ async fn response_metadata_uses_the_captured_model_after_a_turn_update() -> Resu
             .map(|request| request.body_json()["model"].clone())
             .collect::<Vec<_>>(),
         vec![json!(MODEL_A), json!(MODEL_B)]
+    );
+    assert_eq!(
+        response_mock
+            .requests()
+            .iter()
+            .map(request_turn_metadata)
+            .map(|metadata| {
+                json!({
+                    "model": metadata["model"],
+                    "reasoning_effort": metadata["reasoning_effort"],
+                })
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            json!({
+                "model": MODEL_A,
+                "reasoning_effort": "low",
+            }),
+            json!({
+                "model": MODEL_B,
+                "reasoning_effort": "high",
+            }),
+        ]
     );
     // B's matching response header is not a reroute from the turn's initial A.
     // Buffering metadata likewise belongs to the captured B step.
@@ -2174,9 +2231,29 @@ async fn model_activation_uses_destination_metadata_defaults(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_async_description_follows_mid_turn_model_changes() -> Result<()> {
+async fn tool_messages_follow_mid_turn_model_changes() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    const MULTI_AGENT_TOOLS: [&str; 6] = [
+        "spawn_agent",
+        "send_message",
+        "followup_task",
+        "wait_agent",
+        "interrupt_agent",
+        "list_agents",
+    ];
+
+    let parameters = |model: &str| {
+        json!({
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": format!("Agent on {model}.")},
+                "message": {"type": "string", "encrypted": true},
+            },
+            "required": ["target"],
+            "additionalProperties": false,
+        })
+    };
     let server = start_mock_server().await;
     let response_mock = mount_sse_sequence(
         &server,
@@ -2187,7 +2264,12 @@ async fn request_user_input_async_description_follows_mid_turn_model_changes() -
     )
     .await;
     let test = step_settings_test()
-        .with_config(|config| {
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
+            config.multi_agent_v2.expose_spawn_agent_model_overrides = false;
             for model in &mut config
                 .model_catalog
                 .as_mut()
@@ -2197,6 +2279,12 @@ async fn request_user_input_async_description_follows_mid_turn_model_changes() -
                 model
                     .experimental_supported_tools
                     .push("send_user_message_async".to_string());
+                let tool_message = |name| {
+                    Some(ToolMessage {
+                        description: Some(format!("{name} description for {}.", model.slug)),
+                        parameters: Some(parameters(&model.slug).to_string()),
+                    })
+                };
                 model
                     .model_messages
                     .as_mut()
@@ -2204,6 +2292,15 @@ async fn request_user_input_async_description_follows_mid_turn_model_changes() -
                     .tools = Some(ToolMessages {
                     send_user_message_async: Some(ToolMessage {
                         description: Some(format!("Async message description for {}.", model.slug)),
+                        ..Default::default()
+                    }),
+                    multi_agent: Some(MultiAgentToolMessages {
+                        spawn_agent: tool_message("spawn_agent"),
+                        send_message: tool_message("send_message"),
+                        followup_task: tool_message("followup_task"),
+                        wait_agent: tool_message("wait_agent"),
+                        interrupt_agent: tool_message("interrupt_agent"),
+                        list_agents: tool_message("list_agents"),
                     }),
                 });
             }
@@ -2240,13 +2337,31 @@ async fn request_user_input_async_description_follows_mid_turn_model_changes() -
                     .iter()
                     .find(|tool| tool["name"] == "request_user_input_async")
                     .expect("async message tool");
-                json!({"model": body["model"], "description": tool["description"]})
+                let multi_agent_messages = MULTI_AGENT_TOOLS.map(|name| {
+                    let tool = namespace_child_tool(&body, "collaboration", name).expect(name);
+                    (name.to_string(), json!({
+                        "description": tool["description"].as_str().expect("tool description").trim(),
+                        "parameters": tool["parameters"],
+                    }))
+                }).into_iter().collect::<serde_json::Map<String, Value>>();
+                json!({
+                    "model": body["model"],
+                    "async_description": tool["description"],
+                    "multi_agent_messages": multi_agent_messages,
+                })
             })
             .collect::<Vec<_>>(),
         [MODEL_A, MODEL_B]
             .map(|model| json!({
                 "model": model,
-                "description": format!("Async message description for {model}."),
+                "async_description": format!("Async message description for {model}."),
+                "multi_agent_messages": MULTI_AGENT_TOOLS
+                    .map(|name| (name.to_string(), json!({
+                        "description": format!("{name} description for {model}."),
+                        "parameters": parameters(model),
+                    })))
+                    .into_iter()
+                    .collect::<serde_json::Map<String, Value>>(),
             }))
             .to_vec(),
     );
@@ -2787,7 +2902,8 @@ async fn captured_step_controls_mcp_output_limit(supports_images: bool) -> Resul
     Ok(())
 }
 
-struct SettingsEcho;
+#[derive(Clone)]
+struct SettingsEcho(Arc<Mutex<Option<ConversationHistory>>>);
 
 impl ToolContributor for SettingsEcho {
     fn tools(
@@ -2795,7 +2911,7 @@ impl ToolContributor for SettingsEcho {
         _session_store: &ExtensionData,
         _thread_store: &ExtensionData,
     ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
-        vec![Arc::new(Self)]
+        vec![Arc::new(self.clone())]
     }
 }
 
@@ -2820,6 +2936,7 @@ impl<'call> ToolExecutor<ToolCall<'call>> for SettingsEcho {
         'call: 'a,
     {
         Box::pin(async move {
+            *self.0.lock().expect("history lock") = Some(call.conversation_history);
             let metadata: Value = serde_json::from_str(
                 call.codex_turn_metadata
                     .as_deref()
@@ -2836,8 +2953,12 @@ impl<'call> ToolExecutor<ToolCall<'call>> for SettingsEcho {
     }
 }
 
+#[test_case(ThreadHistoryMode::Legacy; "legacy")]
+#[test_case(ThreadHistoryMode::Paginated; "paginated")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn captured_step_settings_reach_extension_executor() -> Result<()> {
+async fn captured_step_settings_and_history_reach_extension_executor(
+    history_mode: ThreadHistoryMode,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
@@ -2850,12 +2971,15 @@ async fn captured_step_settings_reach_extension_executor() -> Result<()> {
                 ev_completed("resp-b"),
             ]),
             sse_completed("resp-result"),
+            sse_completed("resp-later"),
         ],
     )
     .await;
+    let history = Arc::default();
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
-    extensions.tool_contributor(Arc::new(SettingsEcho));
+    extensions.tool_contributor(Arc::new(SettingsEcho(Arc::clone(&history))));
     let test = direct_tool_settings_test()
+        .with_history_mode(history_mode)
         .with_extensions(Arc::new(extensions.build()))
         .with_config(|config| {
             for model in &mut config.model_catalog.as_mut().expect("models").models {
@@ -2893,6 +3017,28 @@ async fn captured_step_settings_reach_extension_executor() -> Result<()> {
             "output_bytes": 512,
         })
     );
+    test.submit_text_turn("later turn").await?;
+    // First read after a later turn: the extension must retain its invocation-time snapshot.
+    let history = history
+        .lock()
+        .expect("history lock")
+        .take()
+        .expect("captured history");
+    let user_texts = history
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "user" => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|item| match item {
+            ContentItem::InputText { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(user_texts.contains(&"pause before continuing"));
+    assert!(!user_texts.contains(&"later turn"));
     Ok(())
 }
 

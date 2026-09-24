@@ -7,6 +7,7 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::InputModality;
 use codex_utils_image::data_url_from_bytes;
@@ -238,7 +239,9 @@ impl ToolOutput for ViewImageOutput {
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
         let body =
             FunctionCallOutputBody::ContentItems(vec![FunctionCallOutputContentItem::InputImage {
-                image_url: self.image_url.clone(),
+                image: ImageReference::Inline {
+                    image_url: self.image_url.clone(),
+                },
                 detail: Some(self.image_detail),
             }]);
         let output = FunctionCallOutputPayload {
@@ -276,6 +279,10 @@ mod tests {
     use crate::tools::context::ToolInvocation;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_protocol::models::PermissionProfile;
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use codex_utils_path_uri::PathUri;
     use core_test_support::TempDirExt;
@@ -290,7 +297,7 @@ mod tests {
 
     fn replace_primary_environment_cwd(turn: &mut crate::TurnContext, cwd: AbsolutePathBuf) {
         let mut current = turn
-            .environments
+            .initial_environments
             .turn_environments()
             .next()
             .cloned()
@@ -299,12 +306,13 @@ mod tests {
         let mut selection = current.selection;
         selection.cwd = PathUri::from_abs_path(&cwd);
         selection.workspace_roots.clear();
-        turn.environments.environments[0] = TurnEnvironmentState::Ready(TurnEnvironment::new(
-            selection,
-            current.config_origin,
-            current.environment,
-            current.shell,
-        ));
+        turn.initial_environments.environments[0] =
+            TurnEnvironmentState::Ready(TurnEnvironment::new(
+                selection,
+                current.config_origin,
+                current.environment,
+                current.shell,
+            ));
     }
 
     fn tiny_png() -> Vec<u8> {
@@ -365,12 +373,19 @@ mod tests {
             .permissions
             .set_permission_profile(PermissionProfile::Disabled)
             .expect("set thread permission profile");
-        let TurnEnvironmentState::Ready(environment) = &mut turn.environments.environments[0]
+        let TurnEnvironmentState::Ready(environment) =
+            &mut turn.initial_environments.environments[0]
         else {
             panic!("primary environment should be ready");
         };
         environment.config_mut().permission_profile =
-            PermissionProfileSnapshot::legacy(PermissionProfile::read_only());
+            PermissionProfileSnapshot::legacy(PermissionProfile::from_runtime_permissions(
+                &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry::new(
+                    image_cwd.into(),
+                    FileSystemAccessMode::Read,
+                )]),
+                NetworkSandboxPolicy::Restricted,
+            ));
         let turn = Arc::new(turn);
 
         let result = ViewImageHandler::default()
@@ -437,7 +452,8 @@ mod tests {
         replace_primary_environment_cwd(&mut turn, image_cwd.clone());
         let image_path = image_cwd.join("image.png");
         std::fs::write(image_path.as_path(), tiny_png()).expect("write test image");
-        let TurnEnvironmentState::Ready(environment) = &mut turn.environments.environments[0]
+        let TurnEnvironmentState::Ready(environment) =
+            &mut turn.initial_environments.environments[0]
         else {
             panic!("primary environment should be ready");
         };
@@ -474,7 +490,8 @@ mod tests {
         let image_path = image_cwd.join("not-an-image.txt");
         std::fs::write(image_path.as_path(), b"arbitrary file contents")
             .expect("write invalid image");
-        let TurnEnvironmentState::Ready(environment) = &mut turn.environments.environments[0]
+        let TurnEnvironmentState::Ready(environment) =
+            &mut turn.initial_environments.environments[0]
         else {
             panic!("primary environment should be ready");
         };

@@ -25,6 +25,7 @@ use tokio::sync::watch;
 use crate::McpEventStreamOpener;
 use crate::McpRuntime;
 use crate::connection_manager::McpConnectionSet;
+use crate::connection_manager::McpServerConnection;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 
 /// One page of resources returned by an MCP server.
@@ -200,6 +201,43 @@ impl PartialEq for McpResourceClientCacheKey {
 
 impl Eq for McpResourceClientCacheKey {}
 
+/// Identity of one server's resource cache across MCP runtime publications.
+///
+/// Survives publications that reuse the same connection until resource caches are explicitly
+/// invalidated. The key does not keep superseded connections alive.
+#[derive(Clone)]
+pub struct McpResourceServerCacheKey {
+    pub(crate) connection: Weak<McpServerConnection>,
+    pub(crate) generation: u64,
+}
+
+impl PartialEq for McpResourceServerCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.connection.ptr_eq(&other.connection) && self.generation == other.generation
+    }
+}
+
+impl Eq for McpResourceServerCacheKey {}
+
+/// Opaque auth scope and server availability, independent of connection-set rebuilds.
+/// This is for fixed, host-owned sources; it does not fingerprint arbitrary server config.
+#[derive(Clone)]
+pub struct McpResourceClientAuthKey {
+    pub(crate) generation: Arc<()>,
+    pub(crate) server: String,
+    pub(crate) available: bool,
+}
+
+impl PartialEq for McpResourceClientAuthKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.generation, &other.generation)
+            && self.server == other.server
+            && self.available == other.available
+    }
+}
+
+impl Eq for McpResourceClientAuthKey {}
+
 impl std::fmt::Debug for McpResourceClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -217,6 +255,17 @@ impl McpResourceClient {
     /// Returns the identity of the connection set used by this client.
     pub fn cache_key(&self) -> McpResourceClientCacheKey {
         McpResourceClientCacheKey(Arc::downgrade(&self.runtime.latest_connections()))
+    }
+
+    /// Returns a server's resource cache identity without starting its connection.
+    pub fn server_cache_key(&self, server: &str) -> Option<McpResourceServerCacheKey> {
+        self.runtime.resource_cache_key(server)
+    }
+
+    /// Tracks published auth and source availability without invalidating on unrelated
+    /// environment changes. This key contains no credentials.
+    pub fn auth_cache_key_for_server(&self, server: &str) -> McpResourceClientAuthKey {
+        self.runtime.auth_cache_key_for_server(server)
     }
 
     /// Returns whether this client can address the named server.

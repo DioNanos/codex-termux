@@ -43,6 +43,10 @@ fn read_denials_use_target_paths_and_native_glob_semantics() {
         let matcher = ReadDenyMatcher::try_new_with_context(&policy, &context)
             .unwrap()
             .unwrap();
+        assert_eq!(
+            policy.get_unreadable_roots_with_context(&context),
+            Ok(vec![cwd.join("private").unwrap()]),
+        );
         for (path, expected) in [
             ("private", true),
             ("private/file", true),
@@ -208,6 +212,17 @@ fn malformed_or_unresolvable_denials_fail_closed() {
         path: uri("file:///C:/private"),
     })]);
     assert!(ReadDenyMatcher::try_new_with_context(&policy, &context).is_err());
+    let policy = FileSystemSandboxPolicy::restricted(vec![deny(FileSystemPath::Special {
+        value: FileSystemSpecialPath::Tmpdir,
+    })]);
+    assert!(
+        policy
+            .get_unreadable_roots_with_context(&FileSystemSandboxPolicyContext {
+                temporary_directories: None,
+                ..context
+            })
+            .is_err()
+    );
 }
 
 #[test]
@@ -228,6 +243,49 @@ fn slash_tmp_denials_follow_the_executor_convention() {
         if let Some(matcher) = matcher {
             assert!(matcher.is_read_denied_uri(&cwd.join("/tmp/file").unwrap(), &context));
         }
+    }
+}
+
+/// Full-disk read policy shares the native check and ignores `:slash_tmp` only on Windows.
+#[test]
+fn full_disk_read_policy_uses_the_executor_convention() {
+    use FileSystemAccessMode::Read;
+    use FileSystemAccessMode::Write;
+    use FileSystemSpecialPath::Minimal;
+    use FileSystemSpecialPath::Root;
+    use FileSystemSpecialPath::SlashTmp;
+    use FileSystemSpecialPath::Tmpdir;
+
+    for (root_access, denial, posix, windows, unknown) in [
+        (Read, None, true, true, true),
+        (Read, Some(SlashTmp), false, true, false),
+        (Read, Some(Tmpdir), false, false, false),
+        (Write, Some(Minimal), false, false, false),
+        (Write, Some(Root), false, false, false),
+    ] {
+        let mut entries = vec![FileSystemSandboxEntry::new(
+            FileSystemPath::Special { value: Root },
+            root_access,
+        )];
+        if let Some(value) = denial {
+            entries.push(deny(FileSystemPath::Special { value }));
+        }
+        let policy = FileSystemSandboxPolicy::restricted(entries);
+        for (convention, expected) in [
+            (Some(PathConvention::Posix), posix),
+            (Some(PathConvention::Windows), windows),
+            (None, unknown),
+        ] {
+            assert_eq!(
+                policy.has_full_disk_read_access_for_convention(convention),
+                expected,
+                "policy={policy:?}, convention={convention:?}",
+            );
+        }
+        assert_eq!(
+            policy.has_full_disk_read_access(),
+            policy.has_full_disk_read_access_for_convention(Some(PathConvention::native())),
+        );
     }
 }
 
@@ -264,6 +322,128 @@ fn remote_workspace_write_keeps_metadata_protected() {
             let path = root.join(name).unwrap().join("file").unwrap();
             assert!(policy.can_read_path(&path, &context));
             assert!(!policy.can_write_path(&path, &context));
+        }
+    }
+}
+
+#[test]
+fn read_globs_reject_metacharacters_in_home_and_cwd_facts() {
+    for prefix in ["file:///home", "file:///C:/Users"] {
+        let parent = uri(prefix);
+        let directory = parent.join("sam[1]").unwrap();
+        for (pattern, cwd, home) in [
+            ("~/private/*.key", &parent, Some(&directory)),
+            ("private/*.key", &directory, None),
+        ] {
+            let policy =
+                FileSystemSandboxPolicy::restricted(vec![deny(FileSystemPath::GlobPattern {
+                    pattern: pattern.into(),
+                })]);
+            let context = FileSystemSandboxPolicyContext {
+                cwd,
+                workspace_roots: std::slice::from_ref(&directory),
+                user_home_dir: home,
+                temporary_directories: None,
+            };
+            assert!(ReadDenyMatcher::try_new_with_context(&policy, &context).is_err());
+            let matcher = ReadDenyMatcher::from_context(&policy, &context).unwrap();
+            assert!(
+                matcher.is_read_denied_uri(&directory.join("private/a.key").unwrap(), &context)
+            );
+        }
+    }
+}
+
+#[test]
+fn workspace_globs_fail_closed_on_literal_root_metacharacters_on_every_host() {
+    for prefix in ["file:///home", "file:///C:/Users"] {
+        let root = uri(prefix).join("sam[1]").unwrap();
+        let policy = FileSystemSandboxPolicy::restricted(vec![deny(FileSystemPath::GlobPattern {
+            pattern: crate::permissions::project_roots_glob_pattern(std::path::Path::new(
+                "private/*.key",
+            )),
+        })]);
+        let materialized = policy
+            .clone()
+            .materialize_project_roots_with_path_uris(std::slice::from_ref(&root));
+        assert_eq!(
+            materialized,
+            FileSystemSandboxPolicy::restricted(vec![deny(root.clone().into())]),
+        );
+        if let Ok(native_root) = root.to_abs_path() {
+            assert_eq!(
+                policy.materialize_project_roots_with_workspace_roots(&[native_root]),
+                materialized,
+            );
+        }
+    }
+}
+
+#[test]
+fn materializing_legacy_home_relative_workspace_denials_removes_all_grants() {
+    for (root, home) in [
+        ("file:///work/repo", "file:///home/sam"),
+        ("file:///C:/work/repo", "file:///D:/Users/sam"),
+    ] {
+        let root = uri(root);
+        let home = uri(home);
+        let convention = root.infer_path_convention().unwrap();
+        for subpath in ["~", "~/private/*.env", r"~\private", r"~\private\*.env"] {
+            if convention.home_relative_suffix(subpath).is_none() {
+                continue;
+            }
+            let denied_path = if subpath.contains('*') {
+                FileSystemPath::GlobPattern {
+                    pattern: crate::permissions::project_roots_glob_pattern(std::path::Path::new(
+                        subpath,
+                    )),
+                }
+            } else {
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::ProjectRoots {
+                        subpath: Some(subpath.into()),
+                    },
+                }
+            };
+            let policy = FileSystemSandboxPolicy::restricted(vec![
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Root,
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::ProjectRoots { subpath: None },
+                    },
+                    FileSystemAccessMode::Write,
+                ),
+                FileSystemSandboxEntry::new(home.clone().into(), FileSystemAccessMode::Write),
+                deny(denied_path),
+            ]);
+            let mut materialized = vec![
+                policy
+                    .clone()
+                    .materialize_project_roots_with_path_uris(std::slice::from_ref(&root)),
+                policy
+                    .clone()
+                    .with_materialized_project_roots_for_path_uris(std::slice::from_ref(&root)),
+            ];
+            if let Ok(native_root) = root.to_abs_path() {
+                materialized.push(
+                    policy
+                        .clone()
+                        .materialize_project_roots_with_workspace_roots(std::slice::from_ref(
+                            &native_root,
+                        )),
+                );
+                materialized.push(policy.with_materialized_project_roots_for_workspace_roots(
+                    std::slice::from_ref(&native_root),
+                ));
+            }
+            for policy in materialized {
+                assert_eq!(policy, FileSystemSandboxPolicy::restricted(Vec::new()));
+            }
         }
     }
 }

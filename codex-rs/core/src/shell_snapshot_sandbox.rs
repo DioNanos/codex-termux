@@ -39,10 +39,9 @@ pub(crate) struct ShellSnapshotSandbox {
     enforce_managed_network: bool,
     sandbox_policy_cwd: PathUri,
     workspace_roots: Vec<PathUri>,
-    codex_linux_sandbox_exe: Option<PathBuf>,
+    sandbox_exe: Option<PathBuf>,
     use_legacy_landlock: bool,
     windows_sandbox_level: WindowsSandboxLevel,
-    windows_sandbox_private_desktop: bool,
     network: Option<NetworkProxy>,
     environment_id: String,
     additional_permissions: Option<AdditionalPermissionProfile>,
@@ -84,10 +83,9 @@ impl ShellSnapshotSandbox {
             enforce_managed_network: attempt.enforce_managed_network,
             sandbox_policy_cwd: attempt.sandbox_cwd.clone(),
             workspace_roots: attempt.workspace_roots.to_vec(),
-            codex_linux_sandbox_exe: attempt.codex_linux_sandbox_exe.cloned(),
+            sandbox_exe: attempt.sandbox_exe.cloned(),
             use_legacy_landlock: attempt.use_legacy_landlock,
             windows_sandbox_level: attempt.windows_sandbox_level,
-            windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
             network: attempt.network_proxy(network).cloned(),
             environment_id: environment_id.to_string(),
             additional_permissions: additional_permissions.cloned(),
@@ -103,10 +101,9 @@ impl ShellSnapshotSandbox {
             self.enforce_managed_network,
             &self.sandbox_policy_cwd,
             &self.workspace_roots,
-            &self.codex_linux_sandbox_exe,
+            &self.sandbox_exe,
             self.use_legacy_landlock,
             self.windows_sandbox_level,
-            self.windows_sandbox_private_desktop,
             self.network
                 .as_ref()
                 .map(|network| (network.http_addr(), network.socks_addr())),
@@ -172,10 +169,9 @@ impl ShellSnapshotSandbox {
                 environment_id: Some(&self.environment_id),
                 network: self.network.as_ref(),
                 sandbox_policy_cwd: &self.sandbox_policy_cwd,
-                codex_linux_sandbox_exe: self.codex_linux_sandbox_exe.as_deref(),
+                sandbox_exe: self.sandbox_exe.as_deref(),
                 use_legacy_landlock: self.use_legacy_landlock,
                 windows_sandbox_level: self.windows_sandbox_level,
-                windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
             })
             .context("failed to prepare shell snapshot sandbox")?;
         let workspace_roots = self

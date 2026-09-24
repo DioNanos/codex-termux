@@ -5,6 +5,7 @@ use crate::app::tests::session_lifecycle_requests::RealtimeRequestBehavior;
 use crate::app::tests::session_lifecycle_requests::recorded_params;
 use crate::app::tests::session_lifecycle_requests::start_recording_realtime_speech_app_server;
 use crate::app::tests::session_lifecycle_requests::start_recording_remote_app_server;
+use crate::chatwidget::commit_realtime_history_events;
 use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
@@ -77,18 +78,76 @@ enum ItemEventKind {
 }
 
 #[tokio::test]
-async fn realtime_start_routes_v3_offer_without_startup_context() -> Result<()> {
+async fn remote_voice_start_routes_v3_offer_and_effective_preference() -> Result<()> {
+    use super::session_lifecycle_requests::HistoryCapabilities;
+    for (capabilities, expected_voice) in [
+        (HistoryCapabilities::Current, Some("juniper")),
+        (HistoryCapabilities::ConfigReadUnsupported(-32601), None),
+        (HistoryCapabilities::Current, Some("cove")),
+        (HistoryCapabilities::VoiceCatalogCustom, Some("maple")),
+        (HistoryCapabilities::VoiceCatalogUnavailable, Some("cove")),
+        (HistoryCapabilities::ConfigReadUnknownVoice, None),
+    ] {
+        check_remote_voice_start(capabilities, expected_voice).await?;
+    }
+    Ok(())
+}
+
+async fn check_remote_voice_start(
+    capabilities: super::session_lifecycle_requests::HistoryCapabilities,
+    expected_voice: Option<&str>,
+) -> Result<()> {
     let (mut app, _events, _ops) = make_test_app_with_channels().await;
-    let (mut app_server, requests, proxy) = start_recording_realtime_speech_app_server(
-        &app.config,
-        RealtimeRequestBehavior::AcceptStart,
-    )
-    .await?;
+    let (mut app_server, requests, proxy) =
+        super::session_lifecycle_requests::start_recording_app_server_with_realtime_speech(
+            &app.config,
+            capabilities,
+            /*blocked_thread_list*/ None,
+            /*failed_thread_name*/ None,
+            crate::app_server_session::ThreadParamsMode::Remote,
+            RealtimeRequestBehavior::AcceptStart,
+            codex_config::LoaderOverrides::default(),
+        )
+        .await?;
     let thread_id = ThreadId::new();
     app.active_thread_id = Some(thread_id);
     app.chat_widget
         .handle_thread_session_quiet(test_thread_session(thread_id, app.config.cwd.to_path_buf()));
     let mut tui = crate::tui::test_support::make_test_tui()?;
+    Box::pin(app.handle_event(
+        &mut tui,
+        &mut app_server,
+        AppEvent::PersistRealtimeVoiceSelection {
+            voice: codex_protocol::protocol::RealtimeVoice::Juniper,
+        },
+    ))
+    .await?;
+    if capabilities == super::session_lifecycle_requests::HistoryCapabilities::Current {
+        assert_eq!(
+            (
+                app.config.realtime.voice,
+                app.chat_widget.config_ref().realtime.voice
+            ),
+            (
+                Some(codex_protocol::protocol::RealtimeVoice::Juniper),
+                Some(codex_protocol::protocol::RealtimeVoice::Juniper)
+            )
+        );
+    }
+    assert_eq!(
+        recorded_params(&requests, "config/batchWrite")[0]["edits"],
+        serde_json::json!([{"keyPath": "realtime.voice", "value": "juniper", "mergeStrategy": "replace"}]),
+    );
+    if expected_voice != Some("juniper") {
+        std::fs::write(
+            app.config.codex_home.join("config.toml"),
+            "[realtime]\ntype = \"conversational\"\n",
+        )?;
+    }
+    // A reconnected TUI can retain a different local preference from its server.
+    app.config.realtime.voice = Some(codex_protocol::protocol::RealtimeVoice::Maple);
+    app.chat_widget
+        .on_realtime_voice_saved(codex_protocol::protocol::RealtimeVoice::Maple);
     Box::pin(app.handle_event(
         &mut tui,
         &mut app_server,
@@ -109,6 +168,7 @@ async fn realtime_start_routes_v3_offer_without_startup_context() -> Result<()> 
             "includeStartupContext": start["includeStartupContext"],
             "outputModality": start["outputModality"],
             "version": start["version"],
+            "voice": start["voice"],
             "transport": start["transport"],
         }),
         serde_json::json!({
@@ -117,6 +177,7 @@ async fn realtime_start_routes_v3_offer_without_startup_context() -> Result<()> 
             "includeStartupContext": false,
             "outputModality": "audio",
             "version": "v3",
+            "voice": expected_voice,
             "transport": {"type": "webrtc", "sdp": "v=0\r\n"},
         })
     );
@@ -350,6 +411,7 @@ async fn switching_threads_keeps_the_source_voice_partial_only_on_reattach() {
         ),
         /*replay_kind*/ None,
     );
+    commit_realtime_history_events(&mut app.chat_widget, &mut source_events);
     let rendered = std::iter::from_fn(|| source_events.try_recv().ok())
         .filter_map(|event| match event {
             AppEvent::InsertHistoryCell(cell) => Some(
@@ -493,6 +555,7 @@ async fn queued_voice_caption_after_switch_returns_once_to_its_source_thread() {
         empty_thread_snapshot(&app, source),
         /*resume_restored_queue*/ false,
     );
+    commit_realtime_history_events(&mut app.chat_widget, &mut source_events);
     let rendered = std::iter::from_fn(|| source_events.try_recv().ok())
         .filter_map(|event| match event {
             AppEvent::InsertHistoryCell(cell) => Some(
@@ -528,6 +591,7 @@ async fn replay_reconciles_only_matching_voice_captions_one_for_one() {
         role: role.to_string(),
         text: text.to_string(),
         complete: true,
+        before_turn_id: None,
     })
     .collect();
     app.pending_realtime_transcript_replay
@@ -564,6 +628,7 @@ async fn replay_reconciles_only_matching_voice_captions_one_for_one() {
         },
         /*resume_restored_queue*/ false,
     );
+    commit_realtime_history_events(&mut app.chat_widget, &mut events);
     let rendered = std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match event {
             AppEvent::InsertHistoryCell(cell) => Some(
@@ -588,7 +653,7 @@ async fn replay_reconciles_only_matching_voice_captions_one_for_one() {
 }
 
 #[tokio::test]
-async fn retained_caption_consumes_only_one_matching_answer_fallback_on_reattach() {
+async fn retained_caption_consumes_only_one_matching_answer_fallback_on_reattach() -> Result<()> {
     let (mut app, _initial_events, _ops) = make_test_app_with_channels().await;
     let source = ThreadId::new();
     let (widget, _, mut events, _) = make_chatwidget_manual_with_sender().await;
@@ -600,6 +665,7 @@ async fn retained_caption_consumes_only_one_matching_answer_fallback_on_reattach
             role: "assistant".into(),
             text: "Same   answer".into(),
             complete: true,
+            before_turn_id: None,
         }]
         .into(),
     );
@@ -623,23 +689,26 @@ async fn retained_caption_consumes_only_one_matching_answer_fallback_on_reattach
         empty_thread_snapshot(&app, source),
         /*resume_restored_queue*/ false,
     );
-    let rendered = std::iter::from_fn(|| events.try_recv().ok())
-        .filter_map(|event| match event {
-            AppEvent::InsertHistoryCell(cell) => Some(
-                cell.display_lines(/*width*/ 80)
-                    .into_iter()
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
-            _ => None,
-        })
+    let (mut app_server, _requests, proxy) = start_recording_remote_app_server(&app.config).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    while let Ok(event) = events.try_recv() {
+        Box::pin(app.handle_event(&mut tui, &mut app_server, event)).await?;
+        app.chat_widget.pre_draw_tick();
+    }
+    let rendered = app
+        .transcript_cells
+        .iter()
+        .flat_map(|cell| cell.display_lines(/*width*/ 80))
+        .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
     assert_eq!(rendered.matches("Same answer").count(), 1);
     assert_eq!(rendered.matches("Same   answer").count(), 1);
     assert_eq!(rendered.matches("Different answer").count(), 1);
     assert!(!rendered.contains("[FINAL]"));
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
 }
 
 #[tokio::test]
@@ -695,6 +764,7 @@ async fn buffered_voice_items_reconcile_captions_after_thread_switch() {
             role: role.to_string(),
             text: text.to_string(),
             complete: true,
+            before_turn_id: None,
         })
         .collect(),
     );
@@ -774,6 +844,7 @@ async fn unrendered_buffered_items_do_not_consume_retained_captions() {
             role: role.to_string(),
             text: text.to_string(),
             complete: true,
+            before_turn_id: None,
         })
         .collect(),
     );
@@ -835,6 +906,7 @@ async fn unrendered_buffered_items_do_not_consume_retained_captions() {
         },
         /*resume_restored_queue*/ false,
     );
+    commit_realtime_history_events(&mut app.chat_widget, &mut events);
     let rendered = std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match event {
             AppEvent::InsertHistoryCell(cell) => Some(
@@ -875,6 +947,7 @@ async fn completed_voice_caption_survives_repeated_thread_replacement() {
         ),
         /*replay_kind*/ None,
     );
+    commit_realtime_history_events(&mut app.chat_widget, &mut initial_events);
     let initial = std::iter::from_fn(|| initial_events.try_recv().ok())
         .filter_map(|event| match event {
             AppEvent::InsertHistoryCell(cell) => Some(
@@ -887,6 +960,16 @@ async fn completed_voice_caption_survives_repeated_thread_replacement() {
         })
         .collect::<String>();
     assert_eq!(initial.matches("spoken complete").count(), 1);
+
+    let typed = test_turn(
+        "later-typed-turn",
+        TurnStatus::Completed,
+        vec![test_user_message("later-user", "Later typed question")],
+    );
+    app.chat_widget.handle_server_notification(
+        turn_started_notification(source, &typed.id),
+        /*replay_kind*/ None,
+    );
 
     for cycle in 0..2 {
         let side = ThreadId::new();
@@ -909,11 +992,16 @@ async fn completed_voice_caption_survives_repeated_thread_replacement() {
         let (source_widget, _, mut source_events, _) = make_chatwidget_manual_with_sender().await;
         app.active_thread_id = Some(source);
         app.replace_chat_widget(source_widget);
-        app.replay_thread_snapshot(
-            empty_thread_snapshot(&app, source),
-            /*resume_restored_queue*/ false,
-        );
+        let mut snapshot = empty_thread_snapshot(&app, source);
+        snapshot.turns.push(Turn {
+            id: "earlier-typed-turn".into(),
+            items: vec![test_agent_message("earlier-answer", "Earlier answer")],
+            ..typed.clone()
+        });
+        snapshot.turns.push(typed.clone());
+        app.replay_thread_snapshot(snapshot, /*resume_restored_queue*/ false);
         assert!(!app.pending_realtime_transcript_replay.contains_key(&source));
+        commit_realtime_history_events(&mut app.chat_widget, &mut source_events);
         let rendered = std::iter::from_fn(|| source_events.try_recv().ok())
             .filter_map(|event| match event {
                 AppEvent::InsertHistoryCell(cell) => Some(
@@ -928,12 +1016,91 @@ async fn completed_voice_caption_survives_repeated_thread_replacement() {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(rendered.matches("spoken complete").count(), 1);
+        assert!(
+            rendered.find("Earlier answer").unwrap() < rendered.find("spoken complete").unwrap()
+        );
+        assert!(
+            rendered.find("spoken complete").unwrap()
+                < rendered.find("Later typed question").unwrap()
+        );
         if cycle == 0 {
             insta::assert_snapshot!(
                 "voice_completed_after_thread_switch",
                 normalize_voice_snapshot_directory(&rendered, &app.config.cwd)
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn inactive_caption_precedes_later_buffered_turn_without_start_event() {
+    for include_delta in [false, true] {
+        let (mut app, _initial_events, _ops) = make_test_app_with_channels().await;
+        let source = ThreadId::new();
+        app.retain_inactive_realtime_transcript(
+            source,
+            &ServerNotification::ThreadRealtimeTranscriptDone(
+                codex_app_server_protocol::ThreadRealtimeTranscriptDoneNotification {
+                    thread_id: source.to_string(),
+                    role: "assistant".into(),
+                    text: "Earlier spoken answer".into(),
+                },
+            ),
+        );
+        app.retain_inactive_realtime_transcript(
+            source,
+            &turn_started_notification(source, "later-turn"),
+        );
+        let (widget, _, mut events, _) = make_chatwidget_manual_with_sender().await;
+        app.active_thread_id = Some(source);
+        app.replace_chat_widget(widget);
+        let mut snapshot = empty_thread_snapshot(&app, source);
+        if include_delta {
+            snapshot
+                .events
+                .push(ThreadBufferedEvent::Notification(Box::new(
+                    ServerNotification::AgentMessageDelta(
+                        codex_app_server_protocol::AgentMessageDeltaNotification {
+                            thread_id: source.to_string(),
+                            turn_id: "later-turn".into(),
+                            item_id: "later-answer".into(),
+                            delta: "Later typed question".into(),
+                        },
+                    ),
+                )));
+        }
+        // The bounded replay buffer may have evicted both the start and item notifications.
+        snapshot
+            .events
+            .push(ThreadBufferedEvent::Notification(Box::new(
+                ServerNotification::TurnCompleted(TurnCompletedNotification {
+                    thread_id: source.to_string(),
+                    turn: test_turn(
+                        "later-turn",
+                        TurnStatus::Completed,
+                        vec![test_agent_message("later-answer", "Later typed question")],
+                    ),
+                }),
+            )));
+        app.replay_thread_snapshot(snapshot, /*resume_restored_queue*/ false);
+        let rendered = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(
+                    cell.transcript_lines(/*width*/ 80)
+                        .into_iter()
+                        .map(|line| line.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(rendered.matches("Earlier spoken answer").count(), 1);
+        assert!(
+            rendered.find("Earlier spoken answer").unwrap()
+                < rendered.find("Later typed question").unwrap()
+        );
     }
 }
 
@@ -1469,5 +1636,290 @@ async fn delegated_final_speech_reaches_app_server_once_and_stale_speech_is_reje
 
     app_server.shutdown().await?;
     proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejected_voice_setting_preserves_current_selection() -> Result<()> {
+    let (mut app, mut events, _ops) = make_test_app_with_channels().await;
+    let (mut app_server, _requests, proxy) = start_recording_remote_app_server(&app.config).await?;
+    let previous = (
+        app.config.realtime.voice,
+        app.chat_widget.config_ref().realtime.voice,
+    );
+    std::fs::write(app.config.codex_home.join("config.toml"), "realtime = [")?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    Box::pin(app.handle_event(
+        &mut tui,
+        &mut app_server,
+        AppEvent::PersistRealtimeVoiceSelection {
+            voice: codex_protocol::protocol::RealtimeVoice::Juniper,
+        },
+    ))
+    .await?;
+    assert_eq!(
+        (
+            app.config.realtime.voice,
+            app.chat_widget.config_ref().realtime.voice
+        ),
+        previous,
+    );
+    let messages = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => Some(
+                cell.display_lines(/*width*/ 80)
+                    .into_iter()
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(messages.contains("Failed to save voice"));
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_voice_config_read_failure_does_not_start_with_local_voice() -> Result<()> {
+    let (mut app, _events, _ops) = make_test_app_with_channels().await;
+    let (mut app_server, requests, proxy) = start_recording_remote_app_server(&app.config).await?;
+    std::fs::write(app.config.codex_home.join("config.toml"), "realtime = [")?;
+    let thread_id = ThreadId::new();
+    let error = app
+        .try_submit_active_thread_op_via_app_server(
+            &mut app_server,
+            thread_id,
+            &AppCommand::RealtimeConversationStart {
+                thread_id,
+                offer_sdp: String::from("v=0\r\n").into(),
+            },
+        )
+        .await
+        .expect_err("invalid server config must not fall back to local voice");
+    assert!(error.to_string().contains("config/read"));
+    assert!(recorded_params(&requests, "thread/realtime/start").is_empty());
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn embedded_voice_settings_follow_project_after_thread_switch() -> Result<()> {
+    use codex_protocol::protocol::RealtimeVoice;
+    let (mut app, _events, _ops) = make_test_app_with_channels().await;
+    let projects = tempfile::tempdir()?;
+    for voice in [RealtimeVoice::Maple, RealtimeVoice::Sol] {
+        let cwd = projects.path().join(voice.wire_name());
+        std::fs::create_dir_all(cwd.join(".codex"))?;
+        std::fs::write(
+            cwd.join(".codex/config.toml"),
+            format!("[realtime]\nvoice = \"{}\"\n", voice.wire_name()),
+        )?;
+        crate::legacy_core::config::set_project_trust_level(
+            &app.config.codex_home,
+            &cwd,
+            codex_protocol::config_types::TrustLevel::Trusted,
+        )
+        .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
+    }
+    app.config.realtime.voice = Some(RealtimeVoice::Maple);
+    let (mut server, requests, proxy) = start_recording_realtime_speech_app_server(
+        &app.config,
+        RealtimeRequestBehavior::AcceptStart,
+    )
+    .await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    for voice in [
+        RealtimeVoice::Maple,
+        RealtimeVoice::Sol,
+        RealtimeVoice::Maple,
+    ] {
+        let thread_id = ThreadId::new();
+        let cwd = projects.path().join(voice.wire_name());
+        app.thread_event_channels.insert(
+            thread_id,
+            ThreadEventChannel::new_with_session(
+                THREAD_EVENT_CHANNEL_CAPACITY,
+                test_thread_session(thread_id, cwd),
+                Vec::new(),
+            ),
+        );
+        Box::pin(app.select_agent_thread(&mut tui, &mut server, thread_id)).await?;
+        app.open_realtime_settings(&server).await;
+        let popup = crate::chatwidget::tests::helpers::render_bottom_popup(
+            &app.chat_widget,
+            /*width*/ 80,
+        );
+        assert!(
+            popup.contains(&format!("{} (current)", voice.wire_name())),
+            "{popup}"
+        );
+        app.try_submit_active_thread_op_via_app_server(
+            &mut server,
+            thread_id,
+            &AppCommand::RealtimeConversationStart {
+                thread_id,
+                offer_sdp: String::from("v=0\r\n").into(),
+            },
+        )
+        .await?;
+        assert_eq!(
+            recorded_params(&requests, "thread/realtime/start")
+                .last()
+                .unwrap()["voice"],
+            serde_json::json!(voice),
+        );
+    }
+    server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_voice_picker_reads_server_preference() -> Result<()> {
+    let (mut app, _events, _ops) = make_test_app_with_channels().await;
+    std::fs::write(
+        app.config.codex_home.join("config.toml"),
+        "[realtime]\nvoice = \"sol\"\n",
+    )?;
+    app.chat_widget
+        .set_realtime_voice(Some(codex_protocol::protocol::RealtimeVoice::Maple));
+    let (server, requests, proxy) = start_recording_remote_app_server(&app.config).await?;
+    app.open_realtime_settings(&server).await;
+    assert_eq!(
+        recorded_params(&requests, "thread/realtime/listVoices").len(),
+        1
+    );
+    insta::assert_snapshot!(
+        "remote_voice_picker",
+        crate::chatwidget::tests::helpers::render_bottom_popup(&app.chat_widget, /*width*/ 80)
+    );
+    server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_voice_picker_uses_server_catalog_and_falls_back_when_unavailable() -> Result<()> {
+    use super::session_lifecycle_requests::HistoryCapabilities;
+    for (capabilities, expected_catalog) in [
+        (HistoryCapabilities::VoiceCatalogCustom, true),
+        (HistoryCapabilities::VoiceCatalogUnavailable, false),
+    ] {
+        let (mut app, _events, _ops) = make_test_app_with_channels().await;
+        let (server, requests, proxy) =
+            super::session_lifecycle_requests::start_recording_app_server_with_realtime_speech(
+                &app.config,
+                capabilities,
+                /*blocked_thread_list*/ None,
+                /*failed_thread_name*/ None,
+                crate::app_server_session::ThreadParamsMode::Remote,
+                RealtimeRequestBehavior::Forward,
+                codex_config::LoaderOverrides::default(),
+            )
+            .await?;
+        app.open_realtime_settings(&server).await;
+        let popup = crate::chatwidget::tests::helpers::render_bottom_popup(
+            &app.chat_widget,
+            /*width*/ 80,
+        );
+        assert_eq!(popup.contains("1. maple (current)"), expected_catalog);
+        assert_eq!(popup.contains("  3. spruce"), !expected_catalog);
+        if expected_catalog {
+            insta::assert_snapshot!("remote_voice_picker_server_default", popup);
+        }
+        assert_eq!(
+            recorded_params(&requests, "thread/realtime/listVoices").len(),
+            1
+        );
+        server.shutdown().await?;
+        proxy.await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn overridden_voice_save_keeps_effective_voice() -> Result<()> {
+    for project_override in [false, true] {
+        let (mut app, mut events, _ops) = make_test_app_with_channels().await;
+        let project = tempfile::tempdir()?;
+        let overrides = if project_override {
+            std::fs::create_dir_all(project.path().join(".codex"))?;
+            std::fs::write(
+                project.path().join(".codex/config.toml"),
+                "[realtime]\nvoice = \"maple\"\n",
+            )?;
+            crate::legacy_core::config::set_project_trust_level(
+                &app.config.codex_home,
+                project.path(),
+                codex_protocol::config_types::TrustLevel::Trusted,
+            )
+            .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
+            app.config.cwd = AbsolutePathBuf::from_absolute_path(project.path())?;
+            app.chat_widget
+                .handle_thread_session_quiet(test_thread_session(
+                    ThreadId::new(),
+                    project.path().to_path_buf(),
+                ));
+            Vec::new()
+        } else {
+            vec![(
+                "realtime.voice".to_string(),
+                toml::Value::String("maple".to_string()),
+            )]
+        };
+        let client = crate::start_embedded_app_server(
+            codex_arg0::Arg0DispatchPaths::default(),
+            app.config.clone(),
+            overrides,
+            codex_config::LoaderOverrides::without_managed_config_for_tests(),
+            /*strict_config*/ false,
+            codex_config::CloudConfigBundleLoader::default(),
+            codex_feedback::CodexFeedback::new(),
+            /*log_db*/ None,
+            /*state_db*/ None,
+            Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        )
+        .await?;
+        let server = AppServerSession::new(
+            codex_app_server_client::AppServerClient::InProcess(client),
+            crate::app_server_session::ThreadParamsMode::Embedded,
+        );
+        while events.try_recv().is_ok() {}
+        app.persist_realtime_voice(&server, codex_protocol::protocol::RealtimeVoice::Juniper)
+            .await;
+        assert_eq!(
+            (
+                app.config.realtime.voice,
+                app.chat_widget.config_ref().realtime.voice
+            ),
+            (
+                Some(codex_protocol::protocol::RealtimeVoice::Maple),
+                Some(codex_protocol::protocol::RealtimeVoice::Maple)
+            ),
+        );
+        let message = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(
+                    cell.display_lines(/*width*/ 80)
+                        .into_iter()
+                        .map(|line| line.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(message.contains("saved but not applied"));
+        if !project_override {
+            insta::assert_snapshot!("overridden_voice_save", message);
+        }
+        server.shutdown().await?;
+    }
     Ok(())
 }

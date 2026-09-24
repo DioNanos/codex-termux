@@ -2,9 +2,14 @@ mod layer_io;
 mod local;
 #[cfg(target_os = "macos")]
 mod macos;
+mod managed_requirements;
 mod project_discovery;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "projectless_directory_tests.rs"]
+mod projectless_directory_tests;
 #[cfg(windows)]
 mod windows;
 
@@ -14,7 +19,6 @@ use crate::CloudConfigBundleLayers;
 use crate::ConfigLayerSource;
 use crate::ProfileV2Name;
 use crate::RequirementsLayerEntry;
-use crate::compose_requirements;
 use crate::config_requirements::RequirementSource;
 use crate::config_requirements::SandboxModeRequirement;
 use crate::config_toml::ConfigToml;
@@ -34,7 +38,8 @@ use crate::state::ConfigLoadOptions;
 use crate::state::LoaderOverrides;
 use crate::state::validate_enabled_config_layers;
 use crate::strict_config::config_error_from_ignored_toml_value_fields;
-use crate::strict_config::ignored_toml_value_field;
+use crate::strict_config::ignored_config_warning;
+use crate::strict_config::ignored_toml_value_fields;
 use crate::strict_config::unknown_feature_toml_value_field;
 use crate::thread_config::ThreadConfigContext;
 use crate::thread_config::ThreadConfigLoader;
@@ -60,6 +65,7 @@ pub use local::LocalConfigLayers;
 pub use local::LocalTomlLayer;
 pub use local::LocalTomlLayerStack;
 pub use local::load_local_config_layers;
+pub use managed_requirements::load_managed_requirements_state;
 #[cfg(windows)]
 pub use windows::WindowsSystemConfigNamespaceProbe;
 #[cfg(windows)]
@@ -189,81 +195,40 @@ pub async fn load_config_layers_state(
         )
     };
     let active_user_profile = overrides.user_config_profile.clone();
-    let ignore_managed_requirements = overrides.ignore_managed_requirements;
     let ignore_user_config = overrides.ignore_user_config;
     let ignore_project_config = overrides.ignore_project_config;
     let ignore_user_and_project_exec_policy_rules =
         overrides.ignore_user_and_project_exec_policy_rules;
-    let mut requirements_layers = Vec::new();
     let mut bundle_requirements_layers = Vec::new();
-    let mut system_requirements_layer = None;
-    let managed_preferences_requirements_layer;
     let mut cloud_config_layers = Vec::new();
 
-    if !ignore_managed_requirements {
-        if let Some(bundle) = cloud_config_bundle.get().await.map_err(io::Error::other)? {
-            let cloud_config_base_dir = AbsolutePathBuf::from_absolute_path(codex_home)?;
-            let bundle_layers = if strict_config {
-                CloudConfigBundleLayers::from_bundle_strict_config(bundle, &cloud_config_base_dir)?
-            } else {
-                CloudConfigBundleLayers::from_bundle(bundle, &cloud_config_base_dir)?
-            };
-            let CloudConfigBundleLayers {
-                enterprise_managed_config,
-                enterprise_managed_requirements,
-            } = bundle_layers;
-            bundle_requirements_layers = enterprise_managed_requirements;
-            cloud_config_layers = enterprise_managed_config;
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let managed_preferences_base_dir = AbsolutePathBuf::from_absolute_path(codex_home)?;
-            managed_preferences_requirements_layer = macos::load_managed_admin_requirements_layer(
-                overrides
-                    .macos_managed_config_requirements_base64
-                    .as_deref(),
-            )
-            .await?
-            .map(|layer| layer.with_base_dir(managed_preferences_base_dir));
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            managed_preferences_requirements_layer = None;
-        }
-
-        // Honor the system requirements.toml location.
-        let requirements_toml_file = system_requirements_toml_file_with_overrides(&overrides)?;
-        system_requirements_layer = load_requirements_toml(fs, &requirements_toml_file).await?;
-    } else {
-        managed_preferences_requirements_layer = None;
+    if !overrides.ignore_managed_requirements
+        && let Some(bundle) = cloud_config_bundle.get().await.map_err(io::Error::other)?
+    {
+        let cloud_config_base_dir = AbsolutePathBuf::from_absolute_path(codex_home)?;
+        let bundle_layers = if strict_config {
+            CloudConfigBundleLayers::from_bundle_strict_config(bundle, &cloud_config_base_dir)?
+        } else {
+            CloudConfigBundleLayers::from_bundle(bundle, &cloud_config_base_dir)?
+        };
+        let CloudConfigBundleLayers {
+            enterprise_managed_config,
+            enterprise_managed_requirements,
+        } = bundle_layers;
+        bundle_requirements_layers = enterprise_managed_requirements;
+        cloud_config_layers = enterprise_managed_config;
     }
 
-    let loaded_config_layers =
-        layer_io::load_config_layers_internal(fs, codex_home, overrides.clone(), strict_config)
-            .await?;
-    let mut startup_warnings = (!loaded_config_layers.startup_warnings.is_empty())
-        .then(|| loaded_config_layers.startup_warnings.clone());
-    if !ignore_managed_requirements {
-        requirements_layers.extend(system_requirements_layer);
-        requirements_layers.extend(bundle_requirements_layers);
-        // Continue to support loaded legacy `managed_config.toml` sources as
-        // requirements layers for backwards compatibility.
-        requirements_layers.extend(requirements_layers_from_legacy_scheme(
-            loaded_config_layers.clone(),
+    let (config_requirements_toml, loaded_config_layers, requirements_layers) =
+        managed_requirements::load_requirements_from_sources(
+            fs,
             codex_home,
-        )?);
-        requirements_layers.extend(managed_preferences_requirements_layer);
-    }
-
-    let mut config_requirements_toml =
-        compose_requirements(requirements_layers)?.unwrap_or_default();
-    // Remote app servers enforce auth policy for their workspaces; do not let local
-    // requirements reintroduce authentication restrictions for those workspaces.
-    if overrides.ignore_login_requirements {
-        config_requirements_toml.allowed_login_methods = None;
-        config_requirements_toml.allowed_chatgpt_workspaces = None;
-    }
+            &overrides,
+            strict_config,
+            bundle_requirements_layers,
+        )
+        .await?;
+    let mut startup_warnings = loaded_config_layers.startup_warnings.clone();
 
     let thread_config_context = ThreadConfigContext {
         thread_id: None,
@@ -364,6 +329,7 @@ pub async fn load_config_layers_state(
         );
     }
 
+    let mut is_projectless = false;
     if !ignore_project_config && let Some(cwd) = cwd {
         let mut merged_so_far = TomlValue::Table(toml::map::Map::new());
         for layer in &layers {
@@ -435,10 +401,11 @@ pub async fn load_config_layers_state(
             strict_config,
         )
         .await?;
+        is_projectless = !project_trust_context.has_project_root_marker
+            && project_trust_context.checkout_root.is_none()
+            && project_layers.layers.is_empty();
         layers.extend(project_layers.layers);
-        startup_warnings
-            .get_or_insert_with(Vec::new)
-            .extend(project_layers.startup_warnings);
+        startup_warnings.extend(project_layers.startup_warnings);
     }
 
     // Add a layer for runtime overrides from the CLI or UI, if any exist.
@@ -515,16 +482,18 @@ pub async fn load_config_layers_state(
         return Err(err);
     }
 
-    let config_layer_stack = ConfigLayerStack::new(
+    let mut config_layer_stack = ConfigLayerStack::new(
         layers,
         config_requirements_toml.clone().try_into()?,
         config_requirements_toml.into_toml(),
     )?
     .with_user_and_project_exec_policy_rules_ignored(ignore_user_and_project_exec_policy_rules);
-    Ok(match startup_warnings {
-        Some(startup_warnings) => config_layer_stack.with_startup_warnings(startup_warnings),
-        None => config_layer_stack,
-    })
+    config_layer_stack.is_projectless = is_projectless;
+    startup_warnings.extend(ignored_config_warning(
+        &config_layer_stack,
+        &requirements_layers,
+    ));
+    Ok(config_layer_stack.with_startup_warnings(startup_warnings))
 }
 
 async fn load_user_config_layer(
@@ -676,8 +645,9 @@ fn validate_cli_overrides_strictly(
     base_dir: &Path,
 ) -> io::Result<()> {
     let _guard = AbsolutePathBufGuard::new(base_dir);
-    if let Some(ignored_path) = ignored_toml_value_field::<ConfigToml>(cli_overrides_layer.clone())
+    if let Some(path) = ignored_toml_value_fields::<ConfigToml>(cli_overrides_layer.clone()).first()
     {
+        let ignored_path = path.join(".");
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown configuration field `{ignored_path}` in -c/--config override"),
@@ -1034,6 +1004,7 @@ fn apply_credential_broker_requirements(
 
 struct ProjectTrustContext {
     project_root: AbsolutePathBuf,
+    has_project_root_marker: bool,
     project_root_key: String,
     project_root_lookup_keys: Vec<String>,
     checkout_root: Option<AbsolutePathBuf>,
@@ -1182,8 +1153,10 @@ fn sanitize_project_config(
         {
             ignored_keys.push("features.shell_snapshot".to_string());
         }
-        if features.remove("respect_system_proxy").is_some() {
-            ignored_keys.push("features.respect_system_proxy".to_string());
+        for key in ["respect_system_proxy", "system_proxy_fallback"] {
+            if features.remove(key).is_some() {
+                ignored_keys.push(format!("features.{key}"));
+            }
         }
         if credential_broker_configured
             && features
@@ -1286,7 +1259,9 @@ async fn project_trust_context(
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
     };
 
-    let project_root = find_project_root(fs, cwd, project_root_markers).await?;
+    let discovered_root = discover_project_root(fs, cwd, project_root_markers).await?;
+    let has_project_root_marker = discovered_root.is_some();
+    let project_root = discovered_root.unwrap_or_else(|| cwd.clone());
     let projects = project_trust_config.projects.unwrap_or_default();
 
     let project_root_lookup_keys = normalized_project_trust_keys(project_root.as_path());
@@ -1351,6 +1326,7 @@ async fn project_trust_context(
 
     Ok(ProjectTrustContext {
         project_root,
+        has_project_root_marker,
         project_root_key,
         project_root_lookup_keys,
         checkout_root,
@@ -1394,7 +1370,8 @@ pub fn project_trust_key(path: &Path) -> String {
         .unwrap_or_else(|| normalize_project_trust_lookup_key(path.to_string_lossy().to_string()))
 }
 
-fn normalized_project_trust_keys(path: &Path) -> Vec<String> {
+/// Returns canonical and original path spellings in trust-lookup precedence order.
+pub fn normalized_project_trust_keys(path: &Path) -> Vec<String> {
     let normalized_path = normalize_project_trust_lookup_key(path.to_string_lossy().to_string());
     let normalized_canonical_path = normalize_project_trust_lookup_key(
         normalize_path(path)
@@ -1494,13 +1471,25 @@ fn copy_shape_from_original(original: &TomlValue, resolved: &TomlValue) -> TomlV
     }
 }
 
-async fn find_project_root(
+/// Finds the nearest ancestor with a configured project marker, or returns `cwd`.
+/// Callers must use markers from configuration loaded before project layers.
+pub async fn find_project_root(
     fs: &dyn ExecutorFileSystem,
     cwd: &AbsolutePathBuf,
     project_root_markers: &[String],
 ) -> io::Result<AbsolutePathBuf> {
+    Ok(discover_project_root(fs, cwd, project_root_markers)
+        .await?
+        .unwrap_or_else(|| cwd.clone()))
+}
+
+async fn discover_project_root(
+    fs: &dyn ExecutorFileSystem,
+    cwd: &AbsolutePathBuf,
+    project_root_markers: &[String],
+) -> io::Result<Option<AbsolutePathBuf>> {
     if project_root_markers.is_empty() {
-        return Ok(cwd.clone());
+        return Ok(None);
     }
 
     for ancestor in cwd.ancestors() {
@@ -1526,10 +1515,10 @@ async fn find_project_root(
             {
                 continue;
             }
-            return Ok(ancestor);
+            return Ok(Some(ancestor));
         }
     }
-    Ok(cwd.clone())
+    Ok(None)
 }
 
 async fn find_git_checkout_root(

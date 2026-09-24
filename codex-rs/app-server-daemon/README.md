@@ -40,7 +40,7 @@ should parse that JSON rather than relying on human-readable text. Lifecycle
 responses report the resolved backend, socket path, local CLI version, and
 running app-server version when applicable.
 
-Standalone-managed daemons check for updates after five minutes, then hourly by
+Eligible managed daemons check for updates after five minutes, then hourly by
 default. Edit `CODEX_HOME/app-server-daemon/settings.json` to change this:
 
 ```json
@@ -53,13 +53,13 @@ Positive minute intervals have no configured cap. `daemon restart` applies the
 enabled state; the next updater wait reads a new interval. The preference does
 not affect an explicit `codex update` command or `daemon update`.
 
-`daemon update` checks the latest stable release once, even with automatic
-updates disabled. It requires a Codex installer-owned latest-channel standalone
-install. JSON reports `updated`, `noUpdate`, or `unsupported`, with installed
-and running versions. The updater owns scheduled and manual installs. A manual
-update restarts a running managed daemon, so active or queued work may be
-interrupted.
-Accepted updates continue if the CLI exits. Installer errors return nonzero.
+`daemon update` selects the latest stable release, even with automatic updates
+disabled. It also returns pinned or local managed packages to production update
+eligibility, preserving the automatic-update preference. Legacy installations
+migrate to the dedicated root once the published installer and release support
+migration. JSON reports `updated`, `noUpdate`, or `unsupported`, with installed
+and running versions. A running daemon restarts, so active or queued work may be
+interrupted; a stopped daemon stays stopped. Installer errors return nonzero.
 The updater uses saved network settings; CLI `-c` overrides do not reach it.
 
 For all managed app-server shutdowns, including explicit stop and restart and
@@ -77,22 +77,54 @@ npm install -g @mmmbuto/codex-cli-termux@latest
 codex app-server daemon bootstrap --remote-control
 ```
 
+On Windows, use a non-elevated PowerShell terminal whose host allows breakaway:
+
+```powershell
+irm https://chatgpt.com/codex/install.ps1 | iex
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+& "$codexHome\packages\standalone\current\bin\codex.exe" app-server daemon bootstrap --remote-control
+```
+
+`bootstrap` can use any complete CLI package. If no daemon package is installed,
+it copies the invoking package into `CODEX_HOME/packages/app-server-daemon` and
+prints an installation message without asking for confirmation. Existing daemon
+packages are reused, including legacy installations; a broken selection is not
+silently replaced. A bare executable cannot supply a new installation.
+
+It records the daemon settings under `CODEX_HOME/app-server-daemon/`, starts app-server as a
+pidfile-backed detached process. It launches a detached updater loop when
+automatic updates are enabled, the installer selected the stable `latest`
+channel, and the managed binary supports the updater command.
+
 On Android, `bootstrap` uses the native `codex.bin` path supplied by the package
-launcher through `CODEX_SELF_EXE` as the managed executable. It records the daemon settings under
-`CODEX_HOME/app-server-daemon/`, starts app-server as a pidfile-backed detached
-process, and keeps automatic updater fetches disabled for this Termux fork.
+launcher through `CODEX_SELF_EXE` as the managed executable, and keeps automatic
+updater fetches disabled for this Termux fork.
 
 ## Installation and update cases
 
-The daemon assumes Codex Termux is installed through the fork npm package. On
-Android it launches the native package path supplied by `CODEX_SELF_EXE`; other Unix
-targets retain the upstream standalone path under `CODEX_HOME`.
+New daemons use `CODEX_HOME/packages/app-server-daemon/current/bin/codex`
+(`codex.exe` on Windows). The package contains the executable and its helpers.
+Daemon-only installer updates leave the user's CLI command and shell setup alone.
+
+Previously launched legacy daemons retain `CODEX_HOME/packages/standalone/current`,
+including its flat binary layout when present. Starts and scheduled updates keep
+using that location. An explicit production update prepares and validates a
+compatible dedicated package before stopping the legacy updater and daemon,
+selecting the new package, and restarting only a previously running daemon.
+The old CLI package files and selection remain unchanged.
 
 | Situation | What starts | Does this daemon fetch new binaries? | Does a running app-server eventually move to a newer binary on its own? |
 | --- | --- | --- | --- |
 | The fork npm package has run, but only `start` is used | On Android, `start` uses the native `codex.bin` path from `CODEX_SELF_EXE` | No | No. The managed path is used when starting or restarting, but no updater is installed. |
 | The fork npm package has run, then `bootstrap` is used | The pidfile backend uses the native managed path supplied by the launcher | No. Bootstrap stops any stale updater loop and leaves `autoUpdateEnabled` false. | No. Update with `npm install -g @mmmbuto/codex-cli-termux@latest`, then restart the daemon. |
 | Some other tool updates the managed binary path | The next fresh start or restart uses the updated file at that path | No | No. Restart app-server after updating the managed path. |
+
+### Managed packages
+
+For dedicated and retained legacy daemon installations:
+
+- lifecycle commands use the selected daemon package, regardless of the invoking
+  CLI version; they do not implicitly replace an existing package
 
 ### Termux npm installs
 

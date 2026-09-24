@@ -86,7 +86,10 @@ pub(crate) fn test_mcp_config(codex_home: PathBuf) -> McpConfig {
     McpConfig {
         chatgpt_base_url: "https://chatgpt.com".to_string(),
         apps_mcp_product_sku: None,
+        requires_read_only_mcp_tools: false,
         codex_home,
+        mcp_enterprise_managed_auth: None,
+        xaa_enabled: false,
         mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode::default(),
         oauth_refresh_mode: McpOAuthRefreshMode::Legacy,
         auth_keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -125,6 +128,63 @@ pub(crate) fn test_elicitation_config(
         .server_permission_profiles
         .insert(server_name.to_string(), permission_profile);
     Arc::new(config)
+}
+
+#[test]
+fn ema_catalog_supports_configured_installed_and_selected_plugins_without_widening_policy() {
+    let server: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "url": "https://resource.example/mcp", "auth": "ema_auth",
+        "oauth": { "client_id": "resource-client", "authorization_server_issuer": "https://as.example" }
+    })).unwrap();
+    let plugin = McpPluginAttribution::agent_plugin("plugin@test".into(), "Plugin".into());
+    let mut catalog = ResolvedMcpCatalog::builder();
+    catalog.register(McpServerRegistration::from_config(
+        "configured".into(),
+        server.clone(),
+    ));
+    catalog.register(McpServerRegistration::from_plugin(
+        "installed".into(),
+        plugin.clone(),
+        /*plugin_order*/ 0,
+        server.clone(),
+    ));
+    catalog.register(McpServerRegistration::from_selected_plugin(
+        "selected".into(),
+        plugin,
+        /*selection_order*/ 0,
+        server,
+    ));
+    let mut config = test_mcp_config(PathBuf::new());
+    let idp = codex_config::McpServerIdpOAuthConfig {
+        issuer: "https://idp.example".into(),
+        client_id: "enterprise-client".into(),
+    };
+    let deny_all = codex_protocol::mcp_policy::EnvironmentMcpPolicy {
+        servers: Some(Default::default()),
+        plugins: None,
+    };
+    for (xaa_enabled, denied) in [(true, false), (true, true), (false, false)] {
+        let mut catalog = catalog.clone();
+        if xaa_enabled {
+            catalog.enable_ema(idp.clone());
+        }
+        config.mcp_server_catalog = catalog.build_with_environment_authority(|_| {
+            if denied {
+                crate::McpEnvironmentAuthority::Restricted(&deny_all)
+            } else {
+                crate::McpEnvironmentAuthority::Unrestricted
+            }
+        });
+        let servers = effective_mcp_servers(&config, /*auth*/ None);
+        for name in ["configured", "installed", "selected"] {
+            assert_eq!(servers[name].enabled(), xaa_enabled && !denied, "{name}");
+            assert_eq!(
+                servers[name].config().oauth_idp(),
+                xaa_enabled.then_some(&idp)
+            );
+            assert_eq!(servers[name].config().auth, McpServerAuth::EmaAuth);
+        }
+    }
 }
 
 #[test]
@@ -253,7 +313,7 @@ fn mcp_prompt_auto_approval_rejects_auto_mode_in_default_permission_mode() {
 }
 
 #[test]
-fn tool_plugin_provenance_collects_app_and_mcp_sources() {
+fn tool_plugin_context_collects_app_and_mcp_sources() {
     let mut config = test_mcp_config(PathBuf::new());
     let mut catalog = ResolvedMcpCatalog::builder();
     catalog.register(McpServerRegistration::from_plugin(
@@ -289,11 +349,12 @@ fn tool_plugin_provenance_collects_app_and_mcp_sources() {
                 ..PluginCapabilitySummary::default()
             },
         ]);
-    let provenance = tool_plugin_provenance(&config);
+    let provenance = tool_plugin_context(&config);
 
     assert_eq!(
         provenance,
-        ToolPluginProvenance {
+        ToolPluginContext {
+            disabled_connector_ids: HashSet::new(),
             plugin_display_names_by_connector_id: HashMap::from([
                 (
                     "connector_example".to_string(),
@@ -351,11 +412,12 @@ fn selected_mcp_attribution_does_not_join_an_unrelated_local_summary() {
             },
         ]);
 
-    let provenance = tool_plugin_provenance(&config);
+    let provenance = tool_plugin_context(&config);
 
     assert_eq!(
         provenance,
-        ToolPluginProvenance {
+        ToolPluginContext {
+            disabled_connector_ids: HashSet::new(),
             plugin_display_names_by_connector_id: HashMap::new(),
             plugin_display_names_by_mcp_server_name: HashMap::from([(
                 "github".to_string(),

@@ -281,7 +281,7 @@ impl App {
         ) {
             label_parts.push(format!("{} to switch", binding.display_label()));
         }
-        label_parts.push("ctrl + c to close".to_string());
+        label_parts.push("ctrl+c to close".to_string());
         self.chat_widget
             .set_side_conversation_context_label(Some(format!("Side {}", label_parts.join(" · "))));
     }
@@ -425,14 +425,14 @@ impl App {
     ) -> bool {
         if let Err(message) = self.interrupt_side_thread(app_server, thread_id).await {
             tracing::warn!("{message}");
-            self.chat_widget.add_error_message(message);
+            self.add_agents_overview_error(message);
             return false;
         }
         if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
             let message =
                 format!("Failed to close side conversation {thread_id}; it is still open: {err}");
             tracing::warn!("{message}");
-            self.chat_widget.add_error_message(message);
+            self.add_agents_overview_error(message);
             return false;
         }
         self.abandoned_side_threads.insert(thread_id);

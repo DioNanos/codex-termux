@@ -188,9 +188,18 @@ def stage_python_sdk_package(
 def stage_python_runtime_package(
     staging_dir: Path,
     codex_version: str,
-    package_archive: Path,
+    package_source: Path,
     platform_tag: str | None = None,
 ) -> Path:
+    if package_source.is_dir():
+        source = package_source.resolve()
+        destination = staging_dir.resolve()
+        if source.is_relative_to(destination) or destination.is_relative_to(source):
+            raise RuntimeError("Codex package and runtime staging directories must not overlap")
+        for path in package_source.rglob("*"):
+            if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                raise RuntimeError(f"Expected a regular Codex package entry: {path}")
+
     package_version = normalize_codex_version(codex_version)
     _copy_package_tree(python_runtime_root(), staging_dir)
 
@@ -202,7 +211,12 @@ def stage_python_runtime_package(
         pyproject_text = _rewrite_runtime_platform_tag(pyproject_text, platform_tag)
     pyproject_path.write_text(pyproject_text)
 
-    _extract_codex_package_archive(package_archive, staged_runtime_package_root(staging_dir))
+    runtime_package_root = staged_runtime_package_root(staging_dir)
+    if package_source.is_dir():
+        shutil.copytree(package_source, runtime_package_root, dirs_exist_ok=True)
+        _validate_codex_package_layout(runtime_package_root, package_source)
+    else:
+        _extract_codex_package_archive(package_source, runtime_package_root)
     return staging_dir
 
 
@@ -220,7 +234,7 @@ def _extract_codex_package_archive(package_archive: Path, runtime_package_root: 
     _validate_codex_package_layout(runtime_package_root, package_archive)
 
 
-def _validate_codex_package_layout(package_dir: Path, package_archive: Path) -> None:
+def _validate_codex_package_layout(package_dir: Path, package_source: Path) -> None:
     missing_entries = []
     if not (package_dir / CODEX_PACKAGE_METADATA).is_file():
         missing_entries.append(CODEX_PACKAGE_METADATA)
@@ -235,7 +249,7 @@ def _validate_codex_package_layout(package_dir: Path, package_archive: Path) -> 
         missing_entries.append(str(Path("bin") / runtime_code_mode_host_name()))
     if missing_entries:
         missing = ", ".join(missing_entries)
-        raise RuntimeError(f"Missing Codex package layout entries in {package_archive}: {missing}")
+        raise RuntimeError(f"Missing Codex package layout entries in {package_source}: {missing}")
 
 
 def _flatten_string_enum_one_of(definition: dict[str, Any]) -> bool:
@@ -561,11 +575,30 @@ def generate_v2_all(schema_dir: Path) -> None:
             ],
             cwd=sdk_root(),
         )
+    _preserve_inline_image_class_names(out_path)
     _require_nullable_chatgpt_account_email(out_path)
     _preserve_reasoning_effort_enum(out_path)
     _preserve_thread_source_enum(out_path)
     _preserve_plan_type_enum(out_path)
     _normalize_generated_timestamps(out_path)
+
+
+def _preserve_inline_image_class_names(out_path: Path) -> None:
+    """Keep the public class names used before ImageReference was introduced."""
+    source = out_path.read_text()
+    stable_names = {
+        "UrlUserInput": "ImageUserInput",
+        "ImageUrlContentItem": "InputImageContentItem",
+        "ImageUrlFunctionCallOutputContentItem": "InputImageFunctionCallOutputContentItem",
+    }
+    for generated_name, stable_name in stable_names.items():
+        if source.count(f"class {generated_name}(") != 1:
+            raise RuntimeError(f"Generated SDK is missing a unique {generated_name} class")
+        if re.search(rf"\b{re.escape(stable_name)}\b", source):
+            raise RuntimeError(f"Generated SDK already defines {stable_name}")
+        source = re.sub(rf"\b{re.escape(generated_name)}\b", stable_name, source)
+
+    out_path.write_text(source)
 
 
 def _require_nullable_chatgpt_account_email(out_path: Path) -> None:
@@ -1405,9 +1438,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory for the staged runtime package",
     )
     stage_runtime_parser.add_argument(
-        "package_archive",
+        "package_source",
         type=Path,
-        help="Path to a Codex package .tar.gz archive for this platform.",
+        help="Path to a Codex package directory or .tar.gz archive for this platform.",
     )
     stage_runtime_parser.add_argument(
         "--codex-version",
@@ -1462,7 +1495,7 @@ def run_command(args: argparse.Namespace, ops: CliOps) -> None:
         ops.stage_python_runtime_package(
             args.staging_dir,
             normalize_codex_version(args.codex_version),
-            args.package_archive.resolve(),
+            args.package_source.resolve(),
             args.platform_tag,
         )
 

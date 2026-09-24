@@ -3,7 +3,6 @@ use std::sync::Arc;
 use async_channel::Receiver;
 use async_channel::Sender;
 use codex_async_utils::OrCancelExt;
-use codex_extension_api::LoadedUserInstructions;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -74,10 +73,7 @@ pub(crate) async fn run_codex_thread_interactive(
 
     let conversation_history = initial_history.unwrap_or(InitialHistory::New);
     let forked_from_thread_id = conversation_history.forked_from_id();
-    let user_instructions = LoadedUserInstructions {
-        instructions: parent_session.user_instructions().await,
-        warnings: Vec::new(),
-    };
+    let instructions = parent_session.inherited_instructions().await;
     let session_source = SessionSource::SubAgent(subagent_source.clone());
     let is_guardian_reviewer = crate::guardian::is_basic_session_source(&session_source);
     let extensions = if isolation == codex_extension_api::SessionIsolation::Isolated {
@@ -85,15 +81,13 @@ pub(crate) async fn run_codex_thread_interactive(
     } else {
         Arc::clone(&parent_session.services.extensions)
     };
-    // Inline delegates never register with ThreadManager or receive on_thread_ready.
-    // Bind their standalone spawn path before inherited extensions run.
     let mut thread_extension_init = codex_extension_api::ExtensionDataInit::default();
     thread_extension_init.insert(isolation);
-    thread_extension_init.insert(crate::guardian::GuardianReviewSessionHost::default());
     let (session, io) = Session::spawn(SessionSpawnArgs {
+        startup: None,
         config,
         allow_provider_model_fallback: false,
-        user_instructions,
+        instructions,
         installation_id: parent_session.installation_id.clone(),
         auth_manager,
         models_manager,
@@ -133,6 +127,7 @@ pub(crate) async fn run_codex_thread_interactive(
         client_mcp_extensions: parent_session.services.client_mcp_extensions.clone(),
         reserved_thread_id: None,
         analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
+        image_store: Arc::clone(&parent_session.services.image_store),
         thread_store: Arc::clone(&parent_session.services.thread_store),
         attestation_provider: parent_session.services.attestation_provider.clone(),
         external_time_provider: Some(Arc::clone(&parent_session.services.time_provider)),
@@ -145,7 +140,7 @@ pub(crate) async fn run_codex_thread_interactive(
     let thread_config = session.thread_config_snapshot().await;
     let client_metadata = parent_session.app_server_client_metadata().await;
     emit_subagent_session_started(
-        &parent_session.services.analytics_events_client,
+        &session.services.analytics_events_client,
         client_metadata,
         session.session_id(),
         session.thread_id(),
@@ -204,7 +199,7 @@ pub(crate) async fn run_codex_thread_one_shot(
     // requiring the caller to cancel the parent token.
     let child_cancel = cancel_token.child_token();
     let parent_turn_id = parent_ctx.sub_id.clone();
-    let parent_environments = parent_ctx.environments.clone();
+    let parent_environments = parent_ctx.initial_environments.clone();
     let root_turn_id = parent_ctx.turn_metadata_state.root_turn_id();
     let (session, io) = Box::pin(run_codex_thread_interactive(
         config,

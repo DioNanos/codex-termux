@@ -1,4 +1,4 @@
-//! Covers effort selection, catalog overrides, and persistent-context transitions.
+//! Covers effort selection and persistent-context transitions.
 
 use super::*;
 use crate::context::world_state::WorldState;
@@ -13,23 +13,19 @@ fn persistent_instructions_follow_effort_and_catalog_updates_without_duplicates(
     let replacement = format!("{REPLACEMENT_NOTICE}\n\nupdated instructions");
 
     for (effort, instructions, expected) in [
-        (None, None, None),
+        (None, "", None),
+        (persistent.clone(), "instructions", Some("instructions")),
+        (persistent.clone(), "instructions", None),
         (
             persistent.clone(),
-            Some("instructions"),
-            Some("instructions"),
-        ),
-        (persistent.clone(), Some("instructions"), None),
-        (
-            persistent.clone(),
-            Some("updated instructions"),
+            "updated instructions",
             Some(replacement.as_str()),
         ),
-        (persistent.clone(), Some(""), Some(REMOVAL_NOTICE)),
-        (persistent.clone(), Some(""), None),
-        (persistent, Some("instructions"), Some("instructions")),
-        (medium.clone(), None, Some(REMOVAL_NOTICE)),
-        (medium, None, None),
+        (persistent.clone(), "", Some(REMOVAL_NOTICE)),
+        (persistent.clone(), "", None),
+        (persistent, "instructions", Some("instructions")),
+        (medium.clone(), "", Some(REMOVAL_NOTICE)),
+        (medium, "", None),
     ] {
         let mut world_state = WorldState::default();
         world_state.add_section(
@@ -79,7 +75,7 @@ fn retained_persistent_instructions_are_replaced_or_retired_without_a_snapshot()
             PersistentModeState::new(
                 "test-model",
                 Some(&effort),
-                Some("current instructions"),
+                "current instructions",
                 /*send_user_message_async_available*/ false,
             )
             .expect("test instructions should be valid"),
@@ -103,7 +99,7 @@ fn persistent_instructions_reject_oversized_values() {
     let error = PersistentModeState::new(
         "test-model",
         Some(&ReasoningEffort::Persistent),
-        Some(&oversized),
+        oversized.as_str(),
         /*send_user_message_async_available*/ false,
     )
     .expect_err("oversized persistent instructions must be rejected");
@@ -116,37 +112,34 @@ fn persistent_instructions_reject_oversized_values() {
 
 #[test]
 fn persistent_instructions_preserve_empty_none_and_exact_limit() {
+    let bundled = codex_prompts::ResolvedModelMessages::bundled()
+        .persistent_instructions()
+        .trim()
+        .to_string();
     let built_in = PersistentModeState::new(
         "test-model",
         Some(&ReasoningEffort::Persistent),
-        None,
+        &bundled,
         false,
     )
-    .expect("missing instructions should use the built-in");
+    .expect("bundled instructions should be valid");
     assert_eq!(
         built_in.body().trim(),
-        DEFAULT_INSTRUCTIONS
-            .trim()
-            .replace("{{ approval_request_channel }}", "")
+        bundled.replace("{{ approval_request_channel }}", "")
     );
     assert!(
-        PersistentModeState::new(
-            "test-model",
-            Some(&ReasoningEffort::Persistent),
-            Some(""),
-            false,
-        )
-        .expect("empty instructions should disable the section")
-        .body()
-        .trim()
-        .is_empty()
+        PersistentModeState::new("test-model", Some(&ReasoningEffort::Persistent), "", false,)
+            .expect("empty instructions should disable the section")
+            .body()
+            .trim()
+            .is_empty()
     );
 
     let exact = "x".repeat(8 * 1024);
     let state = PersistentModeState::new(
         "test-model",
         Some(&ReasoningEffort::Persistent),
-        Some(&exact),
+        exact.as_str(),
         false,
     )
     .expect("8 KiB instructions should pass");
@@ -164,7 +157,7 @@ fn persistent_instructions_validate_after_placeholder_rendering() {
     let error = PersistentModeState::new(
         "test-model",
         Some(&ReasoningEffort::Persistent),
-        Some(&source),
+        source.as_str(),
         true,
     )
     .expect_err("placeholder expansion over the cap must be rejected");

@@ -46,6 +46,7 @@ async fn replay_preserves_typed_updates_before_voice_steers_the_turn() {
         ReplayKind::ThreadSnapshot,
     );
     chat.flush_answer_stream_with_separator();
+    commit_realtime_history_events(&mut chat, &mut events);
     let rendered = std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match event {
             AppEvent::InsertHistoryCell(cell) => Some(
@@ -121,6 +122,7 @@ async fn in_progress_voice_replay_restores_the_late_reasoning_guard() {
         );
         assert!(chat.is_realtime_delegated_reasoning_turn(turn_id));
     }
+    commit_realtime_history_events(&mut chat, &mut events);
     while let Ok(event) = events.try_recv() {
         if let AppEvent::InsertHistoryCell(cell) = event {
             let rendered = cell
@@ -167,6 +169,7 @@ async fn accepted_voice_answer_with_only_an_old_caption_returns_to_history_on_cl
     chat.on_realtime_conversation_closed(Some("transport_closed".into()));
     chat.restore_undelivered_realtime_speech(delivery_id);
     let mut answers = 0;
+    commit_realtime_history_events(&mut chat, &mut events);
     while let Ok(event) = events.try_recv() {
         if let AppEvent::InsertHistoryCell(cell) = event {
             let rendered = cell
@@ -312,6 +315,7 @@ async fn captioned_voice_answer_does_not_duplicate_on_close() {
     chat.reset_realtime_conversation();
     chat.restore_undelivered_realtime_speech(delivery_id);
     let mut rendered = Vec::new();
+    commit_realtime_history_events(&mut chat, &mut events);
     while let Ok(event) = events.try_recv() {
         if let AppEvent::InsertHistoryCell(cell) = event {
             rendered.extend(
@@ -327,27 +331,16 @@ async fn captioned_voice_answer_does_not_duplicate_on_close() {
 #[tokio::test]
 async fn restored_partial_caption_accepts_late_completion_without_duplicate_history() {
     let (mut chat, _sender, mut events, _ops) = make_chatwidget_manual_with_sender().await;
-    chat.config.animations = false;
+    chat.local_settings.tui.animations = false;
     chat.restore_realtime_transcript_cells(VecDeque::from([
         super::super::RealtimeTranscriptRecord {
             role: "user".into(),
             text: "last ".into(),
             complete: false,
+            before_turn_id: None,
         },
     ]));
-    let live = chat
-        .realtime_conversation
-        .live_transcript_cell
-        .as_ref()
-        .unwrap();
-    insta::assert_snapshot!(
-        "restored_voice_partial_live",
-        live.display_lines(/*width*/ 80)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    assert!(chat.realtime_conversation.live_transcript_cell.is_none());
     chat.on_realtime_transcript_delta("user".into(), "words".into());
     let retained = chat.take_realtime_transcript_cells_for_replay();
     assert_eq!(retained.len(), 1);
@@ -361,6 +354,7 @@ async fn restored_partial_caption_accepts_late_completion_without_duplicate_hist
         "last words"
     );
     assert!(chat.realtime_conversation.accepted_transcripts[0].complete);
+    commit_realtime_history_events(&mut chat, &mut events);
     let rendered = std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match event {
             AppEvent::InsertHistoryCell(cell) => Some(
@@ -383,6 +377,7 @@ async fn empty_late_completion_discards_the_restored_partial() {
             role: "user".into(),
             text: "unfinished".into(),
             complete: false,
+            before_turn_id: None,
         },
     ]));
     chat.on_realtime_transcript_done("user".into(), String::new());

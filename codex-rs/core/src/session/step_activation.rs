@@ -2,6 +2,7 @@
 
 use super::session::Session;
 use super::session::SessionConfiguration;
+use super::step_context::StepInputs;
 use super::step_settings::ResolvedStepSettings;
 use super::step_settings::StepSettingsConstraints;
 use super::step_settings::StepSettingsUpdate;
@@ -10,8 +11,8 @@ use crate::config::Config;
 use crate::config::ConstraintResult;
 use crate::context::GuardianNodeReplPolicy;
 use crate::exec_policy::AllowPrefixRules;
-use crate::guardian::BUNDLED_GUARDIAN_POLICY_TEMPLATE;
 use codex_features::Feature;
+use codex_prompts::ResolvedModelMessages;
 use codex_protocol::openai_models::GuardianV2ModelConfig;
 use codex_protocol::openai_models::GuardianV2TranscriptModelConfig;
 use codex_protocol::openai_models::MODEL_SPECIALTY_CYBER;
@@ -95,7 +96,7 @@ fn check_legacy_model_safety(
         return Err("the destination model has only fallback metadata".to_string());
     }
     let retained_models = [admitted, current];
-    // guardian::review::record_guardian_denial still selects its circuit-breaker
+    // The Guardian reviewer extension still selects its circuit-breaker
     // policy from the admitted model's Cyber classification.
     let destination_is_cyber =
         destination.model_specialty.as_deref() == Some(MODEL_SPECIALTY_CYBER);
@@ -175,52 +176,47 @@ fn check_legacy_model_safety(
     // catalog refresh. V1 uses the admitted config; V2 can use the live config.
     // An unchanged explicit reviewer override prevents both fallback paths.
     if destination.auto_review_model_override.is_none() {
-        let destination_node_repl_policy = GuardianNodeReplPolicy::from_model_messages(
-            &destination.slug,
-            destination.model_messages.as_ref(),
-        )
-        .map_err(|error| error.to_string())?;
+        let destination_model_messages = ResolvedModelMessages::from_model(destination);
+        let destination_auto_review = destination_model_messages.auto_review();
+        // codex-vl: the parent-fallback policy source stays fail-closed. Every
+        // compared model (destination and retained) is validated before the
+        // policy comparison, so an oversized catalog message refuses the model
+        // switch instead of flowing into the Guardian prompt.
+        GuardianNodeReplPolicy::from_messages(&destination.slug, destination_model_messages)
+            .map_err(|error| error.to_string())?;
         for model in retained_models {
-            let policy = GuardianNodeReplPolicy::from_model_messages(
+            GuardianNodeReplPolicy::from_messages(
                 &model.slug,
-                model.model_messages.as_ref(),
+                ResolvedModelMessages::from_model(model),
             )
             .map_err(|error| error.to_string())?;
-            if policy != destination_node_repl_policy {
-                return Err(
-                    "the destination changes the Guardian parent-fallback node REPL policy"
-                        .to_string(),
-                );
-            }
+        }
+        let retained_model_messages = retained_models.map(ResolvedModelMessages::from_model);
+        let retained_auto_review = retained_model_messages
+            .each_ref()
+            .map(ResolvedModelMessages::auto_review);
+        if retained_auto_review.iter().any(|auto_review| {
+            auto_review.node_repl_policy != destination_auto_review.node_repl_policy
+        }) {
+            return Err(
+                "the destination changes the Guardian parent-fallback node REPL policy".to_string(),
+            );
         }
         for config in [admitted_config, live_config] {
-            let destination_policy =
-                config.resolve_guardian_policy(destination.model_messages.as_ref());
-            if retained_models.iter().any(|model| {
-                config.resolve_guardian_policy(model.model_messages.as_ref()) != destination_policy
+            let destination_policy = config.resolve_guardian_policy(destination_model_messages);
+            if retained_model_messages.iter().any(|model_messages| {
+                config.resolve_guardian_policy(*model_messages) != destination_policy
             }) {
                 return Err(
                     "the destination changes the Guardian parent-fallback policy".to_string(),
                 );
             }
         }
-        let destination_template = destination
-            .model_messages
-            .as_ref()
-            .and_then(|messages| messages.auto_review.as_ref())
-            .and_then(|messages| messages.policy_template.as_deref())
-            .unwrap_or(BUNDLED_GUARDIAN_POLICY_TEMPLATE)
-            .trim_end();
-        if retained_models.iter().any(|model| {
-            model
-                .model_messages
-                .as_ref()
-                .and_then(|messages| messages.auto_review.as_ref())
-                .and_then(|messages| messages.policy_template.as_deref())
-                .unwrap_or(BUNDLED_GUARDIAN_POLICY_TEMPLATE)
-                .trim_end()
-                != destination_template
-        }) {
+        let destination_template = destination_auto_review.policy_template.trim_end();
+        if retained_auto_review
+            .iter()
+            .any(|auto_review| auto_review.policy_template.trim_end() != destination_template)
+        {
             return Err(
                 "the destination changes the Guardian parent-fallback policy template".to_string(),
             );
@@ -268,7 +264,7 @@ impl Session {
                             (
                                 Arc::clone(&task.turn_context),
                                 Arc::clone(&task.done),
-                                task.turn_context.current_settings.load_full(),
+                                task.turn_context.next_step_input.load_full(),
                             )
                         })
                 })
@@ -296,7 +292,7 @@ impl Session {
         // settings rules. The task can progress, finish, or be cancelled while
         // preparation awaits; no publication locks are held here.
         let prepared = self
-            .prepare_step_settings_activation(&turn_context, &current, &update)
+            .prepare_step_settings_activation(&turn_context, &current.settings, &update)
             .await;
         let active = self.active_turn.lock().await;
         let Some(task) = active.as_ref().and_then(|active| active.task.as_ref()) else {
@@ -307,7 +303,7 @@ impl Session {
         // A mismatch abandons the update without retrying or retargeting.
         if !Arc::ptr_eq(&task.done, &task_done)
             || !Arc::ptr_eq(&task.turn_context, &turn_context)
-            || !Arc::ptr_eq(&task.turn_context.current_settings.load_full(), &current)
+            || !Arc::ptr_eq(&task.turn_context.next_step_input.load_full(), &current)
             || task.cancellation_token.is_cancelled()
         {
             return TurnSettingsUpdateOutcome::TargetUnavailable;
@@ -335,7 +331,7 @@ impl Session {
                 }
                 check_legacy_turn_safety(
                     &turn_context,
-                    &current,
+                    &current.settings,
                     &destination,
                     &state.session_configuration.original_config_do_not_use,
                 )
@@ -346,8 +342,11 @@ impl Session {
         // Publish the immutable snapshot. Frozen initial settings, existing step
         // captures, and future thread settings are not changed.
         task.turn_context
-            .current_settings
-            .store(Arc::new(destination));
+            .next_step_input
+            .store(Arc::new(StepInputs {
+                settings: Arc::new(destination),
+                environments: current.environments.clone(),
+            }));
         TurnSettingsUpdateOutcome::Applied
     }
 
@@ -381,7 +380,6 @@ impl Session {
                 &constraints,
                 self.services.models_manager.as_ref(),
                 &overrides,
-                self.features.enabled(Feature::Personality),
                 self.features.enabled(Feature::FastMode),
             )
             .await

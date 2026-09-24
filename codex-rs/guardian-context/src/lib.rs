@@ -4,8 +4,8 @@
 //! without section composition.
 //! Contributor failures abort collection without returning partial context.
 //! Sections preserve source-specific evidence and share prompt framing, while
-//! profiles retain the consumer-specific transcript policy. Hosts own full/delta
-//! cursors, compaction and request lifecycles.
+//! profiles retain the consumer-specific transcript policy. Shared full/delta selection
+//! proposes cursors; hosts own their admission, compaction and request lifecycles.
 //! Registered contributors declare their scope once and are collected only for
 //! matching context consumers. History and collection settings are borrowed for
 //! each request so the default registry can be reused without retaining state.
@@ -18,11 +18,13 @@ use codex_protocol::models::ResponseItem;
 use authorization::RootConversationSection;
 use authorization::TrustedUserAnswersSection;
 use retained_instructions::RetainedUserInstructionsSection;
+use sender_user_messages::SenderUserMessagesSection;
 use transcript::ConversationTranscriptSection;
 
 pub use action::ActionPresentation;
 pub use action::PlannedAction;
 pub use action::PlannedActionKind;
+pub use action::action_for_review;
 pub use authorization::GuardianRootMessage;
 pub use section::ContextSection;
 
@@ -43,6 +45,7 @@ pub use verified_answers::render_verified_answer;
 pub use verified_answers::render_verified_answers;
 
 mod retained_instructions;
+mod sender_user_messages;
 
 mod action;
 mod enforcement;
@@ -52,6 +55,7 @@ pub use enforcement::HistoryTruncation;
 pub(crate) use enforcement::Retention;
 mod budget;
 mod composition;
+mod cursor;
 pub use budget::DEFAULT_MAX_INPUT_TOKENS;
 pub use budget::REQUEST_TOKENS_BOUNDARIES;
 pub use budget::REQUEST_TOKENS_METRIC;
@@ -61,6 +65,9 @@ pub use budget::SECTION_COST_METRIC;
 pub use budget::SectionCost;
 pub use budget::effective_input_token_limit;
 pub use budget::estimate_input_tokens;
+pub use cursor::TranscriptCursor;
+pub use cursor::TranscriptMode;
+pub use cursor::TranscriptSelection;
 mod profile;
 pub use composition::CollectedContext;
 pub use composition::ComposedContext;
@@ -249,6 +256,7 @@ pub fn default_registry() -> &'static SectionRegistry {
         registry.register(trusted_tool::TrustedToolSection);
         registry.register(trusted_skills::TrustedSkillsSection);
         registry.register(RootConversationSection);
+        registry.register(SenderUserMessagesSection);
         registry.register(RetainedUserInstructionsSection);
         registry.register(TrustedUserAnswersSection);
         registry.register(ConversationTranscriptSection);

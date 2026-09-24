@@ -84,6 +84,9 @@ async fn check_for_update(
     .with_legacy_custom_ca_fallback();
     let source = current_update_source(action);
     let latest_version = match action {
+        // codex-termux fork: daemon update is routed to the fork npm channel
+        // (see UpdateAction::Daemon), so no version check is needed here.
+        Some(UpdateAction::Daemon(_)) => return Ok(()),
         // This fork is not distributed through Homebrew, so a brew install can
         // only have come from the npm package; ask the registry directly for the
         // published version instead of upstream's two-step release/npm check.
@@ -128,6 +131,9 @@ async fn check_for_update(
 
 fn current_update_source(action: Option<UpdateAction>) -> &'static str {
     match action {
+        // codex-termux fork: daemon updates follow the fork npm channel; the
+        // caller short-circuits with an early return before reading the source.
+        Some(UpdateAction::Daemon(_)) => "npm",
         Some(UpdateAction::NpmGlobalLatest) => "npm",
         Some(UpdateAction::BunGlobalLatest) => "bun",
         Some(UpdateAction::VitePlusGlobalLatest) => "npm",

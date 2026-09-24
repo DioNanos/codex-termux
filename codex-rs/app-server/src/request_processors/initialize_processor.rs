@@ -14,6 +14,7 @@ use codex_protocol::mcp::OPENAI_ELICITATION_EXTENSION_ID;
 use super::*;
 use crate::message_processor::ConnectionSessionState;
 use crate::message_processor::InitializedConnectionSessionState;
+use crate::transport::ConnectionOrigin;
 
 const NON_ORIGINATING_CLIENT_NAMES: &[&str] = &["codex_app_server_daemon", "codex-backend"];
 
@@ -95,14 +96,14 @@ impl InitializeRequestProcessor {
                 "Invalid clientInfo.name: '{name}'. Must be a valid HTTP header value."
             )));
         }
-        // The bundled TUI shares this build and implements the typed verification UI.
-        // Independently deployed UIs need their own rollout before receiving this mode.
+        // Activate only the embedded TUI and local desktop host. Client-supplied
+        // extensions cannot opt other hosts into verification.
         let user_verification_enabled = experimental_api_enabled
             && matches!(
-                session.origin,
-                crate::transport::ConnectionOrigin::InProcess
+                (session.origin, name.as_str()),
+                (ConnectionOrigin::InProcess, "codex-tui")
+                    | (ConnectionOrigin::Stdio, "Codex Desktop")
             )
-            && name == "codex-tui"
             && tokio::task::spawn_blocking(self.user_verification.device_supported)
                 .await
                 .unwrap_or(false);
@@ -171,6 +172,22 @@ impl InitializeRequestProcessor {
         set_default_client_residency_requirement(self.config.enforce_residency.value());
         if mutates_global_identity && let Ok(mut suffix) = USER_AGENT_SUFFIX.lock() {
             *suffix = Some(user_agent_suffix);
+        }
+
+        #[cfg(windows)]
+        if matches!(session.origin, ConnectionOrigin::Stdio) && name == "Codex Desktop" {
+            // Uninstall ownership must not depend on account sign-in or sandbox setup.
+            // Keep this bounded attempt ahead of the response; background registration can race uninstall.
+            let home = codex_home.clone();
+            if !matches!(
+                tokio::task::spawn_blocking(move || {
+                    codex_windows_sandbox::register_desktop_installation(&home)
+                })
+                .await,
+                Ok(Ok(()))
+            ) {
+                tracing::warn!("could not register desktop uninstall ownership");
+            }
         }
 
         let user_agent = get_codex_user_agent();

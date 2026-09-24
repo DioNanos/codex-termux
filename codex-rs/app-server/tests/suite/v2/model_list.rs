@@ -39,14 +39,16 @@ use wiremock::matchers::path;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 
-#[test_case(None, false; "default off")]
-#[test_case(None, true; "app rollout")]
-#[test_case(Some(false), true; "user opt out")]
-#[test_case(Some(true), false; "user opt in")]
+#[test_case(None, false, true; "default off")]
+#[test_case(None, true, true; "app rollout")]
+#[test_case(Some(false), true, true; "user opt out")]
+#[test_case(Some(true), false, true; "user opt in")]
+#[test_case(Some(true), false, false; "base URL without catalog opt in")]
 #[tokio::test]
 async fn api_key_model_discovery_startup_enablement_respects_user_config(
     user_enablement: Option<bool>,
     app_enablement: bool,
+    catalog_opt_in: bool,
 ) -> Result<()> {
     let server = MockServer::start().await;
     let mut remote_model = codex_models_manager::bundled_models_response()?
@@ -69,9 +71,24 @@ async fn api_key_model_discovery_startup_enablement_respects_user_config(
     let feature_config = user_enablement
         .map(|enabled| format!("[features]\napi_key_model_discovery = {enabled}\n"))
         .unwrap_or_default();
+    let catalog_config = if catalog_opt_in {
+        format!("model_catalog_url = \"{server_uri}/v1/models\"\n")
+    } else {
+        String::new()
+    };
     std::fs::write(
         codex_home.path().join("config.toml"),
-        format!("openai_base_url = \"{server_uri}/v1\"\n{feature_config}"),
+        format!(
+            r#"
+model_provider = "catalog-test"
+{feature_config}
+[model_providers.catalog-test]
+name = "OpenAI"
+base_url = "{server_uri}/v1"
+requires_openai_auth = true
+{catalog_config}
+"#
+        ),
     )?;
     login_with_api_key(
         codex_home.path(),
@@ -113,7 +130,7 @@ async fn api_key_model_discovery_startup_enablement_respects_user_config(
             },
         })
         .await?;
-    let enabled = user_enablement.unwrap_or(app_enablement);
+    let enabled = user_enablement.unwrap_or(app_enablement) && catalog_opt_in;
     let expected = if enabled { &remote } else { &bundled };
     assert_eq!(
         response,
@@ -135,7 +152,8 @@ async fn api_key_model_discovery_startup_enablement_respects_user_config(
                 .received_requests()
                 .await
                 .expect("request recording is enabled")
-                .is_empty()
+                .iter()
+                .all(|request| request.url.path() != "/v1/models")
         );
     }
     Ok(())
@@ -188,6 +206,7 @@ fn model_from_preset(preset: &ModelPreset) -> Model {
             })
             .collect(),
         default_service_tier: preset.default_service_tier.clone(),
+        available_access_programs: preset.available_access_programs.clone().map(Into::into),
         is_default: preset.is_default,
     }
 }
@@ -275,43 +294,52 @@ async fn list_models_uses_remote_catalog_as_source_of_truth(
     api_key: Option<&str>,
 ) -> Result<()> {
     let server = MockServer::start().await;
-    let remote_models = [json!("2030-01-01T00:00:00Z"), serde_json::Value::Null]
-        .into_iter()
-        .enumerate()
-        .map(|(priority, retirement_at)| {
-            serde_json::from_value::<ModelInfo>(json!({
-                "slug": format!("remote-only-{priority}"),
-                "display_name": "Remote Only",
-                "description": "Remote-only model for app-server model/list coverage",
-                "model_specialty": MODEL_SPECIALTY_CYBER,
-                "default_reasoning_level": "max",
-                "supported_reasoning_levels": [
-                    {"effort": "max", "description": "Maximum"},
-                    {"effort": "low", "description": "Low"},
-                    {"effort": "focused", "description": "Focused"}
-                ],
-                "shell_type": "shell_command",
-                "visibility": "list",
-                "minimal_client_version": [0, 1, 0],
-                "supported_in_api": true,
-                "priority": priority,
-                "upgrade": {
-                    "model": "replacement-model",
-                    "migration_markdown": "Use the replacement model.",
-                    "retirement_at": retirement_at,
-                },
-                "support_verbosity": false,
-                "default_verbosity": null,
-                "apply_patch_tool_type": null,
-                "truncation_policy": {"mode": "bytes", "limit": 10_000},
-                "supports_image_detail_original": false,
-                "multi_agent_version": "v2",
-                "context_window": 272_000,
-                "max_context_window": 272_000,
-                "experimental_supported_tools": [],
-            }))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let remote_models = [
+        (
+            json!("2030-01-01T00:00:00Z"),
+            json!({ "cyber": ["standard", "daybreak_blue"] }),
+        ),
+        (json!(null), json!({ "cyber": ["daybreak_red"] })),
+        (json!(null), json!({ "cyber": [] })),
+        (json!(null), json!(null)),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(priority, (retirement_at, access_programs))| {
+        serde_json::from_value::<ModelInfo>(json!({
+            "slug": format!("remote-only-{priority}"),
+            "display_name": "Remote Only",
+            "description": "Remote-only model for app-server model/list coverage",
+            "model_specialty": MODEL_SPECIALTY_CYBER,
+            "available_access_programs": access_programs,
+            "default_reasoning_level": "max",
+            "supported_reasoning_levels": [
+                {"effort": "max", "description": "Maximum"},
+                {"effort": "low", "description": "Low"},
+                {"effort": "focused", "description": "Focused"}
+            ],
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "minimal_client_version": [0, 1, 0],
+            "supported_in_api": true,
+            "priority": priority,
+            "upgrade": {
+                "model": "replacement-model",
+                "migration_markdown": "Use the replacement model.",
+                "retirement_at": retirement_at,
+            },
+            "support_verbosity": false,
+            "default_verbosity": null,
+            "apply_patch_tool_type": null,
+            "truncation_policy": {"mode": "bytes", "limit": 10_000},
+            "supports_image_detail_original": false,
+            "multi_agent_version": "v2",
+            "context_window": 272_000,
+            "max_context_window": 272_000,
+            "experimental_supported_tools": [],
+        }))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
     // The startup refresh worker and model/list can both fetch before the cache is populated.
     let _models_mock = Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -334,9 +362,14 @@ async fn list_models_uses_remote_catalog_as_source_of_truth(
 model = "mock-model"
 approval_policy = "never"
 sandbox_mode = "read-only"
-openai_base_url = "{server_uri}/v1"
+model_provider = "catalog-test"
 [features]
 api_key_model_discovery = true
+[model_providers.catalog-test]
+name = "OpenAI"
+base_url = "{server_uri}/v1"
+requires_openai_auth = true
+model_catalog_url = "{server_uri}/v1/models"
 "#
         ),
     )?;
@@ -378,6 +411,20 @@ api_key_model_discovery = true
     assert_eq!(
         response.result["data"][1]["upgradeInfo"]["retirementAt"],
         serde_json::Value::Null
+    );
+    assert_eq!(
+        response.result["data"]
+            .as_array()
+            .expect("model/list data should be an array")
+            .iter()
+            .map(|model| model["availableAccessPrograms"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            json!({ "cyber": ["standard", "daybreakBlue"] }),
+            json!({ "cyber": ["daybreakRed"] }),
+            json!({ "cyber": [] }),
+            json!(null),
+        ]
     );
     let ModelListResponse {
         data: items,

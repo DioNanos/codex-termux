@@ -463,9 +463,11 @@ impl ResponseItem {
             .extend(calls);
     }
 
-    /// Marks a host-owned cell's recorded tool calls as complete.
+    /// Marks a host-owned direct invocation or Code Mode cell's call inventory as complete.
+    /// Always includes this output's call list, which can be an empty delta for a terminal wait.
     pub fn mark_tool_calls_complete(&mut self) {
         if let Some(metadata) = self.ensure_tool_call_metadata() {
+            metadata.executed_tool_calls.get_or_insert_default();
             metadata.tool_calls_complete = Some(true);
         }
     }
@@ -483,6 +485,31 @@ impl ResponseItem {
     /// Returns warehouse-only attempted-tool metadata for any supported item variant.
     pub fn executed_tool_call_metadata(&self) -> Option<&InternalChatMessageMetadataPassthrough> {
         self.internal_chat_message_metadata_passthrough()
+    }
+
+    /// Compares raw result metadata and its call bindings, ignoring other internal metadata.
+    pub fn has_same_tool_result_metadata(&self, other: &Self) -> bool {
+        fn result_metadata(
+            item: &ResponseItem,
+        ) -> impl Iterator<Item = (usize, &str, &ExecutedToolCallArguments, &ToolResultMetadata)>
+        {
+            item.executed_tool_call_metadata()
+                .and_then(|metadata| metadata.executed_tool_calls.as_ref())
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter(|(_, call)| call.tool_result_metadata.is_some())
+                .map(|(index, call)| {
+                    (
+                        index,
+                        call.name.as_str(),
+                        call.arguments(),
+                        &call.tool_result_metadata,
+                    )
+                })
+        }
+
+        result_metadata(self).eq(result_metadata(other))
     }
 
     /// Omits raw tool results without changing existing call, source or completion metadata.

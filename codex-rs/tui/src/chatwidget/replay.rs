@@ -102,6 +102,9 @@ impl ChatWidget {
     /// avoid triggering side effects. Event ids are passed as `None` to
     /// distinguish replayed events from live ones.
     pub(crate) fn replay_thread_turns(&mut self, turns: Vec<Turn>, replay_kind: ReplayKind) {
+        if !turns.is_empty() || matches!(replay_kind, ReplayKind::ThreadSnapshot) {
+            self.bottom_pane.dismiss_composer_sparkle();
+        }
         if matches!(replay_kind, ReplayKind::ThreadSnapshot) && !turns.is_empty() {
             self.warning_display_state.startup_complete = true;
         }
@@ -112,6 +115,7 @@ impl ChatWidget {
             }))
             .collect::<Vec<_>>();
         for (turn, hidden_nested_review_turn) in turns.into_iter().zip(hidden_nested_review_turns) {
+            self.restore_realtime_transcripts_before_turn(&turn.id);
             // Defer completed metadata-only turns until their page loads. Active
             // turns must restore their lifecycle even before any items are available.
             if turn.status == TurnStatus::Completed
@@ -241,7 +245,21 @@ impl ChatWidget {
         turn_id: String,
         replay_kind: ReplayKind,
     ) {
-        self.handle_thread_item(item, turn_id, ThreadItemRenderSource::Replay(replay_kind));
+        match item {
+            // Snapshots contain the completed item, without the live start that renders its diff.
+            ThreadItem::FileChange {
+                changes,
+                status: codex_app_server_protocol::PatchApplyStatus::Completed,
+                ..
+            } => {
+                if !changes.is_empty() {
+                    self.on_patch_apply_begin(file_update_changes_to_display(changes));
+                }
+            }
+            item => {
+                self.handle_thread_item(item, turn_id, ThreadItemRenderSource::Replay(replay_kind));
+            }
+        }
     }
 
     pub(super) fn handle_thread_item(
@@ -256,6 +274,15 @@ impl ChatWidget {
             ThreadItem::UserMessage {
                 content, client_id, ..
             } => {
+                if let Some(replies) = crate::async_question_reply::parse_input(&content) {
+                    let ids = replies
+                        .into_iter()
+                        .map(|reply| reply.question_item_id)
+                        .collect::<Vec<_>>();
+                    self.bottom_pane.question_editor().resolve_answers(&ids);
+                    self.refresh_pending_input_preview();
+                    self.request_redraw();
+                }
                 self.on_committed_user_message(
                     &content,
                     client_id.as_deref(),
@@ -445,7 +472,7 @@ impl ChatWidget {
                 agents_states,
             }),
             item @ ThreadItem::SubAgentActivity { .. } => self.on_sub_agent_activity(item),
-            ThreadItem::DynamicToolCall { .. } => {}
+            item @ ThreadItem::DynamicToolCall { .. } => self.on_dynamic_tool_item(item),
             ThreadItem::Sleep(_) => {}
         }
 

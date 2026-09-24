@@ -319,16 +319,24 @@ mod tests {
                 model_json_with_slug_and_instructions("cache-ok-2", 8 * 1024),
             ]
         });
-        fs::write(&path, serde_json::to_vec(&payload).expect("serialize cache fixture"))
-            .await
-            .expect("write cache fixture");
+        fs::write(
+            &path,
+            serde_json::to_vec(&payload).expect("serialize cache fixture"),
+        )
+        .await
+        .expect("write cache fixture");
 
         let loaded = load_fresh_file(&path, Duration::from_secs(60), "0.153.3")
             .await
             .expect("one oversized cached model must not fail the whole cache")
             .expect("fresh cache is served");
         assert_eq!(loaded.models.len(), 2, "the two valid models are loaded");
-        assert!(loaded.models.iter().all(|model| model.slug != "cache-too-long"));
+        assert!(
+            loaded
+                .models
+                .iter()
+                .all(|model| model.slug != "cache-too-long")
+        );
     }
 
     #[tokio::test]
@@ -340,9 +348,12 @@ mod tests {
             "client_version": "0.153.3",
             "models": [model_json_with_persistent_instructions(8 * 1024 + 1)]
         });
-        fs::write(&path, serde_json::to_vec(&payload).expect("serialize cache fixture"))
-            .await
-            .expect("write cache fixture");
+        fs::write(
+            &path,
+            serde_json::to_vec(&payload).expect("serialize cache fixture"),
+        )
+        .await
+        .expect("write cache fixture");
 
         let error = load_fresh_file(&path, Duration::from_secs(60), "0.153.3")
             .await

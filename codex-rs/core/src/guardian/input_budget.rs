@@ -98,7 +98,7 @@ pub(crate) async fn finalize(
         ReasoningSummary::None,
         /*service_tier*/ None,
         &session
-            .responses_metadata(&step.turn, CodexResponsesRequestKind::Turn)
+            .responses_metadata(step, CodexResponsesRequestKind::Turn)
             .await,
     )?;
     let mut existing = super::request_budget::estimate_request_tokens(&request)
@@ -123,8 +123,7 @@ pub(crate) async fn finalize(
     if let Some(reminder) = session
         .services
         .agent_control
-        .rollout_budget()
-        .pending_reminder(session.thread_id(), &session.current_window_id().await)
+        .pending_budget_reminder(session.thread_id(), &session.current_window_id().await)
     {
         let reminder = ContextualUserFragment::into(crate::context::RolloutBudgetContext {
             remaining_tokens: reminder.remaining_tokens,

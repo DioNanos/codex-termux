@@ -35,7 +35,7 @@ use core_test_support::apps_test_server::SEARCH_CALENDAR_NAMESPACE;
 use core_test_support::apps_test_server::search_capable_apps_builder;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
-use core_test_support::context_snapshot::ContextSnapshotRenderMode;
+use core_test_support::context_snapshot::SnapshotEntry;
 use core_test_support::responses;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
@@ -161,7 +161,10 @@ impl McpServerContributor<Config> for AppsMcpServerContributor {
                     .expect("test Apps MCP server config should be valid"),
             );
             let contribution = if self.id == "hosted_plugin_runtime" {
-                McpServerContribution::HostedApps { config }
+                McpServerContribution::HostedApps {
+                    config,
+                    protocol_mode: None,
+                }
             } else {
                 McpServerContribution::Set {
                     name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
@@ -204,9 +207,7 @@ fn format_labeled_requests_snapshot(
     context_snapshot::format_labeled_requests_snapshot(
         scenario,
         sections,
-        &ContextSnapshotOptions::default()
-            .strip_capability_instructions()
-            .render_mode(ContextSnapshotRenderMode::KindWithTextPrefix { max_chars: 96 }),
+        &ContextSnapshotOptions::default().rewrite_known_segments(),
     )
 }
 
@@ -496,10 +497,7 @@ async fn root_reconciliation_reuses_pending_apps_startup() -> Result<()> {
                 ),
                 shell_environment_policy: Default::default(),
                 windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
-                windows_sandbox_private_desktop: test
-                    .config
-                    .permissions
-                    .windows_sandbox_private_desktop,
+                windows_sandbox_type: test.config.permissions.windows_sandbox_type,
                 use_legacy_landlock: test.config.features.use_legacy_landlock(),
                 exec_policy: None,
                 mcp_policy: None,
@@ -1235,12 +1233,13 @@ async fn deferred_tool_world_state_survives_resume_without_duplicate_updates() -
     assert!(tools_states[0][0].contains(SEARCH_CALENDAR_NAMESPACE));
     insta::assert_snapshot!(
         "deferred_tools_resume_without_duplicate_update",
-        format_labeled_requests_snapshot(
+        context_snapshot::format_context_snapshot(
             "Persisted deferred tools remain unchanged after resuming the thread.",
             &[
-                ("Before resume", &requests[0]),
-                ("After resume", &requests[1]),
+                SnapshotEntry::items(&requests[0].input()).labeled("Before resume"),
+                SnapshotEntry::items(&requests[1].input()).labeled("After resume"),
             ],
+            &ContextSnapshotOptions::default().rewrite_known_segments(),
         )
     );
 

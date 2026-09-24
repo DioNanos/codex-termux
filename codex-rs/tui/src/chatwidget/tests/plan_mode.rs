@@ -15,6 +15,7 @@ fn paste_hidden_plan_shell_payload(chat: &mut ChatWidget) -> String {
 
 fn plan_test_session(thread_id: ThreadId) -> crate::session_state::ThreadSessionState {
     crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -132,6 +133,7 @@ async fn plan_implementation_popup_yes_emits_submit_message_event() {
 
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
+    assert_matches!(rx.try_recv(), Ok(AppEvent::FollowTranscript));
     let event = rx.try_recv().expect("expected AppEvent");
     let AppEvent::SubmitUserMessageWithMode {
         text,
@@ -1249,6 +1251,7 @@ async fn submit_user_message_emits_structured_plugin_mentions_from_bindings() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -1329,10 +1332,7 @@ async fn enter_submits_when_plan_stream_is_not_active() {
 
     assert!(chat.input_queue.queued_user_messages.is_empty());
     match next_submit_op(&mut op_rx) {
-        Op::UserTurn {
-            personality: Some(Personality::Pragmatic),
-            ..
-        } => {}
+        Op::UserTurn { .. } => {}
         other => panic!("expected Op::UserTurn, got {other:?}"),
     }
 }
@@ -1720,7 +1720,6 @@ async fn collab_mode_is_sent_after_enabling() {
                     mode: ModeKind::Default,
                     ..
                 }),
-            personality: Some(Personality::Pragmatic),
             ..
         } => {}
         other => {
@@ -1744,7 +1743,6 @@ async fn collab_mode_applies_default_preset() {
                     mode: ModeKind::Default,
                     ..
                 }),
-            personality: Some(Personality::Pragmatic),
             ..
         } => {}
         other => {
@@ -1754,26 +1752,6 @@ async fn collab_mode_applies_default_preset() {
 
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Default);
     assert_eq!(chat.current_collaboration_mode().mode, ModeKind::Default);
-}
-
-#[tokio::test]
-async fn user_turn_includes_personality_from_config() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
-    chat.set_feature_enabled(Feature::Personality, /*enabled*/ true);
-    chat.thread_id = Some(ThreadId::new());
-    chat.set_model("gpt-5.5");
-    chat.set_personality(Personality::Friendly);
-
-    chat.bottom_pane
-        .set_composer_text("hello".to_string(), Vec::new(), Vec::new());
-    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    match next_submit_op(&mut op_rx) {
-        Op::UserTurn {
-            personality: Some(Personality::Friendly),
-            ..
-        } => {}
-        other => panic!("expected Op::UserTurn with friendly personality, got {other:?}"),
-    }
 }
 
 #[tokio::test]

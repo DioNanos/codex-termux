@@ -148,18 +148,39 @@ async fn installed_goal_tools_apply_maximum_token_budget() -> anyhow::Result<()>
 }
 
 #[tokio::test]
-async fn goal_tools_hidden_for_ephemeral_threads() -> anyhow::Result<()> {
+async fn ephemeral_goal_tools_preserve_specs_but_reject_execution() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
     let tools = installed_tools_with_start(
-        runtime,
+        runtime.clone(),
         thread_id,
         SessionSource::Cli,
         /*persistent_thread_state_available*/ false,
     )
     .await;
 
-    assert_eq!(Vec::<String>::new(), tool_names(&tools));
+    let parent_tools = installed_tools(runtime, ThreadId::new()).await;
+    assert_eq!(
+        tools.iter().map(|tool| tool.spec()).collect::<Vec<_>>(),
+        parent_tools
+            .iter()
+            .map(|tool| tool.spec())
+            .collect::<Vec<_>>(),
+    );
+    for tool in tools {
+        let Err(error) = tool
+            .handle(tool_call(&tool.tool_name().name, "ephemeral", json!({})))
+            .await
+        else {
+            panic!("ephemeral goal execution should fail");
+        };
+        assert_eq!(
+            error,
+            FunctionCallError::RespondToModel(
+                "Goal tools require a persistent thread.".to_string()
+            )
+        );
+    }
     Ok(())
 }
 
@@ -242,6 +263,19 @@ async fn create_goal_resets_baseline_before_turn_stop_accounting() -> anyhow::Re
     let thread_id = test_thread_id()?;
     seed_thread_metadata(runtime.as_ref(), thread_id).await?;
     let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    // A missing baseline must not panic or seed accounting with invented token usage.
+    for contributor in harness.registry.turn_lifecycle_contributors() {
+        contributor
+            .on_turn_start(TurnStartInput {
+                turn_id: "missing-baseline",
+                collaboration_mode: &default_collaboration_mode(),
+                token_usage_at_turn_start: None,
+                session_store: &harness.session_store,
+                thread_store: &harness.thread_store,
+                turn_store: &ExtensionData::new("missing-baseline"),
+            })
+            .await;
+    }
     harness
         .start_turn(
             "turn-1",
@@ -1745,7 +1779,7 @@ impl GoalExtensionHarness {
                 .on_turn_start(TurnStartInput {
                     turn_id,
                     collaboration_mode: &collaboration_mode,
-                    token_usage_at_turn_start: usage,
+                    token_usage_at_turn_start: Some(usage),
                     session_store: &self.session_store,
                     thread_store: &self.thread_store,
                     turn_store: &turn_store,

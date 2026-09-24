@@ -275,6 +275,14 @@ stream_max_retries = 0
             crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
         )
         .await?;
+    for cwd in [&app.config.cwd, &other.session.cwd] {
+        crate::legacy_core::config::set_project_trust_level(
+            app.config.codex_home.as_path(),
+            cwd.as_path(),
+            codex_protocol::config_types::TrustLevel::Trusted,
+        )
+        .map_err(std::io::Error::other)?;
+    }
     app.thread_event_channels.insert(
         other_id,
         ThreadEventChannel::new_with_session(
@@ -906,7 +914,9 @@ goals = true
         return Ok(());
     }
 
-    drive_until_request_count(&mut app, &mut app_server, &server, expected_request_count).await;
+    let retry_thread_id = app.chat_widget.thread_id().expect("retry thread id");
+    // Capture the completed retry before processing its automatic goal continuation.
+    wait_for_turn_completed(&mut app, &mut app_server, retry_thread_id).await;
     let mut replayed_history = String::new();
     while let Ok(event) = app_event_rx.try_recv() {
         if let AppEvent::InsertHistoryCell(cell) = event {
@@ -915,7 +925,8 @@ goals = true
                 .as_any()
                 .is::<crate::history_cell::FinalMessageSeparator>()
             {
-                replayed_history.push_str(&normalize_completion_timestamps(rendered));
+                replayed_history
+                    .push_str(&normalize_completion_timestamps(cell.as_ref(), rendered));
             } else {
                 replayed_history.push_str(&rendered);
             }
@@ -943,7 +954,7 @@ goals = true
         insta::assert_snapshot!("safety_retry_committed_steer_history", rendered_retry);
     }
 
-    let retry_thread_id = app.chat_widget.thread_id().expect("retry thread id");
+    drive_until_request_count(&mut app, &mut app_server, &server, expected_request_count).await;
     let source = app_server
         .thread_read(source_thread_id, /*include_turns*/ true)
         .await?;

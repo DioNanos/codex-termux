@@ -2,11 +2,15 @@
 
 #[path = "tests/daybreak_tests.rs"]
 mod daybreak_tests;
+#[path = "tests/math_interruption_tests.rs"]
+mod math_interruption_tests;
 
 #[path = "tests/advanced_reasoning_tests.rs"]
 mod advanced_reasoning_tests;
 #[path = "tests/agents_navigation_tests.rs"]
 mod agents_navigation_tests;
+#[path = "tests/approvals_reviewer_error_tests.rs"]
+mod approvals_reviewer_error_tests;
 #[path = "tests/backend_banner_fallback_tests.rs"]
 mod backend_banner_fallback_tests;
 #[path = "tests/backend_banner_recovery_tests.rs"]
@@ -17,14 +21,22 @@ mod backend_banner_startup_tests;
 mod background_exit_tests;
 #[path = "tests/background_task_defaults_tests.rs"]
 mod background_task_defaults_tests;
+#[path = "tests/browsing_pagination_tests.rs"]
+mod browsing_pagination_tests;
 #[path = "tests/buffered_replay.rs"]
 mod buffered_replay;
 #[path = "tests/connector_policy.rs"]
 mod connector_policy;
 #[path = "tests/disconnect_tests.rs"]
 mod disconnect;
+#[path = "tests/fork_workspace_roots_tests.rs"]
+mod fork_workspace_roots_tests;
+#[path = "tests/fresh_sparkle_tests.rs"]
+mod fresh_sparkle_tests;
 #[path = "tests/key_chords.rs"]
 mod key_chords;
+#[path = "tests/local_command_scroll_tests.rs"]
+mod local_command_scroll_tests;
 #[path = "tests/luna_reserve_recovery_tests.rs"]
 mod luna_reserve_recovery_tests;
 #[path = "tests/mcp_startup.rs"]
@@ -38,6 +50,13 @@ mod model_defaults;
 mod pagination_completion_tests;
 #[path = "tests/patch_approval_tests.rs"]
 mod patch_approval_tests;
+#[path = "tests/permission_selection_tests.rs"]
+mod permission_selection_tests;
+#[path = "tests/unavailable_commands_tests.rs"]
+mod unavailable_commands;
+
+#[path = "tests/history_hydration_tests.rs"]
+mod history_hydration_tests;
 #[path = "tests/permission_shortcuts_tests.rs"]
 mod permission_shortcuts_tests;
 mod plugin_catalog;
@@ -57,6 +76,8 @@ mod safety_buffering;
 mod session_lifecycle_requests;
 mod session_summary;
 mod startup;
+#[path = "tests/startup_frame_tests.rs"]
+mod startup_frame_tests;
 #[path = "tests/startup_warnings_tests.rs"]
 mod startup_warnings_tests;
 #[path = "tests/stream_animation_tests.rs"]
@@ -65,14 +86,19 @@ mod stream_animation_tests;
 mod thread_usage;
 #[path = "tests/transcript_composer.rs"]
 mod transcript_composer;
+#[path = "tests/transcript_selection.rs"]
+mod transcript_selection;
 #[path = "tests/turn_submission.rs"]
 mod turn_submission;
 #[path = "tests/user_verification_routes_tests.rs"]
 mod user_verification_routes;
+#[path = "tests/worktree_background_terminals_tests.rs"]
+mod worktree_background_terminals_tests;
 
 use super::*;
 use crate::app_backtrack::BacktrackSelection;
 use crate::app_backtrack::BacktrackState;
+use crate::app_backtrack::nth_user_position;
 use crate::app_backtrack::user_count;
 use crate::app_event::HistoryBatchEntryResponse;
 
@@ -179,7 +205,6 @@ use codex_protocol::protocol::SessionSource as RolloutSessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
-use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::user_input::TextElement;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -398,6 +423,7 @@ async fn handle_mcp_inventory_result_respects_origin_thread() {
 
     app.handle_mcp_inventory_result(
         Ok(vec![McpServerStatus {
+            server_capabilities: None,
             tools_error: None,
             name: "docs".to_string(),
             runtime_status: None,
@@ -436,7 +462,7 @@ fn bypass_hook_trust_startup_warning_snapshot() {
             "`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."
                 .to_string(),
         )
-        .display_lines(/*width*/ 80),
+        .transcript_lines(/*width*/ 80),
     );
 
     assert_app_snapshot!("bypass_hook_trust_startup_warning", rendered);
@@ -460,7 +486,7 @@ async fn cyber_model_auto_review_notice_snapshot() -> Result<()> {
         Ok(AppEvent::InsertHistoryCell(cell)) => cell,
         other => panic!("expected InsertHistoryCell event, got {other:?}"),
     };
-    let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
+    let rendered = lines_to_single_string(&cell.transcript_lines(/*width*/ 80));
     assert_app_snapshot!("cyber_model_auto_review_notice", rendered);
     Ok(())
 }
@@ -1784,6 +1810,8 @@ async fn replay_thread_snapshot_restores_collaboration_mode_without_input() {
             reasoning_effort: Some(Some(ReasoningEffortConfig::High)),
             developer_instructions: None,
         });
+    app.chat_widget
+        .set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::High));
     let input_state = app
         .chat_widget
         .capture_thread_input_state()
@@ -1791,6 +1819,8 @@ async fn replay_thread_snapshot_restores_collaboration_mode_without_input() {
 
     let (chat_widget, _app_event_tx, _rx, _new_op_rx) = make_chatwidget_manual_with_sender().await;
     app.chat_widget = chat_widget;
+    app.chat_widget
+        .set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::Low));
     app.chat_widget.handle_thread_session(session.clone());
     app.chat_widget
         .set_reasoning_effort(Some(ReasoningEffortConfig::Low));
@@ -1820,6 +1850,14 @@ async fn replay_thread_snapshot_restores_collaboration_mode_without_input() {
         ModeKind::Plan
     );
     assert_eq!(app.chat_widget.current_model(), "gpt-restored");
+    assert_eq!(
+        app.chat_widget.current_reasoning_effort(),
+        Some(ReasoningEffortConfig::High)
+    );
+    for _ in 0..2 {
+        app.chat_widget
+            .handle_key_event(KeyEvent::from(KeyCode::BackTab));
+    }
     assert_eq!(
         app.chat_widget.current_reasoning_effort(),
         Some(ReasoningEffortConfig::High)
@@ -3234,7 +3272,6 @@ default_permissions = "locked-down"
             approvals_reviewer: None,
             permission_profile: Some(app.config.permissions.permission_profile().clone()),
             active_permission_profile: app.config.permissions.active_permission_profile(),
-            windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
@@ -3328,7 +3365,6 @@ async fn update_feature_flags_enabling_guardian_selects_auto_review() -> Result<
             approvals_reviewer: Some(auto_review.approvals_reviewer),
             permission_profile: Some(auto_review.permission_profile()),
             active_permission_profile: Some(auto_review.active_permission_profile.clone()),
-            windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
@@ -3423,7 +3459,6 @@ async fn update_feature_flags_disabling_guardian_clears_review_policy_and_restor
             approvals_reviewer: Some(ApprovalsReviewer::User),
             permission_profile: None,
             active_permission_profile: None,
-            windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
@@ -3504,7 +3539,6 @@ async fn update_feature_flags_enabling_guardian_overrides_explicit_manual_review
             approvals_reviewer: Some(auto_review.approvals_reviewer),
             permission_profile: Some(auto_review.permission_profile()),
             active_permission_profile: Some(auto_review.active_permission_profile.clone()),
-            windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
@@ -3564,7 +3598,6 @@ async fn update_feature_flags_disabling_guardian_clears_manual_review_policy_wit
             approvals_reviewer: Some(ApprovalsReviewer::User),
             permission_profile: None,
             active_permission_profile: None,
-            windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
@@ -3762,7 +3795,7 @@ async fn side_defers_parent_approval_overlay_until_parent_replay() -> Result<()>
 }
 
 #[tokio::test]
-async fn replay_snapshot_with_pending_request_suppresses_replay_notices() {
+async fn replay_snapshot_with_pending_request_retains_warnings_without_covering_approval() {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let thread_id =
         ThreadId::from_string("00000000-0000-0000-0000-000000000011").expect("valid thread");
@@ -3796,14 +3829,19 @@ async fn replay_snapshot_with_pending_request_suppresses_replay_notices() {
     assert_eq!(app.chat_widget.has_active_view(), true);
 
     let mut replayed_history = String::new();
+    let mut warnings = Vec::new();
     while let Ok(event) = app_event_rx.try_recv() {
         if let AppEvent::InsertHistoryCell(cell) = event {
-            replayed_history.push_str(&lines_to_single_string(
-                &cell.transcript_lines(/*width*/ 80),
-            ));
+            warnings.extend(
+                cell.warning_entries()
+                    .into_iter()
+                    .map(|entry| entry.details),
+            );
+            replayed_history.push_str(&lines_to_single_string(&cell.display_lines(/*width*/ 80)));
         }
     }
 
+    assert_eq!(warnings, vec![stale_warning]);
     assert!(
         replayed_history.is_empty(),
         "expected pending approval replay to suppress session notices, got {replayed_history:?}"
@@ -4398,6 +4436,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
     let primary_cwd = test_path_buf("/tmp/main").abs();
     let shared_root = test_path_buf("/tmp/shared").abs();
     let primary_session = ThreadSessionState {
+        windows_sandbox_host: WindowsSandboxHost::Local,
         approval_policy: AskForApproval::OnRequest,
         permission_profile: PermissionProfile::workspace_write(),
         runtime_workspace_roots: vec![primary_cwd.clone(), shared_root.clone()],
@@ -4422,7 +4461,11 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
         ServerNotification::ThreadStarted(ThreadStartedNotification {
             thread: Thread {
                 originator: None,
-                environments: None,
+                environments: Some(vec![codex_app_server_protocol::ThreadEnvironment {
+                    environment_id: "remote".to_string(),
+                    cwd: test_path_buf("/tmp/agent").abs().into(),
+                    runtime_workspace_roots: Vec::new(),
+                }]),
                 id: agent_thread_id.to_string(),
                 extra: None,
                 session_id: agent_thread_id.to_string(),
@@ -4469,6 +4512,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
     drop(store);
 
     assert_eq!(session.thread_id, agent_thread_id);
+    assert_eq!(session.windows_sandbox_host, WindowsSandboxHost::Remote);
     assert_eq!(session.thread_name, Some("agent thread".to_string()));
     assert_eq!(session.model, "gpt-agent");
     assert_eq!(session.model_provider_id, "agent-provider");
@@ -5063,9 +5107,9 @@ async fn side_parent_status_prioritizes_input_over_approval() -> Result<()> {
     assert_snapshot!(
         format!("{input_footer}\n{approval_footer}\n{cleared_footer}"),
         @r"
-        Side from main thread · main needs input · ctrl + / to switch · ctrl + c to close
-        Side from main thread · main needs approval · ctrl + / to switch · ctrl + c to close
-        Side from main thread · ctrl + / to switch · ctrl + c to close
+        Side from main thread · main needs input · ctrl+/ to switch · ctrl+c to close
+        Side from main thread · main needs approval · ctrl+/ to switch · ctrl+c to close
+        Side from main thread · ctrl+/ to switch · ctrl+c to close
         "
     );
 
@@ -5078,6 +5122,7 @@ async fn side_thread_snapshot_hides_forked_parent_transcript() {
     let side_thread_id = ThreadId::new();
     let mut store = ThreadEventStore::new(/*capacity*/ 4);
     let session = ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         forked_from_id: Some(parent_thread_id),
         fork_parent_title: None,
         ..test_thread_session(side_thread_id, test_path_buf("/tmp/side"))
@@ -5145,6 +5190,7 @@ async fn side_thread_snapshot_skips_session_header_preamble() {
     let snapshot = ThreadEventSnapshot {
         delegated_turns: Vec::new(),
         session: Some(ThreadSessionState {
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
             forked_from_id: Some(parent_thread_id),
             fork_parent_title: None,
             ..test_thread_session(side_thread_id, test_path_buf("/tmp/side"))
@@ -5376,14 +5422,7 @@ async fn active_side_thread_renders_live_mcp_startup_notifications() {
             app.insert_history_cell(&mut tui, cell);
         }
     }
-    let inline = app
-        .transcript_cells
-        .iter()
-        .flat_map(|cell| cell.display_lines(/*width*/ 120))
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(inline.contains("1 MCP startup issue"));
+    assert_eq!(history_cell::warning_count(&app.transcript_cells), 1);
     let rendered = rendered_cells.join("\n");
     assert!(app.chat_widget.side_conversation_active());
     assert_eq!(rendered.matches("sentry is not logged in").count(), 1);
@@ -5726,6 +5765,7 @@ async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
     };
     let make_header = |is_first| -> Arc<dyn HistoryCell> {
         let session = ThreadSessionState {
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
             thread_id: ThreadId::new(),
             forked_from_id: None,
             fork_parent_title: None,
@@ -5751,6 +5791,7 @@ async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
             app.chat_widget.config_ref(),
             &app.local_settings,
             app.chat_widget.current_model(),
+            &session.model,
             &session,
             is_first,
             /*tooltip_override*/ None,
@@ -5808,13 +5849,71 @@ async fn clear_ui_after_long_transcript_snapshots_fresh_header_only() {
 }
 
 #[tokio::test]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "snapshot path rendering differs on Windows"
-)]
-async fn ctrl_l_clear_ui_after_long_transcript_reuses_clear_header_snapshot() {
-    let rendered = render_clear_ui_header_after_long_transcript_for_snapshot().await;
-    assert_app_snapshot!("clear_ui_after_long_transcript_fresh_header_only", rendered);
+async fn ctrl_l_clears_owned_history_and_preserves_the_draft() -> Result<()> {
+    let (mut app, _codex_home, thread_id) =
+        pagination_completion_tests::completed_history_app(&["Oldest", "Newest"]).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let started = app_server
+        .resume_thread(
+            &app.local_settings,
+            app.config.clone(),
+            thread_id,
+            crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+        )
+        .await?;
+    app.enqueue_primary_thread_session(started.session, started.turns)
+        .await?;
+    app.scrollback_has_older_history = app_server.has_older_history(thread_id);
+    assert!(app.scrollback_has_older_history);
+    let cursor = app_server
+        .begin_older_history_page(thread_id)
+        .expect("older page");
+    let page = app_server
+        .thread_items_page(
+            thread_id,
+            /*turn_id*/ None,
+            Some(cursor.clone()),
+            /*limit*/ 100,
+        )
+        .await?;
+    app.chat_widget.set_model("gpt-test");
+    app.chat_widget.insert_str("draft survives");
+    app.transcript_cells = vec![Arc::new(history_cell::PlainHistoryCell::new(
+        (0..50).map(|_| "old transcript row".into()).collect(),
+    ))];
+    tui.set_owned_screen(/*owned*/ true)?;
+    let size = ratatui::layout::Size::new(/*width*/ 80, /*height*/ 12);
+    app.render_owned_transcript(&mut tui, size)?;
+    app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+    )
+    .await?;
+    app.render_owned_transcript(&mut tui, size)?;
+    app.handle_older_history_page(&mut tui, &mut app_server, thread_id, &cursor, Ok(page))
+        .await?;
+    assert!(app_server.has_older_history(thread_id));
+    app.request_owned_history(&mut tui, &mut app_server);
+    assert!(!app_server.is_older_history_page_pending(thread_id, &cursor));
+    assert_eq!(app.transcript_cells.len(), 1);
+    assert!(
+        app.transcript_cells[0]
+            .as_any()
+            .is::<history_cell::SessionHeaderHistoryCell>()
+    );
+    let header = lines_to_single_string(&app.transcript_cells[0].display_lines(/*width*/ 80));
+    assert!(header.contains("gpt-test"));
+    assert!(!header.contains("old transcript row"));
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "draft survives"
+    );
+    assert!(tui.is_owned_screen());
+    tui.set_owned_screen(/*owned*/ false)?;
+    app_server.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -5879,10 +5978,14 @@ async fn make_test_app() -> App {
         runtime_permission_profile_override: None,
         file_search,
         transcript_cells: Vec::new(),
+        composer_tips: super::composer_hints::ComposerTips::new(/*seed*/ 0),
+        native_history: Default::default(),
+        transcript_view: Default::default(),
         last_rendered_history_tail: None,
         last_thread_usage_status_cell: None,
         pending_thread_usage_history_refresh: false,
         overlay: None,
+        retained_analytics: None,
         deferred_history_lines: Vec::new(),
         has_emitted_history_lines: false,
         transcript_reflow: TranscriptReflowState::default(),
@@ -5903,6 +6006,7 @@ async fn make_test_app() -> App {
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
         app_server_target: crate::AppServerTarget::Embedded,
         reconnect: Default::default(),
+        daemon_cli_executable: None,
         pending_update_action: None,
         pending_shutdown_exit_thread_id: None,
         windows_sandbox: WindowsSandboxState::default(),
@@ -5911,7 +6015,7 @@ async fn make_test_app() -> App {
         pending_realtime_transcript_replay: HashMap::new(),
         realtime_replay_order: VecDeque::new(),
         temporary_structured_requests: HashMap::new(),
-        pending_thread_titles: HashSet::new(),
+        pending_thread_titles: HashMap::new(),
         thread_event_listener_tasks: HashMap::new(),
         agent_navigation: AgentNavigationState::default(),
         pending_server_profiles: HashMap::new(),
@@ -5978,10 +6082,14 @@ pub(super) async fn make_test_app_with_channels() -> (
             runtime_permission_profile_override: None,
             file_search,
             transcript_cells: Vec::new(),
+            composer_tips: super::composer_hints::ComposerTips::new(/*seed*/ 0),
+            native_history: Default::default(),
+            transcript_view: Default::default(),
             last_rendered_history_tail: None,
             last_thread_usage_status_cell: None,
             pending_thread_usage_history_refresh: false,
             overlay: None,
+            retained_analytics: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
             transcript_reflow: TranscriptReflowState::default(),
@@ -6002,6 +6110,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
             app_server_target: crate::AppServerTarget::Embedded,
             reconnect: Default::default(),
+            daemon_cli_executable: None,
             pending_update_action: None,
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),
@@ -6010,7 +6119,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             pending_realtime_transcript_replay: HashMap::new(),
             realtime_replay_order: VecDeque::new(),
             temporary_structured_requests: HashMap::new(),
-            pending_thread_titles: HashSet::new(),
+            pending_thread_titles: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
             pending_server_profiles: HashMap::new(),
@@ -6270,6 +6379,7 @@ async fn replace_goal_confirmation_snapshot() {
 
 fn test_thread_session(thread_id: ThreadId, cwd: PathBuf) -> ThreadSessionState {
     ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -6469,8 +6579,7 @@ async fn capped_resize_reflow_renders_recent_suffix_only() {
             .map(rendered_line_text)
             .collect::<Vec<_>>(),
         vec![
-            "Earlier messages are available — press ctrl + t to view the full transcript"
-                .to_string(),
+            "Earlier messages are available — press ctrl+t to view the full transcript".to_string(),
             String::new(),
             "cell 18".to_string(),
             String::new(),
@@ -7261,27 +7370,6 @@ fn active_turn_interrupt_race_extracts_actual_turn_id_from_mismatch() {
 }
 
 #[tokio::test]
-async fn fresh_session_config_uses_current_service_tier() {
-    let mut app = make_test_app().await;
-    app.chat_widget.set_service_tier(Some(
-        codex_protocol::config_types::ServiceTier::Fast
-            .request_value()
-            .to_string(),
-    ));
-
-    let config = app.fresh_session_config();
-
-    assert_eq!(
-        config.service_tier,
-        Some(
-            codex_protocol::config_types::ServiceTier::Fast
-                .request_value()
-                .to_string()
-        )
-    );
-}
-
-#[tokio::test]
 async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
 
@@ -7307,6 +7395,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
 
     let make_header = |is_first| {
         let session = ThreadSessionState {
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
             thread_id: ThreadId::new(),
             forked_from_id: None,
             fork_parent_title: None,
@@ -7332,6 +7421,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
             app.chat_widget.config_ref(),
             &app.local_settings,
             app.chat_widget.current_model(),
+            &session.model,
             &session,
             is_first,
             /*tooltip_override*/ None,
@@ -7379,6 +7469,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
     let base_id = ThreadId::new();
     app.chat_widget
         .handle_thread_session(crate::session_state::ThreadSessionState {
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
             thread_id: base_id,
             forked_from_id: None,
             fork_parent_title: None,
@@ -7426,16 +7517,16 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
 
     app.apply_backtrack_selection(selection);
     let event = std::iter::from_fn(|| app_event_rx.try_recv().ok())
-        .find(|event| matches!(event, AppEvent::ForkSessionForPromptEdit { .. }))
+        .find(|event| matches!(event, AppEvent::RevertSessionForPromptEdit { .. }))
         .expect("prompt edit fork should be requested");
     assert_matches!(
         event,
-        AppEvent::ForkSessionForPromptEdit {
+        AppEvent::RevertSessionForPromptEdit {
             thread_id,
-            nth_user_message,
+            selected_cell,
             prompt,
         } if thread_id == expected.thread_id
-            && nth_user_message == expected.nth_user_message
+            && Arc::ptr_eq(&selected_cell, &app.transcript_cells[nth_user_position(&app.transcript_cells, expected.nth_user_message).unwrap()])
             && prompt == expected.prompt
     );
 
@@ -7451,7 +7542,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
 async fn backtrack_branch_failure_restores_selected_prompt_snapshot() {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
 
-    app.restore_backtrack_prompt_after_branch_error(
+    app.restore_backtrack_prompt_after_revert_error(
         crate::chatwidget::UserMessage::from("edit this prompt"),
         "branch unavailable",
     );
@@ -7597,10 +7688,10 @@ async fn in_app_resume_session_cwd_without_metadata_is_non_fatal() -> Result<()>
 
 #[tokio::test]
 async fn remote_resume_keeps_server_only_cwd_out_of_local_config() -> Result<()> {
-    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    // Keep the large setup and resume futures off the Windows test stack.
+    let (mut app, _app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
     let local_cwd = app.config.cwd.to_path_buf();
-    let local_workspace_roots = app
-        .rebuild_config_for_cwd(local_cwd.clone())
+    let local_workspace_roots = Box::pin(app.rebuild_config_for_cwd(local_cwd.clone()))
         .await?
         .workspace_roots;
     let remote_cwd = if cfg!(windows) {
@@ -7629,17 +7720,15 @@ async fn remote_resume_keeps_server_only_cwd_out_of_local_config() -> Result<()>
             auth_token: None,
         },
     };
-    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config))
-        .await?
-        .with_remote_cwd_override(Some(remote_cwd.clone()));
-    app_server
-        .resume_thread(
-            &crate::local_settings::LocalSettings::from(&app.config),
-            app.config.clone(),
-            ThreadId::from_string(&thread_id)?,
-            crate::app_server_session::ResumeModelSettings::RestoreFromThread,
-        )
-        .await?;
+    app.harness_overrides.cwd = Some(remote_cwd.clone());
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    Box::pin(app_server.resume_thread(
+        &crate::local_settings::LocalSettings::from(&app.config),
+        app.config.clone(),
+        ThreadId::from_string(&thread_id)?,
+        crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+    ))
+    .await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
     app.runtime_approval_policy_override = Some(RuntimeApprovalPolicyOverride::Restored(
         AskForApproval::Never,
@@ -7652,21 +7741,20 @@ async fn remote_resume_keeps_server_only_cwd_out_of_local_config() -> Result<()>
         RuntimePermissionProfileOverride::from_restored_config(&prior_config),
     );
 
-    let control = app
-        .resume_target_session(
-            &mut tui,
-            &mut app_server,
-            crate::resume_picker::SessionTarget {
-                path: Some(rollout_path),
-                thread_id: ThreadId::from_string(&thread_id)?,
-                cwd: None,
-                history_mode: None,
-            },
-        )
-        .await?;
+    let control = Box::pin(app.resume_target_session(
+        &mut tui,
+        &mut app_server,
+        crate::resume_picker::SessionTarget {
+            path: Some(rollout_path),
+            thread_id: ThreadId::from_string(&thread_id)?,
+            cwd: None,
+            history_mode: None,
+        },
+    ))
+    .await?;
 
     assert!(matches!(control, AppRunControl::Continue));
-    assert_eq!(app_server.remote_cwd_override(), Some(remote_cwd.as_path()));
+    assert_eq!(app.harness_overrides.cwd, Some(remote_cwd));
     assert!(!crate::session_resume::cwds_differ(
         app.config.cwd.as_path(),
         &local_cwd,
@@ -7715,6 +7803,20 @@ async fn in_app_resume_uses_configured_or_explicit_cwd() -> Result<()> {
             codex_home.join("config.toml"),
             format!("[tui]\nresume_cwd = \"{configured_mode}\"\n"),
         )?;
+        for cwd in [
+            &launch_cwd,
+            &active_cwd,
+            &session_cwd,
+            &explicit_cwd,
+            &runtime_cwd,
+        ] {
+            crate::legacy_core::config::set_project_trust_level(
+                &codex_home,
+                cwd,
+                codex_protocol::config_types::TrustLevel::Trusted,
+            )
+            .map_err(std::io::Error::other)?;
+        }
         let config = ConfigBuilder::default()
             .codex_home(codex_home.clone())
             .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
@@ -7843,6 +7945,12 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
     std::fs::create_dir_all(&active_cwd)?;
     std::fs::create_dir_all(&first_session_cwd)?;
     std::fs::create_dir_all(&second_session_cwd)?;
+    crate::legacy_core::config::set_project_trust_level(
+        &codex_home,
+        &launch_cwd,
+        codex_protocol::config_types::TrustLevel::Trusted,
+    )
+    .map_err(std::io::Error::other)?;
     let config = ConfigBuilder::default()
         .codex_home(codex_home.clone())
         .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
@@ -7914,12 +8022,12 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
     let state_db =
         crate::init_state_db_for_app_server_target(&config, &crate::AppServerTarget::Embedded)
             .await?;
-    let mut app_server = crate::start_app_server_for_picker(
+    let mut app_server = Box::pin(crate::start_app_server_for_picker(
         &config,
         &crate::AppServerTarget::Embedded,
         state_db.clone(),
         Arc::new(EnvironmentManager::default_for_tests()),
-    )
+    ))
     .await?;
     let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
     app.config = config;
@@ -7930,9 +8038,8 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
     let mut tui = crate::tui::test_support::make_test_tui()?;
 
     for target_session in targets {
-        let control = app
-            .resume_target_session(&mut tui, &mut app_server, target_session)
-            .await?;
+        let control =
+            Box::pin(app.resume_target_session(&mut tui, &mut app_server, target_session)).await?;
 
         assert!(matches!(control, AppRunControl::Continue));
         assert!(!crate::session_resume::cwds_differ(
@@ -7949,11 +8056,16 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
 }
 
 #[tokio::test]
-async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Result<()> {
+async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Result<()> {
+    use codex_protocol::items::TurnItem;
+    use codex_protocol::items::UserMessageItem;
+    use codex_protocol::models::ImageReference;
+    use codex_protocol::protocol::ItemCompletedEvent;
+    use codex_protocol::user_input::UserInput;
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let config = app.chat_widget.config_ref().clone();
     let filename_ts = "2025-01-05T12-00-00";
-    let source_thread_id = app_test_support::create_fake_rollout(
+    let source_thread_id = app_test_support::create_fake_paginated_rollout(
         config.codex_home.as_path(),
         filename_ts,
         "2025-01-05T12:00:00Z",
@@ -7971,6 +8083,7 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
         .to_string();
     std::fs::write(&source_path, format!("{session_meta}\n"))?;
     for (turn_id, message, images, local_images) in [
+        ("turn-0", "older prompt", None, Vec::new()),
         ("turn-1", "retained prompt", None, Vec::new()),
         (
             "turn-2",
@@ -7978,20 +8091,50 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
             Some(vec!["https://example.com/backtrack.png".to_string()]),
             vec![PathBuf::from("/tmp/fake-image.png")],
         ),
+        (
+            "turn-3",
+            "selected prompt [Image #1]",
+            Some(vec!["https://example.com/backtrack.png".to_string()]),
+            vec![PathBuf::from("/tmp/fake-image.png")],
+        ),
     ] {
+        let mut content = vec![UserInput::Text {
+            text: message.to_string(),
+            text_elements: Vec::new(),
+        }];
+        content.extend(
+            images
+                .into_iter()
+                .flatten()
+                .map(|image_url| UserInput::Image {
+                    image: ImageReference::Inline { image_url },
+                    detail: None,
+                }),
+        );
+        content.extend(
+            local_images
+                .into_iter()
+                .map(|path| UserInput::LocalImage { path, detail: None }),
+        );
         for item in [
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.to_string(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
                 collaboration_mode_kind: ModeKind::default(),
             })),
-            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-                message: message.to_string(),
-                images,
-                local_images,
-                ..Default::default()
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: ThreadId::from_string(&source_thread_id)?,
+                turn_id: turn_id.to_string(),
+                item: TurnItem::UserMessage(UserMessageItem {
+                    id: format!("user-{turn_id}"),
+                    client_id: None,
+                    content,
+                }),
+                started_at_ms: None,
+                completed_at_ms: 0,
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: turn_id.to_string(),
@@ -8009,17 +8152,25 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
 
     let source_thread_id = ThreadId::from_string(&source_thread_id)?;
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
+    // Bound fixture hydration independently from the owned viewport exercised below.
+    // Inline hydration's row cap leaves the oldest prompt on an unloaded page.
+    let mut local_settings = crate::local_settings::LocalSettings::from(&config);
+    local_settings.transcript_mode = crate::transcript_mode::TranscriptMode::Terminal;
+    local_settings.tui.alternate_screen = codex_config::types::AltScreenMode::Never;
+    local_settings.tui.terminal_resize_reflow_max_rows = Some(2);
     let started = app_server
         .resume_thread(
-            &crate::local_settings::LocalSettings::from(&config),
+            &local_settings,
             config.clone(),
             source_thread_id,
             crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
         )
         .await?;
-    let selected_turn = started.turns[1].clone();
+    assert!(app_server.has_older_history(source_thread_id));
+    let selected_turn = started.turns[3].clone();
     app.enqueue_primary_thread_session(started.session, started.turns)
         .await?;
+    app.scrollback_has_older_history = app_server.has_older_history(source_thread_id);
     {
         let mut store = app
             .thread_event_channels
@@ -8028,7 +8179,8 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
             .store
             .lock()
             .await;
-        store.turns.pop();
+        // The selected prompt can outlive its bounded replay-buffer entries.
+        store.turns.truncate(/*len*/ 2);
         store.push_notification(turn_started_notification(
             source_thread_id,
             &selected_turn.id,
@@ -8049,9 +8201,66 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
             TurnStatus::Interrupted,
         ));
     }
-    while app_event_rx.try_recv().is_ok() {}
-    let source_before = std::fs::read_to_string(&source_path)?;
+    while let Ok(event) = app_event_rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            app.transcript_cells.push(Arc::from(cell));
+        }
+    }
+    assert_eq!(crate::app_backtrack::user_count(&app.transcript_cells), 2);
+    let child_id = ThreadId::new();
+    let child = Arc::clone(&app.ensure_thread_channel(child_id).store);
+    let goal = app_server
+        .thread_goal_set(
+            source_thread_id,
+            Some("Keep this goal".into()),
+            Some(codex_app_server_protocol::ThreadGoalStatus::Paused),
+            /*token_budget*/ None,
+        )
+        .await?
+        .goal;
     let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    let size = Size::new(/*width*/ 80, /*height*/ 24);
+    app.render_owned_transcript(&mut tui, size)?;
+    app.transcript_view
+        .scroll(&app.transcript_cells, /*rows*/ -1);
+    app.render_owned_transcript(&mut tui, size)?;
+    // Freeze a visible selection before the same thread's authoritative history changes.
+    let selected_row = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal)
+        .content()
+        .chunks(usize::from(size.width))
+        .position(|row| {
+            row.iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .contains("selected prompt")
+        })
+        .expect("selected prompt should be visible") as u16;
+    for (kind, column) in [
+        (
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            2,
+        ),
+        (
+            crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            8,
+        ),
+    ] {
+        app.transcript_view.handle_mouse(
+            crossterm::event::MouseEvent {
+                kind,
+                column,
+                row: selected_row,
+                modifiers: KeyModifiers::NONE,
+            },
+            &app.transcript_cells,
+        );
+    }
+    assert!(
+        app.transcript_view
+            .selected_text(&app.transcript_cells)
+            .is_some()
+    );
     let prompt = crate::chatwidget::UserMessage {
         text: "selected prompt [Image #1]".to_string(),
         local_images: vec![crate::bottom_pane::LocalImageAttachment {
@@ -8063,29 +8272,197 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
         mention_bindings: Vec::new(),
     };
 
-    let control = Box::pin(app.handle_event(
+    Box::pin(app.handle_event(
         &mut tui,
         &mut app_server,
-        AppEvent::ForkSessionForPromptEdit {
-            thread_id: source_thread_id,
-            nth_user_message: 1,
-            prompt: prompt.clone(),
-        },
+        AppEvent::UpdateModel("gpt-5.4".into()),
     ))
     .await?;
+    app.app_server_target = crate::AppServerTarget::Remote {
+        endpoint: crate::RemoteAppServerEndpoint::WebSocket {
+            websocket_url: "ws://127.0.0.1:4500".to_string(),
+            auth_token: None,
+        },
+    };
+    let before = app_server
+        .thread_read(source_thread_id, /*include_turns*/ true)
+        .await?;
+    for text in [None, Some("/help"), Some(" \t!")] {
+        let mut remote_prompt = prompt.clone();
+        if let Some(text) = text {
+            remote_prompt.text = text.into();
+            remote_prompt.local_images.clear();
+        }
+        Box::pin(app.handle_event(
+            &mut tui,
+            &mut app_server,
+            AppEvent::RevertSessionForPromptEdit {
+                thread_id: source_thread_id,
+                selected_cell: Arc::clone(
+                    &app.transcript_cells
+                        [nth_user_position(&app.transcript_cells, /*nth*/ 1).unwrap()],
+                ),
+                prompt: remote_prompt,
+            },
+        ))
+        .await?;
+        assert!(app.chat_widget.composer_is_empty());
+        assert_eq!(
+            app_server
+                .thread_read(source_thread_id, /*include_turns*/ true)
+                .await?
+                .turns,
+            before.turns
+        );
+    }
+    app.app_server_target = crate::AppServerTarget::Embedded;
+    let selection = AppEvent::RevertSessionForPromptEdit {
+        thread_id: source_thread_id,
+        selected_cell: Arc::clone(
+            &app.transcript_cells[nth_user_position(&app.transcript_cells, /*nth*/ 1).unwrap()],
+        ),
+        prompt: prompt.clone(),
+    };
+    // A queued page shifts both identical prompts before confirmation is dispatched.
+    let cursor = app_server
+        .begin_older_history_page(source_thread_id)
+        .expect("older page");
+    let page = app_server
+        .thread_items_page(
+            source_thread_id,
+            /*turn_id*/ None,
+            Some(cursor.clone()),
+            /*limit*/ 1,
+        )
+        .await?;
+    app.handle_older_history_page(
+        &mut tui,
+        &mut app_server,
+        source_thread_id,
+        &cursor,
+        Ok(page),
+    )
+    .await?;
+    let control = Box::pin(app.handle_event(&mut tui, &mut app_server, selection)).await?;
 
+    while let Ok(event) = app_event_rx.try_recv() {
+        match event {
+            AppEvent::InsertHistoryCell(cell) => app.transcript_cells.push(Arc::from(cell)),
+            event @ AppEvent::FinishPromptRevert { .. } => {
+                Box::pin(app.handle_event(&mut tui, &mut app_server, event)).await?;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        (
+            app.transcript_view.is_following(),
+            app.transcript_view.selected_text(&app.transcript_cells)
+        ),
+        (true, None),
+    );
+    let bottom = app.render_owned_transcript(&mut tui, size)?;
+    let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
+    let transcript = buffer
+        .content()
+        .chunks(usize::from(size.width))
+        .take(usize::from(bottom.y.saturating_sub(/*rhs*/ 1)))
+        .map(|row| {
+            row.iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stable_cwd = "/tmp/project";
+    let cwd = test_path_buf(stable_cwd).display().to_string();
+    let transcript = transcript.replace(&cwd, &format!("{stable_cwd:<width$}", width = cwd.len()));
+    insta::assert_snapshot!("owned_prompt_revert_retained_history", transcript);
+    assert!(Arc::ptr_eq(
+        &child,
+        &app.thread_event_channels[&child_id].store
+    ));
+    assert_eq!(app.chat_widget.current_model(), "gpt-5.4");
+    assert!(render_bottom_popup(&app.chat_widget, /*width*/ 120).contains("Goal paused"));
     assert!(matches!(control, AppRunControl::Continue));
-    let forked_thread_id = app
+    let reverted_thread_id = app
         .chat_widget
         .thread_id()
-        .expect("prompt edit should switch to a forked thread");
-    assert_ne!(forked_thread_id, source_thread_id);
+        .expect("prompt edit should keep the current thread");
+    assert_eq!(reverted_thread_id, source_thread_id);
     assert_eq!(app.chat_widget.composer_text_with_pending(), prompt.text);
     assert_eq!(
         app.chat_widget.remote_image_urls(),
         prompt.remote_image_urls
     );
-    assert_eq!(std::fs::read_to_string(&source_path)?, source_before);
+    assert_eq!(
+        app_server
+            .thread_read(reverted_thread_id, /*include_turns*/ true)
+            .await?
+            .turns
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn-0", "turn-1", "turn-2"]
+    );
+
+    let history = app
+        .transcript_cells
+        .iter()
+        .map(|cell| lines_to_single_string(&cell.display_lines(/*width*/ 120)))
+        .collect::<Vec<_>>();
+    let retained_index = history
+        .iter()
+        .position(|line| line.contains("retained prompt"))
+        .expect("revert should keep the earlier prompt");
+    let notice_index = history
+        .iter()
+        .position(|line| {
+            line == "• Conversation reverted to this point. File changes are unchanged."
+        })
+        .expect("prompt edit should emit the revert notice");
+    assert!(retained_index < notice_index);
+    assert!(
+        !history
+            .iter()
+            .any(|line| line.contains("Thread forked from"))
+    );
+    // Editing the first visible prompt also discards search state from the removed window.
+    app.transcript_view.begin_search();
+    assert!(app.transcript_view.is_search_active());
+    app.chat_widget.restore_thread_input_state(
+        /*input_state*/ None,
+        crate::chatwidget::ThreadInputStateRestoreMode {
+            preserve_in_flight_turn: false,
+        },
+    );
+    Box::pin(app.handle_event(
+        &mut tui,
+        &mut app_server,
+        AppEvent::RevertSessionForPromptEdit {
+            thread_id: source_thread_id,
+            selected_cell: Arc::clone(
+                &app.transcript_cells[nth_user_position(&app.transcript_cells, /*nth*/ 0).unwrap()],
+            ),
+            prompt: "retained prompt".into(),
+        },
+    ))
+    .await?;
+    while let Ok(event) = app_event_rx.try_recv() {
+        if matches!(event, AppEvent::FinishPromptRevert { .. }) {
+            Box::pin(app.handle_event(&mut tui, &mut app_server, event)).await?;
+        }
+    }
+    assert!(!app.transcript_view.is_search_active());
+    assert!(app.transcript_view.is_following());
+    assert_eq!(app.chat_widget.thread_id(), Some(source_thread_id));
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "retained prompt"
+    );
+    assert_eq!(crate::app_backtrack::user_count(&app.transcript_cells), 0);
     assert_eq!(
         app_server
             .thread_read(source_thread_id, /*include_turns*/ true)
@@ -8094,174 +8471,39 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
             .iter()
             .map(|turn| turn.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["turn-1", "turn-2"]
+        vec!["turn-0"]
     );
+    tui.set_owned_screen(/*owned*/ true)?;
+    app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Draw)
+        .await?;
     assert_eq!(
-        app_server
-            .thread_read(forked_thread_id, /*include_turns*/ true)
-            .await?
-            .turns
-            .iter()
-            .map(|turn| turn.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["turn-1"]
+        app.transcript_view.history,
+        crate::pager_overlay::TranscriptHistoryState::LoadingOlder
     );
-
-    let history = std::iter::from_fn(|| app_event_rx.try_recv().ok())
-        .filter_map(|event| match event {
-            AppEvent::InsertHistoryCell(cell) => {
-                Some(lines_to_single_string(&cell.display_lines(/*width*/ 120)))
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let retained_index = history
+    loop {
+        let event = app_event_rx.recv().await.expect("older history page");
+        if let AppEvent::OlderThreadHistoryLoaded { .. } = event {
+            Box::pin(app.handle_event(&mut tui, &mut app_server, event)).await?;
+            break;
+        }
+    }
+    tui.set_owned_screen(/*owned*/ false)?;
+    let prompts = app
+        .transcript_cells
         .iter()
-        .position(|line| line.contains("retained prompt"))
-        .expect("forked history should replay the retained prompt");
-    let notice_index = history
-        .iter()
-        .position(|line| line == "• You’re continuing from this point in a new conversation")
-        .expect("prompt edit should emit the branch notice");
-    assert!(retained_index < notice_index);
-    assert!(
-        !history
-            .iter()
-            .any(|line| line.contains("Thread forked from"))
-    );
-    app_server.shutdown().await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn prompt_edit_before_first_prompt_starts_fresh_thread() -> Result<()> {
-    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-    let config = app.chat_widget.config_ref().clone();
-    let source_thread_id = app_test_support::create_fake_rollout(
-        config.codex_home.as_path(),
-        "2025-01-05T12-00-00",
-        "2025-01-05T12:00:00Z",
-        "first prompt",
-        Some("test-provider"),
-        /*git_info*/ None,
-    )
-    .expect("materialized rollout should be created");
-    let source_thread_id = ThreadId::from_string(&source_thread_id)?;
-    std::fs::write(
-        config.codex_home.join("config.toml"),
-        "default_permissions = \":workspace\"\n[permissions.server-only]\nextends = \":read-only\"\n",
-    )?;
-    let server_config = ConfigBuilder::default()
-        .codex_home(config.codex_home.to_path_buf())
-        .build()
-        .await?;
-    let mut app_server =
-        Box::pin(crate::start_embedded_app_server_for_picker(&server_config)).await?;
-    let started = app_server
-        .resume_thread(
-            &crate::local_settings::LocalSettings::from(&config),
-            config.clone(),
-            source_thread_id,
-            crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
-        )
-        .await?;
-    app.enqueue_primary_thread_session(started.session, started.turns)
-        .await?;
-    app.select_permission_profile(
-        &mut app_server,
-        PermissionProfileSelection {
-            profile_id: "server-only".into(),
-            approval_policy: None,
-            approvals_reviewer: None,
-            display_label: "server-only".into(),
-        },
-    )
-    .await;
-    while app_event_rx.try_recv().is_ok() {}
-    let mut tui = crate::tui::test_support::make_test_tui()?;
-    Box::pin(app.handle_event(
-        &mut tui,
-        &mut app_server,
-        AppEvent::ForkSessionForPromptEdit {
-            thread_id: source_thread_id,
-            nth_user_message: 0,
-            prompt: crate::chatwidget::UserMessage::from("first prompt"),
-        },
-    ))
-    .await?;
-    assert_eq!(app.chat_widget.thread_id(), Some(source_thread_id));
-    assert_eq!(app.chat_widget.composer_text_with_pending(), "first prompt");
-    insta::assert_snapshot!(
-        next_history_message(&mut app_event_rx),
-        @"■ Wait for permissions to update before editing this prompt."
-    );
-    let settings = next_thread_settings_updated(&mut app_server, source_thread_id).await;
-    app.enqueue_thread_notification(
-        source_thread_id,
-        ServerNotification::ThreadSettingsUpdated(settings),
-    )
-    .await?;
-    while app_event_rx.try_recv().is_ok() {}
-    let endpoint = crate::resolve_remote_addr("ws://127.0.0.1:8765")?;
-    app.app_server_target = crate::AppServerTarget::Remote { endpoint };
-    let local_only_root = tempdir()?;
-    let local_only_root_path = local_only_root.path().abs();
-    app.harness_overrides
-        .additional_writable_roots
-        .push(local_only_root.path().to_path_buf());
-    app.refresh_in_memory_config_from_disk().await?;
-    assert!(app.config.workspace_roots.contains(&local_only_root_path));
-
-    let control = Box::pin(app.handle_event(
-        &mut tui,
-        &mut app_server,
-        AppEvent::ForkSessionForPromptEdit {
-            thread_id: source_thread_id,
-            nth_user_message: 0,
-            prompt: crate::chatwidget::UserMessage::from("first prompt"),
-        },
-    ))
-    .await?;
-
-    assert!(matches!(control, AppRunControl::Continue));
-    let fresh_thread_id = app
-        .chat_widget
-        .thread_id()
-        .expect("first prompt edit should start a fresh thread");
-    assert_ne!(fresh_thread_id, source_thread_id);
-    let active = app
-        .chat_widget
-        .config_ref()
-        .permissions
-        .active_permission_profile()
-        .unwrap();
-    assert_eq!(active.id, "server-only");
-    let session = app
-        .primary_session_configured
-        .as_ref()
-        .expect("new session");
-    let roots = &session.runtime_workspace_roots;
-    assert!(!roots.contains(&local_only_root_path));
-    assert_eq!(app.chat_widget.composer_text_with_pending(), "first prompt");
-    let history = std::iter::from_fn(|| app_event_rx.try_recv().ok())
-        .filter_map(|event| match event {
-            AppEvent::InsertHistoryCell(cell) => {
-                Some(lines_to_single_string(&cell.display_lines(/*width*/ 120)))
-            }
-            _ => None,
+        .filter_map(|cell| {
+            cell.as_any()
+                .downcast_ref::<crate::history_cell::UserHistoryCell>()
         })
+        .map(|cell| cell.message.as_str())
         .collect::<Vec<_>>();
-    assert!(
-        history.iter().any(|line| {
-            line == "• You’re continuing from this point in a new conversation"
-        })
+    assert_eq!(prompts, vec!["older prompt"]);
+    assert!(!app_server.has_older_history(source_thread_id));
+    assert_eq!(
+        app_server.thread_goal_get(source_thread_id).await?.goal,
+        Some(goal)
     );
-    assert!(
-        !history
-            .iter()
-            .any(|line| line.contains("Thread forked from"))
-    );
+    tui.set_owned_screen(/*owned*/ false)?;
     app_server.shutdown().await?;
 
     Ok(())
@@ -8512,44 +8754,13 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
 }
 
 #[tokio::test]
-async fn late_usage_result_can_follow_finalized_plan() {
-    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-    app.chat_widget
-        .add_token_activity_output(crate::chatwidget::TokenActivityView::Daily);
-    let request_id = match app_event_rx.try_recv() {
-        Ok(AppEvent::RefreshTokenActivity { request_id }) => request_id,
-        other => panic!("expected token activity refresh request, got {other:?}"),
-    };
-
-    app.chat_widget.note_stream_consolidation_queued();
-    app.transcript_cells
-        .push(Arc::new(history_cell::new_proposed_plan_stream(
-            vec![Line::from("finalized plan")],
-            /*is_stream_continuation*/ false,
-        )));
-    app.chat_widget.note_stream_consolidation_completed();
-
-    assert!(
-        app.chat_widget.finish_token_activity_refresh(
-            request_id,
-            Err("token activity unavailable".to_string()),
-        )
-    );
-    assert!(!app.pending_usage_output_insertion_blocked());
-    assert!(
-        app.chat_widget
-            .take_completed_token_activity_output()
-            .is_some()
-    );
-}
-
-#[tokio::test]
 async fn new_session_requests_shutdown_for_previous_conversation() {
     Box::pin(async {
         let (mut app, mut app_event_rx, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
 
         let thread_id = ThreadId::new();
         let event = crate::session_state::ThreadSessionState {
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
             thread_id,
             forked_from_id: None,
             fork_parent_title: None,
@@ -8685,6 +8896,7 @@ async fn override_turn_context_sends_thread_settings_update() {
         let thread_id = started.session.thread_id;
         let initial_model = started.session.model.clone();
         let initial_effort = started.session.reasoning_effort.clone();
+        let initial_personality = started.session.personality;
         app.enqueue_primary_thread_session(started.session, started.turns)
             .await
             .expect("primary thread should be registered");
@@ -8705,7 +8917,6 @@ async fn override_turn_context_sends_thread_settings_update() {
             Some(ActivePermissionProfile::new(
                 codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
             )),
-            /*windows_sandbox_level*/ None,
             Some("gpt-5.4".to_string()),
             Some(Some(ReasoningEffortConfig::High)),
             /*summary*/ None,
@@ -8758,8 +8969,8 @@ async fn override_turn_context_sends_thread_settings_update() {
             collaboration_mode.settings.reasoning_effort
         );
         assert_eq!(
-            notification.thread_settings.personality,
-            Some(Personality::Pragmatic)
+            notification.thread_settings.personality, initial_personality,
+            "the Pragmatic turn override should not change personality"
         );
 
         app.handle_app_server_event(
@@ -8788,7 +8999,7 @@ async fn override_turn_context_sends_thread_settings_update() {
             updated_mode.settings.reasoning_effort,
             collaboration_mode.settings.reasoning_effort
         );
-        assert_eq!(updated_session.personality, Some(Personality::Pragmatic));
+        assert_eq!(updated_session.personality, initial_personality);
         assert_eq!(updated_session.service_tier, Some(service_tier));
         assert_eq!(updated_session.approval_policy, AskForApproval::OnRequest);
         assert_eq!(
@@ -8947,8 +9158,25 @@ async fn changing_cyber_model_reasoning_preserves_selected_permissions() {
             .expect("primary thread should be registered");
 
         let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
-        for effort in [ReasoningEffortConfig::High, ReasoningEffortConfig::Ultra] {
-            if effort == ReasoningEffortConfig::Ultra {
+        for (effort, session_only) in [
+            (ReasoningEffortConfig::High, false),
+            (ReasoningEffortConfig::Medium, true),
+            (ReasoningEffortConfig::Ultra, false),
+            (ReasoningEffortConfig::High, true),
+            (ReasoningEffortConfig::Ultra, true),
+        ] {
+            if session_only {
+                app.handle_event(
+                    &mut tui,
+                    &mut app_server,
+                    AppEvent::SelectSessionModel {
+                        model: model_name.clone(),
+                        effort: Some(effort.clone()),
+                    },
+                )
+                .await
+                .expect("session-only reasoning selection should succeed");
+            } else if effort == ReasoningEffortConfig::Ultra {
                 app.chat_widget
                     .set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
                 app.chat_widget
@@ -9213,6 +9441,7 @@ async fn inactive_thread_settings_notification_updates_cached_collaboration_mode
     let notification = ThreadSettingsUpdatedNotification {
         thread_id: inactive_thread_id.to_string(),
         thread_settings: ThreadSettings {
+            disabled_plugin_ids: Vec::new(),
             cwd: test_absolute_path("/tmp/thread-settings"),
             approval_policy: AskForApproval::OnRequest,
             approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::AutoReview,
@@ -9282,6 +9511,7 @@ async fn clear_only_ui_reset_preserves_chat_session_state() {
     let thread_id = ThreadId::new();
     app.chat_widget
         .handle_thread_session(crate::session_state::ThreadSessionState {
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
             thread_id,
             forked_from_id: None,
             fork_parent_title: None,

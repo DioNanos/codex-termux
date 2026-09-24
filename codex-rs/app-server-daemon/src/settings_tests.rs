@@ -23,7 +23,7 @@ async fn remote_control_save_preserves_updater_settings() {
 
     tokio::fs::write(
         &path,
-        r#"{"remoteControlEnabled":true,"shutdownGraceSeconds":25,"updater":{"autoUpdateEnabled":false,"updateIntervalMinutes":17},"futureSetting":42}"#,
+        r#"{"remoteControlEnabled":true,"shutdownGraceSeconds":25,"updater":{"autoUpdateEnabled":false,"updateIntervalMinutes":17},"featureOverrides":{"api_key_model_discovery":true,"code_mode_host":false},"futureSetting":42}"#,
     )
     .await
     .expect("write settings");
@@ -43,6 +43,7 @@ async fn remote_control_save_preserves_updater_settings() {
             "remoteControlEnabled": false,
             "shutdownGraceSeconds": 25,
             "updater": {"autoUpdateEnabled": false, "updateIntervalMinutes": 17},
+            "featureOverrides": {"api_key_model_discovery": true, "code_mode_host": false},
             "futureSetting": 42,
         })
     );
@@ -127,4 +128,28 @@ async fn update_interval_accepts_long_values_and_rejects_zero() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn telemetry_distinguishes_presence_from_default_values() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let dir = home.path().join("app-server-daemon");
+    tokio::fs::create_dir(&dir).await?;
+    let path = dir.join("settings.json");
+    for (contents, presence) in [
+        ("{}", "default"),
+        (
+            r#"{"updater":{"autoUpdateEnabled":true,"updateIntervalMinutes":60},"shutdownGraceSeconds":60}"#,
+            "configured",
+        ),
+    ] {
+        tokio::fs::write(&path, contents).await?;
+        assert_eq!(
+            crate::telemetry::settings_tags(home.path())
+                .await
+                .map(|(_, value)| value),
+            ["enabled", presence, presence, presence]
+        );
+    }
+    Ok(())
 }

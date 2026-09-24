@@ -41,7 +41,7 @@ fn test_turn_environment(environment_id: &str) -> crate::session::turn_context::
                 allow_login_shell: true,
                 workspace_roots: Vec::new(),
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
-                windows_sandbox_private_desktop: true,
+                windows_sandbox_type: SandboxType::None,
                 use_legacy_landlock: false,
                 permission_profile: PermissionProfileSnapshot::legacy(
                     PermissionProfile::read_only(),
@@ -258,10 +258,10 @@ async fn file_system_sandbox_context_preserves_executor_workspace_permissions() 
         manager: &manager,
         sandbox_cwd: &sandbox_policy_cwd,
         workspace_roots: std::slice::from_ref(&sandbox_policy_cwd),
-        codex_linux_sandbox_exe: None,
+        sandbox_exe: None,
         use_legacy_landlock: true,
+        windows_sandbox_type: SandboxType::WindowsRestrictedToken,
         windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
-        windows_sandbox_private_desktop: true,
         network_denial_cancellation_token: None,
         network_proxy: None,
     };
@@ -277,21 +277,19 @@ async fn file_system_sandbox_context_preserves_executor_workspace_permissions() 
     );
     let expected_permissions =
         PermissionProfile::from_runtime_permissions(&file_system_policy, network_policy);
-    let native_permissions: PermissionProfile = sandbox
-        .permissions
-        .clone()
-        .try_into()
-        .expect("native sandbox permissions");
-    assert_eq!(native_permissions, expected_permissions);
+    assert_eq!(sandbox.permissions, expected_permissions);
     assert_eq!(
         sandbox.cwd,
-        Some(codex_utils_path_uri::PathUri::from_abs_path(&path))
+        codex_utils_path_uri::PathUri::from_abs_path(&path)
     );
     assert_eq!(
-        sandbox.windows_sandbox_level,
-        WindowsSandboxLevel::RestrictedToken
+        sandbox.windows_sandbox_selection,
+        if cfg!(windows) {
+            codex_file_system::WindowsSandboxSelection::RestrictedToken
+        } else {
+            codex_file_system::WindowsSandboxSelection::Disabled
+        }
     );
-    assert_eq!(sandbox.windows_sandbox_private_desktop, true);
     assert_eq!(sandbox.use_legacy_landlock, true);
 }
 
@@ -327,10 +325,10 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
         manager: &manager,
         sandbox_cwd: &sandbox_policy_cwd,
         workspace_roots: std::slice::from_ref(&sandbox_policy_cwd),
-        codex_linux_sandbox_exe: None,
+        sandbox_exe: None,
         use_legacy_landlock: false,
+        windows_sandbox_type: SandboxType::None,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
         network_denial_cancellation_token: None,
         network_proxy: None,
     };
@@ -356,13 +354,12 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
     assert_eq!(
         ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt),
         Some(FileSystemSandboxContext {
-            permissions: permissions.into(),
-            cwd: Some(cwd.clone()),
+            permissions,
+            cwd: cwd.clone(),
             workspace_roots: vec![cwd],
             user_home_dir: Some(user_home_dir),
             temporary_directories: None,
-            windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
-            windows_sandbox_private_desktop: false,
+            windows_sandbox_selection: codex_file_system::WindowsSandboxSelection::RestrictedToken,
             windows_sandbox_proxy_settings_mode: None,
             use_legacy_landlock: false,
             sandbox_unavailable_by_construction: false,
@@ -441,10 +438,10 @@ fn r2_unrelated_failure_after_bypass_is_not_a_sandbox_denial() {
         manager: &manager,
         sandbox_cwd: &cwd_uri,
         workspace_roots: std::slice::from_ref(&cwd_uri),
-        codex_linux_sandbox_exe: None,
+        sandbox_exe: None,
         use_legacy_landlock: false,
+        windows_sandbox_type: SandboxType::None,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
         network_denial_cancellation_token: None,
         network_proxy: None,
     };
@@ -531,10 +528,10 @@ async fn approved_apply_patch_on_sandboxless_platform_executes_without_fs_sandbo
         manager: &manager,
         sandbox_cwd: &cwd_uri,
         workspace_roots: std::slice::from_ref(&cwd_uri),
-        codex_linux_sandbox_exe: None,
+        sandbox_exe: None,
         use_legacy_landlock: false,
+        windows_sandbox_type: SandboxType::None,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
         network_denial_cancellation_token: None,
         network_proxy: None,
     };
@@ -563,8 +560,7 @@ fn preverify_context(
     sandbox_unavailable_by_construction: bool,
     cwd: &PathUri,
 ) -> FileSystemSandboxContext {
-    let mut context =
-        FileSystemSandboxContext::from_permission_profile_with_cwd(permissions, cwd.clone());
+    let mut context = FileSystemSandboxContext::from_permission_profile(permissions, cwd.clone());
     context.sandbox_unavailable_by_construction = sandbox_unavailable_by_construction;
     context
 }

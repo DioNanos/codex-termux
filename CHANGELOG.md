@@ -1,3 +1,21 @@
+# [0.156.1] - 2026-09-23
+
+## Codex Termux 0.156.1 — upstream rust-v0.156.1
+
+- Merges upstream tag `rust-v0.156.1` into the Termux fork.
+- GPT-6 Sol/Luna join the catalog; `gpt-6-astra` was already visible.
+- Upstream daemon updater flow adopted with the fork fail-closed guard moved to
+  the new path: no upstream install script fetch, daemon update requests route
+  to the fork npm channel, regression test pins the refusal.
+- The 8 KiB model-message caps follow the `ResolvedModelMessages` refactor
+  (guardian node REPL policy, persistent mode, remote catalog loader).
+- AGENTS.md disk-discovery fix (upstream #37704) re-applied on the new refresh
+  flow; `/init` after startup is picked up again.
+- Status-indicator background-terminal 200 ms frame branch re-applied on the
+  upstream progress/shimmer condition.
+- Fork sandbox fix #22 (no-backend platforms take the unsandboxed path)
+  preserved on the new orchestrator decision path.
+
 # [0.155.1] - 2026-09-19
 
 ## Codex Termux 0.155.1 — upstream rust-v0.155.1

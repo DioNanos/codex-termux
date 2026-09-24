@@ -21,13 +21,18 @@ use wxc_common::filesystem_object::compare_existing_filesystem_objects;
 use wxc_common::filesystem_object::normalize_object_conflicts;
 use wxc_common::logger::Logger;
 use wxc_common::logger::Mode;
+use wxc_common::models::BaseProcessUiConfig;
 use wxc_common::models::ContainerPolicy;
 use wxc_common::models::ExecutionRequest;
 use wxc_common::models::FallbackPolicy;
 use wxc_common::models::NetworkAction;
+use wxc_common::models::NetworkCidr;
 use wxc_common::models::NetworkEgressPolicy;
 use wxc_common::models::NetworkIngressPolicy;
+use wxc_common::models::NetworkPeer;
 use wxc_common::models::NetworkPolicy;
+use wxc_common::models::NetworkRule;
+use wxc_common::models::UiPolicy;
 
 use crate::MxcCommand;
 
@@ -44,7 +49,7 @@ pub enum PolicyError {
     RelativePolicyCwd,
     #[error("MXC requires an absolute command working directory")]
     RelativeCommandCwd,
-    #[error("MXC symbolic filesystem paths other than :root are not implemented")]
+    #[error("MXC policy contains an unresolved symbolic filesystem path")]
     UnsupportedSymbolicPath,
     #[error("MXC requires a Unicode command working directory")]
     NonUnicodeCommandCwd,
@@ -64,12 +69,12 @@ pub enum PolicyError {
     CommandLine(#[from] CommandLineError),
 }
 
-pub fn build_request(
+pub(super) fn build_request(
     command: &MxcCommand,
     command_cwd: &Path,
     env: Vec<String>,
     volume_roots: &[PathBuf],
-    _platform_read_roots: &[PathBuf],
+    platform_read_roots: &[PathBuf],
 ) -> Result<ExecutionRequest, PolicyError> {
     if command.command.is_empty() {
         return Err(PolicyError::EmptyCommand);
@@ -82,7 +87,44 @@ pub fn build_request(
     if !command_cwd.is_absolute() {
         return Err(PolicyError::RelativeCommandCwd);
     }
-    let policy = permissions.file_system_sandbox_policy();
+    let mut policy = permissions.file_system_sandbox_policy();
+    // Resolve Windows temporary directories from the filtered command
+    // environment, including case-insensitive names.
+    let mut temp_values = HashMap::new();
+    for (key, value) in env.iter().filter_map(|entry| entry.split_once('=')) {
+        if key.eq_ignore_ascii_case("TEMP") || key.eq_ignore_ascii_case("TMP") {
+            temp_values.insert(key.to_ascii_uppercase(), value);
+        }
+    }
+    let temp_paths = ["TEMP", "TMP"]
+        .into_iter()
+        .filter_map(|key| temp_values.get(key).copied())
+        .filter(|path| Path::new(path).is_absolute())
+        .map(AbsolutePathBuf::from_absolute_path)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    policy.entries = policy
+        .entries
+        .into_iter()
+        .flat_map(|entry| {
+            match &entry.path {
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Tmpdir,
+                } => temp_paths
+                    .iter()
+                    .map(|path| {
+                        let mut entry = entry.clone();
+                        entry.path = path.clone().into();
+                        entry
+                    })
+                    .collect(),
+                // /tmp has no special meaning on the Windows executor.
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::SlashTmp,
+                } => Vec::new(),
+                _ => vec![entry],
+            }
+        })
+        .collect();
     let full_disk_write = policy.has_full_disk_write_access();
     let volumes = volume_roots
         .iter()
@@ -140,6 +182,9 @@ pub fn build_request(
             .filter(|(_, path)| fs.can_read_local_path_with_cwd(path.as_path(), cwd))
             .map(|(key, path)| (key.clone(), path.clone())),
     );
+    if policy.include_platform_defaults() {
+        read.extend(collect_paths(platform_read_roots.iter().cloned())?);
+    }
     write.retain(|key, _| !carveouts.contains_key(key) && !deny.contains_key(key));
     read.retain(|key, _| !write.contains_key(key) && !deny.contains_key(key));
     let volume_roots = volume_roots
@@ -169,20 +214,49 @@ pub fn build_request(
     // API receives one effective access mode for each path identity.
     read.retain(|key, _| !write.contains_key(key) && !deny.contains_key(key));
     let network_enabled = permissions.network_sandbox_policy().is_enabled();
-    let egress_default = if network_enabled {
+    let proxied = command.managed_network.is_some();
+    if let Some(network) = &command.managed_network {
+        crate::validate_managed_network(network)
+            .map_err(|error| PolicyError::PolicyResolution(error.to_string()))?;
+    }
+    let egress_default = if network_enabled && !proxied {
         NetworkAction::Allow
     } else {
         NetworkAction::Deny
     };
-    let ingress_default = if network_enabled {
+    let ingress_default = if network_enabled && !proxied {
         NetworkAction::Allow
     } else {
         NetworkAction::Deny
     };
-    let egress = NetworkEgressPolicy {
+    let mut egress = NetworkEgressPolicy {
         default: egress_default,
         ..Default::default()
     };
+    if proxied {
+        // PSEC host loopback is bidirectional. This shape is supported only
+        // when the caller already allows local clients and servers. Keep
+        // private-network ingress denied and allow no direct DNS bypass.
+        egress.allow.push(NetworkRule {
+            to: vec![
+                NetworkPeer {
+                    cidr: NetworkCidr {
+                        address: std::net::Ipv4Addr::new(127, 0, 0, 0).into(),
+                        prefix_length: 8,
+                    },
+                    except: Vec::new(),
+                },
+                NetworkPeer {
+                    cidr: NetworkCidr {
+                        address: std::net::Ipv6Addr::LOCALHOST.into(),
+                        prefix_length: 128,
+                    },
+                    except: Vec::new(),
+                },
+            ],
+            ports: Vec::new(),
+        });
+    }
     let mut request = ExecutionRequest {
         script_code: cmdline_from_argv_for_context(
             &command.command,
@@ -210,7 +284,7 @@ pub fn build_request(
             network_egress: Some(egress),
             network_ingress: Some(NetworkIngressPolicy {
                 default: ingress_default,
-                host_loopback: if network_enabled {
+                host_loopback: if network_enabled || proxied {
                     NetworkAction::Allow
                 } else {
                     NetworkAction::Deny
@@ -218,6 +292,16 @@ pub fn build_request(
             }),
             network_specified: true,
             network_mode_specified: true,
+            // PowerShell needs Win32k and desktop handles during DLL startup.
+            // Keep clipboard, input injection, and system-control restrictions.
+            ui: UiPolicy {
+                disable: false,
+                ..Default::default()
+            },
+            base_process_ui: BaseProcessUiConfig {
+                isolation: "desktop".to_owned(),
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..Default::default()
@@ -268,15 +352,14 @@ pub(super) fn materialize_volume_roots(
             })),
             FileSystemPath::Special {
                 value:
-                    FileSystemSpecialPath::Minimal
-                    | FileSystemSpecialPath::ProjectRoots { .. }
+                    FileSystemSpecialPath::ProjectRoots { .. }
                     | FileSystemSpecialPath::Tmpdir
                     | FileSystemSpecialPath::SlashTmp,
             } => return Err(PolicyError::UnsupportedSymbolicPath),
             FileSystemPath::Path { .. }
             | FileSystemPath::GlobPattern { .. }
             | FileSystemPath::Special {
-                value: FileSystemSpecialPath::Unknown { .. },
+                value: FileSystemSpecialPath::Minimal | FileSystemSpecialPath::Unknown { .. },
             } => entries.push(entry),
         }
     }

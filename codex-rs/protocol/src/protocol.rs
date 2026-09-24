@@ -47,6 +47,7 @@ use crate::models::ImageDetail;
 use crate::models::InternalChatMessageMetadataPassthrough;
 use crate::models::MessagePhase;
 use crate::models::PermissionProfile;
+use crate::models::ProfileWorkspaceRoot;
 use crate::models::ResponseInputItem;
 use crate::models::ResponseItem;
 use crate::models::SandboxEnforcement;
@@ -528,7 +529,7 @@ pub struct ThreadSettingsOverrides {
 
     /// Updated profile-defined workspace roots for status summaries and
     /// per-turn config reconstruction.
-    pub profile_workspace_roots: Option<Vec<AbsolutePathBuf>>,
+    pub profile_workspace_roots: Option<Vec<ProfileWorkspaceRoot>>,
 
     /// Updated command approval policy.
     pub approval_policy: Option<AskForApproval>,
@@ -743,12 +744,6 @@ pub enum Op {
     /// model.
     SetThreadMemoryMode { mode: ThreadMemoryMode },
 
-    /// Request Codex to drop the last N user turns from in-memory context.
-    ///
-    /// This does not attempt to revert local filesystem changes. Clients are
-    /// responsible for undoing any edits on disk.
-    ThreadRollback { num_turns: u32 },
-
     /// Request a code review from the agent.
     Review { review_request: ReviewRequest },
 
@@ -962,7 +957,6 @@ impl Op {
             Self::ReloadUserConfig => "reload_user_config",
             Self::Compact => "compact",
             Self::SetThreadMemoryMode { .. } => "set_thread_memory_mode",
-            Self::ThreadRollback { .. } => "thread_rollback",
             Self::Review { .. } => "review",
             Self::ApproveGuardianDeniedAction { .. } => "approve_guardian_denied_action",
             Self::Shutdown => "shutdown",
@@ -1405,7 +1399,8 @@ pub enum EventMsg {
     /// Conversation history was compacted (either automatically or manually).
     ContextCompacted(ContextCompactedEvent),
 
-    /// Conversation history was rolled back by dropping the last N user turns.
+    /// Legacy persisted marker for dropping the last N user turns.
+    /// Retained for replay of existing rollouts; live rollback operations are unsupported.
     ThreadRolledBack(ThreadRolledBackEvent),
 
     /// Agent has started a turn.
@@ -1853,8 +1848,8 @@ pub enum NonSteerableTurnKind {
 }
 
 /// Codex errors that we expose to clients.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+#[schemars(rename_all = "snake_case")]
 #[ts(rename_all = "snake_case")]
 pub enum CodexErrorInfo {
     ContextWindowExceeded,
@@ -1863,6 +1858,7 @@ pub enum CodexErrorInfo {
     RateLimitExceeded,
     ServerOverloaded,
     CyberPolicy,
+    BioPolicy,
     MisalignmentPolicyViolation,
     HttpConnectionFailed {
         http_status_code: Option<u16>,
@@ -1888,6 +1884,7 @@ pub enum CodexErrorInfo {
     ActiveTurnNotSteerable {
         turn_kind: NonSteerableTurnKind,
     },
+    // Retained to deserialize errors recorded in legacy rollouts.
     ThreadRollbackFailed,
     Other,
 }
@@ -1903,6 +1900,7 @@ impl CodexErrorInfo {
             | Self::RateLimitExceeded
             | Self::ServerOverloaded
             | Self::CyberPolicy
+            | Self::BioPolicy
             | Self::MisalignmentPolicyViolation
             | Self::HttpConnectionFailed { .. }
             | Self::ResponseStreamConnectionFailed { .. }
@@ -2174,6 +2172,10 @@ pub struct TurnCompleteEvent {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TurnStartedEvent {
     pub turn_id: String,
+    /// ID of the originating turn in the root thread; equals `turn_id` for root turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub root_turn_id: Option<String>,
     // Persist for rollout consumers that correlate turns with telemetry traces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -2522,6 +2524,14 @@ pub struct AgentMessageEvent {
     pub questions: Option<Vec<AsyncUserInputQuestion>>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum UserMessageImageKind {
+    Inline,
+    File,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 pub struct UserMessageEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2536,6 +2546,19 @@ pub struct UserMessageEvent {
     /// default image detail behavior.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub image_details: Vec<Option<ImageDetail>>,
+    /// File IDs sourced from `UserInput::Image`. These are passed through as
+    /// opaque references and are not created by image preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_ids: Option<Vec<String>>,
+    /// Detail hints for `file_ids`, indexed in parallel. Missing entries imply
+    /// default image detail behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_id_details: Vec<Option<ImageDetail>>,
+    /// Inline and file-backed image kinds in their original input order.
+    /// New producers populate this alongside `images` and `file_ids`; when it
+    /// is absent, consumers retain the legacy inline-then-file ordering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_order: Vec<UserMessageImageKind>,
     /// Local file paths sourced from `UserInput::LocalImage`. These are kept so
     /// the UI can reattach images when editing history. Local image prompts may
     /// include a display form of the path, but these should not be treated as
@@ -2560,6 +2583,27 @@ pub struct UserMessageEvent {
     pub text_elements: Vec<crate::user_input::TextElement>,
 }
 
+impl UserMessageEvent {
+    /// Returns whether `image_order` accounts for every split image reference exactly once.
+    pub fn has_complete_image_order(&self) -> bool {
+        if self.image_order.is_empty() {
+            return false;
+        }
+
+        let mut inline_count = 0;
+        let mut file_count = 0;
+        for image_kind in &self.image_order {
+            match image_kind {
+                UserMessageImageKind::Inline => inline_count += 1,
+                UserMessageImageKind::File => file_count += 1,
+            }
+        }
+
+        inline_count == self.images.as_ref().map_or(0, Vec::len)
+            && file_count == self.file_ids.as_ref().map_or(0, Vec::len)
+    }
+}
+
 /// Returns the user-facing preview text for a user message.
 pub fn user_message_preview(user: &UserMessageEvent) -> Option<String> {
     let message = strip_user_message_prefix(user.message.as_str());
@@ -2570,6 +2614,10 @@ pub fn user_message_preview(user: &UserMessageEvent) -> Option<String> {
         .images
         .as_ref()
         .is_some_and(|images| !images.is_empty())
+        || user
+            .file_ids
+            .as_ref()
+            .is_some_and(|file_ids| !file_ids.is_empty())
         || !user.local_images.is_empty()
     {
         return Some("[Image]".to_string());
@@ -2613,6 +2661,9 @@ pub struct McpInvocation {
 pub struct McpToolCallBeginEvent {
     /// Identifier so this can be paired with the McpToolCallEnd event.
     pub call_id: String,
+    /// Originating turn; absent in older rollout records.
+    #[serde(default)]
+    pub turn_id: String,
     pub invocation: McpInvocation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -2620,6 +2671,9 @@ pub struct McpToolCallBeginEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub mcp_app_resource_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_app_ui: Option<crate::items::McpAppUi>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub link_id: Option<String>,
@@ -2642,6 +2696,9 @@ pub struct McpToolCallBeginEvent {
 pub struct McpToolCallEndEvent {
     /// Identifier for the corresponding McpToolCallBegin that finished.
     pub call_id: String,
+    /// Originating turn; absent in older rollout records.
+    #[serde(default)]
+    pub turn_id: String,
     pub invocation: McpInvocation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -2649,6 +2706,9 @@ pub struct McpToolCallEndEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub mcp_app_resource_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_app_ui: Option<crate::items::McpAppUi>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub link_id: Option<String>,
@@ -4469,6 +4529,16 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn old_turn_started_records_have_no_root_attribution() {
+        let event: TurnStartedEvent = serde_json::from_value(serde_json::json!({
+            "turn_id": "old-turn",
+            "model_context_window": null
+        }))
+        .unwrap();
+        assert_eq!(event.root_turn_id, None);
+    }
+
+    #[test]
     fn review_decision_denied_round_trip() -> Result<()> {
         let decision = ReviewDecision::Denied {
             rejection: "denied reason".to_string(),
@@ -5331,6 +5401,7 @@ mod tests {
                 arguments: json!({"arg": "value"}),
                 connector_id: Some("connector".into()),
                 mcp_app_resource_uri: Some("app://connector".into()),
+                mcp_app_ui: None,
                 link_id: Some("link_123".into()),
                 app_name: Some("Calendar".into()),
                 action_name: Some("create_event".into()),
@@ -5347,6 +5418,7 @@ mod tests {
         assert_eq!(legacy_events.len(), 1);
         match &legacy_events[0] {
             EventMsg::McpToolCallBegin(event) => {
+                assert_eq!(event.turn_id, "turn-1");
                 assert_eq!(event.call_id, "mcp-1");
                 assert_eq!(event.invocation.server, "server");
                 assert_eq!(event.invocation.tool, "tool");
@@ -5451,6 +5523,7 @@ mod tests {
                 arguments: json!({"arg": "value"}),
                 connector_id: Some("connector".into()),
                 mcp_app_resource_uri: Some("app://connector".into()),
+                mcp_app_ui: None,
                 link_id: Some("link_123".into()),
                 app_name: Some("Calendar".into()),
                 action_name: Some("create_event".into()),
@@ -5472,6 +5545,7 @@ mod tests {
         assert_eq!(legacy_events.len(), 1);
         match &legacy_events[0] {
             EventMsg::McpToolCallEnd(event) => {
+                assert_eq!(event.turn_id, "turn-1");
                 assert_eq!(event.call_id, "mcp-1");
                 assert_eq!(event.invocation.server, "server");
                 assert_eq!(event.invocation.tool, "tool");
@@ -5499,6 +5573,7 @@ mod tests {
             turn_id: "turn-1".into(),
             started_at_ms: 10,
             item: TurnItem::CommandExecution(CommandExecutionItem {
+                model_context: None,
                 id: "exec-1".into(),
                 plugin_id: Some("sample@openai-curated".into()),
                 script_path: Some("scripts/run.py".into()),
@@ -5525,6 +5600,7 @@ mod tests {
             started_at_ms: Some(10),
             completed_at_ms: 20,
             item: TurnItem::CommandExecution(CommandExecutionItem {
+                model_context: None,
                 id: "exec-1".into(),
                 plugin_id: Some("sample@openai-curated".into()),
                 script_path: Some("scripts/run.py".into()),
@@ -5925,6 +6001,9 @@ mod tests {
             Some(vec!["https://example.com/image.png".to_string()])
         );
         assert_eq!(event.image_details, Vec::<Option<ImageDetail>>::new());
+        assert_eq!(event.file_ids, None);
+        assert_eq!(event.file_id_details, Vec::<Option<ImageDetail>>::new());
+        assert_eq!(event.image_order, Vec::<UserMessageImageKind>::new());
         assert_eq!(event.local_images, vec![PathBuf::from("/tmp/local.png")]);
         assert_eq!(event.local_image_details, Vec::<Option<ImageDetail>>::new());
         assert_eq!(event.audio, None);
@@ -5940,11 +6019,21 @@ mod tests {
         let local_audio_path = PathBuf::from("/tmp/local.wav");
         let mut item = UserMessageItem::new(&[
             crate::user_input::UserInput::Image {
-                image_url: "https://example.com/first.png".to_string(),
+                image: crate::models::ImageReference::Inline {
+                    image_url: "https://example.com/first.png".to_string(),
+                },
                 detail: Some(ImageDetail::Original),
             },
             crate::user_input::UserInput::Image {
-                image_url: "https://example.com/second.png".to_string(),
+                image: crate::models::ImageReference::File {
+                    file_id: "file_123".to_string(),
+                },
+                detail: Some(ImageDetail::Low),
+            },
+            crate::user_input::UserInput::Image {
+                image: crate::models::ImageReference::Inline {
+                    image_url: "https://example.com/second.png".to_string(),
+                },
                 detail: None,
             },
             crate::user_input::UserInput::LocalImage {
@@ -5963,6 +6052,7 @@ mod tests {
         let EventMsg::UserMessage(event) = item.as_legacy_event() else {
             panic!("expected user message event");
         };
+        let event_json = serde_json::to_value(&event).expect("serialize user message event");
 
         assert_eq!(
             event.images,
@@ -5973,6 +6063,22 @@ mod tests {
         );
         assert_eq!(event.client_id, Some("client-message-1".to_string()));
         assert_eq!(event.image_details, vec![Some(ImageDetail::Original)]);
+        assert_eq!(event.file_ids, Some(vec!["file_123".to_string()]));
+        assert_eq!(event.file_id_details, vec![Some(ImageDetail::Low)]);
+        assert_eq!(
+            event.image_order,
+            vec![
+                UserMessageImageKind::Inline,
+                UserMessageImageKind::File,
+                UserMessageImageKind::Inline,
+            ]
+        );
+        assert_eq!(event_json["file_ids"], json!(["file_123"]));
+        assert_eq!(event_json["file_id_details"], json!(["low"]));
+        assert_eq!(
+            event_json["image_order"],
+            json!(["inline", "file", "inline"])
+        );
         assert_eq!(event.local_images, vec![local_path]);
         assert_eq!(event.local_image_details, vec![Some(ImageDetail::Original)]);
         assert_eq!(
@@ -5990,6 +6096,16 @@ mod tests {
         };
 
         assert_eq!(user_message_preview(&event), Some("[Audio]".to_string()));
+    }
+
+    #[test]
+    fn file_only_user_message_has_placeholder_preview() {
+        let event = UserMessageEvent {
+            file_ids: Some(vec!["file_123".to_string()]),
+            ..Default::default()
+        };
+
+        assert_eq!(user_message_preview(&event), Some("[Image]".to_string()));
     }
 
     #[test]

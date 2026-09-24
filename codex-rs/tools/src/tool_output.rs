@@ -2,6 +2,7 @@ use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseInputItem;
 use serde_json::Value as JsonValue;
 
@@ -16,6 +17,10 @@ pub trait ToolOutput: Send {
     fn log_output(&self) -> String;
 
     fn success_for_logging(&self) -> bool;
+
+    /// Finalizes output using the same completed handler duration reported in tool-call logs.
+    /// Called before recording model-visible history; implementations must not measure time here.
+    fn set_handler_duration_ms(&mut self, _handler_duration_ms: u64) {}
 
     /// Whether this output contains external context that should disable memory generation when
     /// `memories.disable_on_external_context` is enabled.
@@ -72,6 +77,10 @@ where
 
     fn success_for_logging(&self) -> bool {
         (**self).success_for_logging()
+    }
+
+    fn set_handler_duration_ms(&mut self, handler_duration_ms: u64) {
+        (**self).set_handler_duration_ms(handler_duration_ms);
     }
 
     fn contains_external_context(&self) -> bool {
@@ -219,9 +228,9 @@ fn response_input_to_code_mode_result(response: ResponseInputItem) -> JsonValue 
                     | codex_protocol::models::ContentItem::OutputText { text } => {
                         FunctionCallOutputContentItem::InputText { text }
                     }
-                    codex_protocol::models::ContentItem::InputImage { image_url, detail } => {
+                    codex_protocol::models::ContentItem::InputImage { image, detail } => {
                         FunctionCallOutputContentItem::InputImage {
-                            image_url,
+                            image,
                             detail: detail.or(Some(DEFAULT_IMAGE_DETAIL)),
                         }
                     }
@@ -254,11 +263,14 @@ fn content_items_to_code_mode_result(items: &[FunctionCallOutputContentItem]) ->
                 FunctionCallOutputContentItem::InputText { text } if !text.trim().is_empty() => {
                     Some(text.clone())
                 }
-                FunctionCallOutputContentItem::InputImage { image_url, .. }
-                    if !image_url.trim().is_empty() =>
-                {
-                    Some(image_url.clone())
-                }
+                FunctionCallOutputContentItem::InputImage {
+                    image: ImageReference::Inline { image_url },
+                    ..
+                } if !image_url.trim().is_empty() => Some(image_url.clone()),
+                FunctionCallOutputContentItem::InputImage {
+                    image: ImageReference::File { file_id },
+                    ..
+                } if !file_id.trim().is_empty() => Some(file_id.clone()),
                 FunctionCallOutputContentItem::InputAudio { audio_url }
                     if !audio_url.trim().is_empty() =>
                 {
@@ -273,3 +285,7 @@ fn content_items_to_code_mode_result(items: &[FunctionCallOutputContentItem]) ->
             .join("\n"),
     )
 }
+
+#[cfg(test)]
+#[path = "tool_output_tests.rs"]
+mod tests;

@@ -89,7 +89,9 @@ impl PidBackend {
             }
         };
         command
-            .args(self.command_args())
+            // Handoff suppression belongs to the foreground CLI, not its long-lived children.
+            .env_remove(crate::telemetry::HANDOFF_ENV)
+            .args(self.command_args().iter().map(std::borrow::Cow::as_ref))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_log.into_std().await));
@@ -205,7 +207,7 @@ impl PidBackend {
             // Never retry inside the parent's Job Object: that would report a
             // successful launch that dies when the terminal/SSH session closes.
             command.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB);
-            if matches!(self.command_kind, PidCommandKind::UpdateLoop) {
+            if matches!(self.command_kind, PidCommandKind::UpdateLoop { .. }) {
                 match fs::remove_file(self.pid_file.with_extension("ready")).await {
                     Ok(()) => {}
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -216,7 +218,7 @@ impl PidBackend {
                 PidCommandKind::AppServer { .. } => {
                     command.env(codex_app_server_transport::DAEMON_SHUTDOWN_SOCKET_ENV, "1");
                 }
-                PidCommandKind::UpdateLoop => {
+                PidCommandKind::UpdateLoop { .. } => {
                     let shutdown_file = self.pid_file.with_extension("shutdown");
                     match fs::remove_file(&shutdown_file).await {
                         Ok(()) => {}
@@ -260,15 +262,24 @@ impl PidBackend {
             super::super::windows::Process::open(pid)?
                 .context("daemon exited during launch")?
                 .ensure_detached()?;
-            read_process_start_time(pid).await
+            let process_start_time = read_process_start_time(pid).await?;
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let process_identity = super::identity::read_process_details(pid)
+                .await
+                .ok()
+                .map(|(_, identity)| identity);
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            let process_identity = None;
+            anyhow::Ok(PidRecord {
+                pid,
+                process_start_time,
+                process_identity,
+                executable_identity: launched_identity,
+            })
         }
         .await
         {
-            Ok(process_start_time) => PidRecord {
-                pid,
-                process_start_time,
-                executable_identity: launched_identity,
-            },
+            Ok(record) => record,
             Err(err) => {
                 let _ = self.terminate_process(pid);
                 let mut context =
@@ -302,7 +313,7 @@ impl PidBackend {
             });
         }
         #[cfg(windows)]
-        if matches!(self.command_kind, PidCommandKind::UpdateLoop) {
+        if matches!(self.command_kind, PidCommandKind::UpdateLoop { .. }) {
             self.finish_updater_start(&record, replacement.as_ref())
                 .await?;
         }

@@ -6,6 +6,54 @@ use std::num::NonZeroU64;
 use tempfile::tempdir;
 
 #[test]
+fn test_api_provider_applies_current_managed_residency() {
+    let info = ModelProviderInfo {
+        http_headers: Some(maplit::hashmap! {
+            "X-OpenAI-Internal-Codex-Residency".to_string() => "eu".into(),
+            "x-provider-header".to_string() => "preserved".into(),
+        }),
+        ..ModelProviderInfo::create_openai_provider(/*base_url*/ None)
+    };
+    let original_info = info.clone();
+    let previous_requirement = read_managed_residency_requirement();
+    set_managed_residency_requirement(Some(ResidencyRequirement::Us));
+    let managed = info.to_api_provider(/*auth_mode*/ None);
+    set_managed_residency_requirement(/*enforce_residency*/ None);
+    let unmanaged = info.to_api_provider(/*auth_mode*/ None);
+    set_managed_residency_requirement(previous_requirement);
+
+    assert_eq!(
+        managed.expect("managed provider should resolve").headers,
+        HeaderMap::from_iter([
+            (
+                HeaderName::from_static(RESIDENCY_HEADER_NAME),
+                HeaderValue::from_static("us")
+            ),
+            (
+                HeaderName::from_static("x-provider-header"),
+                HeaderValue::from_static("preserved")
+            ),
+        ])
+    );
+    assert_eq!(
+        unmanaged
+            .expect("unmanaged provider should resolve")
+            .headers,
+        HeaderMap::from_iter([
+            (
+                HeaderName::from_static(RESIDENCY_HEADER_NAME),
+                HeaderValue::from_static("eu")
+            ),
+            (
+                HeaderName::from_static("x-provider-header"),
+                HeaderValue::from_static("preserved")
+            ),
+        ])
+    );
+    assert_eq!(info, original_info);
+}
+
+#[test]
 fn test_deserialize_ollama_model_provider_toml() {
     let azure_provider_toml = r#"
 name = "Ollama"
@@ -14,10 +62,12 @@ base_url = "http://localhost:11434/v1"
     let expected_provider = ModelProviderInfo {
         name: "Ollama".into(),
         base_url: Some("http://localhost:11434/v1".into()),
+        model_catalog_url: None,
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: None,
+        gateway_oauth: None,
         aws: None,
         wire_api: WireApi::Responses,
         query_params: None,
@@ -47,10 +97,12 @@ query_params = { api-version = "2025-04-01-preview" }
     let expected_provider = ModelProviderInfo {
         name: "Azure".into(),
         base_url: Some("https://xxxxx.openai.azure.com/openai".into()),
+        model_catalog_url: None,
         env_key: Some("AZURE_OPENAI_API_KEY".into()),
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: None,
+        gateway_oauth: None,
         aws: None,
         wire_api: WireApi::Responses,
         query_params: Some(maplit::hashmap! {
@@ -84,10 +136,12 @@ supports_standalone_web_search = true
     let expected_provider = ModelProviderInfo {
         name: "Example".into(),
         base_url: Some("https://example.com".into()),
+        model_catalog_url: None,
         env_key: Some("API_KEY".into()),
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: None,
+        gateway_oauth: None,
         aws: None,
         wire_api: WireApi::Responses,
         query_params: None,
@@ -266,10 +320,12 @@ fn test_create_amazon_bedrock_provider() {
         ModelProviderInfo {
             name: "Amazon Bedrock".to_string(),
             base_url: None,
+            model_catalog_url: None,
             env_key: None,
             env_key_instructions: None,
             experimental_bearer_token: None,
             auth: None,
+            gateway_oauth: None,
             aws: Some(ModelProviderAwsAuthInfo {
                 profile: None,
                 region: None,
@@ -761,4 +817,35 @@ refresh_interval_ms = 0
     let auth = provider.auth.expect("auth config should deserialize");
     assert_eq!(auth.refresh_interval_ms, 0);
     assert_eq!(auth.refresh_interval(), None);
+}
+
+#[test]
+fn model_catalog_url_deserializes_without_changing_inference_routing() {
+    let provider: ModelProviderInfo = toml::from_str(
+        r#"
+name = "Gateway"
+base_url = "https://gateway.example/v1"
+model_catalog_url = "https://gateway.example/codex/catalog?token=catalog-secret"
+"#,
+    )
+    .unwrap();
+    assert!(!format!("{provider:?}").contains("catalog-secret"));
+    assert_eq!(
+        provider,
+        ModelProviderInfo {
+            name: "Gateway".to_string(),
+            base_url: Some("https://gateway.example/v1".to_string()),
+            model_catalog_url: Some(
+                "https://gateway.example/codex/catalog?token=catalog-secret".into()
+            ),
+            ..ModelProviderInfo::default()
+        }
+    );
+    assert_eq!(
+        provider
+            .to_api_provider(Some(AuthMode::ApiKey))
+            .unwrap()
+            .base_url,
+        "https://gateway.example/v1"
+    );
 }

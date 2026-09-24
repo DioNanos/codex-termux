@@ -1,5 +1,8 @@
 //! Model-history and persisted-rollout domain types.
 
+mod compaction_checkpoint;
+pub use compaction_checkpoint::CompactionCheckpoint;
+
 use std::borrow::Borrow;
 use std::ops::Deref;
 use std::ops::DerefMut;
@@ -59,6 +62,11 @@ pub struct CodexHarnessMetadata {
     )]
     pub history_truncation_token_limit: Option<usize>,
 
+    /// Bounded assistant text confirmed by a successful messaging tool result.
+    /// Captured after input hooks; untrusted context, never user authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_assistant_message: Option<String>,
+
     /// Whether a response configuration update was created by the Codex harness itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub harness_authored_configuration: bool,
@@ -74,6 +82,10 @@ pub struct CodexHarnessMetadata {
     /// Copied parent context stays model-visible but must not become child-local authorization.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inherited_user_message: bool,
+
+    /// Sender context captured by the host when this task message was accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_user_messages: Option<Box<SenderUserMessages>>,
 }
 
 impl ResponseItemEnvelope {
@@ -172,6 +184,9 @@ impl JsonSchema for RolloutItem {
 mod guardian_history;
 mod reconciled_retained_context;
 mod retained_context;
+mod sender_user_messages;
+
+pub use sender_user_messages::SenderUserMessages;
 
 pub use reconciled_retained_context::ReconciledRetainedContext;
 pub use retained_context::RetainedContext;

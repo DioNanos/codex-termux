@@ -1,5 +1,5 @@
 //! Keeps persistent-mode developer instructions current without repeating unchanged context.
-//! Mode changes retire prior instructions; missing catalog values use the bundled default.
+//! Mode changes retire prior instructions; callers provide the resolved instruction template.
 
 use super::PreviousSectionState;
 use super::WorldStateHash;
@@ -12,7 +12,6 @@ use codex_protocol::openai_models::validate_model_message_text;
 use serde::Deserialize;
 use serde::Serialize;
 
-const DEFAULT_INSTRUCTIONS: &str = include_str!("../../../assets/persistent_mode.md");
 const REPLACEMENT_NOTICE: &str = "These persistent-mode instructions replace all previously provided persistent-mode instructions.";
 const REMOVAL_NOTICE: &str =
     "The previously provided persistent-mode instructions no longer apply.";
@@ -54,11 +53,11 @@ impl PersistentModeState {
     pub(crate) fn new(
         model_slug: &str,
         reasoning_effort: Option<&ReasoningEffort>,
-        catalog_instructions: Option<&str>,
+        instructions_template: &str,
         send_user_message_async_available: bool,
     ) -> Result<Self, ModelMessageTextTooLong> {
         let instructions = if reasoning_effort == Some(&ReasoningEffort::Persistent) {
-            let source = catalog_instructions.unwrap_or(DEFAULT_INSTRUCTIONS);
+            let source = instructions_template;
             validate_model_message_text(model_slug, "persistent_instructions", source)?;
             let rendered = source.trim().replace(
                 "{{ approval_request_channel }}",

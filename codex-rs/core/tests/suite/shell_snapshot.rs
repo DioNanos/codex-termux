@@ -574,7 +574,7 @@ async fn shell_snapshot_v2_prewarm_stops_on_shutdown() -> Result<()> {
 }; "untrusted")]
 #[test_case::test_case(|config| {
     config.permissions.network = Some(NetworkProxySpec::from_config_and_constraints(
-        NetworkProxyConfig { enabled: true, allow_local_binding: true, ..Default::default() },
+        NetworkProxyConfig { enabled: true, allow_local_binding: Some(true), ..Default::default() },
         /*requirements*/ None,
         config.permissions.permission_profile(),
     ).expect("configure managed network"));
@@ -700,7 +700,7 @@ async fn shell_snapshot_v2_guardian_uses_its_resolved_permissions_and_tools(
         permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
         shell_environment_policy: test.config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
-        windows_sandbox_private_desktop: test.config.permissions.windows_sandbox_private_desktop,
+        windows_sandbox_type: test.config.permissions.windows_sandbox_type,
         use_legacy_landlock: test.config.features.use_legacy_landlock(),
         exec_policy: None,
         mcp_policy: None,

@@ -46,6 +46,10 @@ pub(crate) type ClientRequestResult = std::result::Result<Result, JSONRPCErrorEr
 static IN_FLIGHT_REQUESTS: Gauge = Gauge::new("app.requests.in_flight");
 static PENDING_SERVER_REQUESTS: Gauge = Gauge::new("app.server_requests.pending");
 
+#[path = "account_notifications.rs"]
+mod account_notifications;
+pub(crate) use account_notifications::AccountNotification;
+
 #[path = "user_verification_auth.rs"]
 mod user_verification_auth;
 
@@ -230,14 +234,6 @@ impl ThreadScopedOutgoingMessageSender {
         T: Into<ClientResponsePayload>,
     {
         self.outgoing.send_response(request_id, response).await;
-    }
-
-    pub(crate) async fn send_error(
-        &self,
-        request_id: ConnectionRequestId,
-        error: impl Into<JSONRPCErrorError>,
-    ) {
-        self.outgoing.send_error(request_id, error).await;
     }
 }
 

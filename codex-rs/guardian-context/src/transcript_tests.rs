@@ -1,5 +1,7 @@
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
 use codex_protocol::models::LocalShellStatus;
@@ -40,7 +42,7 @@ fn entry(kind: ConversationTranscriptEntryKind, text: &str) -> ConversationTrans
 }
 
 #[test]
-fn registered_transcript_preserves_shared_roles_and_node_repl_tool_attribution() {
+fn registered_transcript_filters_roles_and_preserves_node_repl_tool_attribution() {
     let approved_action = format!(
         "{MANUAL_APPROVAL_DEVELOPER_PREFIX}\nApproved action: {}",
         "exact action ".repeat(/*n*/ 1_000)
@@ -51,6 +53,15 @@ fn registered_transcript_preserves_shared_roles_and_node_repl_tool_attribution()
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
                 text: "Inspect the workspace.".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "ordinary developer context".to_string(),
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
@@ -241,6 +252,21 @@ fn outputs_with_call_ids_or_explicit_names_are_retained() {
             Some("notifications"),
             "named notification",
         ),
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: None,
+            name: Some("notifications".to_string()),
+            namespace: Some("slack".to_string()),
+            output: FunctionCallOutputPayload::from_content_items(vec![
+                FunctionCallOutputContentItem::InputImage {
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,image".to_string(),
+                    },
+                    detail: None,
+                },
+            ]),
+            internal_chat_message_metadata_passthrough: None,
+        },
         output(
             Some("missing-call"),
             Some("notifications"),
@@ -290,6 +316,12 @@ fn outputs_with_call_ids_or_explicit_names_are_retained() {
             let mut expected = vec![
                 generic("orphaned function output"),
                 named.clone(),
+                entry(
+                    ConversationTranscriptEntryKind::ToolOutput(
+                        "tool slack.notifications result".to_string(),
+                    ),
+                    "[non-text output]",
+                ),
                 generic("named orphaned function output"),
                 generic("orphaned custom output"),
                 generic("named orphaned custom output"),

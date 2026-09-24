@@ -90,9 +90,9 @@ pub fn formatted_truncate_text_content_items_with_policy(
         text: formatted_truncate_text(&combined, policy),
     }];
     out.extend(items.iter().filter_map(|item| match item {
-        FunctionCallOutputContentItem::InputImage { image_url, detail } => {
+        FunctionCallOutputContentItem::InputImage { image, detail } => {
             Some(FunctionCallOutputContentItem::InputImage {
-                image_url: image_url.clone(),
+                image: image.clone(),
                 detail: *detail,
             })
         }
@@ -159,9 +159,9 @@ pub fn truncate_function_output_items_with_policy(
                     remaining_budget = 0;
                 }
             }
-            FunctionCallOutputContentItem::InputImage { image_url, detail } => {
+            FunctionCallOutputContentItem::InputImage { image, detail } => {
                 out.push(FunctionCallOutputContentItem::InputImage {
-                    image_url: image_url.clone(),
+                    image: image.clone(),
                     detail: *detail,
                 });
             }

@@ -7,6 +7,7 @@ use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
@@ -22,7 +23,6 @@ use super::MAX_TOOL_ENTRY_TOKENS;
 use super::MAX_TOOL_TRANSCRIPT_TOKENS;
 use super::TranscriptConfig;
 use super::TranscriptSource;
-use super::truncate_entry;
 
 struct TestConversationHistory<'a>(&'a [ResponseItem]);
 
@@ -1029,82 +1029,6 @@ fn transcript_truncates_tool_results_using_standard_budget() {
 }
 
 #[test]
-fn transcript_preserves_outputs_with_call_ids_or_explicit_names() {
-    let mut items = vec![ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: None,
-        name: Some("notifications".to_owned()),
-        namespace: Some("slack".to_owned()),
-        output: FunctionCallOutputPayload::from_text("new message".to_owned()),
-        internal_chat_message_metadata_passthrough: None,
-    }];
-    items.extend(
-        [
-            (None, "anonymous output"),
-            (Some("missing-call"), "orphaned function output"),
-        ]
-        .map(|(call_id, text)| ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: call_id.map(str::to_string),
-            name: None,
-            namespace: None,
-            output: FunctionCallOutputPayload::from_text(text.to_string()),
-            internal_chat_message_metadata_passthrough: None,
-        }),
-    );
-
-    assert_eq!(
-        TranscriptConfig::default()
-            .build_context(ContextInput {
-                target: ContextTarget::Async,
-                history: &TestConversationHistory(&items),
-                root_conversation: &[],
-                trusted_user_answers: &[],
-                planned_action: None,
-                previous_reviews: None,
-                trusted_tool: None,
-                trusted_skill_paths: &[],
-                node_repl_images: None,
-            })
-            .expect("collect transcript")
-            .transcript_entries(),
-        vec![
-            "[1] tool slack.notifications result: new message\n",
-            "[2] tool result: orphaned function output\n",
-        ]
-    );
-
-    if let ResponseItem::FunctionCallOutput { output, .. } = &mut items[0] {
-        *output = FunctionCallOutputPayload::from_content_items(vec![
-            FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,image".to_owned(),
-                detail: None,
-            },
-        ]);
-    }
-    assert_eq!(
-        TranscriptConfig::default()
-            .build_context(ContextInput {
-                target: ContextTarget::Async,
-                history: &TestConversationHistory(&items),
-                root_conversation: &[],
-                trusted_user_answers: &[],
-                planned_action: None,
-                previous_reviews: None,
-                trusted_tool: None,
-                trusted_skill_paths: &[],
-                node_repl_images: None,
-            })
-            .expect("collect transcript")
-            .transcript_entries(),
-        vec![
-            "[1] tool slack.notifications result: [non-text output]\n",
-            "[2] tool result: orphaned function output\n",
-        ]
-    );
-}
-
-#[test]
 fn configured_reasoning_counts_against_message_budget() {
     for (repeats, include_reasoning) in [(200, true), (1_000, false)] {
         let mut expected = Vec::new();
@@ -1155,61 +1079,6 @@ fn configured_reasoning_counts_against_message_budget() {
 }
 
 #[test]
-fn truncate_entry_preserves_prefix_suffix_and_utf8_boundaries() {
-    let text = format!("prefix é{}é suffix", "🦀".repeat(2_000));
-    let truncated = truncate_entry(&text, /*max_tokens*/ 200);
-
-    assert!(truncated.starts_with("prefix é"));
-    assert!(truncated.contains("<truncated omitted_approx_tokens=\""));
-    assert!(truncated.ends_with("é suffix"));
-    assert!(truncated.len() <= TruncationPolicy::Tokens(200).byte_budget());
-}
-
-#[test]
-fn transcript_keeps_only_manual_approval_developer_messages() {
-    let approval_text = format!("{MANUAL_APPROVAL_DEVELOPER_PREFIX}\n\nApproved action:\n{{}}");
-    let items = vec![
-        ResponseItem::Message {
-            id: None,
-            role: "developer".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "ordinary developer context".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::Message {
-            id: None,
-            role: "developer".to_string(),
-            content: vec![ContentItem::InputText {
-                text: approval_text.clone(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-
-    let transcript = TranscriptConfig::default()
-        .build_context(ContextInput {
-            target: ContextTarget::Async,
-            history: &TestConversationHistory(&items),
-            root_conversation: &[],
-            trusted_user_answers: &[],
-            planned_action: None,
-            previous_reviews: None,
-            trusted_tool: None,
-            trusted_skill_paths: &[],
-            node_repl_images: None,
-        })
-        .expect("collect transcript")
-        .transcript_entries();
-    assert_eq!(
-        transcript,
-        vec![format!("[1] developer: {approval_text}\n")]
-    );
-}
-
-#[test]
 fn transcript_omits_media_payloads_and_keeps_readable_content() {
     let oversized_image =
         "A".repeat(TruncationPolicy::Tokens(MAX_MESSAGE_TRANSCRIPT_TOKENS).byte_budget() + 1);
@@ -1222,7 +1091,9 @@ fn transcript_omits_media_payloads_and_keeps_readable_content() {
                     text: "Review this screenshot.".to_string(),
                 },
                 ContentItem::InputImage {
-                    image_url: format!("data:image/png;base64,{oversized_image}"),
+                    image: ImageReference::Inline {
+                        image_url: format!("data:image/png;base64,{oversized_image}"),
+                    },
                     detail: None,
                 },
                 ContentItem::InputAudio {
@@ -1242,7 +1113,9 @@ fn transcript_omits_media_payloads_and_keeps_readable_content() {
                     text: "Screenshot captured.".to_string(),
                 },
                 FunctionCallOutputContentItem::InputImage {
-                    image_url: "data:image/png;base64,tool-image".to_string(),
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,tool-image".to_string(),
+                    },
                     detail: None,
                 },
                 FunctionCallOutputContentItem::InputAudio {

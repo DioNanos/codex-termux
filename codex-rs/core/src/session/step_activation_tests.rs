@@ -1,5 +1,6 @@
 use super::*;
-use crate::guardian::BUNDLED_GUARDIAN_POLICY;
+use crate::agents_md_manager::AgentsMdManager;
+use crate::agents_md_manager::SessionInstructions;
 use crate::session::handlers::submission_loop;
 use crate::session::step_context::StepContext;
 use crate::session::step_settings::StepSettings;
@@ -15,6 +16,11 @@ use codex_config::ConfigRequirementsToml;
 use codex_config::ConfigRequirementsWithSources;
 use codex_config::RequirementSource;
 use codex_config::Sourced;
+use codex_extension_api::Instructions;
+use codex_extension_api::LoadInstructionsFuture;
+use codex_extension_api::LoadedUserInstructions;
+use codex_extension_api::ThreadInstructionsProvider;
+use codex_extension_api::UserInstructionsProvider;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
 use codex_models_manager::ModelsManagerConfig;
@@ -41,6 +47,8 @@ use codex_protocol::protocol::TurnAbortReason;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeSet;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use test_case::test_case;
 use tokio::sync::Notify;
@@ -51,6 +59,192 @@ use tokio_util::sync::CancellationToken;
 
 const MODEL_A: &str = "step-activation-a";
 const MODEL_B: &str = "step-activation-b";
+
+struct GatedInstructionsProvider {
+    instructions: StdMutex<Option<Instructions>>,
+    block_next_read: AtomicBool,
+    read_started: Notify,
+}
+
+impl GatedInstructionsProvider {
+    fn load(&self) -> LoadInstructionsFuture<'_> {
+        let instructions = self
+            .instructions
+            .lock()
+            .expect("instruction snapshot")
+            .clone();
+        let block = self.block_next_read.swap(/*val*/ false, Ordering::SeqCst);
+        Box::pin(async move {
+            if block {
+                self.read_started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            LoadedUserInstructions {
+                instructions,
+                warnings: Vec::new(),
+            }
+        })
+    }
+}
+
+impl UserInstructionsProvider for GatedInstructionsProvider {
+    fn load_user_instructions(&self) -> LoadInstructionsFuture<'_> {
+        self.load()
+    }
+}
+
+impl ThreadInstructionsProvider for GatedInstructionsProvider {
+    fn load_thread_instructions(&self) -> LoadInstructionsFuture<'_> {
+        self.load()
+    }
+}
+
+#[tokio::test]
+async fn instruction_refresh_serializes_reads_and_releases_on_cancellation() {
+    let (mut session, turn) = make_session_and_context().await;
+    let turn = Arc::new(turn);
+    let source = turn.config.codex_home.join("AGENTS.md");
+    let instructions = |text: &str| {
+        Some(Instructions {
+            text: text.to_string(),
+            source: Some(source.clone()),
+        })
+    };
+    let provider = Arc::new(GatedInstructionsProvider {
+        instructions: StdMutex::new(instructions("initial")),
+        block_next_read: AtomicBool::new(/*v*/ false),
+        read_started: Notify::new(),
+    });
+    session.services.agents_md_manager = Arc::new(AgentsMdManager::new(SessionInstructions {
+        user_provider: Some(provider.clone()),
+        ..Default::default()
+    }));
+    let session = Arc::new(session);
+    session
+        .services
+        .agents_md_manager
+        .refresh(&turn.config, &turn.initial_environments)
+        .await
+        .0
+        .expect("install initial provider");
+    *provider.instructions.lock().expect("instruction snapshot") = instructions("cancelled");
+    provider
+        .block_next_read
+        .store(/*val*/ true, Ordering::SeqCst);
+
+    let cancellation = CancellationToken::new();
+    let first_capture = session.capture_step_context(Arc::clone(&turn), &cancellation);
+    tokio::pin!(first_capture);
+    tokio::select! {
+        _ = &mut first_capture => panic!("capture must wait for provider"),
+        () = provider.read_started.notified() => {}
+    }
+
+    *provider.instructions.lock().expect("instruction snapshot") = instructions("latest");
+    let next_cancellation = CancellationToken::new();
+    let next_capture = session.capture_step_context(turn, &next_cancellation);
+    tokio::pin!(next_capture);
+    assert!(futures::poll!(&mut next_capture).is_pending());
+    assert_eq!(
+        session.inherited_instructions().await.user,
+        instructions("initial")
+    );
+
+    cancellation.cancel();
+    assert!(first_capture.await.is_err());
+    next_capture
+        .await
+        .expect("cancelled read releases the refresh guard");
+    assert_eq!(
+        session.inherited_instructions().await.user,
+        instructions("latest")
+    );
+}
+
+#[test_case(None; "thread only")]
+#[test_case(Some("global instructions"); "with global instructions")]
+#[tokio::test]
+async fn thread_instruction_refresh_serializes_reads_and_releases_on_cancellation(
+    global_text: Option<&str>,
+) {
+    let (mut session, mut turn) = make_session_and_context().await;
+    // This tests provider snapshots, not the checkout's repository instructions.
+    Arc::make_mut(&mut turn.config).project_doc_max_bytes = 0;
+    let turn = Arc::new(turn);
+    let global = global_text.map(|text| Instructions {
+        text: text.to_string(),
+        source: Some(turn.config.codex_home.join("AGENTS.md")),
+    });
+    let instructions = |text: &str| {
+        Some(Instructions {
+            text: text.to_string(),
+            source: None,
+        })
+    };
+    let provider = Arc::new(GatedInstructionsProvider {
+        instructions: StdMutex::new(instructions("initial")),
+        block_next_read: AtomicBool::new(/*v*/ false),
+        read_started: Notify::new(),
+    });
+    session.services.agents_md_manager = Arc::new(AgentsMdManager::new(SessionInstructions {
+        user: global.clone(),
+        thread_provider: Some(provider.clone()),
+        ..Default::default()
+    }));
+    let session = Arc::new(session);
+    session
+        .services
+        .agents_md_manager
+        .refresh(&turn.config, &turn.initial_environments)
+        .await
+        .0
+        .expect("install initial provider");
+    *provider.instructions.lock().expect("instruction snapshot") = instructions("cancelled");
+    provider
+        .block_next_read
+        .store(/*val*/ true, Ordering::SeqCst);
+
+    let cancellation = CancellationToken::new();
+    let first_capture = session.capture_step_context(Arc::clone(&turn), &cancellation);
+    tokio::pin!(first_capture);
+    tokio::select! {
+        _ = &mut first_capture => panic!("capture must wait for provider"),
+        () = provider.read_started.notified() => {}
+    }
+
+    *provider.instructions.lock().expect("instruction snapshot") = instructions("latest");
+    let next_cancellation = CancellationToken::new();
+    let next_capture = session.capture_step_context(turn, &next_cancellation);
+    tokio::pin!(next_capture);
+    assert!(futures::poll!(&mut next_capture).is_pending());
+    let inherited = session.inherited_instructions().await;
+    assert_eq!(
+        (inherited.user, inherited.thread),
+        (global.clone(), instructions("initial"))
+    );
+
+    cancellation.cancel();
+    assert!(first_capture.await.is_err());
+    let step = next_capture
+        .await
+        .expect("cancelled read releases the refresh guard");
+    let inherited = session.inherited_instructions().await;
+    assert_eq!(
+        (inherited.user, inherited.thread),
+        (global, instructions("latest"))
+    );
+    let expected = global_text.map_or_else(
+        || "latest".to_string(),
+        |global| format!("{global}\n\nlatest"),
+    );
+    assert_eq!(
+        step.loaded_agents_md
+            .as_ref()
+            .expect("captured instructions")
+            .text(),
+        expected
+    );
+}
 
 fn activation_models() -> Vec<ModelInfo> {
     let model = bundled_models_response()
@@ -318,10 +512,9 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
     let model_manager_config = {
         let state = session.state.lock().await;
         let configuration = &state.session_configuration;
-        configuration.model_info_overrides.models_manager_config(
-            configuration.step_settings.personality,
-            session.features.enabled(Feature::Personality),
-        )
+        configuration
+            .model_info_overrides
+            .models_manager_config(configuration.step_settings.personality)
     };
     let expected_destination = with_config_overrides(expected_destination, &model_manager_config);
     let desired = desired_step_settings(&session).await;
@@ -546,7 +739,7 @@ async fn delayed_activation_does_not_retarget_a_task(change: TaskChangeDuringLoo
         lookup,
     } = activation_fixture(models).await;
     let desired = desired_step_settings(&session).await;
-    let original = turn.current_settings.load_full();
+    let original = turn.next_step_input.load_full();
     let update_session = Arc::clone(&session);
     let turn_id = turn.sub_id.clone();
     let update = tokio::spawn(async move {
@@ -570,7 +763,7 @@ async fn delayed_activation_does_not_retarget_a_task(change: TaskChangeDuringLoo
             .expect("active task");
         (task.cancellation_token.clone(), Arc::clone(&task.done))
     };
-    let (expected_turn, expected_settings) = match change {
+    let (expected_turn, expected_inputs) = match change {
         TaskChangeDuringLookup::CancelledWithRejectedDestination => {
             cancellation_token.cancel();
             (Arc::clone(&turn), original)
@@ -594,7 +787,7 @@ async fn delayed_activation_does_not_retarget_a_task(change: TaskChangeDuringLoo
                 TaskChangeDuringLookup::FinishedAndReusedContext => Arc::clone(&turn),
                 TaskChangeDuringLookup::CancelledWithRejectedDestination => unreachable!(),
             };
-            let settings = replacement.current_settings.load_full();
+            let inputs = replacement.next_step_input.load_full();
             session
                 .spawn_task(
                     Arc::clone(&replacement),
@@ -605,8 +798,8 @@ async fn delayed_activation_does_not_retarget_a_task(change: TaskChangeDuringLoo
                     },
                 )
                 .await;
-            assert!(Arc::ptr_eq(&turn.current_settings.load_full(), &original));
-            (replacement, settings)
+            assert!(Arc::ptr_eq(&turn.next_step_input.load_full(), &original));
+            (replacement, inputs)
         }
     };
     lookup.release();
@@ -615,8 +808,8 @@ async fn delayed_activation_does_not_retarget_a_task(change: TaskChangeDuringLoo
         TurnSettingsUpdateOutcome::TargetUnavailable
     );
     assert!(Arc::ptr_eq(
-        &expected_turn.current_settings.load_full(),
-        &expected_settings,
+        &expected_turn.next_step_input.load_full(),
+        &expected_inputs,
     ));
     assert_eq!(desired_step_settings(&session).await, desired);
     session.abort_all_tasks(TurnAbortReason::Replaced).await;
@@ -633,7 +826,7 @@ enum ManagedAuthorizationChange {
 #[tokio::test]
 async fn reviewer_only_activation_enforces_managed_authority(required_review: bool) {
     let ActivationFixture { session, turn, .. } = activation_fixture(activation_models()).await;
-    let original = turn.current_settings.load_full();
+    let original = turn.next_step_input.load_full();
     let desired = desired_step_settings(&session).await;
     let source = RequirementSource::Unknown;
     let mut sourced = ConfigRequirementsWithSources::default();
@@ -677,7 +870,7 @@ async fn reviewer_only_activation_enforces_managed_authority(required_review: bo
             .await,
         TurnSettingsUpdateOutcome::Rejected { .. }
     ));
-    assert!(Arc::ptr_eq(&turn.current_settings.load_full(), &original));
+    assert!(Arc::ptr_eq(&turn.next_step_input.load_full(), &original));
     assert_eq!(desired_step_settings(&session).await, desired);
     session.abort_all_tasks(TurnAbortReason::Replaced).await;
 }
@@ -694,7 +887,7 @@ async fn delayed_activation_rechecks_live_managed_authorization(
         lookup,
         ..
     } = activation_fixture(activation_models()).await;
-    let original = turn.current_settings.load_full();
+    let original = turn.next_step_input.load_full();
     let desired = desired_step_settings(&session).await;
     let update_session = Arc::clone(&session);
     let turn_id = turn.sub_id.clone();
@@ -720,7 +913,7 @@ async fn delayed_activation_rechecks_live_managed_authorization(
     };
     let sourced = match change {
         ManagedAuthorizationChange::ApprovalPolicy => {
-            let allowed = if original.approval_policy() == AskForApproval::Never {
+            let allowed = if original.settings.approval_policy() == AskForApproval::Never {
                 AskForApproval::OnRequest
             } else {
                 AskForApproval::Never
@@ -731,7 +924,7 @@ async fn delayed_activation_rechecks_live_managed_authorization(
             }
         }
         ManagedAuthorizationChange::ApprovalsReviewer => {
-            let allowed = if original.approvals_reviewer() == ApprovalsReviewer::User {
+            let allowed = if original.settings.approvals_reviewer() == ApprovalsReviewer::User {
                 ApprovalsReviewer::AutoReview
             } else {
                 ApprovalsReviewer::User
@@ -761,10 +954,10 @@ async fn delayed_activation_rechecks_live_managed_authorization(
         match change {
             ManagedAuthorizationChange::ApprovalPolicy => requirements
                 .approval_policy
-                .can_set(&original.approval_policy()),
+                .can_set(&original.settings.approval_policy()),
             ManagedAuthorizationChange::ApprovalsReviewer => requirements
                 .approvals_reviewer
-                .can_set(&original.approvals_reviewer()),
+                .can_set(&original.settings.approvals_reviewer()),
         }
         .expect_err("the refreshed constraint rejects the admitted value")
     };
@@ -775,7 +968,7 @@ async fn delayed_activation_rechecks_live_managed_authorization(
             reason: expected_error.to_string(),
         }
     );
-    assert!(Arc::ptr_eq(&turn.current_settings.load_full(), &original,));
+    assert!(Arc::ptr_eq(&turn.next_step_input.load_full(), &original));
     assert_eq!(desired_step_settings(&session).await, desired);
     session.abort_all_tasks(TurnAbortReason::Replaced).await;
 }
@@ -1012,6 +1205,26 @@ async fn model_safety_rejects_fallback_metadata() {
     }
 }
 
+#[tokio::test]
+async fn model_safety_rejects_oversized_parent_fallback_messages() {
+    let (_, turn) = make_session_and_context().await;
+    let (admitted, mut destination) = safety_models();
+    // codex-vl: the parent-fallback policy source stays fail-closed — an
+    // oversized node REPL policy on any compared model refuses the switch
+    // before the Guardian policy comparison happens.
+    let oversized = "x".repeat(8 * 1024 + 1);
+    parent_review_messages(&mut destination).node_repl_policy = Some(oversized);
+    for current in [&admitted, &destination] {
+        let error =
+            check_legacy_model_safety(&admitted, current, &destination, &turn.config, &turn.config)
+                .expect_err("oversized parent-fallback messages must refuse the switch");
+        assert!(
+            error.contains("field `node_repl_policy` is 8193 bytes; maximum is 8192 bytes"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
 #[test_case(None, None, false; "both catalog policies")]
 #[test_case(Some("admitted policy"), None, false; "live config unmasks catalog")]
 #[test_case(None, Some("live policy"), false; "admitted config unmasks catalog")]
@@ -1048,6 +1261,7 @@ async fn parent_fallback_policy_uses_both_config_lifetimes(
 
 #[tokio::test]
 async fn parent_fallback_preserves_explicit_empty_and_bundled_defaults() {
+    let defaults = ResolvedModelMessages::bundled().auto_review();
     let (_, turn) = make_session_and_context().await;
     let mut config = turn.config.as_ref().clone();
     config.guardian_policy_config = None;
@@ -1055,9 +1269,9 @@ async fn parent_fallback_preserves_explicit_empty_and_bundled_defaults() {
     let check = |destination: &ModelInfo| {
         check_legacy_model_safety(&admitted, &admitted, destination, &config, &config)
     };
-    parent_review_messages(&mut destination).policy = Some(BUNDLED_GUARDIAN_POLICY.to_string());
+    parent_review_messages(&mut destination).policy = Some(defaults.policy.to_string());
     parent_review_messages(&mut destination).policy_template =
-        Some(BUNDLED_GUARDIAN_POLICY_TEMPLATE.to_string());
+        Some(defaults.policy_template.to_string());
     assert_eq!(check(&destination), Ok(()));
     parent_review_messages(&mut destination).policy_template = Some(String::new());
     assert_eq!(

@@ -278,7 +278,6 @@ async fn exec_full_buffer_capture_ignores_expiration() -> Result<()> {
             network_environment_id: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
-            windows_sandbox_private_desktop: false,
             justification: None,
             arg0: None,
         },
@@ -315,7 +314,6 @@ async fn exec_full_buffer_capture_keeps_io_drain_timeout_when_descendant_holds_p
                 network_environment_id: None,
                 sandbox_permissions: SandboxPermissions::UseDefault,
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
-                windows_sandbox_private_desktop: false,
                 justification: None,
                 arg0: None,
             },
@@ -507,7 +505,6 @@ async fn process_exec_tool_call_preserves_full_buffer_capture_policy(
             network_environment_id: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
-            windows_sandbox_private_desktop: false,
             justification: None,
             arg0: None,
         },
@@ -515,6 +512,7 @@ async fn process_exec_tool_call_preserves_full_buffer_capture_policy(
         &cwd,
         std::slice::from_ref(&cwd),
         &None,
+        /*codex_self_exe*/ &None,
         /*use_legacy_landlock*/ false,
         /*stdout_stream*/ None,
     )
@@ -1186,7 +1184,7 @@ fn process_exec_tool_call_uses_platform_sandbox_for_network_only_restrictions() 
                 &FileSystemSandboxPolicy::unrestricted(),
                 NetworkSandboxPolicy::Restricted,
             ),
-            codex_protocol::config_types::WindowsSandboxLevel::Disabled,
+            SandboxType::None,
             /*enforce_managed_network*/ false,
         ),
         expected
@@ -1194,38 +1192,72 @@ fn process_exec_tool_call_uses_platform_sandbox_for_network_only_restrictions() 
 }
 
 #[test]
-fn build_exec_request_preserves_windows_workspace_roots() -> Result<()> {
+fn build_exec_request_projects_workspace_roots_only_for_windows_sandbox() -> Result<()> {
     let temp_dir = tempfile::TempDir::new()?;
     let cwd = temp_dir.path().abs();
-    let additional_root = temp_dir.path().join("additional").abs();
-    let workspace_roots = vec![cwd.clone(), additional_root];
-
-    let exec_request = build_exec_request(
-        ExecParams {
-            command: vec!["echo".to_string(), "ok".to_string()],
-            cwd: cwd.clone(),
-            expiration: ExecExpiration::DefaultTimeout,
-            capture_policy: ExecCapturePolicy::ShellTool,
-            env: HashMap::new(),
-            network: None,
-            network_environment_id: None,
-            sandbox_permissions: SandboxPermissions::UseDefault,
-            windows_sandbox_level: WindowsSandboxLevel::Disabled,
-            windows_sandbox_private_desktop: false,
-            justification: None,
-            arg0: None,
-        },
-        &PermissionProfile::Disabled,
-        &cwd,
-        workspace_roots.as_slice(),
-        &None,
-        /*use_legacy_landlock*/ false,
+    let build_request = |profile: &PermissionProfile, roots: &[PathUri]| {
+        build_exec_request(
+            ExecParams {
+                command: vec!["echo".to_string(), "ok".to_string()],
+                cwd: cwd.clone(),
+                expiration: ExecExpiration::DefaultTimeout,
+                capture_policy: ExecCapturePolicy::ShellTool,
+                env: HashMap::new(),
+                network: None,
+                network_environment_id: None,
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
+                justification: None,
+                arg0: None,
+            },
+            profile,
+            &cwd,
+            roots,
+            &Some(temp_dir.path().join("codex-linux-sandbox")),
+            /*codex_self_exe*/ &None,
+            SandboxType::WindowsRestrictedToken,
+            /*use_legacy_landlock*/ false,
+        )
+    };
+    let native_roots = vec![cwd.clone(), temp_dir.path().join("additional").abs()];
+    let request = build_request(
+        &PermissionProfile::read_only(),
+        &native_roots
+            .iter()
+            .map(PathUri::from_abs_path)
+            .collect::<Vec<_>>(),
     )?;
-
     assert_eq!(
-        exec_request.windows_sandbox_workspace_roots,
-        workspace_roots
+        request.windows_sandbox_workspace_roots,
+        if cfg!(windows) {
+            native_roots
+        } else {
+            Vec::new()
+        },
     );
+
+    let foreign_root = PathUri::parse(if cfg!(windows) {
+        "file:///workspace"
+    } else {
+        "file:///C:/workspace"
+    })
+    .expect("foreign workspace URI");
+    let roots = [PathUri::from_abs_path(&cwd), foreign_root];
+    assert_eq!(
+        build_request(&PermissionProfile::Disabled, &roots)?.windows_sandbox_workspace_roots,
+        Vec::new(),
+    );
+    let request = build_request(&PermissionProfile::read_only(), &roots);
+    if cfg!(windows) {
+        let error = request.expect_err("native Windows sandbox must reject foreign roots");
+        assert!(matches!(
+            error.details(),
+            codex_protocol::error::CodexErrorDetails::InvalidRequest(message)
+                if message.starts_with("invalid Windows sandbox workspace roots:")
+        ));
+    } else {
+        assert_eq!(request?.windows_sandbox_workspace_roots, Vec::new());
+    }
     Ok(())
 }
 
@@ -1266,7 +1298,6 @@ async fn kill_child_process_group_kills_grandchildren_on_timeout() -> Result<()>
         network_environment_id: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
         justification: None,
         arg0: None,
     };
@@ -1322,7 +1353,6 @@ async fn process_exec_tool_call_respects_cancellation_token() -> Result<()> {
         network_environment_id: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
         justification: None,
         arg0: None,
     };
@@ -1338,6 +1368,7 @@ async fn process_exec_tool_call_respects_cancellation_token() -> Result<()> {
             &cwd,
             std::slice::from_ref(&cwd),
             &None,
+            /*codex_self_exe*/ &None,
             /*use_legacy_landlock*/ false,
             /*stdout_stream*/ None,
         ),
@@ -1406,7 +1437,6 @@ while :; do sleep 1; done"#
         network_environment_id: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
         justification: None,
         arg0: None,
     };
@@ -1419,6 +1449,7 @@ while :; do sleep 1; done"#
             &cwd,
             std::slice::from_ref(&cwd),
             &None,
+            /*codex_self_exe*/ &None,
             /*use_legacy_landlock*/ false,
             /*stdout_stream*/ None,
         ),

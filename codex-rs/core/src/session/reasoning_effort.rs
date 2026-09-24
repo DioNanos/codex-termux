@@ -1,14 +1,15 @@
 //! Cache-preserving effort updates and the request-effort baseline for a context window.
 //!
-//! Only trusted harness items establish overrides. Replay and rollback preserve startup
-//! prewarm's baseline while it is retained; later rollback invalidates the runtime pin.
+//! Only trusted harness items establish overrides. Replay preserves startup prewarm's
+//! baseline while it is retained.
 //! Successful compaction retires the overrides and allows a fresh request baseline.
+//! Fixed-effort workers always use their selected request-level effort.
+//! Unsupported models use selected request effort without rewriting saved updates.
 
 use super::session::Session;
 use super::step_context::StepContext;
 use super::step_settings::ResolvedStepSettings;
 use crate::state::ReasoningEffortPin;
-use codex_features::Feature;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::models::ConfigurationReasoning;
@@ -26,7 +27,7 @@ impl Session {
     /// Establishes the selected effort in surviving history, independent of replayed settings.
     pub(crate) async fn record_reasoning_effort_override(&self, step_context: &StepContext) {
         let settings = &step_context.settings;
-        let Some(effort) = self.effort_for_configuration_update(settings).await else {
+        let Some(effort) = self.effort_for_configuration_update(settings) else {
             return;
         };
         let should_skip = {
@@ -96,7 +97,14 @@ impl Session {
         usage: RequestEffortUsage,
     ) -> Option<ReasoningEffort> {
         let selected_effort = settings.reasoning_effort().cloned();
-        if !self.enabled(Feature::ReasoningEffortOverride) {
+        if !self
+            .services
+            .model_client
+            .reasoning_effort_override_enabled(&settings.model_info)
+        {
+            if usage == RequestEffortUsage::Sampling {
+                self.state.lock().await.reasoning_effort_pin = ReasoningEffortPin::Unset;
+            }
             return selected_effort;
         }
         if usage == RequestEffortUsage::Compaction
@@ -109,7 +117,7 @@ impl Session {
         {
             return Some(pinned);
         }
-        let effort = self.effort_for_configuration_update(settings).await;
+        let effort = self.effort_for_configuration_update(settings);
         let mut state = self.state.lock().await;
         let Some(effort) = effort else {
             if usage == RequestEffortUsage::Sampling {
@@ -126,13 +134,14 @@ impl Session {
         })
     }
 
-    async fn effort_for_configuration_update(
+    fn effort_for_configuration_update(
         &self,
         settings: &ResolvedStepSettings,
     ) -> Option<ReasoningEffort> {
-        if !self.enabled(Feature::ReasoningEffortOverride)
-            || !settings.model_info.use_responses_lite
-            || !self.provider().await.is_openai()
+        if !self
+            .services
+            .model_client
+            .reasoning_effort_override_enabled(&settings.model_info)
         {
             return None;
         }

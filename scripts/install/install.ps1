@@ -341,7 +341,8 @@ function Move-OldStandaloneBinIfApproved {
 }
 
 function Add-JunctionSupportType {
-    if (([System.Management.Automation.PSTypeName]'CodexInstaller.Junction').Type) {
+    # Older installer types remain loaded when users rerun irm | iex in one session.
+    if (([System.Management.Automation.PSTypeName]'CodexInstaller.JunctionV2').Type) {
         return
     }
 
@@ -355,7 +356,7 @@ using Microsoft.Win32.SafeHandles;
 
 namespace CodexInstaller
 {
-    public static class Junction
+    public static class JunctionV2
     {
         private const uint GENERIC_WRITE = 0x40000000;
         private const uint FILE_SHARE_READ = 0x00000001;
@@ -388,6 +389,25 @@ namespace CodexInstaller
             int nOutBufferSize,
             out int lpBytesReturned,
             IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFinalPathNameByHandleW(
+            SafeFileHandle file, StringBuilder path, uint length, uint flags);
+
+        public static string ResolveDirectory(string path)
+        {
+            using (SafeFileHandle handle = CreateFileW(
+                path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero))
+            {
+                if (handle.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+                StringBuilder resolved = new StringBuilder(32768);
+                uint length = GetFinalPathNameByHandleW(handle, resolved, (uint)resolved.Capacity, 0);
+                if (length == 0) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+                if (length >= resolved.Capacity) { throw new IOException("Resolved path is too long."); }
+                return resolved.ToString().TrimEnd('\\');
+            }
+        }
 
         public static void SetTarget(string linkPath, string targetPath)
         {
@@ -460,7 +480,7 @@ function Set-JunctionTarget {
     )
 
     Add-JunctionSupportType
-    [CodexInstaller.Junction]::SetTarget($LinkPath, $TargetPath)
+    [CodexInstaller.JunctionV2]::SetTarget($LinkPath, $TargetPath)
 }
 
 function Test-IsJunction {
@@ -490,14 +510,15 @@ function Ensure-Junction {
 
     $item = Get-Item -LiteralPath $LinkPath -Force
     if (Test-IsJunction -Path $LinkPath) {
-        $existingTarget = [string]$item.Target
+        Add-JunctionSupportType
+        $existingTarget = [CodexInstaller.JunctionV2]::ResolveDirectory($LinkPath)
         if (-not [string]::IsNullOrWhiteSpace($InstallerOwnedTargetPrefix)) {
-            $ownedTargetPrefix = $InstallerOwnedTargetPrefix.TrimEnd("\\")
+            $ownedTargetPrefix = [CodexInstaller.JunctionV2]::ResolveDirectory($InstallerOwnedTargetPrefix) + "\"
             if (-not $existingTarget.StartsWith($ownedTargetPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
                 throw "Refusing to retarget junction at $LinkPath because it is not managed by this installer."
             }
         }
-        if ($existingTarget.Equals($TargetPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if ($existingTarget.Equals([CodexInstaller.JunctionV2]::ResolveDirectory($TargetPath), [System.StringComparison]::OrdinalIgnoreCase)) {
             return
         }
 
@@ -733,9 +754,15 @@ $codexHome = if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
 } else {
     $env:CODEX_HOME
 }
-$standaloneRoot = Join-Path $codexHome "packages\standalone"
+$daemonOnly = $env:CODEX_INSTALL_DAEMON_ONLY -eq "1"
+$standaloneRoot = Join-Path $codexHome $(if ($daemonOnly) { "packages\app-server-daemon" } else { "packages\standalone" })
 $releasesDir = Join-Path $standaloneRoot "releases"
 $currentDir = Join-Path $standaloneRoot "current"
+$deferSelection = $env:CODEX_INSTALL_DEFER_SELECTION -eq "1"
+if ($deferSelection) {
+    if (-not $daemonOnly) { throw "Deferred selection requires a daemon-only installation." }
+    $currentDir = Join-Path $standaloneRoot ".migration-current"
+}
 $autoUpdateVersion = Join-Path $standaloneRoot "auto-update-version"
 $lockPath = Join-Path $standaloneRoot "install.lock"
 
@@ -761,7 +788,7 @@ if (-not [string]::IsNullOrWhiteSpace($currentVersion) -and $currentVersion -ne 
 Write-Step "Detected platform: $platformLabel"
 Write-Step "Resolved version: $resolvedVersion"
 
-$conflictingInstall = Get-ConflictingInstall -VisibleBinDir $visibleBinDir
+$conflictingInstall = if ($daemonOnly) { $null } else { Get-ConflictingInstall -VisibleBinDir $visibleBinDir }
 $oldStandaloneBackup = $null
 
 $packageAsset = "codex-package-$target.tar.gz"
@@ -786,8 +813,9 @@ $guardRejected = $false
 try {
     Invoke-WithInstallLock -LockPath $lockPath -Script {
         $updaterRecord = Join-Path $codexHome "app-server-daemon\app-server-updater.pid"
+        if ($daemonOnly) { $updaterRecord = Join-Path $codexHome "app-server-daemon\daemon-updater.pid" }
         $oldUpdaterParent = $false
-        if ($Release -eq "latest" -and $env:CODEX_INSTALL_IF_LATEST -ne "1" -and (Test-Path -LiteralPath $updaterRecord)) {
+        if ($Release -eq "latest" -and $env:CODEX_INSTALL_IF_LATEST -ne "1" -and $env:CODEX_INSTALL_IF_CURRENT -ne "1" -and (Test-Path -LiteralPath $updaterRecord)) {
             $updaterPid = $null
             $updaterStartTime = $null
             try {
@@ -815,17 +843,25 @@ try {
                 }
             }
         }
-        if ($env:CODEX_INSTALL_IF_LATEST -eq "1" -or $oldUpdaterParent) {
+        if ($env:CODEX_INSTALL_IF_LATEST -eq "1" -or $env:CODEX_INSTALL_IF_CURRENT -eq "1" -or $oldUpdaterParent) {
             $previousRelease = if ($oldUpdaterParent -and (Test-Path -LiteralPath $autoUpdateVersion)) {
                 [System.IO.File]::ReadAllText($autoUpdateVersion)
             } else {
                 $env:CODEX_UPDATE_FROM_RELEASE
             }
+            Add-JunctionSupportType
             $currentTarget = if (Test-Path -LiteralPath $currentDir) { (Get-Item -LiteralPath $currentDir).Target } else { $null }
             if ($Release -ne "latest" -or [string]::IsNullOrEmpty($previousRelease) -or [string]::IsNullOrEmpty($currentTarget) -or
-                -not (Test-Path -LiteralPath $autoUpdateVersion) -or
-                [System.IO.File]::ReadAllText($autoUpdateVersion) -cne $previousRelease -or
-                [System.IO.Path]::GetFullPath($currentTarget) -ne [System.IO.Path]::GetFullPath((Join-Path $releasesDir $previousRelease))) {
+                -not (Test-Path -LiteralPath (Join-Path $releasesDir $previousRelease)) -or
+                [CodexInstaller.JunctionV2]::ResolveDirectory($currentDir) -ne [CodexInstaller.JunctionV2]::ResolveDirectory((Join-Path $releasesDir $previousRelease))) {
+                if ($env:CODEX_INSTALL_IF_CURRENT -eq "1") { throw "Daemon selection changed; retry the update." }
+                $script:guardRejected = $true
+                return
+            }
+            # Explicit daemon updates may leave a local or pinned release.
+            if ($env:CODEX_INSTALL_IF_CURRENT -ne "1" -and
+                (-not (Test-Path -LiteralPath $autoUpdateVersion) -or
+                [System.IO.File]::ReadAllText($autoUpdateVersion) -cne $previousRelease)) {
                 $script:guardRejected = $true
                 return
             }
@@ -834,6 +870,7 @@ try {
 
         if (-not (Test-ReleaseIsComplete -ReleaseDir $releaseDir -ExpectedVersion $resolvedVersion -ExpectedTarget $target -Layout $installLayout)) {
             if (Test-Path -LiteralPath $releaseDir) {
+                if ($daemonOnly) { throw "Refusing to overwrite existing daemon release $releaseDir." }
                 Write-WarningStep "Found incomplete existing release at $releaseDir. Reinstalling."
             }
 
@@ -893,6 +930,16 @@ try {
         }
 
         New-Item -ItemType Directory -Force -Path $standaloneRoot | Out-Null
+        if ($deferSelection -and (Get-Item -LiteralPath (Join-Path $standaloneRoot "current") -Force -ErrorAction SilentlyContinue)) {
+            throw "A dedicated daemon is already selected; retry the update."
+        }
+        if ($daemonOnly -and -not $deferSelection) {
+            $installedCodex = Join-Path $releaseDir $(if ($installLayout -eq "Package") { "bin\codex.exe" } else { "codex.exe" })
+            & $installedCodex app-server daemon pid-update-loop --check-package-ownership | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "The production release does not support daemon-owned packages; the current selection was left unchanged."
+            }
+        }
         Ensure-Junction -LinkPath $currentDir -TargetPath $releaseDir -InstallerOwnedTargetPrefix $releasesDir
         if ($Release -eq "latest") {
             $tempMarker = "$autoUpdateVersion.tmp.$PID"
@@ -904,6 +951,7 @@ try {
             }
         }
 
+        if ($daemonOnly) { return }
         $visibleParent = Split-Path -Parent $visibleBinDir
         $currentBinDir = if ($installLayout -eq "Package") {
             Join-Path $currentDir "bin"
@@ -931,7 +979,7 @@ try {
 } finally {
     Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
 }
-if ($guardRejected) { return }
+if ($guardRejected -or $daemonOnly) { return }
 
 Maybe-HandleConflictingInstall -Conflict $conflictingInstall
 

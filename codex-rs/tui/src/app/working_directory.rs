@@ -266,7 +266,7 @@ impl App {
         {
             return;
         }
-        let local_settings = crate::local_settings::LocalSettings::from(&config);
+        let local_settings = self.local_settings.reloaded(&config);
         let keymap = match RuntimeKeymap::from_config(&local_settings.tui.keymap) {
             Ok(keymap) => keymap,
             Err(error) => return self.chat_widget.add_error_message(error),
@@ -317,8 +317,11 @@ impl App {
             };
             let handle = app_server.request_handle();
             let result = handle.request_typed::<ListResponse>(request).await;
-            if !matches!(result, Ok(response) if response.data.is_empty()) {
-                return self.working_directory_error("Active background terminals block /cd.");
+            if let Some(message) = super::managed_worktree_creation::background_terminals_blocker(
+                result,
+                &self.app_server_target,
+            ) {
+                return self.working_directory_error(message);
             }
         }
         if is_new_worktree {

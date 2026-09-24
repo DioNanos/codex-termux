@@ -1,10 +1,14 @@
 //! Disconnects preserve editable input but never automatically retry queued submissions.
+//! Unavailable threads retain uncertain prompts in recovered queues before clearing activity.
 
 use super::realtime::RealtimeConversationPhase;
 use super::*;
+use crate::bottom_pane::RestrictedInputMode;
 
 impl ChatWidget {
     pub(crate) fn pause_for_disconnect(&mut self) {
+        self.cancel_startup_submission();
+        self.cancel_image_submission();
         // The app-server transport can fail while the separate WebRTC helper
         // still sends microphone audio. Retire local media before showing offline UI.
         if matches!(
@@ -51,7 +55,7 @@ impl ChatWidget {
                 input.recovered_queue = true;
             }
             input.current_collaboration_mode = self.current_collaboration_mode.clone();
-            // Resume supplies model/effort, but not the user's selected collaboration mode.
+            // Keep the local selection for older servers. Replay reapplies a supplied mode.
             if let Some(mask) = input.active_collaboration_mask.as_mut() {
                 mask.model = Some(self.current_model().to_string());
                 mask.reasoning_effort = Some(self.effective_reasoning_effort());
@@ -73,14 +77,33 @@ impl ChatWidget {
         }
         self.turn_lifecycle
             .restore_running(/*running*/ false, Instant::now());
+        // Cached activity must not keep recovery commands blocked on an unavailable thread.
+        self.review.is_review_mode = false;
+        self.mcp_startup_status = None;
+        if self.input_queue.user_turn_pending_start
+            && let Some(prompt) = self.safety_buffering_prompt.take()
+        {
+            self.input_queue
+                .queued_user_messages
+                .push_front(QueuedUserMessage {
+                    source: self.safety_buffering_source,
+                    ..QueuedUserMessage::from(prompt)
+                });
+            self.input_queue
+                .queued_user_message_history_records
+                .push_front(UserMessageHistoryRecord::UserMessageText);
+        }
+        self.input_queue.user_turn_pending_start = false;
+        self.input_queue.recovered_queue = true;
         self.update_task_running_state();
+        self.refresh_pending_input_preview();
     }
 
     pub(crate) fn handle_disconnected_view_key(&mut self, key: KeyEvent) {
         self.bottom_pane.handle_key_event(key);
     }
 
-    pub(crate) fn handle_disconnected_key(&mut self, key: KeyEvent) {
+    pub(crate) fn handle_restricted_key(&mut self, key: KeyEvent, mode: RestrictedInputMode) {
         if self.external_writer_view {
             return;
         }
@@ -97,12 +120,15 @@ impl ChatWidget {
                 ));
                 self.input_queue.recovered_queue &= !self.input_queue.pending_steers.is_empty();
             }
-            self.bottom_pane
-                .handle_disconnected_key(KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
+            self.bottom_pane.handle_restricted_key(
+                KeyEvent::new(KeyCode::Null, KeyModifiers::NONE),
+                RestrictedInputMode::Disconnected,
+            );
             self.refresh_pending_input_preview();
             self.request_redraw();
         } else {
-            self.bottom_pane.handle_disconnected_key(key);
+            let result = self.bottom_pane.handle_restricted_key(key, mode);
+            self.handle_composer_input_result(result, /*had_modal_or_popup*/ false);
         }
     }
 

@@ -277,7 +277,7 @@ async fn plugins_popup_truncates_long_descriptions_in_list_rows() {
         .expect("expected verbose plugin row in popup");
     insta::assert_snapshot!(
         verbose_row,
-        @"  [-] Verbose Plugin  Available · OpenAI Curated · This description…"
+        @"  [-] Verbose Plugin  Available · OpenAI Curated · This description k…"
     );
     assert!(
         !popup
@@ -379,8 +379,8 @@ async fn plugins_popup_upgrades_user_configured_git_marketplace_from_marketplace
     let popup = select_plugins_tab_containing(&mut chat, /*width*/ 100, "Repo Marketplace.");
     assert!(
         popup.contains("Repo Marketplace.")
-            && popup.contains("ctrl + u upgrade")
-            && popup.contains("ctrl + r remove")
+            && popup.contains("ctrl+u upgrade")
+            && popup.contains("ctrl+r remove")
             && popup.contains("Debug Plugin"),
         "expected upgradeable user-configured marketplace tab, got:\n{popup}"
     );
@@ -476,8 +476,8 @@ async fn marketplace_add_success_refreshes_to_new_marketplace_tab() {
     assert_chatwidget_snapshot!("plugins_popup_newly_installed_marketplace", popup);
     assert!(
         popup.contains("Debug Marketplace installed successfully.")
-            && popup.contains("ctrl + u upgrade")
-            && popup.contains("ctrl + r remove")
+            && popup.contains("ctrl+u upgrade")
+            && popup.contains("ctrl+r remove")
             && popup.contains("Debug Plugin"),
         "expected marketplace add refresh to switch to the new marketplace tab, got:\n{popup}"
     );
@@ -487,7 +487,7 @@ async fn marketplace_add_success_refreshes_to_new_marketplace_tab() {
     let reopened_popup = (0..8)
         .find_map(|_| {
             let popup = render_bottom_popup(&chat, /*width*/ 100);
-            if popup.contains("[Debug Marketplace]") {
+            if popup.contains("Installed 0 of 1 Debug Marketplace plugins.") {
                 Some(popup)
             } else {
                 chat.handle_key_event(KeyEvent::from(KeyCode::Right));
@@ -542,8 +542,8 @@ async fn plugins_popup_removes_user_configured_marketplace_flow() {
         select_plugins_tab_containing(&mut chat, /*width*/ 100, "Repo Marketplace.");
     assert!(
         repo_tab.contains("Repo Marketplace.")
-            && repo_tab.contains("ctrl + u upgrade")
-            && repo_tab.contains("ctrl + r remove")
+            && repo_tab.contains("ctrl+u upgrade")
+            && repo_tab.contains("ctrl+r remove")
             && repo_tab.contains("Debug Plugin"),
         "expected removable user-configured marketplace tab, got:\n{repo_tab}"
     );
@@ -611,7 +611,7 @@ async fn plugins_popup_removes_user_configured_marketplace_flow() {
         refreshed.contains("Browse plugins from available marketplaces.")
             && !refreshed.contains("Repo Marketplace")
             && !refreshed.contains("Debug Plugin")
-            && !refreshed.contains("ctrl + r remove"),
+            && !refreshed.contains("ctrl+r remove"),
         "expected refreshed plugin list without removed marketplace, got:\n{refreshed}"
     );
 }
@@ -870,6 +870,7 @@ async fn plugin_detail_unmaterialized_default_uses_remote_install_path() {
         cwd.to_path_buf(),
         Ok(PluginReadResponse {
             plugin: PluginDetail {
+                onboarding_skill: None,
                 marketplace_name: "workspace-shared-with-me-private".to_string(),
                 marketplace_path: None,
                 summary,
@@ -3038,8 +3039,6 @@ async fn apps_popup_for_not_installed_app_uses_install_only_selected_description
 async fn experimental_features_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    let worktrees = Feature::Worktrees.stage();
-    let voice = Feature::RealtimeConversation.stage();
     let features = vec![
         ExperimentalFeatureItem {
             key: Feature::JsRepl.key().to_string(),
@@ -3056,17 +3055,10 @@ async fn experimental_features_popup_snapshot() {
             enabled: true,
         },
         ExperimentalFeatureItem {
-            key: Feature::Worktrees.key().to_string(),
-            writable: true,
-            name: worktrees.experimental_menu_name().unwrap().to_string(),
-            description: worktrees.experimental_menu_description().unwrap().to_string(),
-            enabled: false,
-        },
-        ExperimentalFeatureItem {
             key: Feature::RealtimeConversation.key().to_string(),
             writable: true,
-            name: voice.experimental_menu_name().unwrap().to_string(),
-            description: voice.experimental_menu_description().unwrap().to_string(),
+            name: "Voice conversations".to_string(),
+            description: "Talk with Codex using /voice.".to_string(),
             enabled: false,
         },
     ];
@@ -3449,6 +3441,9 @@ async fn model_picker_refresh_preserves_highlight() {
             get_available_model(&chat, "gpt-5.5"),
             get_available_model(&chat, "gpt-5.6-terra"),
         ];
+        for preset in &mut presets {
+            preset.display_name = "Shared display name".to_string();
+        }
         chat.model_catalog = Arc::new(ModelCatalog::new(presets.clone()));
         chat.open_model_popup();
         chat.handle_key_event(KeyEvent::from(KeyCode::Down));
@@ -3457,6 +3452,7 @@ async fn model_picker_refresh_preserves_highlight() {
         }
         let before = render_bottom_popup(&chat, /*width*/ 80);
         presets.reverse();
+        presets[0].display_name = "Renamed model".to_string();
         if remove_selected {
             presets.remove(/*index*/ 0);
         }
@@ -3599,16 +3595,6 @@ async fn model_picker_refresh_dismisses_empty_choices() {
 }
 
 #[tokio::test]
-async fn personality_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
-    chat.thread_id = Some(ThreadId::new());
-    chat.open_personality_popup();
-
-    let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert_chatwidget_snapshot!("personality_selection_popup", popup);
-}
-
-#[tokio::test]
 async fn skills_menu_default_mentions_shortcut_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.open_skills_menu();
@@ -3636,6 +3622,7 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
         default_service_tier: None,
+        available_access_programs: None,
         is_default: false,
         upgrade: None,
         show_in_picker,
@@ -3826,7 +3813,7 @@ async fn select_ultra_with_multi_agent_thread_limit(max_threads: usize) -> (bool
                 selected_ultra = true;
             }
             AppEvent::InsertHistoryCell(cell) => {
-                warnings.push(lines_to_single_string(&cell.display_lines(/*width*/ 80)));
+                warnings.push(lines_to_single_string(&cell.transcript_lines(/*width*/ 80)));
             }
             _ => {}
         }
@@ -4120,6 +4107,7 @@ async fn single_reasoning_option_skips_selection() {
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
         default_service_tier: None,
+        available_access_programs: None,
         is_default: false,
         upgrade: None,
         show_in_picker: true,

@@ -2,7 +2,6 @@
 source: tui/src/update_prompt.rs
 expression: terminal.backend()
 ---
-  ✨ Update available! 0.0.0 -> 9.9.9
 
   Release notes: https://github.com/DioNanos/codex-termux/releases/latest
 
@@ -10,4 +9,4 @@ expression: terminal.backend()
   2. Skip
   3. Skip until next version
 
-  Press enter to continue
+  enter continue · esc skip

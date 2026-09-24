@@ -89,7 +89,7 @@ async fn run_lifecycle_modal<T>(
             Some(event) = events.next() => {
                 tui.screen_size_for_event(&event)?;
                 match event {
-                    tui::TuiEvent::Key(_) | tui::TuiEvent::Paste(_) | tui::TuiEvent::FocusLost => {}
+                    tui::TuiEvent::Key(_) | tui::TuiEvent::Paste(_) | tui::TuiEvent::FocusLost | tui::TuiEvent::Mouse(_) => {}
                     tui::TuiEvent::Draw | tui::TuiEvent::Resize(_) | tui::TuiEvent::Resume | tui::TuiEvent::FocusGained => {
                         tui.draw(u16::MAX, |frame| {
                             progress.render(frame.area(), frame.buffer_mut());
@@ -153,11 +153,11 @@ impl App {
                         tx.send(AppEvent::RunAgentsOverviewAction { thread_id, action })
                     })],
                     dismiss_on_select: true,
-                    require_explicit_confirmation: true,
+                    require_explicit_confirmation: action == AgentsOverviewAction::Delete,
                     ..Default::default()
                 },
             ],
-            ..Default::default()
+            ..SelectionViewParams::picker()
         });
     }
 
@@ -168,6 +168,9 @@ impl App {
         thread_id: ThreadId,
         action: AgentsOverviewAction,
     ) -> color_eyre::Result<()> {
+        if self.windows_sandbox_blocks_thread_switch() {
+            return Ok(());
+        }
         // The overview may lack intermediate ancestors, or even the primary's metadata.
         let mut removes_primary = self.primary_thread_id == Some(thread_id);
         let mut attempted = false;
@@ -262,6 +265,7 @@ impl App {
                 self.agents_overview.threads.remove(&removed_id);
                 self.agents_overview.activity.remove(&removed_id);
                 self.agents_overview.last_messages.remove(&removed_id);
+                self.agents_overview.usage.remove(&removed_id);
                 self.agents_overview.refresh_thread_ids.remove(&removed_id);
                 self.agents_overview.input_states.remove(&removed_id);
                 self.agents_overview.dispatched_requests.remove(&removed_id);
@@ -309,7 +313,7 @@ impl App {
                     dismiss_on_select: true,
                     ..Default::default()
                 }],
-                ..Default::default()
+                ..SelectionViewParams::picker()
             });
         }
 

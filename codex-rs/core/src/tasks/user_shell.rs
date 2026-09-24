@@ -36,7 +36,6 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandSource;
-use codex_protocol::protocol::TurnStartedEvent;
 use codex_sandboxing::SandboxType;
 use codex_shell_command::parse_command::parse_command;
 use codex_thread_store::PersistContext;
@@ -123,18 +122,11 @@ pub(crate) async fn execute_user_shell_command(
         // standalone lifecycle tasks (for example /shell, and review once it emits TurnStarted).
         // `/compact` is an intentional exception because compaction requests should not include
         // freshly reinjected context before the summary/replacement history is applied.
-        let event = EventMsg::TurnStarted(TurnStartedEvent {
-            turn_id: turn_context.sub_id.clone(),
-            trace_id: turn_context.trace_id.clone(),
-            started_at: turn_context.turn_timing_state.started_at_unix_secs().await,
-            model_context_window: turn_context.model_context_window(),
-            collaboration_mode_kind: turn_context.mode(),
-        });
-        session.send_event(turn_context.as_ref(), event).await;
+        session.emit_turn_started(&turn_context).await;
     }
 
     let Some((turn_environment, environment_shell)) = turn_context
-        .environments
+        .initial_environments
         .local()
         .and_then(|environment| environment.shell.as_ref().map(|shell| (environment, shell)))
     else {
@@ -196,6 +188,7 @@ pub(crate) async fn execute_user_shell_command(
         .emit_turn_item_started(
             turn_context.as_ref(),
             &TurnItem::CommandExecution(CommandExecutionItem {
+                model_context: None,
                 id: call_id.clone(),
                 plugin_id: None,
                 script_path: None,
@@ -231,12 +224,8 @@ pub(crate) async fn execute_user_shell_command(
         capture_policy: ExecCapturePolicy::ShellTool,
         sandbox: SandboxType::None,
         windows_sandbox_policy_cwd: cwd.clone().into(),
-        windows_sandbox_workspace_roots: turn_context.effective_workspace_roots(),
+        windows_sandbox_workspace_roots: Vec::new(),
         windows_sandbox_level: turn_context.windows_sandbox_level,
-        windows_sandbox_private_desktop: turn_context
-            .config
-            .permissions
-            .windows_sandbox_private_desktop,
         permission_profile,
         windows_sandbox_filesystem_overrides: None,
         arg0: None,
@@ -279,6 +268,7 @@ pub(crate) async fn execute_user_shell_command(
                 .emit_turn_item_completed(
                     turn_context.as_ref(),
                     TurnItem::CommandExecution(CommandExecutionItem {
+                        model_context: None,
                         id: call_id,
                         plugin_id: None,
                         script_path: None,
@@ -304,6 +294,7 @@ pub(crate) async fn execute_user_shell_command(
                 .emit_turn_item_completed(
                     turn_context.as_ref(),
                     TurnItem::CommandExecution(CommandExecutionItem {
+                        model_context: None,
                         id: call_id.clone(),
                         plugin_id: None,
                         script_path: None,
@@ -349,6 +340,7 @@ pub(crate) async fn execute_user_shell_command(
                 .emit_turn_item_completed(
                     turn_context.as_ref(),
                     TurnItem::CommandExecution(CommandExecutionItem {
+                        model_context: None,
                         id: call_id,
                         plugin_id: None,
                         script_path: None,

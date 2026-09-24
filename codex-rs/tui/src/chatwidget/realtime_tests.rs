@@ -13,6 +13,7 @@ use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ReplayKind;
 use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
 use crate::chatwidget::tests::render_bottom_popup;
+use crate::history_cell::FinalMessageSeparator;
 use codex_app_server_protocol::AgentMessageDeltaNotification;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
@@ -31,6 +32,27 @@ use codex_protocol::items::AsyncUserInputQuestion;
 use codex_protocol::models::MessagePhase;
 use futures::future::AbortHandle;
 use std::collections::VecDeque;
+
+// Model the app's atomic handoff before inspecting its ordinary history events.
+pub(crate) fn commit_realtime_history_events(
+    chat: &mut ChatWidget,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) {
+    let mut forwarded = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            AppEvent::CommitRealtimeTranscriptHistory => forwarded.extend(
+                chat.take_realtime_transcript_history()
+                    .into_iter()
+                    .map(AppEvent::InsertHistoryCell),
+            ),
+            event => forwarded.push(event),
+        }
+    }
+    for event in forwarded {
+        chat.app_event_tx.send(event);
+    }
+}
 
 fn activate_voice(chat: &mut ChatWidget) -> ThreadId {
     let thread_id = ThreadId::new();
@@ -115,19 +137,6 @@ fn finish_turn(
         }),
         /*replay_kind*/ None,
     );
-}
-
-fn without_completion_metadata(rendered: &str) -> String {
-    rendered
-        .lines()
-        .filter_map(|line| {
-            let stable = line
-                .split_once("  done ")
-                .map_or(line, |(before, _)| before);
-            (!stable.is_empty()).then_some(stable)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[path = "realtime_tests/caption_replay.rs"]

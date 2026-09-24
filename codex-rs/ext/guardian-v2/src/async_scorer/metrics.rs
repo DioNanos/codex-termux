@@ -41,6 +41,7 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
             ApiError::Transport(TransportError::Network(_)) => "network_error",
             ApiError::Transport(TransportError::RetryLimit) => "retry_limit",
             ApiError::Transport(TransportError::Build(_)) => "request_build_error",
+            ApiError::Transport(TransportError::ResponseTooLarge { .. }) => "response_too_large",
             ApiError::Stream(_) => "stream_error",
             ApiError::ContextWindowExceeded => "context_window_exceeded",
             ApiError::QuotaExceeded => "quota_exceeded",
@@ -48,9 +49,9 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
             ApiError::Retryable { .. } => "retryable_api_error",
             ApiError::RateLimitExceeded { .. } | ApiError::RateLimit(_) => "rate_limit",
             ApiError::InvalidRequest { .. } => "invalid_request",
-            ApiError::CyberPolicy { .. } | ApiError::MisalignmentPolicyViolation { .. } => {
-                "policy_error"
-            }
+            ApiError::CyberPolicy { .. }
+            | ApiError::BioPolicy { .. }
+            | ApiError::MisalignmentPolicyViolation { .. } => "policy_error",
             ApiError::ServerOverloaded => "server_overloaded",
         },
     }

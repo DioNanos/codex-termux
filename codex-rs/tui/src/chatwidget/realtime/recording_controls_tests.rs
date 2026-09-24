@@ -120,7 +120,7 @@ async fn voice_composer_preserves_normal_colors_across_microphone_states() {
             assert_eq!(marker.fg, Color::Red);
             assert_ne!(marker.bg, Color::Red);
         }
-        if recording && chat.config.animations {
+        if recording && chat.local_settings.tui.animations {
             let rows = buffer
                 .content
                 .chunks(/*chunk_size*/ 47)
@@ -159,7 +159,7 @@ async fn voice_composer_preserves_normal_colors_across_microphone_states() {
             .unwrap()
     };
     let foreground = check(&mut chat, /*recording*/ true);
-    chat.config.animations = false;
+    chat.local_settings.tui.animations = false;
     assert_eq!(check(&mut chat, /*recording*/ true), foreground);
     chat.realtime_conversation.microphone_muted = true;
     assert_eq!(check(&mut chat, /*recording*/ false), foreground);
@@ -188,7 +188,7 @@ async fn voice_preserves_the_normal_composer_prompt() {
     }
     for (muted, animations) in [(true, true), (false, false), (false, true)] {
         chat.realtime_conversation.microphone_muted = muted;
-        chat.config.animations = animations;
+        chat.local_settings.tui.animations = animations;
         assert_eq!(prompt(&mut chat), Some('›'));
     }
     chat.thread_id = Some(ThreadId::new());
@@ -266,7 +266,7 @@ async fn voice_meters_do_not_sample_again_on_early_redraws() {
             (119, 255)
         ])
     );
-    // Each channel settles on its first quiet sample, without clearing the other one.
+    // Quiet samples scroll into each channel without erasing earlier speech.
     for (elapsed_ms, peaks) in [(700, (0, 8192)), (800, (8192, 0))] {
         chat.refresh_realtime_audio_meters(
             now + std::time::Duration::from_millis(elapsed_ms),
@@ -274,6 +274,20 @@ async fn voice_meters_do_not_sample_again_on_early_redraws() {
         );
         meters.push(render_meter(&chat, /*width*/ 80));
     }
+    for frame in 0..super::super::MAX_REALTIME_AUDIO_METER_FRAMES {
+        chat.refresh_realtime_audio_meters(
+            now + std::time::Duration::from_millis(900 + frame as u64 * 100),
+            || (0, 0),
+        );
+        if frame == 0 {
+            meters.push(render_meter(&chat, /*width*/ 80));
+        }
+    }
+    assert_eq!(
+        chat.realtime_conversation.audio_meter_history,
+        std::collections::VecDeque::from([(0, 0); super::super::MAX_REALTIME_AUDIO_METER_FRAMES])
+    );
+    meters.push(render_meter(&chat, /*width*/ 80));
     insta::assert_snapshot!(meters.join("\n"));
 }
 
@@ -287,7 +301,7 @@ async fn voice_meters_preserve_silence_and_restart_sampling_after_reset() {
     chat.refresh_realtime_audio_meters(now + std::time::Duration::from_secs(1), || (0, 0));
     assert_eq!(
         chat.realtime_conversation.audio_meter_history,
-        std::collections::VecDeque::from([(0, 0), (0, 0)])
+        std::collections::VecDeque::from([(255, 119), (0, 0)])
     );
     chat.reset_realtime_conversation();
     activate_voice(&mut chat);
@@ -356,7 +370,7 @@ async fn voice_footer_renders_the_main_conversation_states() {
             "Hello there",
         ),
     ] {
-        chat.config.animations = label != "connecting";
+        chat.local_settings.tui.animations = label != "connecting";
         chat.realtime_conversation.phase = phase;
         chat.realtime_conversation.microphone_muted = muted;
         chat.realtime_conversation.microphone_level = level;
@@ -402,7 +416,7 @@ async fn voice_footer_renders_the_main_conversation_states() {
 #[tokio::test]
 async fn narrow_voice_footer_keeps_the_stop_control_before_meters() {
     let (mut chat, _sender, _events, _ops) = make_chatwidget_manual_with_sender().await;
-    chat.config.animations = true;
+    chat.local_settings.tui.animations = true;
     activate_voice(&mut chat);
     chat.realtime_conversation.speaker_active_until =
         Some(std::time::Instant::now() + super::super::SPEAKER_ACTIVITY_HOLD);
@@ -474,7 +488,7 @@ async fn narrow_voice_footer_keeps_the_stop_control_before_meters() {
 #[tokio::test]
 async fn voice_acknowledges_only_a_real_interruption_once() {
     let (mut chat, _sender, _events, _ops) = make_chatwidget_manual_with_sender().await;
-    chat.config.animations = true;
+    chat.local_settings.tui.animations = true;
     activate_voice(&mut chat);
 
     chat.on_realtime_transcript_delta("user".to_string(), "hello".to_string());
@@ -503,7 +517,7 @@ async fn voice_acknowledges_only_a_real_interruption_once() {
             .is_none()
     );
 
-    chat.config.animations = false;
+    chat.local_settings.tui.animations = false;
     chat.realtime_conversation.speaker_level = 3;
     chat.on_realtime_transcript_delta("user".to_string(), "stop".to_string());
     assert!(
@@ -619,7 +633,7 @@ async fn clipped_voice_composer_keeps_the_draft_and_cursor_visible() {
     use ratatui::prelude::Rect;
 
     let (mut chat, _sender, _events, _ops) = make_chatwidget_manual_with_sender().await;
-    chat.config.animations = false;
+    chat.local_settings.tui.animations = false;
     activate_voice(&mut chat);
     chat.bottom_pane
         .set_composer_text("typed".to_string(), Vec::new(), Vec::new());
@@ -651,6 +665,7 @@ async fn clipped_voice_composer_keeps_the_draft_and_cursor_visible() {
 
     insta::assert_snapshot!(layouts.join("\n\n"), @r"
     5 rows:
+    voice ● listening ctrl+x mute     /voice stop
     › typed
 
     6 rows:
@@ -666,7 +681,7 @@ async fn clipped_voice_composer_keeps_the_draft_and_cursor_visible() {
 #[tokio::test]
 async fn compact_voice_meters_keep_real_speaker_history_when_the_microphone_is_muted() {
     let (mut chat, _sender, _events, _ops) = make_chatwidget_manual_with_sender().await;
-    chat.config.animations = false;
+    chat.local_settings.tui.animations = true;
     let thread_id = activate_voice(&mut chat);
     chat.realtime_conversation.audio_meter_history = [
         (0, 255),
@@ -702,4 +717,78 @@ async fn compact_voice_meters_keep_real_speaker_history_when_the_microphone_is_m
     chat.realtime_conversation.phase = RealtimeConversationPhase::Stopping;
     chat.update_realtime_footer();
     assert!(!render_bottom_popup(&chat, /*width*/ 45).contains("codex"));
+}
+
+#[tokio::test]
+async fn voice_toggle_shortcut_uses_the_slash_command_start_guard_and_preserves_draft() {
+    let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
+    let config =
+        toml::from_str::<codex_config::types::TuiKeymap>("[chat]\ntoggle_voice = 'f8'").unwrap();
+    let runtime = crate::keymap::RuntimeKeymap::from_config(&config).unwrap();
+    chat.apply_keymap_update(config, &runtime);
+    chat.set_side_conversation_active(/*active*/ true);
+    chat.bottom_pane
+        .set_composer_text("draft".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE));
+
+    let Ok(AppEvent::InsertHistoryCell(cell)) = events.try_recv() else {
+        panic!("voice should report that side conversations are unsupported");
+    };
+    assert!(
+        cell.display_lines(/*width*/ 80)
+            .iter()
+            .any(|line| line.to_string().contains("side conversations"))
+    );
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("draft"));
+    assert!(!chat.realtime_conversation_is_running());
+    assert!(ops.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn voice_toggle_shortcut_stops_only_on_press_outside_popups() {
+    let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+    let config =
+        toml::from_str::<codex_config::types::TuiKeymap>("[chat]\ntoggle_voice = 'f8'").unwrap();
+    let runtime = crate::keymap::RuntimeKeymap::from_config(&config).unwrap();
+    chat.apply_keymap_update(config, &runtime);
+    let thread_id = activate_voice(&mut chat);
+    let shortcut = KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE);
+    for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+        chat.handle_key_event(KeyEvent { kind, ..shortcut });
+        assert!(chat.realtime_conversation_is_running());
+    }
+    chat.bottom_pane
+        .set_composer_text("/".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(shortcut);
+    assert!(chat.realtime_conversation_is_running());
+    assert!(ops.try_recv().is_err());
+    chat.bottom_pane
+        .set_composer_text(String::new(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(shortcut);
+
+    assert!(!chat.realtime_conversation_is_running());
+    assert!(
+        matches!(ops.try_recv(), Ok(AppCommand::RealtimeConversationStop { thread_id: stopped }) if stopped == thread_id)
+    );
+}
+
+#[tokio::test]
+async fn voice_toggle_shortcut_respects_live_remapping_and_unbinding() {
+    let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+    for (binding, stops) in [("'f9'", true), ("[]", false)] {
+        let config = toml::from_str::<codex_config::types::TuiKeymap>(&format!(
+            "[chat]\ntoggle_voice = {binding}"
+        ))
+        .unwrap();
+        let runtime = crate::keymap::RuntimeKeymap::from_config(&config).unwrap();
+        chat.apply_keymap_update(config, &runtime);
+        activate_voice(&mut chat);
+        chat.handle_key_event(KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE));
+        assert!(chat.realtime_conversation_is_running());
+        chat.handle_key_event(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE));
+        assert_eq!(chat.realtime_conversation_is_running(), !stops);
+        assert_eq!(ops.try_recv().is_ok(), stops);
+    }
 }

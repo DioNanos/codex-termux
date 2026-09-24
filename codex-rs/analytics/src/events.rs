@@ -1,3 +1,4 @@
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::facts::AppInvocation;
@@ -12,6 +13,7 @@ use crate::facts::CompactionReason;
 use crate::facts::CompactionStatus;
 use crate::facts::CompactionStrategy;
 use crate::facts::CompactionTrigger;
+use crate::facts::ElicitationType;
 use crate::facts::GoalEventKind;
 use crate::facts::HookRunFact;
 use crate::facts::ImagePreparationMetadata;
@@ -211,6 +213,7 @@ pub(crate) struct SkillInvocationEventParams {
     pub(crate) remote_plugin_id: Option<String>,
     pub(crate) thread_id: Option<String>,
     pub(crate) turn_id: Option<String>,
+    pub(crate) voice_session_id: Option<String>,
     pub(crate) invoke_type: Option<InvocationType>,
     pub(crate) model_slug: Option<String>,
 }
@@ -654,6 +657,16 @@ pub(crate) enum ToolItemFailureKind {
     PolicyForbidden,
 }
 
+/// The immediate initiator of the tool request associated with an analytics event.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ToolEventType {
+    /// The event item ID matches a tool call emitted in a sampled model response.
+    ModelToolCall,
+    /// The event item ID matches a child call dispatched by an executing tool.
+    InnerToolCall,
+}
+
 #[derive(Serialize)]
 pub(crate) struct CodexToolItemEventBase {
     pub(crate) thread_id: String,
@@ -673,6 +686,8 @@ pub(crate) struct CodexToolItemEventBase {
     pub(crate) subagent_source: Option<String>,
     pub(crate) parent_thread_id: Option<String>,
     pub(crate) tool_name: String,
+    /// Absent when origin evidence is unavailable or conflicting at emission time.
+    pub(crate) tool_event_type: Option<ToolEventType>,
     pub(crate) started_at_ms: u64,
     pub(crate) completed_at_ms: u64,
     // Observed item lifecycle duration. This may undercount end-to-end execution
@@ -778,6 +793,8 @@ pub(crate) enum WebSearchActionKind {
 
 #[derive(Serialize)]
 pub(crate) struct CodexCommandExecutionEventParams {
+    pub(crate) model_slug: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
     #[serde(flatten)]
     pub(crate) base: CodexToolItemEventBase,
     pub(crate) plugin_id: Option<String>,
@@ -803,6 +820,8 @@ pub(crate) struct CodexPluginMeasurementEventParams {
     pub(crate) turn_id: String,
     pub(crate) item_id: String,
     pub(crate) originator: String,
+    pub(crate) model_slug: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
     pub(crate) plugin_id: String,
     pub(crate) execution_id: String,
     pub(crate) operation: String,
@@ -843,6 +862,8 @@ pub(crate) struct CodexMcpToolCallEventParams {
     pub(crate) mcp_error_present: bool,
     pub(crate) plugin_id: Option<String>,
     pub(crate) connector_id: Option<String>,
+    pub(crate) voice_session_id: Option<String>,
+    pub(crate) elicitation_type: Option<ElicitationType>,
 }
 
 #[derive(Serialize)]
@@ -952,9 +973,17 @@ pub(crate) struct CodexAppMentionedEventRequest {
 }
 
 #[derive(Serialize)]
+pub(crate) struct CodexAppUsedMetadata {
+    #[serde(flatten)]
+    pub(crate) app: CodexAppMetadata,
+    pub(crate) voice_session_id: Option<String>,
+    pub(crate) elicitation_type: Option<ElicitationType>,
+}
+
+#[derive(Serialize)]
 pub(crate) struct CodexAppUsedEventRequest {
     pub(crate) event_type: &'static str,
-    pub(crate) event_params: CodexAppMetadata,
+    pub(crate) event_params: CodexAppUsedMetadata,
 }
 
 #[derive(Serialize)]
@@ -1040,6 +1069,9 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) thread_id: String,
     pub(crate) session_id: String,
     pub(crate) turn_id: String,
+    /// First received active plugin inventory. Null is unknown; [] is observed empty.
+    pub(crate) active_plugin_ids_at_turn_start: Option<Vec<String>>,
+    pub(crate) voice_session_id: Option<String>,
     pub(crate) root_turn_id: Option<String>,
     pub(crate) turn_trigger: Option<String>,
     pub(crate) codex_turn_source: Option<String>,
@@ -1465,7 +1497,9 @@ fn analytics_hook_source(source: HookSource) -> &'static str {
 }
 
 pub(crate) fn current_runtime_metadata() -> CodexRuntimeMetadata {
-    let os_info = os_info::get();
+    // Runtime metadata is stable; avoid launching OS discovery subprocesses per event.
+    static OS_INFO: LazyLock<os_info::Info> = LazyLock::new(os_info::get);
+    let os_info = &*OS_INFO;
     CodexRuntimeMetadata {
         codex_rs_version: env!("CARGO_PKG_VERSION").to_string(),
         runtime_os: std::env::consts::OS.to_string(),

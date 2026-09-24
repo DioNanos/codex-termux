@@ -1,6 +1,7 @@
-//! Keeps the older remote server notice in the overview's shared view state.
+//! Keeps the server version notice and local maintenance guidance in the overview.
 
 use super::*;
+use crate::update_versions::ServerVersionNoticeKind;
 
 impl App {
     pub(super) fn refresh_server_version_overview_notice(&mut self, client_version: &str) {
@@ -41,13 +42,27 @@ impl App {
     pub(super) fn update_server_version_overview_notice(
         &mut self,
         client_version: &str,
-        older_server: Option<&str>,
+        server_version: Option<&str>,
     ) {
         self.agents_overview
             .view_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .server_version_notice =
-            older_server.map(|server| format!("Service v{server} < Codex CLI v{client_version}"));
+            .server_version_notice = server_version.and_then(|server| {
+            let guidance = if matches!(self.app_server_target, AppServerTarget::LocalDaemon { .. })
+            {
+                " · /daemon"
+            } else {
+                ""
+            };
+            let comparison =
+                match crate::update_versions::server_version_notice_kind(client_version, server)? {
+                    ServerVersionNoticeKind::Older => "<",
+                    ServerVersionNoticeKind::Different => "≠",
+                };
+            Some(format!(
+                "Service v{server} {comparison} Codex CLI v{client_version}{guidance}"
+            ))
+        });
     }
 }

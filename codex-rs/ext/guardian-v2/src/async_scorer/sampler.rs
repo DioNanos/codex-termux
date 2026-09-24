@@ -2,9 +2,9 @@
 //! Both transports share request identity, retry, cancellation, and output handling.
 
 mod connection_pool;
+mod execution;
 
 use connection_pool::ConnectionPool;
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -14,14 +14,11 @@ use std::sync::atomic::Ordering;
 use codex_api::ApiError;
 use codex_api::Reasoning;
 use codex_api::ReasoningContext;
-use codex_api::ResponseEvent;
 use codex_api::ResponsesApiRequest;
-use codex_api::ResponsesEndpoint;
-use codex_api::TransportError;
+use codex_context_fragments::RenderedFragment;
 use codex_extension_api::ExtensionMetrics;
 use codex_http_client::HttpClientFactory;
 use codex_login::AgentIdentityAuthPolicy;
-use codex_login::UnauthorizedRecovery;
 use codex_model_provider::SharedModelProvider;
 use codex_protocol::ResponseItemId;
 use codex_protocol::error::CodexErr;
@@ -29,9 +26,6 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::TokenUsage;
-use http::StatusCode;
-use serde_json::json;
 use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -42,10 +36,6 @@ pub(crate) const CLASSIFICATION_TOKEN_USAGE_METRIC: &str =
 const MAX_OUTPUT_BYTES: usize = 8 * 1024;
 pub(super) const INITIAL_WEBSOCKET_CONNECTIONS: usize = if cfg!(test) { 2 } else { 8 };
 const MAX_CONCURRENT_REQUESTS: usize = 16;
-const MAX_SAMPLING_RETRIES: usize = 2;
-const RESPONSES_LITE_METADATA_KEY: &str =
-    "ws_request_header_x_openai_internal_codex_responses_lite";
-const TURN_METADATA_KEY: &str = "x-codex-turn-metadata";
 
 /// Host-owned provider, authentication, and attribution for one Luna connection.
 pub struct LunaSamplerConfig {
@@ -63,8 +53,6 @@ pub struct LunaSamplerConfig {
     pub thread_id: String,
     /// Optional host-resolved request originator.
     pub originator: Option<String>,
-    /// Whether this thread may use the unmetered Guardian classifier endpoint.
-    pub free_guardian: bool,
     /// Optional inference service tier.
     pub service_tier: Option<String>,
     /// Luna model's host-resolved encrypted-compaction compatibility hash.
@@ -79,8 +67,8 @@ pub struct LunaSamplerConfig {
 pub struct LunaSamplingRequest {
     /// ID of the response handling the classified tool.
     pub parent_response_id: Option<String>,
-    /// Trusted instructions describing the requested classification.
-    pub instructions: String,
+    /// Trusted classifier instructions with their role and content attribution.
+    pub instructions: RenderedFragment,
     /// Composed evidence messages, with roles, annotations and content order intact.
     pub input: Vec<ResponseItem>,
     /// Opaque parent compaction to reuse only for compatible model configurations.
@@ -129,34 +117,6 @@ struct ActiveRequest {
     scored: Arc<AtomicBool>,
 }
 
-fn record_token_usage(metrics: Option<&dyn ExtensionMetrics>, token_usage: Option<&TokenUsage>) {
-    let (Some(metrics), Some(token_usage)) = (metrics, token_usage) else {
-        return;
-    };
-
-    for (token_type, value) in [
-        ("total", token_usage.total_tokens.max(0)),
-        ("input", token_usage.input_tokens.max(0)),
-        ("cached_input", token_usage.cached_input()),
-        (
-            "cache_write_input",
-            token_usage.cache_write_input_tokens.max(0),
-        ),
-        ("non_cached_input", token_usage.non_cached_input()),
-        ("output", token_usage.output_tokens.max(0)),
-        (
-            "reasoning_output",
-            token_usage.reasoning_output_tokens.max(0),
-        ),
-    ] {
-        metrics.histogram(
-            CLASSIFICATION_TOKEN_USAGE_METRIC,
-            value,
-            &[("token_type", token_type)],
-        );
-    }
-}
-
 /// Runs bounded Luna classifications over pooled WebSockets or HTTP.
 pub struct LunaSampler {
     config: Arc<LunaSamplerConfig>,
@@ -189,65 +149,6 @@ impl LunaSampler {
         }
     }
 
-    async fn retry_after_failure(
-        &self,
-        error: &LunaSamplerError,
-        auth_recovery: &mut Option<UnauthorizedRecovery>,
-        retries: &mut usize,
-    ) -> bool {
-        let retryable = match error {
-            LunaSamplerError::ConnectionTimeout
-            | LunaSamplerError::Api(
-                ApiError::Retryable { .. }
-                | ApiError::RateLimitExceeded { .. }
-                | ApiError::Stream(_)
-                | ApiError::ServerOverloaded,
-            )
-            | LunaSamplerError::Api(ApiError::Transport(
-                TransportError::RetryLimit
-                | TransportError::Timeout
-                | TransportError::Connection(_)
-                | TransportError::Network(_),
-            )) => true,
-            LunaSamplerError::Api(ApiError::Transport(TransportError::Http { status, .. }))
-            | LunaSamplerError::Api(ApiError::Api { status, .. }) => {
-                if *status == StatusCode::UNAUTHORIZED {
-                    let Some(recovery) = auth_recovery.as_mut() else {
-                        return false;
-                    };
-                    if !recovery.has_next() || recovery.next().await.is_err() {
-                        return false;
-                    }
-                    self.connections.clear();
-                    return true;
-                } else {
-                    status.is_server_error() || *status == StatusCode::TOO_MANY_REQUESTS
-                }
-            }
-            LunaSamplerError::Provider(_)
-            | LunaSamplerError::MissingOutput
-            | LunaSamplerError::OutputTooLarge
-            | LunaSamplerError::Superseded
-            | LunaSamplerError::IncompatibleCompaction
-            | LunaSamplerError::InputTooLarge
-            | LunaSamplerError::Api(
-                ApiError::Transport(TransportError::Build(_))
-                | ApiError::ContextWindowExceeded
-                | ApiError::QuotaExceeded
-                | ApiError::UsageNotIncluded
-                | ApiError::RateLimit(_)
-                | ApiError::InvalidRequest { .. }
-                | ApiError::MisalignmentPolicyViolation { .. }
-                | ApiError::CyberPolicy { .. },
-            ) => false,
-        };
-        if retryable && *retries < MAX_SAMPLING_RETRIES {
-            *retries += 1;
-            return true;
-        }
-        false
-    }
-
     /// Sends one tool-less classification request using an available transport.
     pub async fn sample(&self, request: LunaSamplingRequest) -> Result<String, LunaSamplerError> {
         if request.parent_compaction.is_some()
@@ -266,15 +167,7 @@ impl LunaSampler {
                 role: "developer".to_owned(),
                 tools: Vec::new(),
             },
-            ResponseItem::Message {
-                id: None,
-                role: "developer".to_owned(),
-                content: vec![ContentItem::InputText {
-                    text: request.instructions,
-                }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            },
+            ResponseItem::from(request.instructions),
         ];
         if let Some(parent_compaction) = request.parent_compaction {
             input.push(parent_compaction);
@@ -320,7 +213,7 @@ impl LunaSampler {
         if total_tokens > self.config.max_input_tokens.saturating_sub(/*rhs*/ 256) {
             return Err(LunaSamplerError::InputTooLarge);
         }
-        let mut request = ResponsesApiRequest {
+        let request = ResponsesApiRequest {
             model: MODEL.to_owned(),
             instructions: String::new(),
             input,
@@ -342,7 +235,7 @@ impl LunaSampler {
             client_metadata: None,
             access_programs: None,
         };
-        let (supersede, mut superseded) = oneshot::channel();
+        let (supersede, superseded) = oneshot::channel();
         let scored = Arc::new(AtomicBool::new(false));
         {
             let mut active_requests = self
@@ -364,172 +257,17 @@ impl LunaSampler {
                 scored: Arc::clone(&scored),
             });
         }
-        let mut retries = 0;
-        let mut auth_recovery = self
-            .config
-            .provider
-            .auth_manager()
-            .map(|manager| manager.unauthorized_recovery());
-        'retry: loop {
-            let lease = match tokio::select! {
-                biased;
-                _ = &mut superseded => return Err(LunaSamplerError::Superseded),
-                lease = self.connections.lease() => lease,
-            } {
-                Ok(lease) => lease,
-                Err(error) => {
-                    if self
-                        .retry_after_failure(&error, &mut auth_recovery, &mut retries)
-                        .await
-                    {
-                        continue;
-                    }
-                    return Err(error);
-                }
-            };
-            request.service_tier = if lease.endpoint == ResponsesEndpoint::GuardianClassifier {
-                None
-            } else {
-                self.config.service_tier.clone()
-            };
-            let thread_id = &lease.thread_id;
-            let mut turn_metadata = json!({
-                "session_id": self.config.session_id,
-                "thread_id": thread_id,
-                "guardian_classifier_source_thread_id": self.config.thread_id,
-                "turn_id": turn_id,
-                "parent_turn_id": parent_turn_id,
-                "thread_source": "guardian_classifier",
-                "turn_trigger": "guardian_classifier",
-            });
-            let mut client_metadata = HashMap::from([
-                ("session_id".to_owned(), self.config.session_id.clone()),
-                ("thread_id".to_owned(), thread_id.clone()),
-                ("turn_id".to_owned(), turn_id.clone()),
-                ("parent_turn_id".to_owned(), parent_turn_id.clone()),
-                ("x-openai-subagent".to_owned(), "guardian".to_owned()),
-                // Classifier requests do not advance their own context window.
-                ("x-codex-window-id".to_owned(), format!("{thread_id}:0")),
-                (RESPONSES_LITE_METADATA_KEY.to_owned(), "true".to_owned()),
-            ]);
-            if let Some(root_turn_id) = &root_turn_id {
-                client_metadata.insert("root_turn_id".to_owned(), root_turn_id.clone());
-                turn_metadata["root_turn_id"] = json!(root_turn_id);
-            }
-            client_metadata.insert(TURN_METADATA_KEY.to_owned(), turn_metadata.to_string());
-            if lease.endpoint == ResponsesEndpoint::GuardianClassifier
-                && let Some(parent_response_id) = &parent_response_id
-            {
-                client_metadata.insert("parent_response_id".to_owned(), parent_response_id.clone());
-            }
-            request.client_metadata = Some(client_metadata);
-            let mut stream = match tokio::select! {
-                biased;
-                _ = &mut superseded => return Err(LunaSamplerError::Superseded),
-                stream = lease.stream_request(&request) => stream,
-            } {
-                Ok(stream) => stream,
-                Err(error) => {
-                    let error = LunaSamplerError::Api(error);
-                    if self
-                        .retry_after_failure(&error, &mut auth_recovery, &mut retries)
-                        .await
-                    {
-                        continue;
-                    }
-                    return Err(error);
-                }
-            };
-
-            let mut output = String::new();
-            while let Some(event) = tokio::select! {
-                biased;
-                _ = &mut superseded => {
-                    return if scored.load(Ordering::Relaxed) && !output.is_empty() {
-                        Ok(output)
-                    } else {
-                        Err(LunaSamplerError::Superseded)
-                    };
-                }
-                event = stream.rx_event.recv() => event,
-            } {
-                let event = match event {
-                    Ok(event) => event,
-                    Err(error) => {
-                        let error = LunaSamplerError::Api(error);
-                        if self
-                            .retry_after_failure(&error, &mut auth_recovery, &mut retries)
-                            .await
-                        {
-                            continue 'retry;
-                        }
-                        return Err(error);
-                    }
-                };
-                match event {
-                    ResponseEvent::OutputTextDelta(delta) => {
-                        if delta.is_empty() {
-                            continue;
-                        }
-                        if delta.len() > MAX_OUTPUT_BYTES {
-                            return Err(LunaSamplerError::OutputTooLarge);
-                        }
-                        // The first output token is the complete classification.
-                        // Later output cannot revise that decision; drain it only
-                        // to preserve connection reuse and token accounting.
-                        scored.store(true, Ordering::Relaxed);
-                        let mut remaining_events = stream.rx_event;
-                        let metrics = self.config.metrics.clone();
-                        tokio::spawn(async move {
-                            while let Some(event) = tokio::select! {
-                                biased;
-                                _ = &mut superseded => None,
-                                event = remaining_events.recv() => event,
-                            } {
-                                match event {
-                                    Ok(ResponseEvent::Completed { token_usage, .. }) => {
-                                        record_token_usage(
-                                            metrics.as_deref(),
-                                            token_usage.as_ref(),
-                                        );
-                                        lease.reuse();
-                                        break;
-                                    }
-                                    Err(_) => break,
-                                    _ => {}
-                                }
-                            }
-                        });
-                        return Ok(delta);
-                    }
-                    ResponseEvent::OutputItemDone(ResponseItem::Message {
-                        role, content, ..
-                    }) if role == "assistant" => {
-                        for item in content {
-                            if let ContentItem::OutputText { text } = item {
-                                output.push_str(&text);
-                            }
-                        }
-                    }
-                    ResponseEvent::Completed { token_usage, .. } => {
-                        record_token_usage(self.config.metrics.as_deref(), token_usage.as_ref());
-                        lease.reuse();
-                        if !output.is_empty() {
-                            return Ok(output);
-                        }
-                        return Err(LunaSamplerError::MissingOutput);
-                    }
-                    _ => {}
-                }
-                if output.len() > MAX_OUTPUT_BYTES {
-                    return Err(LunaSamplerError::OutputTooLarge);
-                }
-                if !output.is_empty() {
-                    scored.store(true, Ordering::Relaxed);
-                }
-            }
-            return Err(LunaSamplerError::MissingOutput);
+        execution::SamplingExecution {
+            config: Arc::clone(&self.config),
+            connections: Arc::clone(&self.connections),
+            request,
+            turn_id,
+            parent_response_id,
+            parent_turn_id,
+            root_turn_id,
         }
+        .run(superseded, scored)
+        .await
     }
 }
 

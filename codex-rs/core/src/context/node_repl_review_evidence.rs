@@ -10,8 +10,9 @@ use std::sync::PoisonError;
 use codex_features::Feature;
 use codex_guardian_context::NodeReplContext;
 use codex_guardian_context::NodeReplResponse;
-pub use codex_guardian_context::NodeReplReviewEvidenceMode;
+pub(crate) use codex_guardian_context::NodeReplReviewEvidenceMode;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ImageReference;
 use codex_protocol::user_input::UserInput;
 use codex_protocol::user_input::UserInput::Image;
 use codex_protocol::user_input::UserInput::Text;
@@ -62,7 +63,14 @@ impl NodeReplReviewResponse {
             .saturating_add(self.items.iter().fold(0_usize, |bytes, item| {
                 bytes.saturating_add(match item {
                     Text { text, .. } => text.len(),
-                    Image { image_url, .. } => image_url.len(),
+                    Image {
+                        image: ImageReference::Inline { image_url },
+                        ..
+                    } => image_url.len(),
+                    Image {
+                        image: ImageReference::File { file_id },
+                        ..
+                    } => file_id.len(),
                     _ => 0,
                 })
             }))
@@ -115,25 +123,18 @@ impl NodeReplReviewEvidence {
             .iter()
             .flat_map(|response| &response.items)
             .filter_map(|item| match item {
-                Image { image_url, detail } if seen_images.insert(image_url) => {
-                    Some(ContentItem::InputImage {
+                Image {
+                    image: ImageReference::Inline { image_url },
+                    detail,
+                } if seen_images.insert(image_url) => Some(ContentItem::InputImage {
+                    image: ImageReference::Inline {
                         image_url: image_url.clone(),
-                        detail: *detail,
-                    })
-                }
+                    },
+                    detail: *detail,
+                }),
                 _ => None,
             })
             .collect()
-    }
-
-    /// Returns bounded REPL evidence using the existing Guardian text and image layout.
-    pub fn review_inputs(&self, mode: NodeReplReviewEvidenceMode) -> Vec<UserInput> {
-        if mode == NodeReplReviewEvidenceMode::Disabled {
-            return Vec::new();
-        }
-        self.snapshot_since(/*reviewed_sequence*/ 0)
-            .map(|snapshot| snapshot.context(mode).render_inputs())
-            .unwrap_or_default()
     }
 
     pub(crate) fn record(

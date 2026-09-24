@@ -1,6 +1,11 @@
 use super::*;
+use crate::model_catalog::ModelCatalog;
+use codex_config::ConfigPathContext;
 use codex_core::config::permission_profile_catalog;
 use codex_hooks::HookListEntryHandler;
+use codex_utils_absolute_path::AbsolutePathBufGuard;
+use codex_utils_path_uri::PathConvention;
+use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
 
 #[derive(Clone)]
@@ -10,6 +15,7 @@ pub(crate) struct CatalogRequestProcessor {
     pub(super) thread_manager: Arc<ThreadManager>,
     pub(super) config: Arc<Config>,
     pub(super) config_manager: ConfigManager,
+    model_catalog: Arc<ModelCatalog>,
 }
 
 const SKILLS_LIST_CWD_CONCURRENCY: usize = 5;
@@ -120,6 +126,7 @@ impl CatalogRequestProcessor {
         thread_manager: Arc<ThreadManager>,
         config: Arc<Config>,
         config_manager: ConfigManager,
+        model_catalog: Arc<ModelCatalog>,
     ) -> Self {
         Self {
             outgoing,
@@ -127,6 +134,7 @@ impl CatalogRequestProcessor {
             thread_manager,
             config,
             config_manager,
+            model_catalog,
         }
     }
 
@@ -170,13 +178,9 @@ impl CatalogRequestProcessor {
         &self,
         params: ModelListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        Self::list_models(
-            self.thread_manager.clone(),
-            self.config.http_client_factory(),
-            params,
-        )
-        .await
-        .map(|response| Some(response.into()))
+        self.list_models(params)
+            .await
+            .map(|response| Some(response.into()))
     }
 
     pub(crate) async fn experimental_feature_list(
@@ -241,8 +245,7 @@ impl CatalogRequestProcessor {
     }
 
     async fn list_models(
-        thread_manager: Arc<ThreadManager>,
-        http_client_factory: codex_http_client::HttpClientFactory,
+        &self,
         params: ModelListParams,
     ) -> Result<ModelListResponse, JSONRPCErrorError> {
         let ModelListParams {
@@ -250,12 +253,12 @@ impl CatalogRequestProcessor {
             cursor,
             include_hidden,
         } = params;
-        let models = supported_models(
-            thread_manager,
-            include_hidden.unwrap_or(false),
-            http_client_factory,
-        )
-        .await;
+        let presets = self
+            .model_catalog
+            .list_models(codex_models_manager::manager::RefreshStrategy::OnlineIfUncached)
+            .await
+            .map_err(|err| config_load_error(&err))?;
+        let models = supported_models(presets, include_hidden.unwrap_or(false));
         let total = models.len();
 
         if total == 0 {
@@ -327,7 +330,10 @@ impl CatalogRequestProcessor {
                     .map_err(|_| invalid_request(format!("thread not found: {thread_id}")))?;
                 let thread_config = thread.config().await;
                 self.config_manager
-                    .load_latest_config_for_thread(thread_config.as_ref())
+                    .load_latest_config_with_session_layers(
+                        &thread_config.config_layer_stack,
+                        &thread_config.cwd,
+                    )
                     .await
                     .map_err(|err| internal_error(format!("failed to reload config: {err}")))?
             }
@@ -413,22 +419,26 @@ impl CatalogRequestProcessor {
         params: PermissionProfileListParams,
     ) -> Result<PermissionProfileListResponse, JSONRPCErrorError> {
         let PermissionProfileListParams { cursor, limit, cwd } = params;
-        let config_layer_stack = match cwd {
-            Some(cwd) => {
-                let cwd = PathBuf::from(cwd);
-                let (_, config_layer_stack) = self
-                    .resolve_cwd_config(&cwd)
-                    .await
-                    .map_err(|err| internal_error(format!("failed to reload config: {err}")))?;
-                config_layer_stack
-            }
-            None => self
-                .config_manager
-                .load_config_layers(/*cwd*/ None)
+        let (cwd, config_layer_stack) = match cwd {
+            Some(cwd) => self
+                .resolve_cwd_config(&PathBuf::from(cwd))
                 .await
                 .map_err(|err| internal_error(format!("failed to reload config: {err}")))?,
+            None => (
+                self.config.cwd.clone(),
+                self.config_manager
+                    .load_config_layers(/*cwd*/ None)
+                    .await
+                    .map_err(|err| internal_error(format!("failed to reload config: {err}")))?,
+            ),
         };
-        let profiles = permission_profile_catalog(&config_layer_stack)
+        let context = ConfigPathContext::new(
+            PathConvention::native(),
+            Some(PathUri::from_abs_path(&cwd)),
+            AbsolutePathBufGuard::home_directory()
+                .and_then(|home| PathUri::from_host_native_path(home).ok()),
+        );
+        let profiles = permission_profile_catalog(&config_layer_stack, &context)
             .map_err(|err| internal_error(format!("failed to resolve permission profiles: {err}")))?
             .into_iter()
             .map(|profile| PermissionProfileSummary {
