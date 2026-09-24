@@ -2302,7 +2302,10 @@ async fn guardian_oversized_node_repl_policy_denies_before_tool_execution() -> R
             "Guardian cap diagnostic missing {expected}: {rejection}"
         );
     }
-    assert!(rejection.contains("rejected"));
+    // The review failed, so the text says the review could not be completed
+    // and that this is not a judgement about the action being unsafe.
+    assert!(rejection.contains("Automatic approval review failed"));
+    assert!(rejection.contains("not a determination that the action is unsafe"));
     assert!(!rejection.contains(&oversized_policy));
 
     let completion_event = wait_for_event(&test.codex, |event| {
@@ -2352,7 +2355,10 @@ async fn guardian_oversized_node_repl_policy_denies_before_tool_execution() -> R
             "Guardian cap diagnostic missing {expected}: {tool_output}"
         );
     }
-    assert!(tool_output.contains("rejected"));
+    // The tool result carries the same review-failure text, wrapped with its
+    // wall time — again a failure reported to the model, not a rejection.
+    assert!(tool_output.contains("Automatic approval review failed"));
+    assert!(tool_output.contains("not a determination that the action is unsafe"));
     assert!(!tool_output.contains(&oversized_policy));
     assert!(!tool_output.contains(execution_marker));
     assert!(

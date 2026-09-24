@@ -578,16 +578,40 @@ fi
 if ! npm_package_version="$(node -p "require('./npm-package/package.json').version")"; then
   npm_package_version=
 fi
+fork_version_matches=0
+if [ -n "$cargo_workspace_version" ]; then
+  if [ "$npm_package_version" = "$cargo_workspace_version" ]; then
+    fork_version_matches=1
+  else
+    case "$npm_package_version" in
+      "${cargo_workspace_version}-termux."*)
+        fork_patch="${npm_package_version#"${cargo_workspace_version}-termux."}"
+        case "$fork_patch" in
+          '' | 0 | 0* | *[!0-9]*) ;;   # empty, zero, a leading zero, or not a number
+          *) fork_version_matches=1 ;;
+        esac
+        ;;
+    esac
+  fi
+fi
 # The release contract has two deliberately separate relationships. BASE is
 # the upstream identity: the package description's base, the release note's
 # base, and the existing upstream tag must agree (rust-v0.149.1 here). FORK is
 # the public package identity: npm version, Cargo workspace version (what
 # CARGO_PKG_VERSION reports in TUI/doctor), the versioned release note, and
-# the changelog entry must ALL agree on the fork's non-colliding version. As
-# of 0.149.3 the Cargo workspace version deliberately equals the npm version:
-# when they diverged (npm 0.149.2 vs Cargo 0.149.1) every fresh install
-# immediately showed a false "update available" banner. Fork and upstream
-# version numbers remain separate lines and must not be equated.
+# the changelog entry must ALL agree on the fork's non-colliding version.
+#
+# Under the versioning standard (2026-09-24) the npm version carries this
+# fork's suffix while the Cargo workspace version stays at the upstream
+# version, because the binary must keep printing `codex-cli <upstream>` for
+# the hook guard of the fleet. The FORK identity is therefore accepted in
+# exactly two shapes:
+#   npm == cargo                            the bare line
+#   npm == "<cargo>-termux.<n>", n >= 1     the standard's shape, no leading zeros
+# The upstream part must match EXACTLY: a different number is a different
+# release, not a suffix. When the two diverged in 0.149.2/0.149.1 every fresh
+# install showed a false "update available" banner, which is why they may
+# differ by the suffix and by nothing else.
 if ! upstream_base_tag="$(node -p "(require('./npm-package/package.json').description.match(/rust-v[0-9]+\\.[0-9]+\\.[0-9]+/)||[''])[0]")"; then
   upstream_base_tag=
 fi
@@ -638,7 +662,7 @@ else
   fi
 fi
 if [ -n "$cargo_workspace_version" ] \
-  && [ "$cargo_workspace_version" = "$npm_package_version" ] \
+  && [ "$fork_version_matches" = "1" ] \
   && { [ "$base_verification" = "verified" ] || [ "$base_verification" = "unverified-allowed" ]; } \
   && [ -f ".release/v${npm_package_version}.md" ] \
   && grep -q "^# \[${npm_package_version}\]" CHANGELOG.md \

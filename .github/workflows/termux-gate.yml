@@ -133,6 +133,64 @@ jobs:
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           toolchain: ${{ steps.rust_toolchain.outputs.channel }}
+      - name: Check no rustls-platform-verifier on Android targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The platform verifier needs an initialized JVM Context on
+          # Android, which a Termux CLI process never has (startup panic).
+          # Guard both halves of the contract: the crate stays out of the
+          # Android dependency graph, and the only source reference remains
+          # the Windows-gated TLS path.
+          android_tree="$(cargo tree --target aarch64-linux-android -i rustls-platform-verifier 2>/dev/null || true)"
+          if [ -n "$android_tree" ]; then
+            echo "rustls-platform-verifier must not appear in the Android dependency graph:" >&2
+            printf '%s\n' "$android_tree" >&2
+            exit 1
+          fi
+          refs="$(grep -rl 'rustls_platform_verifier' --include='*.rs' . | grep -v '/target/' || true)"
+          if [ "$refs" != "./http-client/src/windows_tls.rs" ]; then
+            echo "unexpected rustls_platform_verifier source references:" >&2
+            printf '%s\n' "$refs" >&2
+            exit 1
+          fi
+          if ! grep -A4 '^\[target\.'"'"'cfg(target_os = "windows")'"'"'\.dependencies\]' http-client/Cargo.toml | grep -q 'rustls-platform-verifier'; then
+            echo "rustls-platform-verifier must stay inside the Windows-gated dependency section" >&2
+            exit 1
+          fi
+          echo "rustls-platform-verifier absent from Android graph; Windows-gated only"
+      - name: Test apply_patch sandbox bypass chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pins the approved apply_patch bypass chain for platforms without a
+          # sandbox backend: explicit approval takes the unsandboxed path,
+          # denied reads stay enforced, unapproved requests stay fail-closed,
+          # and unrelated post-bypass failures never resurface as sandbox
+          # denials. These tests inject the platform branch explicitly, so
+          # this job exercises the Android/Termux decision logic on the Linux
+          # host; the inline cfg!(target_os = "android") call sites
+          # (orchestrator decision, apply_patch runtime context, turn
+          # context, shell snapshot) are not compiled here and stay covered
+          # by the injected decision functions plus the Android build
+          # pipeline.
+          cargo test -p codex-core -- file_system_sandbox_context_preserves_executor_workspace_permissions file_system_sandbox_context_respects_sandbox_request approved_apply_patch_on_sandboxless_platform_executes_without_fs_sandbox r2_unrelated_failure_after_bypass_is_not_a_sandbox_denial approved_needs_approval_bypasses_sandbox_on_platform_without_sandbox_by_construction approved_needs_approval_keeps_sandbox_on_platform_expected_to_have_one by_construction_bypass_still_respects_denied_reads by_construction_flag_alone_does_not_bypass_without_approval unapproved_request_on_sandboxless_platform_stays_fail_closed linux_platform_keeps_sandboxed_first_attempt delete_preverification_reads_host_files_when_no_sandbox_can_exist update_preverification_reads_host_files_when_no_sandbox_can_exist denied_read_policy_keeps_preverification_fail_closed_when_no_sandbox_can_exist linux_platform_keeps_preverification_on_the_sandboxed_routing unapproved_apply_patch_on_sandboxless_platform_still_gets_no_bypass 2>&1 | tee termux-gate-apply-patch-sandbox.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-apply-patch-sandbox.out
+          grep -F 'file_system_sandbox_context_preserves_executor_workspace_permissions ... ok' termux-gate-apply-patch-sandbox.out
+          grep -F 'file_system_sandbox_context_respects_sandbox_request ... ok' termux-gate-apply-patch-sandbox.out
+          grep -F 'approved_apply_patch_on_sandboxless_platform_executes_without_fs_sandbox ... ok' termux-gate-apply-patch-sandbox.out
+          grep -F 'r2_unrelated_failure_after_bypass_is_not_a_sandbox_denial ... ok' termux-gate-apply-patch-sandbox.out
+          grep -F 'approved_needs_approval_bypasses_sandbox_on_platform_without_sandbox_by_construction ... ok' termux-gate-apply-patch-sandbox.out
+          grep -F 'approved_needs_approval_keeps_sandbox_on_platform_expected_to_have_one ... ok' termux-gate-apply-patch-sandbox.out
+          grep -F 'by_construction_bypass_still_respects_denied_reads ... ok' termux-gate-apply-patch-sandbox.out
+          grep -F 'by_construction_flag_alone_does_not_bypass_without_approval ... ok' termux-gate-apply-patch-sandbox.out
+          grep -F 'unapproved_request_on_sandboxless_platform_stays_fail_closed ... ok' termux-gate-apply-patch-sandbox.out
+          grep -F 'linux_platform_keeps_sandboxed_first_attempt ... ok' termux-gate-apply-patch-sandbox.out
+          grep -F 'delete_preverification_reads_host_files_when_no_sandbox_can_exist ... ok' termux-gate-apply-patch-sandbox.out
+          grep -F 'update_preverification_reads_host_files_when_no_sandbox_can_exist ... ok' termux-gate-apply-patch-sandbox.out
+          grep -F 'denied_read_policy_keeps_preverification_fail_closed_when_no_sandbox_can_exist ... ok' termux-gate-apply-patch-sandbox.out
+          grep -F 'linux_platform_keeps_preverification_on_the_sandboxed_routing ... ok' termux-gate-apply-patch-sandbox.out
+          grep -F 'unapproved_apply_patch_on_sandboxless_platform_still_gets_no_bypass ... ok' termux-gate-apply-patch-sandbox.out
       - name: Test TUI exec flow
         shell: bash
         run: |
@@ -191,12 +249,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p codex-api -- remote_models_loader_accepts_exact_limit_and_rejects_oversized_messages 2>&1 | tee termux-gate-model-api-caps.out
+          cargo test -p codex-api -- remote_models_loader_drops_only_the_oversized_model remote_models_loader_accepts_the_exact_limit 2>&1 | tee termux-gate-model-api-caps.out
           grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-model-api-caps.out
-          grep -F 'remote_models_loader_accepts_exact_limit_and_rejects_oversized_messages ... ok' termux-gate-model-api-caps.out
-          cargo test -p codex-models-manager -- file_cache_loader_accepts_exact_limit_and_rejects_oversized_messages 2>&1 | tee termux-gate-model-cache-caps.out
+          grep -F 'remote_models_loader_drops_only_the_oversized_model ... ok' termux-gate-model-api-caps.out
+          grep -F 'remote_models_loader_accepts_the_exact_limit ... ok' termux-gate-model-api-caps.out
+          cargo test -p codex-models-manager -- file_cache_loader_keeps_the_valid_models_when_one_is_oversized file_cache_loader_still_fails_when_every_cached_model_is_oversized 2>&1 | tee termux-gate-model-cache-caps.out
           grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-model-cache-caps.out
-          grep -F 'file_cache_loader_accepts_exact_limit_and_rejects_oversized_messages ... ok' termux-gate-model-cache-caps.out
+          grep -F 'file_cache_loader_keeps_the_valid_models_when_one_is_oversized ... ok' termux-gate-model-cache-caps.out
+          grep -F 'file_cache_loader_still_fails_when_every_cached_model_is_oversized ... ok' termux-gate-model-cache-caps.out
       - name: Test protocol model message caps
         shell: bash
         run: |

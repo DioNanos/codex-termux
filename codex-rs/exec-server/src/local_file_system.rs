@@ -137,12 +137,20 @@ impl LocalFileSystem {
         &'a dyn ExecutorFileSystem,
         Option<&'a FileSystemSandboxContext>,
     )> {
+        // What "this context demands a platform sandbox" means must be the same
+        // question the unsandboxed backend asks when it refuses a context
+        // (`reject_platform_sandbox_context`): reads OR writes. A read-only
+        // policy needs no sandbox to read and still demands one to write, so
+        // asking about reads alone would route it past both fallback branches
+        // below and hand the context to a backend that then refuses it.
         if sandbox.is_some_and(|context| {
-            context.should_read_from_sandbox() && !context.unsandboxed_read_fallback_allowed()
+            (context.should_read_from_sandbox() || context.should_write_into_sandbox())
+                && !context.unsandboxed_read_fallback_allowed()
         }) {
             Ok((self.sandboxed()?, sandbox))
         } else if sandbox.is_some_and(|context| {
-            context.should_read_from_sandbox() && context.unsandboxed_read_fallback_allowed()
+            (context.should_read_from_sandbox() || context.should_write_into_sandbox())
+                && context.unsandboxed_read_fallback_allowed()
         }) {
             // Host read fallback: the unsandboxed backend rejects a context
             // that demands the platform sandbox, so the read runs without

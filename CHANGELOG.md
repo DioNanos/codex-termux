@@ -1,6 +1,6 @@
-# [0.156.1] - 2026-09-23
+# [0.156.1-termux.1] - 2026-09-24
 
-## Codex Termux 0.156.1 — upstream rust-v0.156.1
+## Codex Termux 0.156.1-termux.1 — upstream rust-v0.156.1
 
 - Merges upstream tag `rust-v0.156.1` into the Termux fork.
 - GPT-6 Sol/Luna join the catalog; `gpt-6-astra` was already visible.
@@ -15,6 +15,14 @@
   upstream progress/shimmer condition.
 - Fork sandbox fix #22 (no-backend platforms take the unsandboxed path)
   preserved on the new orchestrator decision path.
+- A read that needs no sandbox no longer fails on a platform that cannot
+  provide one. The read routing asked whether the context needs a sandbox for
+  **reading**, while the backend refuses a context that needs one for reads
+  **or writes**: a read-only policy — full disk reads, no writes — fell between
+  the two questions and failed with "sandboxed filesystem operations require
+  configured runtime paths" on a read nothing had denied. Both now ask the same
+  question, so apply_patch pre-verification reads the host file again instead of
+  refusing to verify the patch.
 
 # [0.155.1] - 2026-09-19
 
