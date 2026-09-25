@@ -26,6 +26,12 @@ pub struct InstallRequest {
 
 /// Prepare a missing package while the caller holds the daemon operation lock.
 pub(super) async fn prepare(daemon: &Daemon, settings: &DaemonSettings) -> Result<()> {
+    // Termux's npm launcher selects its bundled ELF through CODEX_SELF_EXE.
+    // It intentionally lives outside packages/app-server-daemon, and npm owns
+    // its updates. Do not feed that selection into standalone package staging.
+    if cfg!(target_os = "android") {
+        return daemon.ensure_managed_codex_bin();
+    }
     let source = InstallContext::current().package_layout.as_ref();
     // Keep package replacement state out of the CLI dispatcher's async stack frame.
     Box::pin(prepare_from_package(
