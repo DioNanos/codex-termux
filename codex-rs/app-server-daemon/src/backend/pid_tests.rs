@@ -923,3 +923,40 @@ fn inaccessible_pid_preserves_identity_check_error() {
     .join()
     .expect("anonymous identity check");
 }
+
+#[test]
+fn proc_stat_details_handle_parentheses_and_zombies() {
+    for state in ["S", "Z"] {
+        let stat = format!(
+            "42 (worker (with) spaces)) {state} 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 123456 0 0"
+        );
+        assert_eq!(
+            super::parse_proc_stat_details(&stat, /*pid*/ 42).unwrap(),
+            (state.to_string(), "123456".to_string())
+        );
+    }
+}
+
+#[test]
+fn proc_stat_details_reject_truncated_records() {
+    for stat in ["", "42 (worker", "42 (worker) S 1 2"] {
+        assert!(super::parse_proc_stat_details(stat, /*pid*/ 42).is_err());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recorded_start_time_matches_live_process() {
+    let pid = std::process::id();
+    let record = PidRecord {
+        pid,
+        process_start_time: read_process_start_time(pid).await.expect("start time"),
+        process_identity: None,
+        executable_identity: None,
+    };
+    assert!(
+        super::process_matches_record(&record)
+            .await
+            .expect("verify process")
+    );
+}

@@ -112,9 +112,11 @@ required to publish a working Android Termux package.
      the standalone installer path `~/.codex/packages/standalone/current/codex`
      which does not exist on npm-based Termux installs. The ELF resolves
      `libc++_shared.so` via `RUNPATH=$ORIGIN` (Patch #10b).
-  2. **`read_process_start_time`** (`pid.rs`): on Android, reads process start time
-     from `/proc/<pid>/stat` field 22 (starttime in jiffies since boot) instead of
-     `ps -o lstart=`, which is not available in Android toybox.
+  2. **Process identity checks** (`pid.rs`): on Android, both PID record creation
+     and verification read start time from `/proc/<pid>/stat` field 22 (clock
+     ticks since boot). Verification also reads the process state to detect
+     zombies. Mixing these ticks with `ps -o lstart=` wall-clock strings makes
+     status, stop, and restart reject every live daemon.
   3. **Foreground socket dir** (`remote_control_cmd.rs`): uses `std::env::temp_dir()`
      (honours `$TMPDIR`) instead of hardcoding `/tmp`, which does not exist on
      stock Android. Applied unconditionally; correct on all Unix platforms.

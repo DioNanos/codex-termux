@@ -22,7 +22,7 @@ use serde::Serialize;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncSeekExt;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 use tokio::process::Command;
 use tokio::time::sleep;
 
@@ -743,15 +743,15 @@ async fn inspect_empty_pid_reservation(
 // start time from /proc/<pid>/stat field 22 (starttime in clock ticks since
 // boot), which is always present on Linux/Android.
 #[cfg(target_os = "android")]
-async fn read_process_start_time(pid: u32) -> Result<String> {
+async fn read_process_details(pid: u32) -> Result<(String, String)> {
     let stat = tokio::fs::read_to_string(format!("/proc/{pid}/stat"))
         .await
         .with_context(|| format!("failed to read /proc/{pid}/stat"))?;
-    parse_proc_stat_start_time(&stat, pid)
+    parse_proc_stat_details(&stat, pid)
 }
 
 #[cfg(any(test, target_os = "android"))]
-fn parse_proc_stat_start_time(stat: &str, pid: u32) -> Result<String> {
+fn parse_proc_stat_details(stat: &str, pid: u32) -> Result<(String, String)> {
     let after_comm = stat
         .rfind(')')
         .with_context(|| format!("malformed /proc/{pid}/stat: missing closing paren"))?;
@@ -760,15 +760,15 @@ fn parse_proc_stat_start_time(stat: &str, pid: u32) -> Result<String> {
     let starttime = fields
         .get(19)
         .with_context(|| format!("malformed /proc/{pid}/stat: starttime field missing"))?;
-    Ok(starttime.to_string())
+    Ok((fields[0].to_string(), starttime.to_string()))
 }
 
-#[cfg(all(unix, not(target_os = "android")))]
+#[cfg(unix)]
 async fn read_process_start_time(pid: u32) -> Result<String> {
     Ok(read_process_details(pid).await?.1)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 async fn read_process_details(pid: u32) -> Result<(String, String)> {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "stat=", "-o", "lstart="])
