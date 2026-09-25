@@ -6,6 +6,31 @@ use tokio::io::AsyncWriteExt;
 
 use super::*;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn shared_daemon_directory_accepts_full_length_socket_names() {
+    use std::os::unix::fs::MetadataExt;
+
+    let directory = prepare_shared_daemon_socket_directory().expect("private daemon directory");
+    let metadata = std::fs::symlink_metadata(&directory).expect("daemon directory metadata");
+    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    assert_eq!(metadata.mode() & 0o777, 0o700);
+
+    // The app-server names physical sockets with the full hex SHA-256 digest.
+    // A longer Android temporary root can otherwise pass directory creation
+    // and still fail at bind with an overlong sockaddr_un path.
+    let socket_path = directory.join(format!("{:064x}", std::process::id()));
+    let listener = UnixListener::bind(&socket_path)
+        .await
+        .expect("bind a full-length daemon socket");
+    let client = UnixStream::connect(&socket_path)
+        .await
+        .expect("connect to daemon socket");
+    drop(client);
+    drop(listener);
+    std::fs::remove_file(socket_path).expect("remove test socket");
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn private_directory_rejects_volume_roots() {
