@@ -1,3 +1,4 @@
+use crate::LinuxSandboxPidNamespace;
 #[cfg(target_os = "linux")]
 use crate::bwrap::WSL1_BWRAP_WARNING;
 #[cfg(target_os = "linux")]
@@ -266,6 +267,7 @@ impl std::error::Error for SandboxTransformError {
 
 #[derive(Clone, Default)]
 pub struct SandboxManager {
+    linux_sandbox_pid_namespace: LinuxSandboxPidNamespace,
     #[cfg(target_os = "macos")]
     seatbelt_profile: MacosSeatbeltProfile,
     #[cfg(target_os = "macos")]
@@ -280,11 +282,18 @@ impl SandboxManager {
     /// Creates a manager that applies the narrower runtime profile required by filesystem helpers.
     pub fn for_file_system_helpers() -> Self {
         Self {
+            linux_sandbox_pid_namespace: LinuxSandboxPidNamespace::default(),
             #[cfg(target_os = "macos")]
             seatbelt_profile: MacosSeatbeltProfile::FileSystemHelper,
             #[cfg(target_os = "macos")]
             allowed_symlinked_codex_home: None,
         }
+    }
+
+    /// Applies a trusted executor startup policy, never a command or repository setting.
+    pub fn with_linux_sandbox_pid_namespace(mut self, mode: LinuxSandboxPidNamespace) -> Self {
+        self.linux_sandbox_pid_namespace = mode;
+        self
     }
 
     /// Allows otherwise-authorized writable roots beneath the opted-in user home
@@ -500,6 +509,11 @@ impl SandboxManager {
                     use_legacy_landlock,
                     managed_network.as_ref(),
                 );
+                // Keep default invocations compatible with older helpers. Only the
+                // startup opt-in requires a helper that understands PID inheritance.
+                if self.linux_sandbox_pid_namespace == LinuxSandboxPidNamespace::Inherit {
+                    args.insert(0, "--inherit-pid-namespace".to_string());
+                }
                 let mut full_command = Vec::with_capacity(1 + args.len());
                 full_command.push(os_string_to_command_component(exe.as_os_str().to_owned()));
                 full_command.append(&mut args);
@@ -665,7 +679,7 @@ fn wrap_windows_sandbox_exec_request_for_direct_spawn(
             inner_command,
             &native_cwd,
             workspace_roots,
-            &request.env,
+            &mut request.env,
             &request.permission_profile,
             request.windows_sandbox_level,
             proxy_enforced,

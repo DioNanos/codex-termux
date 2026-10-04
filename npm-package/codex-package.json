@@ -1,0 +1,6 @@
+{
+  "layoutVersion": 1,
+  "variant": "codex-termux",
+  "target": "aarch64-linux-android",
+  "entrypoint": "bin/codex.bin"
+}

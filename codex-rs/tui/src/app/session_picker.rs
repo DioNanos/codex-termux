@@ -13,12 +13,16 @@ impl App {
         // picker on a fresh event-loop iteration; its auth manager needs more stack headroom.
         let picker_config = self.config.clone();
         let picker_target = self.app_server_target.clone();
+        let picker_cli_kv_overrides = self.cli_kv_overrides.clone();
+        let picker_loader_overrides = self.loader_overrides.clone();
         let picker_state_db = self.state_db.clone();
         let picker_environment_manager = Arc::clone(&self.environment_manager);
         let picker_app_server = tokio::spawn(async move {
             crate::start_app_server_for_picker(
                 &picker_config,
                 &picker_target,
+                picker_cli_kv_overrides,
+                picker_loader_overrides,
                 picker_state_db,
                 picker_environment_manager,
             )
@@ -29,7 +33,7 @@ impl App {
             Ok(result) => result,
             Err(err) => Err(err.into()),
         };
-        let picker_app_server = match picker_app_server {
+        let mut picker_app_server = match picker_app_server {
             Ok(app_server) => app_server,
             Err(err) => {
                 self.add_session_picker_error(format!("Failed to start TUI session picker: {err}"));
@@ -37,6 +41,7 @@ impl App {
                 return Ok(AppRunControl::Continue);
             }
         };
+        picker_app_server.model_provider_override = self.harness_overrides.model_provider.clone();
         let selection =
             crate::resume_picker::run_resume_picker_from_existing_session_with_app_server(
                 crate::uses_remote_workspace_or_environment(

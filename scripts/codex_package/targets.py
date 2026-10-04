@@ -63,6 +63,14 @@ PACKAGE_VARIANTS: dict[str, PackageVariant] = {
         cargo_bin="codex-app-server",
         executable_stem="codex-app-server",
     ),
+    # codex-termux fork: same on-disk layout as upstream (bin/codex next to
+    # codex-package.json), with the fork identity in the manifest variant so
+    # the daemon never executes an upstream binary staged in its place.
+    "codex-termux": PackageVariant(
+        name="codex-termux",
+        cargo_bin="codex",
+        executable_stem="codex",
+    ),
 }
 
 

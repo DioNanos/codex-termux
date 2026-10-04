@@ -18,7 +18,13 @@ const REALTIME_STOP_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 1);
 
 impl App {
     pub(super) async fn stop_realtime_conversation(&mut self, app_server: &mut AppServerSession) {
-        let Some(thread_id) = self.chat_widget.reset_realtime_conversation() else {
+        let thread_id = self
+            .background_voice
+            .as_mut()
+            .and_then(|owner| owner.reset_realtime_conversation())
+            .or_else(|| self.chat_widget.reset_realtime_conversation());
+        self.retire_background_voice();
+        let Some(thread_id) = thread_id else {
             return;
         };
         match tokio::time::timeout(
@@ -39,14 +45,8 @@ impl App {
 
     pub(super) async fn shutdown_current_thread(&mut self, app_server: &mut AppServerSession) {
         self.stop_realtime_conversation(app_server).await;
-        self.shutdown_side_threads(app_server).await;
-        if let Some(thread_id) = self.chat_widget.thread_id() {
-            if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
-                tracing::warn!("failed to unsubscribe thread {thread_id}: {err}");
-            }
-            self.abort_thread_event_listener(thread_id);
-            self.pending_server_profiles.remove(&thread_id);
-        }
+        self.detach_current_thread_for_navigation(app_server, /*destination*/ None)
+            .await;
     }
 
     pub(super) async fn shutdown_side_threads(&mut self, app_server: &mut AppServerSession) {
@@ -739,7 +739,7 @@ impl App {
                 cwd,
                 approval_policy,
                 approvals_reviewer,
-                active_permission_profile,
+                active_permission_profile: _,
                 model,
                 effort,
                 summary,
@@ -830,10 +830,6 @@ impl App {
                     let selected_profile = self.pending_server_profiles.get(&thread_id);
                     let selected_active = selected_profile
                         .map(|profile| ActivePermissionProfile::new(profile.profile_id.clone()));
-                    let confirmed_active = (self.app_server_target.thread_params_mode()
-                        == crate::app_server_session::ThreadParamsMode::Remote)
-                        .then(|| config.permissions.active_permission_profile())
-                        .flatten();
                     let (turn_approval_policy, turn_approvals_reviewer) =
                         if let Some(profile) = selected_profile {
                             (
@@ -857,14 +853,21 @@ impl App {
                                 ),
                             )
                         };
+                    // Only explicit choices may override the saved server profile.
+                    let explicit_profile = self
+                        .runtime_permission_profile_override
+                        .as_ref()
+                        .filter(|profile| {
+                            profile.turn_override
+                                == RuntimePermissionProfileTurnOverride::LegacySandbox
+                        });
                     let permissions_override = Self::turn_permissions_override_from_config(
                         config,
-                        selected_active
-                            .as_ref()
-                            .or(confirmed_active.as_ref())
-                            .or(active_permission_profile.as_ref()),
-                        self.runtime_permission_profile_override
-                            .as_ref()
+                        selected_active.as_ref().or_else(|| {
+                            explicit_profile
+                                .and_then(|profile| profile.active_permission_profile.as_ref())
+                        }),
+                        explicit_profile
                             .and_then(RuntimePermissionProfileOverride::turn_permission_profile),
                     );
                     let response = app_server
@@ -947,7 +950,7 @@ impl App {
                     .config_ref()
                     .experimental_realtime_ws_model
                     .clone();
-                let voices = self.realtime_voices(app_server).await;
+                let voices = self.realtime_voices(app_server).await?;
                 let voice = self.effective_realtime_voice(app_server, &voices).await?;
                 app_server
                     .thread_realtime_start(
@@ -1144,6 +1147,7 @@ impl App {
         thread_id: ThreadId,
         notification: ServerNotification,
     ) -> Result<()> {
+        self.deliver_background_voice_notification(thread_id, &notification);
         if self.abandoned_side_threads.contains(&thread_id) {
             return Ok(());
         }
@@ -1185,7 +1189,7 @@ impl App {
         {
             return Ok(());
         }
-        let mut permission_change_confirmed = false;
+        let mut confirmed_profile = None;
         if let ServerNotification::ThreadSettingsUpdated(notification) = &notification {
             self.apply_thread_settings_to_cached_session(thread_id, &notification.thread_settings)
                 .await;
@@ -1206,8 +1210,7 @@ impl App {
                         })
                 })
             {
-                self.pending_server_profiles.remove(&thread_id);
-                permission_change_confirmed = true;
+                confirmed_profile = self.pending_server_profiles.remove(&thread_id);
             }
         }
         let inferred_session = if let ServerNotification::ThreadStarted(started) = &notification
@@ -1261,7 +1264,13 @@ impl App {
                 guard.push_notification_ref(&notification);
                 Some(notification)
             } else {
-                self.retain_inactive_realtime_transcript(thread_id, &notification);
+                if self
+                    .background_voice
+                    .as_ref()
+                    .is_none_or(|owner| owner.thread_id() != Some(thread_id))
+                {
+                    self.retain_inactive_realtime_transcript(thread_id, &notification);
+                }
                 guard.push_notification(notification);
                 None
             };
@@ -1289,7 +1298,13 @@ impl App {
                 .on_thread_settings_updated(settings.clone());
             notification = None;
         }
-        if permission_change_confirmed {
+        if let Some(selected) = confirmed_profile {
+            if self.chat_widget.thread_id() == Some(thread_id) {
+                if selected.approvals_reviewer.is_some() {
+                    self.runtime_approvals_reviewer_override = None;
+                }
+                self.runtime_permission_profile_override = None;
+            }
             if self.chat_widget.thread_id() == Some(thread_id)
                 && let Some(profile) = self
                     .chat_widget
@@ -1315,6 +1330,7 @@ impl App {
                     Some(RuntimeApprovalPolicyOverride::Explicit(
                         self.config.permissions.approval_policy.value().into(),
                     ));
+                self.runtime_approvals_reviewer_override = Some(self.config.approvals_reviewer);
                 self.runtime_permission_profile_override =
                     Some(RuntimePermissionProfileOverride::from_config(&self.config));
             }
@@ -1547,6 +1563,14 @@ impl App {
             tracing::warn!(%err, "failed to sync app permissions from thread session");
         }
         self.config.approvals_reviewer = session.approvals_reviewer;
+        if !self.app_server_target.uses_remote_workspace() {
+            self.config
+                .workspace_roots
+                .clone_from(&session.runtime_workspace_roots);
+            self.config
+                .permissions
+                .set_workspace_roots(session.runtime_workspace_roots.clone());
+        }
 
         let thread_id = session.thread_id;
         self.pending_server_profiles.remove(&thread_id);
@@ -1573,7 +1597,9 @@ impl App {
             self.chat_widget.set_token_info(/*info*/ None);
         }
         match presentation {
-            ThreadAttachPresentation::Fresh | ThreadAttachPresentation::SessionLineage => {
+            ThreadAttachPresentation::Fresh
+            | ThreadAttachPresentation::FreshWithDraft
+            | ThreadAttachPresentation::SessionLineage => {
                 self.chat_widget.handle_thread_session(session);
             }
         }
@@ -1601,6 +1627,7 @@ impl App {
             &replayed_final_items,
             retained_assistant_captions,
         );
+        self.restore_voice_owner_after_replay();
         let pending = std::mem::take(&mut self.pending_primary_events);
         for pending_event in pending {
             match pending_event {
@@ -1868,10 +1895,38 @@ impl App {
             self.chat_widget
                 .remember_realtime_delegated_reasoning_turn(turn_id);
         }
+        let confirmed_message_ids = snapshot
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.items)
+            .chain(snapshot.events.iter().filter_map(|event| {
+                let ThreadBufferedEvent::Notification(notification) = event else {
+                    return None;
+                };
+                if let ServerNotification::ItemStarted(notification) = notification.as_ref() {
+                    Some(&notification.item)
+                } else if let ServerNotification::ItemCompleted(notification) =
+                    notification.as_ref()
+                {
+                    Some(&notification.item)
+                } else {
+                    None
+                }
+            }))
+            .filter_map(|item| {
+                if let ThreadItem::UserMessage { client_id, .. } = item {
+                    client_id.clone()
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
         let recovered_input = snapshot
             .input_state
             .as_ref()
-            .is_some_and(|input| input.recovered_queue)
+            .is_some_and(|input| {
+                input.recovered_queue || input.reconnect_pending || input.has_unconfirmed_messages()
+            })
             .then(|| snapshot.input_state.take())
             .flatten();
         self.chat_widget.restore_thread_input_state(
@@ -1898,10 +1953,12 @@ impl App {
             self.app_event_tx
                 .send(AppEvent::EndInitialHistoryReplayBuffer);
         }
-        if recovered_input.is_some() {
+        let recovered = recovered_input.is_some();
+        if recovered {
             let mode = has_resumed_collaboration_mode
                 .then(|| self.chat_widget.effective_collaboration_mode());
-            self.chat_widget.restore_reconnected_input(recovered_input);
+            self.chat_widget
+                .restore_reconnected_input(recovered_input, &confirmed_message_ids);
             if let Some(mode) = mode {
                 self.chat_widget.set_effective_collaboration_mode(mode);
             }
@@ -1910,6 +1967,7 @@ impl App {
             &replayed_final_items,
             retained_assistant_captions,
         );
+        self.restore_voice_owner_after_replay();
         self.chat_widget
             .set_queue_autosend_suppressed(/*suppressed*/ false);
         self.chat_widget
@@ -2012,8 +2070,13 @@ impl App {
         match event {
             ThreadBufferedEvent::Notification(notification) => {
                 self.cache_collab_receiver_threads_for_notification(notification.as_ref());
+                let tip_ready = self.turn_tips.observe(&notification, Instant::now());
                 self.chat_widget
                     .handle_server_notification(*notification, /*replay_kind*/ None);
+                // History cells queued by completion must be applied before anchoring its tip.
+                if let Some(event) = tip_ready {
+                    self.app_event_tx.send(event);
+                }
             }
             ThreadBufferedEvent::Request(request) => {
                 if self
@@ -2045,6 +2108,7 @@ impl App {
     }
 
     pub(super) fn handle_thread_event_replay(&mut self, event: ThreadBufferedEvent) {
+        self.turn_tips.dismiss();
         match event {
             ThreadBufferedEvent::Notification(notification) => self
                 .chat_widget

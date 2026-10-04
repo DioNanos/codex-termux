@@ -14,6 +14,7 @@ use std::cell::Cell;
 
 struct ExternalWriterNotice {
     command_center_available: bool,
+    agents_navigation_key_available: bool,
     transcript_hint: Option<crate::key_hint::ShortcutHint>,
 }
 
@@ -64,8 +65,8 @@ impl ExternalWriterNotice {
         ]
         .into();
         let retry: Line<'static> = vec![
-            Span::styled("R", crate::style::accent_style()),
-            " to Retry".into(),
+            Span::styled("r", crate::style::accent_style()),
+            " to retry".into(),
         ]
         .into();
         let mut lines = word_wrap_lines(&[title], usize::from(width));
@@ -88,14 +89,23 @@ impl ExternalWriterNotice {
     }
 
     fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut items = vec![("r".to_string(), "retry".to_string())];
+        let mut items = vec![
+            ("r".to_string(), "retry".to_string()),
+            ("f".to_string(), "fork".to_string()),
+        ];
         let escape = crate::key_hint::plain(KeyCode::Esc).display_label();
         let mut quit_keys = vec![
             crate::key_hint::ctrl(KeyCode::Char('c')).display_label(),
             crate::key_hint::plain(KeyCode::Char('q')).display_label(),
         ];
         if self.command_center_available {
-            items.push((escape, "command center".to_string()));
+            let key = if self.agents_navigation_key_available {
+                let left = crate::key_hint::plain(KeyCode::Left).display_label();
+                format!("{left}/{escape}")
+            } else {
+                escape
+            };
+            items.push((key, "command center".to_string()));
         } else {
             quit_keys.insert(/*index*/ 0, escape);
         }
@@ -125,6 +135,8 @@ impl ChatWidget {
             return self.bottom_pane_renderable(
                 /*footer*/ None,
                 crate::bottom_pane::CommandPopupPlacement::AboveComposer,
+                /*composer_gap*/ None,
+                /*working_tip*/ None,
             );
         }
 
@@ -189,6 +201,8 @@ impl ChatWidget {
             self.bottom_pane_renderable(
                 /*footer*/ None,
                 crate::bottom_pane::CommandPopupPlacement::AboveComposer,
+                /*composer_gap*/ None,
+                /*working_tip*/ None,
             )
             .inset(Insets::tlbr(
                 /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
@@ -200,15 +214,24 @@ impl ChatWidget {
     /// Returns the composer, footer, and active modal without the live transcript above it.
     ///
     /// Both transcript surfaces use this composition so read-only notices and cursor placement
-    /// remain consistent. The caller owns any spacing between the transcript and this surface.
+    /// remain consistent. Owned transcripts reserve their shared hint row above the composer.
     pub(crate) fn bottom_pane_renderable<'a>(
         &'a self,
         footer: Option<&'a crate::bottom_pane::TranscriptFooter>,
         command_popup_placement: crate::bottom_pane::CommandPopupPlacement,
+        composer_gap: Option<&'a crate::bottom_pane::ComposerGap>,
+        working_tip: Option<&'a crate::turn_tip::TurnTip>,
     ) -> RenderableItem<'a> {
-        if self.external_writer_view && !self.bottom_pane.has_active_view() {
+        if self.fork_in_progress {
+            RenderableItem::Owned(Box::new(
+                Paragraph::new("Forking conversation…".dim()).inset(Insets::tlbr(
+                    /*top*/ 1, /*left*/ 2, /*bottom*/ 1, /*right*/ 2,
+                )),
+            ))
+        } else if self.external_writer_view && !self.bottom_pane.has_active_view() {
             RenderableItem::Owned(Box::new(ExternalWriterNotice {
                 command_center_available: self.remote_connection.is_some(),
+                agents_navigation_key_available: self.agents_navigation_key_available(),
                 transcript_hint: self.bottom_pane.transcript_shortcut_hint(),
             }))
         } else {
@@ -223,6 +246,8 @@ impl ChatWidget {
             };
             self.bottom_pane
                 .as_renderable_with_options(crate::bottom_pane::ComposerRenderOptions {
+                    composer_gap,
+                    working_tip,
                     warning_count: self.warning_display_state.count,
                     textarea_right_reserve: right_reserve,
                     separate_status_line: command_popup_placement

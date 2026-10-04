@@ -9,11 +9,19 @@ use codex_config::ConfigLayerSource;
 
 async fn build_config_on_runtime_worker(
     builder: ConfigBuilder,
+    application_network_policy: codex_http_client::NetworkPolicy,
     error_context: String,
 ) -> Result<Config> {
     // Tokio stores the task output inline even when it boxes the future. Keep the large
     // Config off the caller's stack while Tokio allocates the task during session switches.
-    match tokio::spawn(async move { builder.build().await.map(Box::new) }).await {
+    match tokio::spawn(async move {
+        builder.build().await.map(|mut config| {
+            config.application_network_policy = application_network_policy;
+            Box::new(config)
+        })
+    })
+    .await
+    {
         Ok(build_result) => build_result.map(|config| *config).wrap_err(error_context),
         Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
         Err(err) => Err(err).wrap_err_with(|| format!("{error_context} task failed")),
@@ -50,36 +58,43 @@ pub(super) fn has_explicit_resume_permission_override(
     config: &Config,
     overrides: &ConfigOverrides,
 ) -> bool {
-    overrides.approval_policy.is_some()
-        || overrides.approvals_reviewer.is_some()
-        || overrides.sandbox_mode.is_some()
-        || overrides.permission_profile.is_some()
-        || overrides.default_permissions.is_some()
-        || !overrides.additional_writable_roots.is_empty()
-        || overrides.workspace_roots.is_some()
-        || config.config_layer_stack.layers_high_to_low().any(|layer| {
-            matches!(
-                &layer.name,
-                ConfigLayerSource::SessionFlags
-                    | ConfigLayerSource::User {
-                        profile: Some(_),
-                        ..
-                    }
-            ) && [
-                "approval_policy",
-                "approvals_reviewer",
-                "sandbox_mode",
-                "default_permissions",
-                "permissions",
-                "network",
-                "sandbox_workspace_write",
-            ]
-            .iter()
-            .any(|key| layer.config.get(*key).is_some())
-        })
+    // A directory choice is supported remotely even when permission overrides are not.
+    let selected = crate::resume_permissions::ResumePermissions::from_overrides(
+        config,
+        &ConfigOverrides {
+            cwd: None,
+            ..overrides.clone()
+        },
+    );
+    selected.approval_policy
+        || selected.approvals_reviewer
+        || selected.profile
+        || selected.workspace_roots
 }
 
 impl App {
+    pub(super) fn resume_permission_overrides(
+        &self,
+        config: &Config,
+    ) -> crate::resume_permissions::ResumePermissions {
+        let mut permission_overrides = crate::resume_permissions::ResumePermissions::from_overrides(
+            config,
+            &self.harness_overrides,
+        );
+        permission_overrides.approvals_reviewer |=
+            self.runtime_approvals_reviewer_override.is_some();
+        permission_overrides.approval_policy |= matches!(
+            self.runtime_approval_policy_override,
+            Some(RuntimeApprovalPolicyOverride::Explicit(_))
+        );
+        if let Some(profile) = self.runtime_permission_profile_override.as_ref()
+            && profile.turn_override == RuntimePermissionProfileTurnOverride::LegacySandbox
+        {
+            permission_overrides.profile = true;
+        }
+        permission_overrides
+    }
+
     pub(super) async fn rebuild_config_for_cwd(&self, cwd: PathBuf) -> Result<Config> {
         let mut overrides = self.harness_overrides.clone();
         overrides.cwd = Some(cwd.clone());
@@ -92,6 +107,7 @@ impl App {
             .cloud_config_bundle(self.cloud_config_bundle.clone());
         build_config_on_runtime_worker(
             builder,
+            self.config.application_network_policy.clone(),
             format!("Failed to rebuild config for cwd {cwd_display}"),
         )
         .await
@@ -114,6 +130,7 @@ impl App {
             .cloud_config_bundle(self.cloud_config_bundle.clone());
         build_config_on_runtime_worker(
             builder,
+            self.config.application_network_policy.clone(),
             format!("Failed to rebuild config for permission profile {profile_id}"),
         )
         .await
@@ -217,6 +234,8 @@ impl App {
                 .selected_permission_profiles
                 .insert(thread_id, profile_id.clone());
         }
+        self.runtime_approvals_reviewer_override =
+            approvals_reviewer.or(self.runtime_approvals_reviewer_override);
         self.runtime_permission_profile_override =
             Some(RuntimePermissionProfileOverride::from_config(&self.config));
         self.sync_active_thread_permission_settings_to_cached_session()
@@ -399,7 +418,7 @@ impl App {
         let mut config = self
             .rebuild_config_for_cwd(self.chat_widget.config_ref().cwd.to_path_buf())
             .await?;
-        self.apply_runtime_policy_overrides(&mut config, RuntimePolicyOverrideScope::All);
+        self.apply_runtime_policy_overrides(&mut config, RuntimePolicyOverrideScope::All)?;
         self.local_settings = self.local_settings.reloaded(&config);
         self.refresh_server_version_overview_notice(CODEX_CLI_VERSION);
         // Other preferences have runtime caches and are adopted when the widget is replaced.
@@ -475,7 +494,7 @@ impl App {
         &mut self,
         config: &mut Config,
         scope: RuntimePolicyOverrideScope,
-    ) {
+    ) -> Result<()> {
         if let Some(policy) = self.runtime_approval_policy_override
             && (scope == RuntimePolicyOverrideScope::All
                 || matches!(policy, RuntimeApprovalPolicyOverride::Explicit(_)))
@@ -484,27 +503,38 @@ impl App {
                 .approval_policy
                 .set(policy.policy().to_core())
         {
+            if scope == RuntimePolicyOverrideScope::ExplicitOnly {
+                return Err(err).wrap_err("Failed to carry forward approval policy override");
+            }
             tracing::warn!(%err, "failed to carry forward approval policy override");
             self.chat_widget.add_error_message(format!(
                 "Failed to carry forward approval policy override: {err}"
             ));
         }
-        if let Some(profile_override) = self.runtime_permission_profile_override.as_ref()
-            && (scope == RuntimePolicyOverrideScope::All
-                || profile_override.turn_override
-                    == RuntimePermissionProfileTurnOverride::LegacySandbox)
-        {
-            match config
+        let profile_override =
+            self.runtime_permission_profile_override
+                .as_ref()
+                .filter(|profile| {
+                    scope == RuntimePolicyOverrideScope::All
+                        || profile.turn_override
+                            == RuntimePermissionProfileTurnOverride::LegacySandbox
+                });
+        if let Some(reviewer) = self.runtime_approvals_reviewer_override.or_else(|| {
+            profile_override
+                .filter(|profile| {
+                    profile.turn_override == RuntimePermissionProfileTurnOverride::Preserve
+                })
+                .map(|_| self.config.approvals_reviewer)
+        }) {
+            config
                 .config_layer_stack
                 .requirements()
                 .approvals_reviewer
-                .can_set(&profile_override.approvals_reviewer)
-            {
-                Ok(()) => config.approvals_reviewer = profile_override.approvals_reviewer,
-                Err(error) => self.chat_widget.add_error_message(format!(
-                    "Failed to carry forward approvals reviewer: {error}"
-                )),
-            }
+                .can_set(&reviewer)
+                .wrap_err("Failed to carry forward approvals reviewer")?;
+            config.approvals_reviewer = reviewer;
+        }
+        if let Some(profile_override) = profile_override {
             match config
                 .permissions
                 .set_permission_profile_from_session_snapshot(
@@ -517,6 +547,10 @@ impl App {
                     config.permissions.network = profile_override.network.clone();
                 }
                 Err(err) => {
+                    if scope == RuntimePolicyOverrideScope::ExplicitOnly {
+                        return Err(err)
+                            .wrap_err("Failed to carry forward permission profile override");
+                    }
                     tracing::warn!(%err, "failed to carry forward permission profile override");
                     self.chat_widget.add_error_message(format!(
                         "Failed to carry forward permission profile override: {err}"
@@ -524,6 +558,7 @@ impl App {
                 }
             }
         }
+        Ok(())
     }
 
     pub(super) fn set_approvals_reviewer_in_app_and_widget(&mut self, reviewer: ApprovalsReviewer) {
@@ -760,6 +795,7 @@ impl App {
             self.chat_widget.add_memories_enable_notice();
         }
         if approvals_reviewer_override.is_some() {
+            self.runtime_approvals_reviewer_override = approvals_reviewer_override;
             self.set_approvals_reviewer_in_app_and_widget(self.config.approvals_reviewer);
         }
         if approval_policy_override.is_some() {
@@ -788,6 +824,7 @@ impl App {
                 .add_error_message(format!("Failed to enable Approve for me: {err}"));
         }
         if permission_profile_override.is_some() {
+            self.runtime_approvals_reviewer_override = Some(self.config.approvals_reviewer);
             self.runtime_permission_profile_override =
                 Some(RuntimePermissionProfileOverride::from_config(&self.config));
         }
@@ -1049,6 +1086,7 @@ impl App {
         }
         let explicitly_selected =
             has_explicit_resume_permission_override(config, &self.harness_overrides)
+                || self.runtime_approvals_reviewer_override.is_some()
                 || matches!(
                     self.runtime_approval_policy_override,
                     Some(RuntimeApprovalPolicyOverride::Explicit(_))
@@ -1198,6 +1236,7 @@ impl App {
             return;
         }
 
+        self.runtime_approvals_reviewer_override = Some(self.config.approvals_reviewer);
         self.runtime_permission_profile_override =
             Some(RuntimePermissionProfileOverride::from_config(&self.config));
         self.sync_active_thread_permission_settings_to_cached_session()
@@ -1702,6 +1741,78 @@ enabled = false
             Some(false)
         );
         assert_cloud_requirements(&app);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_session_and_config_rebuilds_keep_the_live_application_network_policy() -> Result<()>
+    {
+        use codex_http_client::ClientRouteClass;
+        use codex_http_client::DestinationPolicy;
+        use codex_http_client::HttpError;
+        use codex_http_client::NetworkPolicyController;
+        use codex_http_client::NetworkPolicyDenied;
+        use wiremock::Mock;
+        use wiremock::MockServer;
+        use wiremock::ResponseTemplate;
+        use wiremock::matchers::method;
+
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        let controller = NetworkPolicyController::default();
+        let denied = DestinationPolicy::Restricted {
+            allowed_hosts: Default::default(),
+        };
+        assert!(controller.publish(controller.policy().revision(), denied.clone()));
+        app.config.application_network_policy = controller.policy();
+        let app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        app.refresh_in_memory_config_from_disk().await?;
+        let new_config = app.load_new_session_config(&app_server).await?;
+        let permission_config = app
+            .rebuild_config_for_permission_profile(":workspace")
+            .await?;
+        let pet_url =
+            "https://persistent.oaistatic.com/codex/pets/v1/dewey-spritesheet-v4.webp".parse()?;
+        for config in [&app.config, &new_config, &permission_config] {
+            assert_eq!(config.application_network_policy, controller.policy());
+            assert_eq!(
+                config
+                    .http_client_factory()
+                    .network_policy()
+                    .acquire(&pet_url)
+                    .map(|_| ()),
+                Err(NetworkPolicyDenied::Destination),
+            );
+        }
+        let client = new_config
+            .http_client_factory()
+            .build_client(&server.uri(), ClientRouteClass::Other)?;
+        assert!(matches!(
+            client.get(server.uri()).send().await,
+            Err(HttpError::Policy(NetworkPolicyDenied::Destination))
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        assert!(controller.publish(
+            controller.policy().revision(),
+            DestinationPolicy::Unrestricted
+        ));
+        assert!(client.get(server.uri()).send().await?.status().is_success());
+        assert!(controller.publish(controller.policy().revision(), denied));
+        assert!(matches!(
+            client.get(server.uri()).send().await,
+            Err(HttpError::Policy(NetworkPolicyDenied::Destination))
+        ));
+        server.verify().await;
+        app_server.shutdown().await?;
         Ok(())
     }
 

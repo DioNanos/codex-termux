@@ -19,6 +19,7 @@ use codex_history::RolloutItem;
 use codex_network_proxy::NetworkProxyConfig;
 use codex_network_proxy::PROXY_ACTIVE_ENV_KEY;
 use codex_protocol::approvals::ExecApprovalKind;
+use codex_protocol::approvals::GuardianAssessmentAction;
 use codex_protocol::approvals::NetworkApprovalContext;
 use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::approvals::NetworkPolicyAmendment;
@@ -243,6 +244,7 @@ async fn guardian_network_approval_preserves_action_and_outcome_routing() -> Res
             "protocol": "http",
             "target": NETWORK_TEST_TARGET,
             "tool": "network_access",
+            "environment_id": LOCAL_ENVIRONMENT_ID,
             "trigger": {
                 "callId": first_call_id,
                 "command": expected_command,
@@ -789,6 +791,15 @@ async fn background_network_approval_uses_current_review_settings_and_original_e
             ),
             ev_completed("resp-cross-turn-network-stdin"),
         ]),
+        // Strict review approves terminal input before the process can request network access.
+        sse(vec![
+            ev_response_created("resp-cross-turn-stdin-guardian"),
+            ev_assistant_message(
+                "msg-cross-turn-stdin-guardian",
+                r#"{"risk_level":"low","user_authorization":"high","outcome":"allow","rationale":"Continue the existing terminal."}"#,
+            ),
+            ev_completed("resp-cross-turn-stdin-guardian"),
+        ]),
         sse(vec![
             ev_response_created("resp-network-guardian-environment"),
             ev_function_call(
@@ -919,6 +930,7 @@ async fn background_network_approval_uses_current_review_settings_and_original_e
             event,
             EventMsg::GuardianAssessment(assessment)
                 if assessment.status == GuardianAssessmentStatus::Approved
+                    && matches!(assessment.action, GuardianAssessmentAction::NetworkAccess { .. })
         ) || matches!(
             event,
             EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_)
@@ -953,7 +965,7 @@ async fn background_network_approval_uses_current_review_settings_and_original_e
         .iter()
         .filter(|request| request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian")
         .collect::<Vec<_>>();
-    assert_eq!(reviews.len(), 2);
+    assert_eq!(reviews.len(), 3);
     for review in &reviews {
         assert_eq!(review.body_json()["model"], "guardian-parent-b");
         assert_eq!(review.body_json()["reasoning"]["effort"], "medium");
@@ -974,7 +986,7 @@ async fn background_network_approval_uses_current_review_settings_and_original_e
     )?;
     // Strict review does not change this field's policy-routing meaning.
     assert_eq!(metadata["auto_review_enabled"], false);
-    let pwd_output = reviews[1]
+    let pwd_output = reviews[2]
         .function_call_output_text("guardian-pwd")
         .context("Guardian pwd output")?;
     let original_cwd = test
@@ -2171,31 +2183,75 @@ async fn guardian_receives_exact_trigger_for_single_network_request() -> Result<
     let server = start_mock_server().await;
     let test = managed_network_unified_exec_test(&server).await?;
     let command = "python3 -c \"import urllib.request; opener = urllib.request.build_opener(urllib.request.ProxyHandler()); print('OK:' + opener.open('http://1.1.1.1', timeout=10).read().decode(errors='replace'))\"".to_string();
-    let responses = mount_sse_sequence(
+    let call_id = "exec-network-single";
+    mount_sse_once_match(
         &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-network-single"),
-                ev_function_call(
-                    "exec-network-single",
-                    "exec_command",
-                    &serde_json::to_string(&network_exec_args(&command))?,
-                ),
-                ev_completed("resp-network-single"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-network-guardian"),
-                ev_assistant_message("msg-network-guardian", r#"{"outcome":"deny"}"#),
-                ev_completed("resp-network-guardian"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-network-done"),
-                ev_assistant_message("msg-network-done", "done"),
-                ev_completed("resp-network-done"),
-            ]),
-        ],
+        move |request: &wiremock::Request| {
+            !is_guardian_request(request) && !request_body_contains(request, call_id)
+        },
+        sse(vec![
+            ev_response_created("resp-network-single"),
+            ev_function_call(
+                call_id,
+                "exec_command",
+                &serde_json::to_string(&network_exec_args(&command))?,
+            ),
+            ev_completed("resp-network-single"),
+        ]),
     )
     .await;
+    let guardian = mount_sse_once_match(
+        &server,
+        is_guardian_request,
+        sse(vec![
+            ev_response_created("resp-network-guardian"),
+            ev_assistant_message("msg-network-guardian", r#"{"outcome":"deny"}"#),
+            ev_completed("resp-network-guardian"),
+        ]),
+    )
+    .await;
+
+    // The command can yield before its network request reaches Guardian. Keep the
+    // parent on that process until it exits, without consuming Guardian's reply.
+    let _parent = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/responses"))
+        .and(move |request: &wiremock::Request| {
+            !is_guardian_request(request) && request_body_contains(request, call_id)
+        })
+        .respond_with(move |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(
+                &decoded_request_body(request).expect("decode parent request"),
+            )
+            .expect("parse parent request");
+            let input = body["input"].as_array().expect("parent input");
+            let output = input
+                .iter()
+                .rev()
+                .find(|item| item["type"] == "function_call_output")
+                .and_then(|item| item["output"].as_str())
+                .expect("network command or poll output");
+            let response_id = format!("{call_id}-{}", input.len());
+            let event = if let Some(session_id) = output
+                .lines()
+                .find_map(|line| line.strip_prefix("Process running with session ID "))
+            {
+                ev_function_call(
+                    &response_id,
+                    "write_stdin",
+                    &json!({
+                        "session_id": session_id.parse::<i32>().expect("session id"),
+                        "chars": "",
+                        "yield_time_ms": 1_000,
+                    })
+                    .to_string(),
+                )
+            } else {
+                ev_assistant_message(&response_id, "done")
+            };
+            sse_response(sse(vec![event, ev_completed(&response_id)]))
+        })
+        .mount_as_scoped(&server)
+        .await;
 
     submit_managed_network_turn(
         &test,
@@ -2205,11 +2261,13 @@ async fn guardian_receives_exact_trigger_for_single_network_request() -> Result<
         AskForApproval::OnRequest,
     )
     .await?;
-    wait_for_turn_complete(&test).await;
+    tokio::time::timeout(Duration::from_secs(30), wait_for_turn_complete(&test))
+        .await
+        .context("timed out waiting for the network process and Guardian review to finish")?;
 
     assert_eq!(
-        guardian_network_triggers(&[&responses])?,
-        vec![("exec-network-single".to_string(), command)]
+        guardian_network_triggers(&[&guardian])?,
+        vec![(call_id.to_string(), command)]
     );
 
     Ok(())
@@ -2396,6 +2454,7 @@ async fn remote_guardian_network_decisions_are_scoped_to_each_request_and_enviro
             "protocol": "http",
             "target": NETWORK_TEST_TARGET,
             "tool": "network_access",
+            "environment_id": environment.environment_id,
             "trigger": {
                 "callId": call_id,
                 "command": command,
@@ -2449,9 +2508,22 @@ async fn owner_network_policy_follows_the_selected_remote_command() -> Result<()
     skip_if_no_remote_env!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut scenarios = vec![("ROOTED", managed_network_unified_exec_test(&server).await?)];
-    for (scenario, configured_controller) in [("ROOTLESS", false), ("USER_ROOTED", true)] {
+    let mut scenarios = vec![(
+        "ROOTED",
+        managed_network_unified_exec_test(&server).await?,
+        Some(true),
+    )];
+    for (scenario, configured_controller, allow_local_binding) in [
+        ("ROOTLESS", false, None),
+        ("USER_ROOTED", true, Some(true)),
+        ("USER_UNSET", true, None),
+        ("USER_DENIED", true, Some(false)),
+    ] {
         let mut builder = test_codex().with_config(move |config| {
+            config
+                .features
+                .disable(Feature::NetworkProxy)
+                .expect("test config should allow feature update");
             for feature in [Feature::UnifiedExec, Feature::ExecPermissionApprovals] {
                 config
                     .features
@@ -2472,7 +2544,7 @@ async fn owner_network_policy_follows_the_selected_remote_command() -> Result<()
                 NetworkProxySpec::from_config_and_constraints(
                     NetworkProxyConfig {
                         enabled: true,
-                        allow_local_binding: Some(true),
+                        allow_local_binding,
                         ..NetworkProxyConfig::default()
                     },
                     /*requirements*/ None,
@@ -2483,14 +2555,15 @@ async fn owner_network_policy_follows_the_selected_remote_command() -> Result<()
         });
         let test = builder.build_with_remote_and_local_env(&server).await?;
         assert!(!test.config.managed_network_requirements_enabled());
+        assert!(!test.config.features.enabled(Feature::NetworkProxy));
         assert_eq!(
             test.session_configured.network_proxy.is_some(),
             configured_controller
         );
-        scenarios.push((scenario, test));
+        scenarios.push((scenario, test, allow_local_binding));
     }
 
-    for (scenario, test) in scenarios {
+    for (scenario, test, controller_local_binding) in scenarios {
         let mut remote = test.executor_environment().selection().clone();
         let remote_private_path = remote.cwd.join("secondary-environment-private")?;
         let permissions = test.config.permissions.permission_profile();
@@ -2525,19 +2598,51 @@ async fn owner_network_policy_follows_the_selected_remote_command() -> Result<()
             ("DENIED", "owner-only.invalid", "HTTP/1.1 403"),
             ("REVIEWED", "owner-only.invalid", "HTTP/1.1 502"),
             ("OFFLINE", "owner-only.invalid", "ROOTLESS_OWNER_OFFLINE"),
+            ("REQUIRED_ALLOWED", NETWORK_TEST_HOST, "HTTP/1.1 502"),
+            ("REQUIRED_DENIED", "owner-only.invalid", "HTTP/1.1 403"),
             ("GRANTED_DENIED", "owner-only.invalid", "HTTP/1.1 403"),
+            (
+                "LOCAL_GRANTED",
+                "127.0.0.?",
+                if controller_local_binding == Some(false) {
+                    "HTTP/1.1 403"
+                } else {
+                    "HTTP/1.1 502"
+                },
+            ),
+            ("LOCAL_DENIED", "127.0.0.?", "HTTP/1.1 403"),
+            (
+                "LOCAL_OMITTED",
+                "127.0.0.?",
+                if controller_local_binding == Some(true) {
+                    "HTTP/1.1 502"
+                } else {
+                    "HTTP/1.1 403"
+                },
+            ),
         ] {
+            let local_binding_probe =
+                matches!(suffix, "LOCAL_GRANTED" | "LOCAL_DENIED" | "LOCAL_OMITTED");
+            if matches!(scenario, "USER_UNSET" | "USER_DENIED") && !local_binding_probe {
+                continue;
+            }
             let escalated = matches!(
                 suffix,
                 "ESCALATED" | "ESCALATION_DENIED" | "ESCALATED_DENY_READ"
             );
-            let restricted = matches!(suffix, "OFFLINE" | "GRANTED_DENIED");
+            let requires_proxy = matches!(suffix, "REQUIRED_ALLOWED" | "REQUIRED_DENIED");
+            let restricted = requires_proxy || matches!(suffix, "OFFLINE" | "GRANTED_DENIED");
             if scenario != "ROOTLESS" && restricted {
                 continue;
             }
             let marker = format!("{scenario}_OWNER_{suffix}");
             let mut proxy_config = NetworkProxyConfig {
-                allow_local_binding: Some(true),
+                enabled: requires_proxy,
+                allow_local_binding: match suffix {
+                    "LOCAL_DENIED" => Some(false),
+                    "LOCAL_OMITTED" => None,
+                    _ => Some(true),
+                },
                 ..NetworkProxyConfig::default()
             };
             proxy_config.set_allowed_domains(vec![allowed_domain.to_string()]);
@@ -2593,10 +2698,27 @@ async fn owner_network_policy_follows_the_selected_remote_command() -> Result<()
             });
             remote.config = EnvironmentConfigState::Ready(owner_config);
 
-            // Restricted owners run offline until an approved grant enables their filtered proxy.
+            // Traffic policy alone leaves restricted owners offline. Required proxies and
+            // approved network grants activate the filtered route without a controller proxy.
             let command = if suffix == "OFFLINE" {
                 format!(
                     "python3 -c \"import socket; sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); sock.connect(('198.51.100.1', 9))\" 2>/dev/null || printf {marker}"
+                )
+            } else if requires_proxy {
+                let direct_probe = r#"python3 - <<'PYTHON'
+import errno, socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    sock.connect(('198.51.100.1', 9))
+except OSError as error:
+    assert error.errno in (errno.ENETUNREACH, errno.EACCES, errno.EPERM), error
+    print('OWNER_DIRECT_NETWORK_BLOCKED')
+else:
+    raise AssertionError('direct network unexpectedly allowed')
+PYTHON"#;
+                format!(
+                    "{direct_probe}\n{}",
+                    remote_network_proxy_request_command(&marker)
                 )
             } else if suffix == "ESCALATED_DENY_READ" {
                 let read_probe = r#"python3 - <<'PYTHON'
@@ -2610,6 +2732,12 @@ PYTHON"#;
                     "{read_probe}\n{}",
                     remote_network_proxy_request_command(&marker)
                 )
+            } else if local_binding_probe {
+                // A wildcard allowlist does not explicitly authorize private destinations.
+                // Port zero has no listener: 502 proves the request passed policy enforcement,
+                // while 403 proves the controller/owner composition denied the loopback target.
+                remote_network_proxy_request_command(&marker)
+                    .replace(NETWORK_TEST_HOST, "127.0.0.1:0")
             } else if escalated {
                 // Direct sockets and an unproxied environment exercise the actual remote launch.
                 format!(
@@ -2619,6 +2747,7 @@ PYTHON"#;
                 remote_network_proxy_request_command(&marker)
             };
             let mut args = network_exec_args(&command);
+            args.as_object_mut().unwrap().remove("shell");
             args["environment_id"] = json!(REMOTE_ENVIRONMENT_ID);
             if escalated {
                 args["sandbox_permissions"] = json!("require_escalated");
@@ -2716,6 +2845,9 @@ PYTHON"#;
                 output.contains(expected),
                 "unexpected network output for {marker}: {output}"
             );
+            if requires_proxy {
+                assert!(output.contains("OWNER_DIRECT_NETWORK_BLOCKED"), "{output}");
+            }
             if suffix == "ESCALATION_DENIED" {
                 assert!(!output.contains(":unproxied"));
             } else if suffix == "ESCALATED_DENY_READ" {
@@ -2969,8 +3101,8 @@ pub(super) fn guardian_parent_catalog() -> ModelsResponse {
         .expect("bundled model catalog")
         .models
         .into_iter()
-        .find(|model| model.slug == "gpt-5.4")
-        .expect("gpt-5.4 in bundled catalog");
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("gpt-5.5 in bundled catalog");
     // Keep safety settings compatible so active publication can switch A to B.
     ModelsResponse {
         models: ["guardian-parent-a", "guardian-parent-b"]

@@ -5,8 +5,8 @@
 
 use super::DecodedTextMerge;
 use super::Event;
-use super::FileCitations;
 use super::HyperlinkLine;
+use super::InlineDirectives;
 use super::ListSpacing;
 use super::Options;
 use super::Parser;
@@ -46,14 +46,18 @@ pub(crate) fn render_streaming_markdown_lines_with_width_and_cwd(
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
-    let citations = FileCitations::new(input, options);
-    let math = MathMarkdown::new(&citations.markdown, options, width);
+    options.set(
+        Options::ENABLE_TASKLISTS,
+        super::preferences::current().lists,
+    );
+    let directives = InlineDirectives::new(input, options);
+    let math = MathMarkdown::new(&directives.markdown, options, width);
     let parser = Parser::new_ext(&math.markdown, options);
     let has_reference_link_definition = parser.reference_definitions().iter().next().is_some();
     let parser = TopLevelBlockTracker {
         iter: DecodedTextMerge::new(super::source_tables::preserve(
             input,
-            citations.events(math.events(parser.into_offset_iter()), cwd),
+            directives.events(math.events(parser.into_offset_iter()), cwd),
         )),
         depth: 0,
         block_count: 0,
@@ -61,14 +65,16 @@ pub(crate) fn render_streaming_markdown_lines_with_width_and_cwd(
         first_is_html: false,
         mutable_fence_start: None,
     };
-    let mut writer = Writer::new(input, parser, width, cwd, is_hidden_link_destination);
+    let mut writer = Writer::new(input, width, cwd, is_hidden_link_destination);
+    // Drop the consumed parser before the rendering state, including on unwind.
+    let mut parser = parser;
     writer.list_spacing = list_spacing;
-    writer.run();
+    writer.run(&mut parser);
     StreamingMarkdownRender {
         lines: writer.text,
         pending_math_start: math.pending_start,
-        last_top_level_block_start: (writer.iter.block_count > 1)
-            .then_some(writer.iter.last_start)
+        last_top_level_block_start: (parser.block_count > 1)
+            .then_some(parser.last_start)
             .filter(|start| math.pending_start.is_none_or(|pending| *start <= pending))
             .filter(|start| {
                 !math
@@ -77,8 +83,8 @@ pub(crate) fn render_streaming_markdown_lines_with_width_and_cwd(
                     .any(|range| range.start < *start && *start < range.end)
             }),
         has_reference_link_definition,
-        first_top_level_block_is_html: writer.iter.first_is_html,
-        mutable_fence_start: writer.iter.mutable_fence_start,
+        first_top_level_block_is_html: parser.first_is_html,
+        mutable_fence_start: parser.mutable_fence_start,
     }
 }
 

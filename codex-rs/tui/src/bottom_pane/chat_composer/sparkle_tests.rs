@@ -1,5 +1,6 @@
 //! Covers the original starfield appearance, protected content, and composer eligibility.
 
+use super::super::LARGE_PASTE_CHAR_THRESHOLD;
 use super::*;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::BottomPaneParams;
@@ -723,6 +724,7 @@ fn history_search_preserves_a_held_sparkle_command_without_reclassifying_it() {
                 assert_eq!(pane.composer.sparkle.draft.get(), SparkleDraft::Command);
                 pane.handle_paste("history".into());
                 assert_eq!(pane.composer.current_text(), "history prompt");
+                pane.set_composer_pending_pastes(Vec::new());
                 assert_eq!(pane.composer.sparkle.draft.get(), SparkleDraft::Command);
                 let searching = draw(&pane.composer, /*width*/ 80, during).0;
                 assert!(dots(&searching).is_empty());
@@ -786,16 +788,17 @@ fn cancelling_history_search_preserves_a_typed_command_despite_attachment_previe
 }
 
 #[test]
-fn replacing_a_draft_outside_the_history_preview_dismisses_sparkles_during_search() {
+fn fresh_draft_replacement_ends_search_and_dismisses_sparkles() {
     let mut pane = pane();
     pane.mark_fresh_task_for_sparkle("gpt-5.5", &enabled());
     pane.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
     assert!(pane.composer.history_search_active());
     pane.composer
         .set_text_content("external draft".into(), Vec::new(), Vec::new());
+    assert!(!pane.composer.history_search_active());
     assert_eq!(pane.composer.sparkle.draft.get(), SparkleDraft::Dismissed);
     key(&mut pane, KeyCode::Esc);
-    assert!(pane.composer.is_empty());
+    assert_eq!(pane.composer.current_text(), "external draft");
     assert_eq!(pane.composer.sparkle.draft.get(), SparkleDraft::Dismissed);
 }
 
@@ -874,7 +877,7 @@ fn canceled_commands_remain_eligible_but_inserted_content_and_ordinary_paste_do_
         canceled.select_sparkle_model("astra", &enabled());
         assert!(!dots(&draw(&canceled.composer, /*width*/ 80, now).0).is_empty());
 
-        for input in ["paste draft", "inserted"] {
+        for input in ["paste draft", "inserted", "recovered"] {
             let mut pane = pane();
             pane.mark_fresh_task_for_sparkle("gpt-5.5", &enabled());
             if input == "inserted" {
@@ -884,6 +887,9 @@ fn canceled_commands_remain_eligible_but_inserted_content_and_ordinary_paste_do_
                     InputResult::Command(SlashCommand::Mention)
                 ));
                 pane.composer.insert_str("@");
+            } else if input == "recovered" {
+                pane.composer
+                    .append_recovered_drafts(&"x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1));
             } else {
                 pane.handle_paste(input.to_string());
             }
@@ -892,6 +898,12 @@ fn canceled_commands_remain_eligible_but_inserted_content_and_ordinary_paste_do_
             pane.select_sparkle_model("astra", &enabled());
             assert_eq!(pane.composer.sparkle.draft.get(), SparkleDraft::Dismissed);
             assert!(dots(&draw(&pane.composer, /*width*/ 80, now).0).is_empty());
+            if input == "recovered" {
+                insta::assert_snapshot!(
+                    "cleared_recovered_draft_keeps_sparkle_dismissed",
+                    text(&draw(&pane.composer, /*width*/ 80, now).0)
+                );
+            }
         }
     });
 }

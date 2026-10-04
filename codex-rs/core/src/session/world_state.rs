@@ -24,12 +24,17 @@ use crate::context::world_state::WorldState;
 use codex_connectors::AppToolPolicyEvaluator;
 use codex_extension_api::WorldStateContributionInput;
 use codex_features::Feature;
+use codex_file_system::FileSystemSandboxContext;
 use codex_prompts::ApprovalPromptContext;
 use codex_prompts::ResolvedModelMessages;
 use codex_prompts::render_model_instructions;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructionsProvenance;
+use codex_protocol::protocol::MultiAgentVersion;
+
+const MAX_ENVIRONMENT_SUBAGENTS: usize = 8;
+const MAX_ENVIRONMENT_SUBAGENT_BYTES: usize = 1_024;
 
 impl Session {
     #[tracing::instrument(name = "world_state.build", level = "info", skip_all)]
@@ -76,13 +81,36 @@ impl Session {
                 })
         };
         let environment_subagents = if turn_context.config.include_environment_context {
-            self.services
-                .agent_control
-                .format_environment_context_subagents(
-                    self.thread_id,
-                    turn_context.multi_agent_version,
-                )
-                .await
+            match turn_context.multi_agent_version {
+                MultiAgentVersion::V2 => {
+                    let agent_paths = self
+                        .services
+                        .agent_control
+                        .child_agent_paths(self.thread_id)
+                        .await;
+                    let mut lines =
+                        Vec::with_capacity(agent_paths.len().min(MAX_ENVIRONMENT_SUBAGENTS));
+                    let mut rendered_bytes = "  <subagents>\n  </subagents>\n".len();
+                    for agent_path in agent_paths {
+                        if lines.len() == MAX_ENVIRONMENT_SUBAGENTS {
+                            break;
+                        }
+                        let line = format!(r#"<agent name="{agent_path}" />"#);
+                        let line_bytes = "    \n".len() + line.len();
+                        if rendered_bytes + line_bytes <= MAX_ENVIRONMENT_SUBAGENT_BYTES {
+                            rendered_bytes += line_bytes;
+                            lines.push(line);
+                        }
+                    }
+                    lines.join("\n")
+                }
+                MultiAgentVersion::Disabled | MultiAgentVersion::V1 => {
+                    self.services
+                        .local_agent_runtime
+                        .format_legacy_environment_context_subagents(self.thread_id)
+                        .await
+                }
+            }
         } else {
             String::new()
         };
@@ -117,17 +145,19 @@ impl Session {
             .and_then(|config| config.guidance_message.as_deref())
             .filter(|_| token_budget_enabled);
         world_state.add_section(ContextWindowGuidanceState::new(guidance));
-        let realtime_mode_instructions = self.conversation.mode_instructions().await;
+        let realtime = &step_context.realtime;
         world_state.add_section(RealtimeState::new(
-            turn_context.realtime_active,
-            realtime_mode_instructions
+            realtime.active,
+            realtime
+                .mode_instructions
                 .as_ref()
                 .and_then(|instructions| instructions.start.as_deref())
                 .or(turn_context
                     .config
                     .experimental_realtime_start_instructions
                     .as_deref()),
-            realtime_mode_instructions
+            realtime
+                .mode_instructions
                 .as_ref()
                 .and_then(|instructions| instructions.end.as_deref()),
         ));
@@ -138,6 +168,14 @@ impl Session {
             .current_for_prefix_rules(turn_context.allow_prefix_rules());
         if turn_context.config.include_permissions_instructions {
             let environment = step_context.environments.primary();
+            let sandbox = environment
+                .filter(|environment| environment.environment.is_remote())
+                .map(|environment| {
+                    environment.sandbox_context(/*additional_permissions*/ None)
+                });
+            let paths = sandbox
+                .as_ref()
+                .map(FileSystemSandboxContext::policy_context);
             let permission_profile =
                 turn_context.permission_profile_for_environments(&step_context.environments);
             #[allow(deprecated)]
@@ -150,6 +188,7 @@ impl Session {
                 ApprovalPromptContext::new(settings.approvals_reviewer(), model_messages),
                 exec_policy.as_ref(),
                 &cwd,
+                paths.as_ref(),
                 turn_context
                     .config
                     .features
@@ -181,7 +220,9 @@ impl Session {
                         .any(|tool| tool == "send_user_message_async");
             let persistent_mode = PersistentModeState::new(
                 &step_context.settings.model_info.slug,
-                step_context.settings.effective_reasoning_effort().as_ref(),
+                turn_context.config.features.persistent_execution_enabled(
+                    step_context.settings.effective_reasoning_effort().as_ref(),
+                ),
                 model_messages.persistent_instructions(),
                 send_user_message_async_available,
             )
@@ -238,6 +279,9 @@ impl Session {
         world_state.add_section(PluginsInstructionsState::new(
             plugins_usage_instructions_available,
         ));
+        let extension_metrics = super::extension_metrics::from_session_telemetry(
+            step_context.session_telemetry.clone(),
+        );
         if turn_context
             .config
             .features
@@ -245,6 +289,7 @@ impl Session {
         {
             world_state.add_section(ToolsState::new(
                 step_context.tool_router.deferred_tool_namespaces(),
+                Arc::clone(&extension_metrics),
             ));
         }
         let environments = step_context.environments.to_selections();
@@ -253,9 +298,7 @@ impl Session {
             .iter()
             .map(|root| root.selected_root().clone())
             .collect::<Vec<_>>();
-        let extension_metrics = super::extension_metrics::from_session_telemetry(
-            step_context.session_telemetry.clone(),
-        );
+        let previous_world_state = self.state.lock().await.history.world_state_checkpoint();
         for contributor in self.services.extensions.context_contributors() {
             for section in contributor
                 .contribute_world_state(WorldStateContributionInput {
@@ -271,6 +314,7 @@ impl Session {
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
                     turn_store: turn_context.extension_data.as_ref(),
+                    previous_world_state: previous_world_state.as_ref().map(|state| &state.state),
                 })
                 .await
             {

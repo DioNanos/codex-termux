@@ -1,5 +1,5 @@
 //! Grouped live tasks with shared identity colors and stable title, status and age columns.
-//! Current-task labels and full titles share the flexible column; metadata drops at narrow widths.
+//! Full titles use the flexible column; metadata drops at narrow widths.
 //! The final cell stays blank inside the full-width selection highlight.
 
 use super::navigation::CenterRow;
@@ -44,7 +44,7 @@ impl AgentsOverviewView {
         if area.is_empty() {
             return;
         }
-        let indices = self.visible_indices();
+        let indices = self.selectable_indices();
         let mut state = self.state();
         if indices.is_empty() {
             line(
@@ -68,7 +68,11 @@ impl AgentsOverviewView {
         let entries = self.center_rows(&indices, state.grouping);
         let selected = entries
             .iter()
-            .position(|row| matches!(row, CenterRow::Task(index) if *index == self.selected))
+            .position(|row| match row {
+                CenterRow::Task(index) => *index == self.selected,
+                CenterRow::ShowMore => self.selected == usize::MAX,
+                _ => false,
+            })
             .unwrap_or_default();
         let padding = u16::from(area.height >= 3);
         let viewport = row(area, padding, area.height - padding * 2);
@@ -102,6 +106,36 @@ impl AgentsOverviewView {
             let index = match entry {
                 CenterRow::Group(index) | CenterRow::Task(index) => *index,
                 CenterRow::Gap => continue,
+                CenterRow::ShowMore => {
+                    let rect = row(viewport, offset as u16, /*height*/ 1);
+                    let selected = self.selected == usize::MAX;
+                    let style = if selected {
+                        selection_style()
+                    } else {
+                        Style::default()
+                    };
+                    buf.set_style(
+                        Rect {
+                            width: row_width,
+                            ..rect
+                        },
+                        style,
+                    );
+                    let label = if state.loading {
+                        "Loading more…"
+                    } else if state.refresh_failed {
+                        "Show more (retry)"
+                    } else {
+                        "Show more"
+                    };
+                    let marker = if selected { "›" } else { " " };
+                    line(
+                        Line::from(format!("{marker}   {label}")).style(style),
+                        rect,
+                        buf,
+                    );
+                    continue;
+                }
             };
             let task = &self.rows[index];
             let rect = row(viewport, offset as u16, /*height*/ 1);
@@ -118,7 +152,9 @@ impl AgentsOverviewView {
                 };
                 let count = indices
                     .iter()
-                    .filter(|&&candidate| self.same_group(state.grouping, candidate, index))
+                    .filter(|&&candidate| {
+                        candidate != usize::MAX && self.same_group(state.grouping, candidate, index)
+                    })
                     .count();
                 let total = (0..self.rows.len())
                     .filter(|&candidate| self.same_group(state.grouping, candidate, index))
@@ -153,7 +189,10 @@ impl AgentsOverviewView {
                 },
                 style,
             );
-            let (status, dot) = Self::status(task);
+            let (status, mut dot) = Self::status(task);
+            if index == self.selected {
+                dot.style = style;
+            }
             line(
                 Line::from(if index == self.selected { "›" } else { " " }).style(style),
                 rect,
@@ -170,15 +209,15 @@ impl AgentsOverviewView {
                 buf,
             );
             let (mut title, status_area, updated) = columns(rect);
-            if task.is_current && title.width >= 14 {
+            if task.has_voice && title.width >= 8 {
                 let badge = Rect::new(
-                    title.right() - 10,
+                    title.right() - 8,
                     title.y,
-                    /*width*/ 10,
+                    /*width*/ 8,
                     /*height*/ 1,
                 );
-                title.width -= 10;
-                line(Line::from("  current").style(style), badge, buf);
+                title.width -= 8;
+                line(Line::from("  voice").style(style), badge, buf);
             }
             let title_style = if index == self.selected {
                 style

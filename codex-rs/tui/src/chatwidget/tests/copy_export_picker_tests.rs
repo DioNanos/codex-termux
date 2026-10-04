@@ -6,6 +6,57 @@ use crate::clipboard_copy::CopyFormat;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn whole_response_copy_uses_followup_labels() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let directive = r#":codex-followup[**Inspect items[0]**]{prompt="private"}"#;
+    let literal =
+        format!("\n\n`{directive}`\n\n```text\n{directive}\n```\n\n:codex-followup[unfinished");
+    let source = format!("- {directive}{literal}");
+    let expected = format!("- **Inspect items[0]**{literal}");
+    replay_agent_message(
+        &mut chat,
+        "followups",
+        source.clone(),
+        ReplayKind::ThreadSnapshot,
+    );
+    let shortcut = match chat.prepare_last_response_copy() {
+        crate::chatwidget::KeyEventAction::CopyLastResponse(text) => Some(text.to_string()),
+        _ => None,
+    };
+    assert_eq!(shortcut, Some(expected.clone()));
+    chat.show_copy_picker();
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    let copied = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+        AppEvent::CopySelection { text, format, .. } => Some((text.to_string(), format)),
+        _ => None,
+    });
+    assert_eq!(copied, Some((expected, CopyFormat::Markdown)));
+    assert_eq!(chat.transcript.last_agent_source, Some(source));
+}
+
+#[tokio::test]
+async fn completed_response_copy_preserves_markdown_line_endings() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let markdown = "Hard break:  \nstarts a new line.\n\n```text\ncode with trailing spaces  \n```";
+    replay_agent_message(
+        &mut chat,
+        "hard-break",
+        format!("{markdown}\n\n::git-stage{{cwd=\"/repo\"}}"),
+        ReplayKind::ThreadSnapshot,
+    );
+    chat.show_copy_picker();
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    let copied = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+        AppEvent::CopySelection { text, format, .. } => Some((text.to_string(), format)),
+        _ => None,
+    });
+    assert_eq!(copied, Some((markdown.to_string(), CopyFormat::Markdown)));
+    insta::assert_debug_snapshot!(crate::clipboard_html::render_markdown(
+        chat.transcript.last_agent_markdown.as_deref().unwrap()
+    ), @r#""<p>Hard break:<br />\nstarts a new line.</p>\n<pre><code class=\"language-text\">code with trailing spaces  \n</code></pre>\n""#);
+}
+
+#[tokio::test]
 async fn copy_export_picker_custom_keys_preserve_payloads_and_composer_draft() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let mut keymap = crate::keymap::RuntimeKeymap::defaults();

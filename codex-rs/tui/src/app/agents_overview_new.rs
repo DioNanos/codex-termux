@@ -62,7 +62,7 @@ impl App {
             display_config.cwd = cwd.clone();
         }
         draft.apply_config(&display_config);
-        tui.terminal.clear()?;
+        draft.show(tui)?;
         // Keep the large session-start future off the TUI's stack in dev builds.
         let result = Box::pin(self.start_agents_overview_session(
             tui,
@@ -74,6 +74,10 @@ impl App {
         .await;
         if self.current_displayed_thread_id() != previous_thread {
             draft.flush_pending_paste_newline(tui).await?;
+            self.chat_widget
+                .empty_state_animation
+                .borrow_mut()
+                .continue_from(&mut draft.blossom.borrow_mut());
             self.chat_widget.restore_startup_draft(draft.take_draft());
         } else {
             // Retain edits if setup fails so retrying `n` does not lose the draft.

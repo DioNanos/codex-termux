@@ -21,6 +21,7 @@ fn mermaid_fences_use_native_renderer_for_every_family() {
     for source in [
         "%% heading\nflowchart TD; A --> B",
         "graph LR; A --> B",
+        "flowchart; A -- send --> B & C; B <-.-> C",
         "sequenceDiagram; A->>B: request; B-->>A: response",
         "stateDiagram-v2; [*] --> Active; Active --> [*]",
         "stateDiagram; [*] --> Active; Active --> [*]",
@@ -39,6 +40,27 @@ fn mermaid_fences_use_native_renderer_for_every_family() {
 fn mermaid_nested_fences_and_unicode() {
     let source = "> ~~~~mermaid\n> flowchart TD\n>     A[请求] --> B[Réponse]\n> ~~~~~\n\n- Diagram:\n\n  ```mermaid\n  flowchart LR\n      A --> B\n  ```\n";
     assert_snapshot!(markdown_text(source, /*width*/ 60));
+}
+
+#[test]
+fn mermaid_quoted_labels_and_ampersands() {
+    let source = r#"```mermaid
+flowchart LR
+    A["Your saved order"] --> B["Review & confirm"] --> C["DoorDash checkout"]
+```"#;
+    let output = markdown_text(source, /*width*/ 100);
+    assert!(output.starts_with('┌'));
+    assert_snapshot!(output);
+}
+
+#[test]
+fn mermaid_entities_keep_source() {
+    let source = "```mermaid\nsequenceDiagram\nA->>B: &amp;\n```";
+    let output = markdown_text(source, /*width*/ 100);
+    assert!(output.ends_with(&markdown_text(
+        &source.replacen("mermaid", "unknown", /*count*/ 1),
+        /*width*/ 100,
+    )));
 }
 
 #[test]
@@ -61,24 +83,20 @@ flowchart TD
     let output = markdown_text(source, /*width*/ 100);
     assert!(output.starts_with('╭'));
     assert_snapshot!(output);
-    assert_eq!(
-        markdown_text(source, /*width*/ 40),
-        markdown_text(
+    assert!(
+        markdown_text(source, /*width*/ 40).ends_with(&markdown_text(
             &source.replacen("mermaid", "unknown", /*count*/ 1),
             /*width*/ 40,
-        )
+        ))
     );
 }
 
 #[test]
-fn mermaid_unclosed_invalid_unsupported_and_wide_blocks_keep_source() {
+fn mermaid_unclosed_blocks_keep_source_without_notice() {
     for (source, width) in [
         ("```mermaid\nflowchart LR\nA --> B\n", 80),
+        ("```mermaid\nflowchart TD\nA[unfinished\n", 80),
         ("````mermaid\nflowchart LR\nA --> B\n```\n", 80),
-        ("```mermaid\nflowchart LR\nA[unfinished\n```", 80),
-        ("```mermaid\nflowchart TD\nA([unfinished]\n```", 80),
-        ("```mermaid\npie\n\"Cats\": 2\n```", 80),
-        ("```mermaid\nflowchart LR\nA[Request] --> B[Reply]\n```", 8),
         ("> ```mermaid\n> flowchart LR\n> A --> B\n", 80),
     ] {
         assert_eq!(
@@ -87,6 +105,62 @@ fn mermaid_unclosed_invalid_unsupported_and_wide_blocks_keep_source() {
             "source: {source:?}",
         );
     }
+}
+
+#[test]
+fn mermaid_fallback_notices_preserve_source() {
+    let mut cases = Vec::new();
+    for (name, source, width) in [
+        ("invalid", "```mermaid\nflowchart LR\nA[unfinished\n```", 80),
+        ("unsupported", "```mermaid\npie\n\"Cats\": 2\n```", 80),
+        (
+            "unsupported shape after supported edges",
+            "```mermaid\nflowchart TD\nP --> Q\nA[(Database)]\n```",
+            80,
+        ),
+        (
+            "Markdown string after supported edges",
+            "```mermaid\nflowchart TD\nP --> Q\nA[\"`hello **world**`\"]\n```",
+            80,
+        ),
+        (
+            "too wide",
+            "```mermaid\nflowchart LR\nA[Request] --> B[Reply]\n```",
+            8,
+        ),
+        (
+            "limit",
+            "```mermaid\nflowchart TD\nA[This label exceeds the forty column limit]\n```",
+            80,
+        ),
+    ] {
+        let rendered = render_markdown_text_with_width(source, Some(width));
+        assert!(
+            rendered.lines[0]
+                .spans
+                .iter()
+                .filter(|span| !span.content.is_empty())
+                .all(|span| {
+                    span.style
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::DIM)
+                }),
+            "{rendered:?}"
+        );
+        let output = rendered.to_string();
+        assert!(output.ends_with(&markdown_text(
+            &source.replacen("mermaid", "unknown", /*count*/ 1),
+            width,
+        )));
+        cases.push(format!("{name}\n{output}"));
+    }
+    assert_snapshot!(cases.join("\n\n---\n\n"));
+}
+
+#[test]
+fn mermaid_fallback_notices_follow_nested_indentation() {
+    let source = "> ```mermaid\n> pie\n> \"Cats\": 2\n> ```\n\n- Diagram:\n\n  ```mermaid\n  pie\n  \"Cats\": 2\n  ```\n";
+    assert_snapshot!(markdown_text(source, /*width*/ 40));
 }
 
 #[test]
@@ -118,7 +192,6 @@ fn mermaid_styles_follow_the_supplied_theme() {
                 /*width*/ Some(40),
                 theme,
             )
-            .unwrap()
         });
         let styled = lines
             .into_iter()

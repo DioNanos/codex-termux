@@ -64,6 +64,196 @@ pub(super) fn text(buffer: &Buffer) -> String {
 }
 
 #[test]
+fn terminal_output_disclosure_follows_live_history_and_keymap() {
+    use crate::exec_cell::CommandOutput;
+    use crate::exec_cell::new_active_exec_command;
+    use crate::keymap::RuntimeKeymap;
+    use codex_app_server_protocol::CommandExecutionSource;
+
+    let mut cell = new_active_exec_command(
+        "output-test".into(),
+        vec!["echo".into()],
+        Vec::new(),
+        CommandExecutionSource::Agent,
+        /*interaction_input*/ None,
+        /*animations_enabled*/ false,
+    );
+    cell.complete_call(
+        "output-test",
+        CommandOutput::new(/*exit_code*/ 0, "1\n2\n3\n4\n5\n6\n7\n8\n".into()),
+        std::time::Duration::ZERO,
+    );
+    let cell: Arc<dyn HistoryCell> = Arc::new(cell);
+    let mut view = TranscriptView::default();
+    view.sync_live_activity(&[], cell.activity_ids());
+    view.sync_live_activity_tail(
+        /*width*/ 72,
+        /*key*/ None,
+        /*expanded*/ false,
+        |width| {
+            Some(ActivityTranscriptLines {
+                activity: cell.compact_hyperlink_lines(width),
+                auxiliary: Vec::new(),
+                disclosure: cell.activity_disclosure(width),
+            })
+        },
+    );
+    let live = text(&render(
+        &mut view,
+        &[],
+        /*width*/ 72,
+        /*height*/ 6,
+    ));
+    let cells = [cell];
+    view.sync_live_activity(&cells, Vec::new());
+    view.sync_live_tail(/*width*/ 72, /*key*/ None, |_| None);
+    let committed = text(&render(
+        &mut view, &cells, /*width*/ 72, /*height*/ 6,
+    ));
+    assert_eq!(live, committed);
+    let hint = " (ctrl+t to expand)";
+    assert!(live.contains(&format!("+ 5 lines{hint}")));
+    // Check where the hint is visible, so the copy/search exclusion cannot pass vacuously.
+    assert!(
+        !view
+            .layout(&cells, /*index*/ 0)
+            .unwrap()
+            .text()
+            .contains(hint)
+    );
+    // Warm layouts must follow config changes, including chords and disabling the action.
+    for (configured, expected) in [
+        (serde_json::json!("f12"), " (f12 to expand)"),
+        (serde_json::json!("ctrl-x t"), " (ctrl+x t to expand)"),
+        (serde_json::json!([]), ""),
+    ] {
+        let config = serde_json::from_value(serde_json::json!({
+            "global": {"open_transcript": configured}
+        }))
+        .unwrap();
+        let keymap = RuntimeKeymap::from_config(&config).unwrap();
+        view.set_keymap_bindings(&keymap);
+        assert_eq!(
+            text(&render(
+                &mut view, &cells, /*width*/ 72, /*height*/ 6,
+            )),
+            live.replace(hint, expected),
+        );
+    }
+}
+
+#[test]
+fn terminal_output_disclosure_counts_only_revealable_lines() {
+    use crate::exec_cell::CommandOutput;
+    use crate::exec_cell::new_active_exec_command;
+    use codex_app_server_protocol::CommandExecutionSource;
+
+    let mut frames = Vec::new();
+    for (name, command, output, width, streamed) in [
+        ("three visible", "echo", "a\nb\nc\n".to_owned(), 64, false),
+        ("one hidden", "echo", "a\nb\nc\nd\n".to_owned(), 64, false),
+        (
+            "clipped line",
+            "echo",
+            "abcdefghijklmnopqrstuvwxyz\n".to_owned(),
+            20,
+            false,
+        ),
+        ("command only", "echo a\necho b", String::new(), 64, false),
+        (
+            "storage truncated",
+            "echo",
+            "x\n".repeat(/*n*/ 530_000),
+            64,
+            true,
+        ),
+    ] {
+        let mut cell = new_active_exec_command(
+            "output-test".into(),
+            vec!["sh".into(), "-c".into(), command.into()],
+            Vec::new(),
+            CommandExecutionSource::Agent,
+            /*interaction_input*/ None,
+            /*animations_enabled*/ false,
+        );
+        if streamed {
+            cell.append_output("output-test", &output);
+        } else {
+            cell.complete_call(
+                "output-test",
+                CommandOutput::new(/*exit_code*/ 0, output),
+                std::time::Duration::from_secs(/*secs*/ 1),
+            );
+        }
+        let cells: [Arc<dyn HistoryCell>; 1] = [Arc::new(cell)];
+        frames.push(format!(
+            "{name}\n{}",
+            text(&render(
+                &mut TranscriptView::default(),
+                &cells,
+                width,
+                /*height*/ 6,
+            ))
+            .trim_end()
+        ));
+    }
+    insta::assert_snapshot!(frames.join("\n\n"));
+}
+
+#[test]
+fn startup_warning_keeps_first_visible_header_in_place() {
+    let header: Arc<dyn HistoryCell> =
+        Arc::new(crate::history_cell::SessionHeaderHistoryCell::new(
+            "gpt-test".into(),
+            /*reasoning_effort*/ None,
+            crate::test_support::test_path_buf("/project"),
+            "test",
+        ));
+    let mut view = TranscriptView::default();
+    view.sync_live_tail(/*width*/ 80, /*key*/ None, |width| {
+        Some(header.compact_hyperlink_lines(width))
+    });
+    let mut cells = Vec::new();
+    let before = render(&mut view, &cells, /*width*/ 80, /*height*/ 24);
+    cells.push(Arc::new(crate::history_cell::StartupWarningsCell::new(vec![
+        "Skill manifest is invalid.".into(),
+    ])) as Arc<dyn HistoryCell>);
+    assert_eq!(
+        render(&mut view, &cells, /*width*/ 80, /*height*/ 24),
+        before
+    );
+    view.sync_live_tail(/*width*/ 80, /*key*/ None, |_| None);
+    cells.insert(/*index*/ 0, header);
+    assert_eq!(
+        render(&mut view, &cells, /*width*/ 80, /*height*/ 24),
+        before
+    );
+    assert_eq!(crate::history_cell::warning_count(&cells), 1);
+}
+
+#[test]
+fn hidden_initial_entries_do_not_add_a_separator_but_visible_entries_do() {
+    let cells = vec![cell(""), cell(""), cell("First"), cell(""), cell("Second")];
+    let mut view = TranscriptView::default();
+    view.sync_live_tail(
+        /*width*/ 20,
+        /*key*/ None,
+        |_| Some(vec![HyperlinkLine::from("Live")]),
+    );
+    let frame = render(&mut view, &cells, /*width*/ 20, /*height*/ 5);
+    insta::assert_snapshot!(text(&frame), @"
+    First
+
+    Second
+
+    Live
+    ");
+    // Scrolling past the first visible entry must stop at its content, not its separator.
+    view.scroll(&cells, /*rows*/ -100);
+    assert_eq!(render(&mut view, &cells, /*width*/ 20, /*height*/ 5), frame);
+}
+
+#[test]
 fn reading_survives_prepend_and_new_output_then_returns_to_latest() {
     let mut cells = vec![cell("older\nline two"), cell("current\nlast line")];
     let mut view = TranscriptView::default();
@@ -340,7 +530,7 @@ fn single_row_scrolling_crosses_an_entry_separator_in_both_directions() {
 }
 
 #[test]
-fn clicking_an_edge_does_not_start_selection_autoscroll() {
+fn selecting_within_an_edge_row_does_not_start_selection_autoscroll() {
     let cells = vec![cell(
         (0..40)
             .map(|row| format!("row {row:02}\n"))
@@ -367,6 +557,64 @@ fn clicking_an_edge_does_not_start_selection_autoscroll() {
                 before
             );
         }
+        view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 3,
+                row: edge,
+                modifiers: KeyModifiers::NONE,
+            },
+            &cells,
+        );
+        let selected = render(&mut view, &cells, /*width*/ 20, /*height*/ 6);
+        assert_eq!(text(&selected), text(&before));
+        assert_eq!(view.selected_text(&cells).as_deref(), Some("row"));
+        for _ in 0..10 {
+            assert!(!view.tick_selection(&cells));
+            assert_eq!(
+                render(&mut view, &cells, /*width*/ 20, /*height*/ 6),
+                selected
+            );
+            assert_eq!(view.selected_text(&cells).as_deref(), Some("row"));
+        }
+        insta::assert_snapshot!(
+            format!("horizontal_selection_at_edge_{edge}"),
+            text(&selected)
+        );
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 3,
+            row: edge,
+            modifiers: KeyModifiers::NONE,
+        };
+        view.handle_mouse(
+            MouseEvent {
+                kind: if edge == 0 {
+                    MouseEventKind::ScrollUp
+                } else {
+                    MouseEventKind::ScrollDown
+                },
+                ..drag
+            },
+            &cells,
+        );
+        render(&mut view, &cells, /*width*/ 20, /*height*/ 6);
+        view.handle_mouse(drag, &cells);
+        assert!(!view.tick_selection(&cells));
+        // A deliberate vertical drag can return to its starting edge and still autoscroll.
+        for row in [2, edge] {
+            view.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Drag(MouseButton::Left),
+                    column: 3,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &cells,
+            );
+            render(&mut view, &cells, /*width*/ 20, /*height*/ 6);
+        }
+        assert!(view.tick_selection(&cells));
     }
 }
 
@@ -393,6 +641,10 @@ fn wheel_scrolling_pauses_selection_autoscroll_until_the_next_drag() {
             row: edge,
             modifiers: KeyModifiers::NONE,
         };
+        // Wheel input before the first drag must not lose the original physical row.
+        view.handle_mouse(MouseEvent { kind, ..drag }, &cells);
+        assert!(!view.tick_selection(&cells));
+        render(&mut view, &cells, /*width*/ 20, /*height*/ 6);
         view.handle_mouse(drag, &cells);
         assert!(view.tick_selection(&cells));
         render(&mut view, &cells, /*width*/ 20, /*height*/ 6);

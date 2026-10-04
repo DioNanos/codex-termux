@@ -104,20 +104,32 @@ required to publish a working Android Termux package.
   `DioNanos/codex-termux`.
 
 ### Patch #16 - Android remote-control daemon support
-- Files: `codex-rs/app-server-daemon/src/managed_install.rs`, `codex-rs/app-server-daemon/src/backend/pid.rs`, `codex-rs/cli/src/remote_control_cmd.rs`
+- Files: `codex-rs/app-server-daemon/src/managed_install.rs`, `codex-rs/app-server-daemon/src/prepare_install.rs`, `codex-rs/app-server-daemon/src/backend/pid.rs`, `codex-rs/cli/src/remote_control_cmd.rs`, `codex-rs/uds/src/daemon_directory.rs`
 - Enables `codex remote-control` daemon mode (`start`/`stop`) on Android/Termux.
-  Three sub-fixes, all gated on `#[cfg(target_os = "android")]`:
+  Android-specific sub-fixes, except for the portable foreground temp-dir selection:
   1. **`managed_codex_bin`** (`managed_install.rs`): on Android, resolves the daemon
      ELF via `CODEX_SELF_EXE` (set by the npm launcher, Patch #10) instead of
      the standalone installer path `~/.codex/packages/standalone/current/codex`
      which does not exist on npm-based Termux installs. The ELF resolves
      `libc++_shared.so` via `RUNPATH=$ORIGIN` (Patch #10b).
-  2. **`read_process_start_time`** (`pid.rs`): on Android, reads process start time
-     from `/proc/<pid>/stat` field 22 (starttime in jiffies since boot) instead of
-     `ps -o lstart=`, which is not available in Android toybox.
+  2. **Process identity checks** (`pid.rs`): on Android, both PID record creation
+     and verification read start time from `/proc/<pid>/stat` field 22 (clock
+     ticks since boot). Verification also reads the process state to detect
+     zombies. Mixing these ticks with `ps -o lstart=` wall-clock strings makes
+     status, stop, and restart reject every live daemon.
   3. **Foreground socket dir** (`remote_control_cmd.rs`): uses `std::env::temp_dir()`
      (honours `$TMPDIR`) instead of hardcoding `/tmp`, which does not exist on
      stock Android. Applied unconditionally; correct on all Unix platforms.
+  4. **Initial package preparation** (`prepare_install.rs`): reuse the selected
+     npm ELF on Android, while still rejecting a missing binary. Upstream's
+     standalone staging requires a path beneath `packages/app-server-daemon`,
+     which conflicts with the Termux npm selection and otherwise makes every
+     fresh daemon start fail with `daemon package location changed`.
+  5. **Shared physical socket directory** (`daemon_directory.rs`): use the fixed
+     private app root `/data/data/com.termux/cdx-<uid>` on Android. This is
+     independent of `HOME`, `TMPDIR`, and `CODEX_HOME`, retains the existing
+     owner/mode/symlink checks, and leaves room for the full 64-character socket
+     hash. The foreground rendezvous fix alone does not cover this shared root.
 
 ### Patch #17 - flock ENOTSUP/EOPNOTSUPP tolerance for Termux storage
 - Files: `codex-rs/app-server-daemon/src/backend/pid.rs`, `codex-rs/app-server-daemon/src/lib.rs`

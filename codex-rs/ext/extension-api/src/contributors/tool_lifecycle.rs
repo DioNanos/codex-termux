@@ -135,6 +135,8 @@ pub struct ToolStartInput<'a> {
     pub tool_name: &'a ToolName,
     /// Read-only metadata and provenance from the exact MCP call that will execute.
     pub mcp_tool: Option<&'a McpToolContext>,
+    /// Resolves evidence from the issuing step only when awaited; `None` prevents cached approval.
+    pub permissions: crate::ExtensionFuture<'a, Option<codex_guardian_context::PermissionContext>>,
     /// Finalized tool arguments, including any pre-tool-use hook rewrites.
     ///
     /// Payloads can contain sensitive plaintext and must not be logged.
@@ -210,4 +212,46 @@ pub struct ToolFinishInput<'a> {
     pub source: ToolCallSource,
     /// Host-observed result of the tool call.
     pub outcome: ToolCallOutcome,
+}
+
+/// The execution interval represented by a tool timing observation.
+#[derive(Clone, Copy, Debug)]
+pub enum ToolTimingBoundary {
+    /// Elapsed time from admission through the parallel-execution gate until the
+    /// outer dispatch completes or is dropped. Includes routing, hooks, policy
+    /// checks, and result processing; excludes runtime readiness and gate waiting.
+    /// Zero if dispatch never passed the gate.
+    Handler,
+    /// Duration reported by the code-mode host for its exec or wait operation.
+    /// Measures the remote operation rather than the enclosing local dispatch.
+    HostOperation,
+}
+
+/// A measured tool interval. Handler observations also cover cancellation;
+/// host-operation observations are available only when the host reports a duration.
+/// Observers must not block.
+pub struct ToolTimingInput<'a> {
+    /// Thread that owns the tool call.
+    pub thread_id: &'a str,
+    /// Current turn submission id.
+    pub turn_id: &'a str,
+    /// Model-visible tool call id used to correlate dispatch and timing observations.
+    pub call_id: &'a str,
+    /// Execution interval measured by this observation.
+    pub boundary: ToolTimingBoundary,
+    /// Elapsed time within the specified boundary.
+    pub duration: std::time::Duration,
+}
+
+/// A direct call entering dispatch, before readiness, hooks, or policy checks.
+/// Observers must return promptly and cannot affect tool execution.
+pub struct ToolDispatchInput<'a> {
+    /// Thread that owns the tool call.
+    pub thread_id: &'a str,
+    /// Current turn submission id.
+    pub turn_id: &'a str,
+    /// Model-visible tool call id used to correlate dispatch and timing observations.
+    pub call_id: &'a str,
+    /// Tool name supplied to dispatch, before pre-tool hooks run.
+    pub tool_name: &'a ToolName,
 }

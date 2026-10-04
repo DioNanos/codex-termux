@@ -1,5 +1,6 @@
 //! Inline editing for asynchronous questions. Legacy request_user_input keeps its own overlay.
 //! Local submissions and committed desktop replies remove questions; arrival never steals focus.
+//! Live turn completion recovers unsent typed drafts before removing pending questions.
 
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::CancellationEvent;
@@ -66,7 +67,6 @@ pub(crate) struct AsyncQuestions {
     pub(crate) delivery_enabled: bool,
     pub(crate) submission: Option<QuestionSubmission>,
     visible_options: std::cell::Cell<(usize, usize)>,
-    pub(crate) next_hint: Option<crate::key_hint::ShortcutHint>,
     keymap: RuntimeKeymap,
     // Ignore autorepeat from the number key that opened Other.
     other_selector: Option<KeyCode>,
@@ -102,7 +102,6 @@ impl AsyncQuestions {
             delivery_enabled: true,
             submission: None,
             visible_options: std::cell::Cell::new((0, 0)),
-            next_hint: None,
             keymap,
             other_selector: None,
             composer,

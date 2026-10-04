@@ -341,6 +341,7 @@ impl ChatWidget {
             }
             ServerNotification::ServerRequestResolved(_)
             | ServerNotification::AccountUpdated(_)
+            | ServerNotification::GatewayOAuthChanged(_)
             | ServerNotification::AccountRateLimitsUpdated(_)
             | ServerNotification::ThreadStarted(_)
             | ServerNotification::ThreadStatusChanged(_)
@@ -409,6 +410,7 @@ impl ChatWidget {
         // this TUI already rendered locally. Once that turn ends, another
         // client can submit the same text and it still needs its own user cell.
         self.last_rendered_user_message_display = None;
+        let mut question_drafts = None;
         let was_replaying_turn_completion = self.thread_usage.replaying_turn_completion;
         self.thread_usage.replaying_turn_completion = replay_kind.is_some();
         match notification.turn.status {
@@ -454,6 +456,9 @@ impl ChatWidget {
                 {
                     self.speak_completed_realtime_delegation(&notification.turn.id, item);
                 }
+                if replay_kind.is_none() {
+                    question_drafts = self.take_question_drafts();
+                }
                 self.last_non_retry_error = None;
                 let completion = self.completion_cell(&notification.turn, replay_kind);
                 self.on_task_complete(
@@ -463,6 +468,9 @@ impl ChatWidget {
                 );
             }
             TurnStatus::Interrupted => {
+                if replay_kind.is_none() {
+                    question_drafts = self.take_question_drafts();
+                }
                 self.last_non_retry_error = None;
                 let reason = if self
                     .turn_lifecycle
@@ -475,6 +483,9 @@ impl ChatWidget {
                 self.on_interrupted_turn(reason);
             }
             TurnStatus::Failed => {
+                if replay_kind.is_none() {
+                    question_drafts = self.take_question_drafts();
+                }
                 if let Some(error) = notification.turn.error {
                     if replay_kind.is_none()
                         && error.codex_error_info
@@ -500,6 +511,14 @@ impl ChatWidget {
                 }
             }
             TurnStatus::InProgress => {}
+        }
+        if let Some(drafts) = question_drafts
+            && !self.has_misalignment_policy_violation()
+        {
+            // Interruption can restore queued input into the composer during finalization.
+            self.bottom_pane.append_question_drafts(&drafts);
+            self.refresh_pending_input_preview();
+            self.request_redraw();
         }
         if replay_kind.is_none() {
             self.finish_realtime_turn(&notification.turn.id);

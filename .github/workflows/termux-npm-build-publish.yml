@@ -82,6 +82,8 @@ jobs:
           node --check npm-package/scripts/postinstall_termux_launcher.js
           node --check npm-package/tests/launcher_termux_shebang.test.mjs
           node --test npm-package/tests/launcher_termux_shebang.test.mjs
+          node --check npm-package/tests/codex_package_manifest.test.mjs
+          node --test npm-package/tests/codex_package_manifest.test.mjs
           node -e 'const fs = require("node:fs"); const p = JSON.parse(fs.readFileSync("npm-package/package.json", "utf8")); if (p.scripts?.postinstall !== "node scripts/postinstall_termux_launcher.js" || !p.files?.includes("bin/codex-exec.js") || !p.files?.includes("scripts/postinstall_termux_launcher.js")) process.exit(1);'
 
       - name: Install host dependencies
@@ -176,13 +178,34 @@ jobs:
           # under `pipefail` the pipeline reports failure — so a tarball that
           # DOES contain the file is reported as missing.
           tar -tzf "${package_tgz}" > /tmp/tarball-entries.txt
-          for required in package/bin/codex package/bin/codex-exec package/bin/codex.js package/bin/codex-exec.js package/bin/codex.bin package/bin/codex-code-mode-host package/bin/libc++_shared.so package/scripts/postinstall_termux_launcher.js; do
+          for required in package/bin/codex package/bin/codex-exec package/bin/codex.js package/bin/codex-exec.js package/bin/codex.bin package/bin/codex-code-mode-host package/bin/libc++_shared.so package/codex-package.json package/scripts/postinstall_termux_launcher.js; do
             if ! grep -qxF "${required}" /tmp/tarball-entries.txt; then
               echo "packaged tarball is missing ${required}" >&2
               exit 1
             fi
           done
-          echo "tarball payload verified: codex.bin, codex-code-mode-host, libc++_shared.so"
+          # The daemon's L1 check (ensure_selected_variant_is_fork) reads
+          # codex-package.json beside the npm package root on every start:
+          # a tarball that ships the wrong variant or target fails every
+          # remote-control start on Android, so the values are validated here
+          # from the archive that will be published.
+          tar -xzOf "${package_tgz}" package/codex-package.json > /tmp/packaged-manifest.json
+          node -e '
+            const fs = require("node:fs");
+            const manifest = JSON.parse(fs.readFileSync("/tmp/packaged-manifest.json", "utf8"));
+            for (const [key, expected] of [
+              ["layoutVersion", 1],
+              ["variant", "codex-termux"],
+              ["target", "aarch64-linux-android"],
+              ["entrypoint", "bin/codex.bin"],
+            ]) {
+              if (manifest[key] !== expected) {
+                console.error(`packaged codex-package.json has ${key}=${JSON.stringify(manifest[key])}, expected ${JSON.stringify(expected)}`);
+                process.exit(1);
+              }
+            }
+          '
+          echo "tarball payload verified: codex.bin, codex-code-mode-host, libc++_shared.so, codex-package.json variant codex-termux"
           unpacked="$(node -p "require('child_process').execSync('npm pack --dry-run --json',{stdio:['ignore','pipe','ignore']}).toString().trim()" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8'))[0].unpackedSize")"
           echo "unpacked size: ${unpacked} bytes"
           package_version="$(node -p "require('./package.json').version")"

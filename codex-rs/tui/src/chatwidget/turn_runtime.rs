@@ -2,6 +2,7 @@
 //!
 //! This module owns task start/completion state, runtime metrics, plan updates,
 //! and completion metadata rendering.
+//! Terminal errors retain live question drafts across queued input delivery.
 
 use super::*;
 
@@ -484,12 +485,19 @@ impl ChatWidget {
         message: String,
         codex_error_info: Option<AppServerCodexErrorInfo>,
     ) {
-        if codex_error_info == Some(AppServerCodexErrorInfo::MisalignmentPolicyViolation) {
-            self.on_misalignment_policy_violation();
-        } else if codex_error_info
+        if codex_error_info
             .as_ref()
             .is_some_and(|info| self.handle_app_server_steer_rejected_error(info))
         {
+            return;
+        }
+        let question_drafts = if self.thread_usage.replaying_turn_completion {
+            None
+        } else {
+            self.take_question_drafts()
+        };
+        if codex_error_info == Some(AppServerCodexErrorInfo::MisalignmentPolicyViolation) {
+            self.on_misalignment_policy_violation();
         } else if codex_error_info
             .as_ref()
             .is_some_and(is_app_server_cyber_policy_error)
@@ -520,6 +528,13 @@ impl ChatWidget {
             }
         } else {
             self.on_error(message);
+        }
+        if let Some(drafts) = question_drafts
+            && !self.has_misalignment_policy_violation()
+        {
+            self.bottom_pane.append_question_drafts(&drafts);
+            self.refresh_pending_input_preview();
+            self.request_redraw();
         }
     }
 
@@ -555,13 +570,5 @@ impl ChatWidget {
         self.transcript.last_plan_progress = (total > 0).then_some((completed, total));
         self.refresh_status_surfaces();
         self.add_to_history(history_cell::new_plan_update(update));
-    }
-
-    pub(super) fn interrupted_turn_message(&self, reason: TurnAbortReason) -> String {
-        if reason == TurnAbortReason::BudgetLimited {
-            return "Goal budget reached - the turn was stopped.".to_string();
-        }
-
-        "Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.".to_string()
     }
 }

@@ -200,6 +200,7 @@ fn ignores_legacy_abort_without_turn_id_and_context_only_records() {
         TurnAbortedEvent {
             turn_id: None,
             reason: TurnAbortReason::Interrupted,
+            error: None,
             started_at: None,
             completed_at: None,
             duration_ms: None,
@@ -217,6 +218,7 @@ fn ignores_legacy_abort_without_turn_id_and_context_only_records() {
         window_id: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     }));
     let security_risk = project(RolloutItem::SecurityRiskScore(SecurityRiskScore {
         scores: BTreeMap::from([("action_risk".to_string(), 0.92)]),
@@ -236,6 +238,7 @@ fn projects_identified_turn_aborts() {
         TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            error: None,
             started_at: Some(10),
             completed_at: Some(20),
             duration_ms: Some(10_000),

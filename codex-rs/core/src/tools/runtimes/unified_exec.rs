@@ -24,7 +24,7 @@ use crate::tools::runtimes::RuntimePathPrepends;
 use crate::tools::runtimes::apply_zsh_fork_path_prepend;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
-use crate::tools::runtimes::prepare_powershell_command_for_elevated_windows_sandbox;
+use crate::tools::runtimes::prepare_powershell_command_for_windows_sandbox;
 use crate::tools::runtimes::zsh_fork;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalAction;
@@ -34,6 +34,7 @@ use crate::tools::sandboxing::Sandboxable;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
+use crate::tools::sandboxing::executor_windows_sandbox_selection;
 use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::unified_exec::NoopSpawnLifecycle;
@@ -60,6 +61,10 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+mod launch;
+
+use launch::with_launch_failure_events;
 
 // Allow 5s for Guardian cleanup and 5s for controller processing after review.
 const REMOTE_NETWORK_POLICY_DECISION_MARGIN: Duration = Duration::from_secs(10);
@@ -567,11 +572,17 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
         {
             network.restore_and_disable_brokered_credentials(&mut env, &mut command);
         }
-        let command = prepare_powershell_command_for_elevated_windows_sandbox(
+        // The executor selection is Disabled for non-Windows target paths, so this
+        // preparation is a no-op for PowerShell on other platforms.
+        let command = prepare_powershell_command_for_windows_sandbox(
             &command,
             Some(&req.shell_type),
             attempt.sandbox_requested,
-            attempt.windows_sandbox_level,
+            executor_windows_sandbox_selection(
+                attempt.windows_sandbox_type,
+                attempt.windows_sandbox_level,
+                attempt.sandbox_cwd,
+            ),
             environment_is_remote,
         );
         let command = if matches!(req.shell_type, ShellType::PowerShell) {
@@ -653,7 +664,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                                 .to_string(),
                         ));
                     }
-                    let mut process = self
+                    let process = self
                         .manager
                         .open_session_with_prepared_exec_env(
                             req.process_id,
@@ -674,7 +685,8 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                                 }))
                             }
                             other => ToolError::Rejected(other.to_string()),
-                        })?;
+                        });
+                    let mut process = with_launch_failure_events(process, req, ctx).await?;
                     process._shell_snapshot = shell_snapshot;
                     return Ok(UnifiedExecAttempt {
                         process,
@@ -703,7 +715,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
             error @ ToolError::Codex(_) => error,
         })?;
         let options = unified_exec_options(attempt.network_denial_cancellation_token.clone());
-        let mut process = self
+        let process = self
             .manager
             .open_session_with_exec_env(
                 req.process_id,
@@ -721,7 +733,8 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                 Box::new(NoopSpawnLifecycle),
                 req.turn_environment.environment.as_ref(),
             )
-            .await?;
+            .await;
+        let mut process = with_launch_failure_events(process, req, ctx).await?;
         process._shell_snapshot = shell_snapshot;
         Ok(UnifiedExecAttempt {
             process,

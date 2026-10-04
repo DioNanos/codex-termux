@@ -213,7 +213,8 @@ impl<'a> MathMarkdown<'a> {
                 {
                     continue;
                 }
-                if formula.starts_with(|ch: char| ch.is_ascii_digit())
+                if formula != "0"
+                    && formula.starts_with(|ch: char| ch.is_ascii_digit())
                     && !formula.contains(['\\', '^', '_', '=', '+', '-', '*', '/', '<', '>'])
                     || formula.len() > 1 && formula.chars().all(|ch| ch.is_ascii_uppercase())
                 {

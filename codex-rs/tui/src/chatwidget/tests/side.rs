@@ -41,7 +41,7 @@ async fn suppressed_interrupted_turn_notice_skips_history_warning() {
     assert!(
         inserted.iter().all(|cell| {
             let rendered = lines_to_single_string(cell);
-            !rendered.contains("Conversation interrupted - tell the model what to do differently.")
+            !rendered.contains("Conversation interrupted")
                 && !rendered.contains("Model interrupted to submit steer instructions.")
         }),
         "unexpected interrupted-turn notice in side conversation: {inserted:?}"

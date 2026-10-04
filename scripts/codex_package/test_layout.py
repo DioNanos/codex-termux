@@ -82,7 +82,7 @@ class PackageLayoutTest(unittest.TestCase):
                     self.assertEqual(hashlib.sha256(actual[name]).hexdigest(), digest)
 
     def test_macos_package_preserves_prebuilt_resource_binaries(self) -> None:
-        for variant_name in ("codex", "codex-app-server"):
+        for variant_name in ("codex", "codex-app-server", "codex-termux"):
             for target in ("aarch64-apple-darwin", "x86_64-apple-darwin"):
                 with self.subTest(variant=variant_name, target=target):
                     with tempfile.TemporaryDirectory() as temp_dir:

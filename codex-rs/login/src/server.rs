@@ -190,7 +190,7 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
     };
     let server = Arc::new(server);
 
-    let redirect_uri = format!("http://localhost:{actual_port}/auth/callback");
+    let redirect_uri = format!("http://127.0.0.1:{actual_port}/auth/callback");
     let auth_url = build_authorize_url(
         &opts.issuer,
         &opts.client_id,
@@ -724,7 +724,7 @@ pub(crate) async fn exchange_code_for_tokens(
     auth_route_config: &AuthRouteConfig,
 ) -> io::Result<(ExchangedTokens, HttpClient)> {
     let token_endpoint = format!("{}/oauth/token", issuer.trim_end_matches('/'));
-    let factory = auth_route_config.http_client_factory();
+    let factory = auth_route_config.authentication_factory(&token_endpoint);
     let allows_fallback = factory.allows_system_proxy_fallback();
     let redirect_observed = Arc::new(AtomicBool::new(false));
     let mut builder = HttpClientBuilder::new().without_request_logging();
@@ -742,7 +742,7 @@ pub(crate) async fn exchange_code_for_tokens(
         "starting oauth token exchange"
     );
     let (mut client, mut result) = send_code_exchange_request(
-        factory,
+        &factory,
         builder.clone(),
         &token_endpoint,
         client_id,

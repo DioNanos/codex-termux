@@ -19,6 +19,44 @@ use pretty_assertions::assert_eq;
 use std::time::Instant;
 
 #[test]
+fn selection_highlights_hard_breaks_within_and_between_entries() {
+    let mut frames = Vec::new();
+    for (lines, end_row) in [
+        (vec![vec!["code", "next"]], 1),
+        (vec![vec!["code"], vec!["next"]], 2),
+    ] {
+        let cells: Vec<Arc<dyn HistoryCell>> = lines
+            .into_iter()
+            .map(|lines| {
+                Arc::new(PlainHistoryCell::new(
+                    lines.into_iter().map(Line::from).collect(),
+                )) as _
+            })
+            .collect();
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 8, /*height*/ 3,
+        );
+        let mut view = TranscriptView::default();
+        let mut buffer = Buffer::empty(area);
+        view.render(area, &mut buffer, &cells);
+        view.begin_selection(&cells, /*column*/ 0, /*row*/ 0, /*clicks*/ 1);
+        view.extend_selection(/*column*/ 7, /*row*/ 0);
+        view.render(area, &mut buffer, &cells);
+        assert_eq!(view.selected_text(&cells).as_deref(), Some("code"));
+        assert!(
+            !buffer[(4, 0)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        view.extend_selection(/*column*/ 0, end_row);
+        view.render(area, &mut buffer, &cells);
+        assert_eq!(view.selected_text(&cells).as_deref(), Some("code\n"));
+        frames.push(format!("{buffer:?}"));
+    }
+    insta::assert_snapshot!(frames.join("\n"));
+}
+
+#[test]
 fn copy_shortcuts_clear_selection_only_after_confirmed_delivery() {
     use crate::clipboard_copy::CopyStatus;
 
@@ -56,10 +94,15 @@ fn copy_shortcuts_clear_selection_only_after_confirmed_delivery() {
                     panic!("selection key must request a copy");
                 };
                 assert_eq!(text, "selected\tcafé");
-                let failed = view.copy_selected_text_with(&cells, &text, |text| {
-                    assert_eq!(text, "selected\tcafé");
-                    Err("clipboard unavailable".to_string())
-                });
+                let failed = view.copy_selected_text_with(
+                    &cells,
+                    &text,
+                    /*clear_selection*/ true,
+                    |text, _format| {
+                        assert_eq!(text, "selected\tcafé");
+                        Err("clipboard unavailable".to_string())
+                    },
+                );
                 assert_eq!(failed, Err("clipboard unavailable".to_string()));
                 assert_eq!(
                     view.selected_text(&cells).as_deref(),
@@ -71,10 +114,15 @@ fn copy_shortcuts_clear_selection_only_after_confirmed_delivery() {
                 else {
                     panic!("failed copy must remain retryable");
                 };
-                let copied = view.copy_selected_text_with(&cells, &text, |text| {
-                    assert_eq!(text, "selected\tcafé");
-                    Ok(status)
-                });
+                let copied = view.copy_selected_text_with(
+                    &cells,
+                    &text,
+                    /*clear_selection*/ true,
+                    |text, _format| {
+                        assert_eq!(text, "selected\tcafé");
+                        Ok(status)
+                    },
+                );
                 assert_eq!(copied, Ok(status));
                 assert_eq!(
                     (view.selected_text(&cells), view.is_search_active()),
@@ -121,7 +169,7 @@ fn command_c_ignores_release_and_copies_only_an_active_selection() {
         panic!("Cmd+C must copy the transcript selection");
     };
     assert_eq!(text, "selected café");
-    view.copy_selected_text_with(&cells, &text, |_| {
+    view.copy_selected_text_with(&cells, &text, /*clear_selection*/ true, |_, _format| {
         Ok(crate::clipboard_copy::CopyStatus::Confirmed)
     })
     .unwrap();
@@ -576,4 +624,53 @@ fn loading_older_history_extends_the_snapshot_without_adopting_new_commits() {
     );
     render(&mut view, &cells, /*width*/ 32, /*height*/ 6);
     assert_eq!(view.selected_text(&cells).as_deref(), Some("selected"));
+}
+
+#[test]
+fn pending_copy_only_finishes_the_original_selection() {
+    use crate::clipboard_copy::CopyStatus;
+    for change in [
+        "none",
+        "replace",
+        "move",
+        "navigate",
+        "hide",
+        "presentation",
+    ] {
+        let cells = vec![
+            Arc::new(PlainHistoryCell::new(vec!["selected text".into()])) as Arc<dyn HistoryCell>,
+        ];
+        let mut view = TranscriptView::default();
+        render(&mut view, &cells, /*width*/ 32, /*height*/ 3);
+        view.begin_selection(&cells, /*column*/ 0, /*row*/ 0, /*clicks*/ 3);
+        let selected = view.selected_text(&cells).unwrap();
+        view.copy_selected_text_with(
+            &cells,
+            &selected,
+            /*clear_selection*/ true,
+            |_, _format| Ok(CopyStatus::Pending(1)),
+        )
+        .unwrap();
+        view.follow_pending_copy();
+        match change {
+            "replace" => {
+                view.begin_selection(&cells, /*column*/ 0, /*row*/ 0, /*clicks*/ 3)
+            }
+            "move" => {
+                view.selection_key(&cells, KeyCode::Left);
+            }
+            "navigate" => view.jump_to_latest(),
+            "presentation" => {
+                view.set_presentation(/*detailed*/ true, HistoryRenderMode::Rich)
+            }
+            _ => {}
+        }
+        let before = view.selected_text(&cells);
+        let result = view.finish_copy(&cells, &(1, Ok(CopyStatus::Confirmed)), change != "hide");
+        assert_eq!(result, (change == "none").then_some(/*t*/ true), "{change}");
+        assert_eq!(
+            view.selected_text(&cells),
+            if change == "none" { None } else { before }
+        );
+    }
 }

@@ -378,6 +378,7 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
 
     chat.restore_thread_input_state(
         Some(ThreadInputState {
+            pending_thread_settings: None,
             questions: None,
             composer: None,
             safety_buffering_prompt: None,
@@ -389,7 +390,9 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
             queued_user_messages,
             queued_user_message_history_records: VecDeque::new(),
             recovered_queue: false,
+            reconnect_pending: false,
             user_turn_pending_start: false,
+            pending_user_message_client_id: None,
             submit_pending_steers_after_interrupt: false,
             current_collaboration_mode: chat.current_collaboration_mode.clone(),
             active_collaboration_mask: chat.active_collaboration_mask.clone(),
@@ -1217,8 +1220,7 @@ async fn interrupt_exec_marks_failed_snapshot() {
     assert_chatwidget_snapshot!("interrupt_exec_marks_failed", exec_blob);
 }
 
-// Snapshot test: after an interrupted turn, a gentle error message is inserted
-// suggesting the user to tell the model what to do differently and to use /feedback.
+// Interruptions show a short, neutral notice with the feedback command.
 #[tokio::test]
 async fn interrupted_turn_error_message_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -1232,9 +1234,18 @@ async fn interrupted_turn_error_message_snapshot() {
     let cells = drain_insert_history(&mut rx);
     assert!(
         !cells.is_empty(),
-        "expected error message to be inserted after interruption"
+        "expected notice to be inserted after interruption"
     );
-    let last = lines_to_single_string(cells.last().unwrap());
+    let last = cells.last().unwrap();
+    let line = last.last().unwrap();
+    assert_eq!(
+        line.spans
+            .iter()
+            .map(|span| line.style.patch(span.style))
+            .collect::<Vec<_>>(),
+        vec![crate::style::secondary_text_style(); line.spans.len()]
+    );
+    let last = lines_to_single_string(last);
     assert_chatwidget_snapshot!("interrupted_turn_error_message", last);
 }
 
@@ -1335,9 +1346,7 @@ async fn budget_limited_turn_restores_queued_input_without_submitting() {
     assert_no_submit_op(&mut op_rx);
 }
 
-// Snapshot test: interrupting specifically to submit pending steers shows an
-// informational banner instead of the generic "tell the model what to do
-// differently" error prompt.
+// Interrupting to submit pending steers shows the steer-specific notice.
 #[tokio::test]
 async fn interrupted_turn_pending_steers_message_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;

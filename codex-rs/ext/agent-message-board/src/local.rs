@@ -73,10 +73,15 @@ CREATE TABLE IF NOT EXISTS posts (
 );
 CREATE INDEX IF NOT EXISTS posts_board_channel ON posts(board,channel,seq);
 CREATE INDEX IF NOT EXISTS posts_board_channel_timestamp ON posts(board,channel,timestamp,seq);
+CREATE INDEX IF NOT EXISTS posts_roots_created ON posts(board,channel,timestamp,seq) WHERE id=root;
 CREATE INDEX IF NOT EXISTS posts_board_root ON posts(board,root,seq);
 CREATE INDEX IF NOT EXISTS posts_board_root_timestamp ON posts(board,root,timestamp,seq);
 CREATE INDEX IF NOT EXISTS posts_board_timestamp ON posts(board,timestamp,seq);
 CREATE TABLE IF NOT EXISTS subscriptions (
+ board TEXT NOT NULL, target TEXT NOT NULL, agent TEXT NOT NULL,
+ PRIMARY KEY(board,target,agent)
+);
+CREATE TABLE IF NOT EXISTS subscription_opt_outs (
  board TEXT NOT NULL, target TEXT NOT NULL, agent TEXT NOT NULL,
  PRIMARY KEY(board,target,agent)
 );";
@@ -230,6 +235,12 @@ impl LocalAgentMessageBoard {
             PostDestination::NewChannel(channel) => {
                 validate_channel(channel)?;
                 self.insert_channel(&mut tx, channel, &author, now).await?;
+                self.subscribe(
+                    &mut tx,
+                    &SubscriptionTarget::Channel(channel.clone()),
+                    caller,
+                )
+                .await?;
                 (
                     channel.clone(),
                     id,
@@ -262,6 +273,7 @@ impl LocalAgentMessageBoard {
         for recipient in subscribed {
             recipients.insert(ThreadId::from_string(&recipient).map_err(storage_error)?);
         }
+        recipients.remove(&caller);
         let post = StoredPost {
             metadata: PostMetadata {
                 message_id: id,
@@ -277,16 +289,18 @@ impl LocalAgentMessageBoard {
             .bind(author.to_string()).bind(now.timestamp_micros()).bind(default_case_fold_str(&request.text))
             .bind(serde_json::to_string(&post).map_err(storage_error)?).bind(request_id).bind(request_json)
             .execute(&mut *tx).await.map_err(storage_error)?;
+        // Participation subscribes by default, without overriding an explicit opt-out.
         self.subscribe(&mut tx, &SubscriptionTarget::Thread(root), caller)
             .await?;
         tx.commit().await.map_err(storage_error)?;
 
         // A committed post succeeds even if a best-effort notice cannot be delivered.
+        let notice = paging::preview(post.clone(), /*max_chars*/ 150);
         futures::stream::iter(recipients)
             .for_each_concurrent(/*limit*/ 16, |recipient| {
-                let metadata = post.metadata.clone();
+                let notice = notice.clone();
                 async move {
-                    if let Err(error) = self.host.notify(recipient, metadata).await {
+                    if let Err(error) = self.host.notify(recipient, notice).await {
                         tracing::warn!(%recipient, %error, "Failed to deliver message-board notification");
                     }
                 }
@@ -324,20 +338,26 @@ impl LocalAgentMessageBoard {
             }
         };
         let enabled = request.change == SubscriptionChange::Subscribe;
-        match request.change {
-            SubscriptionChange::Subscribe => {
-                self.subscribe(&mut tx, &request.target, target_agent)
-                    .await?
-            }
-            SubscriptionChange::Unsubscribe => {
-                sqlx::query("DELETE FROM subscriptions WHERE board=? AND target=? AND agent=?")
-                    .bind(self.identity.to_string())
-                    .bind(target_key(&request.target)?)
-                    .bind(target_agent.to_string())
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(storage_error)?;
-            }
+        // Keep active subscriptions readable by older binaries. Opt-outs only
+        // prevent implicit subscription when this agent participates again.
+        let statements = match request.change {
+            SubscriptionChange::Subscribe => [
+                "DELETE FROM subscription_opt_outs WHERE board=? AND target=? AND agent=?",
+                "INSERT OR IGNORE INTO subscriptions(board,target,agent) VALUES(?,?,?)",
+            ],
+            SubscriptionChange::Unsubscribe => [
+                "DELETE FROM subscriptions WHERE board=? AND target=? AND agent=?",
+                "INSERT OR IGNORE INTO subscription_opt_outs(board,target,agent) VALUES(?,?,?)",
+            ],
+        };
+        for statement in statements {
+            sqlx::query(statement)
+                .bind(self.identity.to_string())
+                .bind(target_key(&request.target)?)
+                .bind(target_agent.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(storage_error)?;
         }
         tx.commit().await.map_err(storage_error)?;
         Ok(SubscriptionState {
@@ -396,7 +416,7 @@ impl LocalAgentMessageBoard {
         target: &SubscriptionTarget,
         agent: ThreadId,
     ) -> Result<()> {
-        sqlx::query("INSERT OR IGNORE INTO subscriptions(board,target,agent) VALUES(?,?,?)")
+        sqlx::query("INSERT OR IGNORE INTO subscriptions(board,target,agent) SELECT ?1,?2,?3 WHERE NOT EXISTS(SELECT 1 FROM subscription_opt_outs WHERE board=?1 AND target=?2 AND agent=?3)")
             .bind(self.identity.to_string())
             .bind(target_key(target)?)
             .bind(agent.to_string())

@@ -500,7 +500,6 @@ fn search_scans_a_page_inserted_after_the_retained_session_header() {
         Arc::new(crate::history_cell::SessionHeaderHistoryCell::new(
             "test model".to_string(),
             /*reasoning_effort*/ None,
-            /*show_fast_status*/ false,
             std::path::PathBuf::from("/project"),
             "test",
         ));

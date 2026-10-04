@@ -4,21 +4,21 @@ assertion_line: 68
 expression: "snapshots.join(\"\\n\\n\")"
 ---
 Latest
-Second café question
+› Second café question
 seven
 eight
 nine
 ten
 
 Earlier answer
-First question
+› First question
 one
 two
 three
 four
 
 After prepend
-First question
+› First question
 one
 two
 three

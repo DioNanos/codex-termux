@@ -1,3 +1,6 @@
+#[path = "agents_overview_discovery_tests.rs"]
+mod discovery;
+
 #[path = "agent_center_tests.rs"]
 mod command_center;
 
@@ -61,6 +64,10 @@ async fn overview_thread_colors_match_footer_and_respect_color_suppression() {
             let text: String = row.iter().map(ratatui::buffer::Cell::symbol).collect();
             if let Some(x) = text.find("Named task") {
                 let x = text[..x].chars().count();
+                let dot = row.iter().find(|cell| cell.symbol() == "○").unwrap();
+                let mut expected = ratatui::buffer::Cell::default();
+                expected.set_symbol("○").set_style(Style::default().cyan());
+                assert_eq!(dot, &expected);
                 snapshot.push(format!(
                     "{} | title style: {:?}",
                     normalize_agent_center_snapshot(&text),
@@ -147,6 +154,7 @@ use pretty_assertions::assert_eq;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 
 static OVERVIEW_TIMESTAMP: std::sync::LazyLock<i64> =
     std::sync::LazyLock::new(|| chrono::Utc::now().timestamp() - 120);
@@ -366,6 +374,7 @@ async fn shared_overview_keeps_rows_and_replays_changes_over_stale_reads() -> Re
                 (deleted, Some(deleted_thread)),
             ]),
             recent_seed_complete: true,
+            discovery: None,
         }),
     );
     retained_thread.name = Some("New name".to_string());
@@ -385,6 +394,7 @@ async fn shared_overview_keeps_rows_and_replays_changes_over_stale_reads() -> Re
             last_messages: HashMap::new(),
             threads: HashMap::from([(retained, None)]),
             recent_seed_complete: true,
+            discovery: None,
         }),
     );
     assert_eq!(app.agents_overview.threads, expected);
@@ -433,6 +443,7 @@ async fn shared_overview_keeps_rows_and_replays_changes_over_stale_reads() -> Re
                     threads: HashMap::new(),
                     last_messages,
                     recent_seed_complete: true,
+                    discovery: None,
                 }),
             );
             assert!(app.agents_overview.last_messages.is_empty());
@@ -623,6 +634,21 @@ async fn shared_overview_seeds_once_and_retains_locally_resumed_history() -> Res
         "agents_overview_recent_sessions",
         age.replace_all(&rendered, " [age]")
     );
+    assert!(restarted.agents_overview.discovery.has_more());
+    // Opening starts a metadata refresh; Show more queues behind it.
+    restarted.show_more_agents_overview(&app_server);
+    finish_overview_refresh(&mut restarted, &app_server, &mut event_rx).await;
+    finish_overview_refresh(&mut restarted, &app_server, &mut event_rx).await;
+    assert_eq!(
+        restarted
+            .agents_overview
+            .threads
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>(),
+        ids.into_iter().collect()
+    );
+    assert!(!restarted.agents_overview.discovery.has_more());
     app_server.shutdown().await?;
     Ok(())
 }
@@ -1306,7 +1332,7 @@ async fn shared_overview_shows_only_root_sessions() {
     assert!(
         rendered
             .lines()
-            .any(|line| line.contains("› ● Inspect unnamed task") && line.contains("current"))
+            .any(|line| line.contains("› ● Inspect unnamed task"))
     );
 
     app.transcript_cells.push(std::sync::Arc::new(
@@ -1707,6 +1733,7 @@ async fn overview_selection_applies_user_permissions_only_to_unloaded_threads() 
         )
         .await?
         .session;
+    app.runtime_approvals_reviewer_override = Some(ApprovalsReviewer::AutoReview);
     app.harness_overrides.sandbox_mode = Some(codex_protocol::config_types::SandboxMode::ReadOnly);
     app.harness_overrides.approval_policy =
         Some(codex_protocol::protocol::AskForApproval::UnlessTrusted);
@@ -1751,6 +1778,7 @@ async fn overview_selection_applies_user_permissions_only_to_unloaded_threads() 
                 Some(codex_protocol::config_types::SandboxMode::WorkspaceWrite);
             app.harness_overrides.approval_policy =
                 Some(codex_protocol::protocol::AskForApproval::Never);
+            app.runtime_approvals_reviewer_override = Some(app.config.approvals_reviewer);
             app.runtime_permission_profile_override =
                 Some(RuntimePermissionProfileOverride::from_config(&app.config));
             app.runtime_approval_policy_override = Some(RuntimeApprovalPolicyOverride::Explicit(
@@ -1759,6 +1787,11 @@ async fn overview_selection_applies_user_permissions_only_to_unloaded_threads() 
         }
         app.select_agents_overview_thread(&mut tui, &mut app_server, thread_id)
             .await?;
+        assert_eq!(
+            app.runtime_approvals_reviewer_override,
+            (thread_id == thread_ids[2] || thread_id == thread_ids[3])
+                .then_some(ApprovalsReviewer::User)
+        );
         let observed = app_server
             .resume_thread(
                 &app.local_settings,
@@ -1789,6 +1822,8 @@ async fn overview_selection_applies_user_permissions_only_to_unloaded_threads() 
         "allowed_approvals_reviewers = [\"auto_review\"]\n",
     )?;
     app.loader_overrides.system_requirements_path = Some(requirements.to_path_buf());
+    let view = app.agents_overview_view(Vec::new(), /*selected_thread_id*/ None);
+    app.chat_widget.show_bottom_pane_view(Box::new(view));
     app.select_agents_overview_thread(&mut tui, &mut app_server, thread_ids[4])
         .await?;
     assert_eq!(
@@ -1803,6 +1838,59 @@ async fn overview_selection_applies_user_permissions_only_to_unloaded_threads() 
             Some(thread_ids[3]),
             codex_app_server_protocol::ThreadStatus::NotLoaded
         ),
+    );
+    let mut rendered =
+        crate::chatwidget::tests::helpers::render_bottom_popup(&app.chat_widget, /*width*/ 96);
+    let start = rendered.find("(set by ").expect("requirement source");
+    let end = start + rendered[start..].find(')').expect("source end") + 1;
+    rendered.replace_range(start..end, "(set by <requirements>)");
+    insta::with_settings!({snapshot_path => "../snapshots"}, {
+        insta::assert_snapshot!("agents_overview_reviewer_conflict", rendered);
+    });
+    // The picker must also abort when a session-only choice violates destination policy.
+    std::fs::write(&requirements, "allowed_approval_policies = [\"never\"]\n")?;
+    app.harness_overrides.approval_policy = Some(codex_protocol::protocol::AskForApproval::Never);
+    app.resume_target_session(
+        &mut tui,
+        &mut app_server,
+        SessionTarget {
+            path: None,
+            thread_id: thread_ids[4],
+            cwd: None,
+            history_mode: None,
+        },
+    )
+    .await?;
+    assert_eq!(app.primary_thread_id, Some(thread_ids[3]));
+    assert_eq!(
+        app_server
+            .thread_read(thread_ids[4], /*include_turns*/ false)
+            .await?
+            .status,
+        codex_app_server_protocol::ThreadStatus::NotLoaded,
+    );
+
+    app.loader_overrides.system_requirements_path = None;
+    app.runtime_permission_profile_override = None;
+    Box::pin(app.handle_event(
+        &mut tui,
+        &mut app_server,
+        AppEvent::UpdateApprovalsReviewer(ApprovalsReviewer::AutoReview),
+    ))
+    .await?;
+    app.select_agents_overview_thread(&mut tui, &mut app_server, thread_ids[4])
+        .await?;
+    let resumed = app_server
+        .resume_thread(
+            &app.local_settings,
+            app.config.clone(),
+            thread_ids[4],
+            crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        )
+        .await?;
+    assert_eq!(
+        resumed.session.approvals_reviewer,
+        ApprovalsReviewer::AutoReview
     );
     app_server.shutdown().await?;
     Ok(())
@@ -2406,6 +2494,18 @@ async fn command_center_attach_conflict_opens_read_only_and_retries() -> Result<
         .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID);
     let mut tui = crate::tui::test_support::make_test_tui()?;
 
+    app.config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    app.runtime_approvals_reviewer_override = Some(ApprovalsReviewer::AutoReview);
+    app.runtime_approval_policy_override = Some(RuntimeApprovalPolicyOverride::Explicit(
+        AskForApproval::Never,
+    ));
+    app.runtime_permission_profile_override =
+        Some(RuntimePermissionProfileOverride::from_config(&app.config));
+    let expected_overrides = (
+        app.runtime_approvals_reviewer_override,
+        app.runtime_approval_policy_override,
+        app.runtime_permission_profile_override.clone(),
+    );
     app.chat_widget.handle_key_event(KeyCode::Right.into());
     let event = rx.try_recv()?;
     assert!(
@@ -2434,22 +2534,22 @@ async fn command_center_attach_conflict_opens_read_only_and_retries() -> Result<
         insta::assert_snapshot!("agents_overview_attach_conflict", render_bottom_popup(&app.chat_widget, /*width*/ 96));
     });
 
-    app.handle_key_event(&mut tui, &mut server, KeyCode::Esc.into())
-        .await;
+    for key in [KeyCode::Left, KeyCode::Esc] {
+        Box::pin(app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(key.into()))).await?;
+        assert_eq!(
+            app.chat_widget
+                .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID),
+            selection
+        );
 
-    assert_eq!(
-        app.chat_widget
-            .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID),
-        selection
-    );
-
-    // Opening the displayed task returns to the same frozen snapshot without retrying.
-    Box::pin(app.handle_event(
-        &mut tui,
-        &mut server,
-        AppEvent::SelectAgentsOverviewThread { thread_id },
-    ))
-    .await?;
+        // Opening the displayed task returns to the same frozen snapshot without retrying.
+        Box::pin(app.handle_event(
+            &mut tui,
+            &mut server,
+            AppEvent::SelectAgentsOverviewThread { thread_id },
+        ))
+        .await?;
+    }
     assert!(app.chat_widget.no_modal_or_popup_active());
     assert!(app.chat_widget.is_external_writer_view());
     app.chat_widget.handle_paste(" should be ignored".into());
@@ -2470,6 +2570,14 @@ async fn command_center_attach_conflict_opens_read_only_and_retries() -> Result<
     // An explicit retry remains read-only while the other server owns the task.
     Box::pin(app.handle_key_event(&mut tui, &mut server, KeyCode::Char('r').into())).await;
     assert!(app.chat_widget.is_external_writer_view());
+    assert_eq!(
+        (
+            app.runtime_approvals_reviewer_override,
+            app.runtime_approval_policy_override,
+            app.runtime_permission_profile_override.clone()
+        ),
+        expected_overrides,
+    );
     assert_eq!(
         app.chat_widget.composer_text_with_pending(),
         "Retained task draft"
@@ -2526,6 +2634,7 @@ async fn command_center_refresh_failure_is_inline_and_clears_on_success() -> Res
             threads: HashMap::new(),
             last_messages: HashMap::new(),
             recent_seed_complete: false,
+            discovery: None,
         }),
     ] {
         let request_id = Uuid::new_v4();
@@ -2556,6 +2665,7 @@ async fn command_center_refresh_failure_is_inline_and_clears_on_success() -> Res
             threads: HashMap::new(),
             last_messages: HashMap::new(),
             recent_seed_complete: true,
+            discovery: None,
         }),
     );
     assert_eq!(render_bottom_popup(&app.chat_widget, /*width*/ 48), before);

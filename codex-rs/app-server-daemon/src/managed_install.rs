@@ -15,47 +15,43 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 /// New daemons own their packages, regardless of how the calling CLI was installed.
-/// Preserve legacy launch state, including logs left after a daemon is stopped;
-/// settings, installer selections, and lock files alone do not prove a prior launch.
+/// codex-termux fork (L2): the fork owns a dedicated packages namespace, so it
+/// never reads or overwrites the packages the upstream daemon (or the other
+/// fork) stages under `packages/app-server-daemon` or `packages/standalone`.
+/// The first start on an existing CODEX_HOME sees this root empty and
+/// installs the fork's own package from npm.
 pub(crate) fn package_root(codex_home: &Path) -> PathBuf {
-    let dedicated = codex_home.join("packages/app-server-daemon");
-    if !matches!(dedicated.join("current").symlink_metadata(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-    {
-        return dedicated;
-    }
-    let state = codex_home.join("app-server-daemon");
-    for (package, artifacts) in [
-        (
-            "app-server-daemon",
-            [
-                crate::DAEMON_PID_FILE_NAME,
-                "daemon.stderr.log",
-                crate::DAEMON_UPDATE_PID_FILE_NAME,
-                "daemon-updater.stderr.log",
-            ],
-        ),
-        (
-            "standalone",
-            [
-                crate::LEGACY_PID_FILE_NAME,
-                "app-server.stderr.log",
-                crate::LEGACY_UPDATE_PID_FILE_NAME,
-                "app-server-updater.stderr.log",
-            ],
-        ),
-    ] {
-        if artifacts.iter().any(|name| {
-            !matches!(state.join(name).symlink_metadata(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-        }) {
-            return codex_home.join("packages").join(package);
-        }
-    }
-    dedicated
+    codex_home.join("packages/app-server-daemon-termux")
 }
 
 /// Resolve both packaged and legacy binaries without requiring a valid install.
+/// codex-termux fork (L1): a managed selection must carry the fork's own
+/// codex-package.json manifest with variant "codex-termux". Upstream and the
+/// other fork stage their binaries into the same CODEX_HOME; a selection
+/// without our manifest (upstream install or legacy layout) or with a foreign
+/// variant must never be executed by this daemon.
+pub(crate) fn ensure_selected_variant_is_fork(selected: &Path) -> Result<()> {
+    let Some(current) = selected.parent().and_then(Path::parent) else {
+        anyhow::bail!("managed selection {selected:?} has no packages root");
+    };
+    let manifest_path = current.join("codex-package.json");
+    let manifest_bytes = std::fs::read(&manifest_path).with_context(|| {
+        format!(
+            "the selected daemon binary at {selected:?} has no {} manifest: \
+             reinstall codex-termux so the daemon executes the fork, not upstream",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
+    let variant = manifest["variant"].as_str().unwrap_or_default();
+    anyhow::ensure!(
+        variant == "codex-termux",
+        "the selected daemon package variant is {variant:?}: this daemon executes only \
+         codex-termux; reinstall codex-termux"
+    );
+    Ok(())
+}
+
 pub(crate) fn managed_codex_bin(codex_home: &Path) -> PathBuf {
     // On Android/Termux the binary is installed via npm, not the standalone
     // installer. CODEX_SELF_EXE is set by the npm package launcher (Patch #10)
@@ -72,7 +68,7 @@ pub(crate) fn managed_codex_bin(codex_home: &Path) -> PathBuf {
     let packaged = current.join("bin").join(managed_codex_file_name());
     let legacy = current.join(managed_codex_file_name());
     if packaged.is_file()
-        || !legacy.is_file() && (cfg!(windows) || root.ends_with("app-server-daemon"))
+        || !legacy.is_file() && (cfg!(windows) || root.ends_with("app-server-daemon-termux"))
     {
         packaged
     } else {
@@ -197,16 +193,26 @@ pub(crate) struct ExecutableIdentity {
 }
 
 pub(crate) async fn executable_identity(executable: &Path) -> Result<ExecutableIdentity> {
-    let bytes = fs::read(executable)
-        .await
-        .with_context(|| format!("failed to read executable {}", executable.display()))?;
-    Ok(executable_identity_from_bytes(&bytes))
+    let executable = executable.to_path_buf();
+    // Debug executables can be hundreds of MB. Stream the digest off the async
+    // runtime instead of allocating the whole file and blocking a runtime thread.
+    tokio::task::spawn_blocking(move || {
+        std::fs::File::open(&executable)
+            .and_then(executable_identity_from_reader)
+            .with_context(|| format!("failed to read executable {}", executable.display()))
+    })
+    .await
+    .context("executable identity task failed")?
 }
 
-pub(crate) fn executable_identity_from_bytes(bytes: &[u8]) -> ExecutableIdentity {
-    ExecutableIdentity {
-        digest: *blake3::hash(bytes).as_bytes(),
-    }
+pub(crate) fn executable_identity_from_reader(
+    reader: impl std::io::Read,
+) -> std::io::Result<ExecutableIdentity> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(reader)?;
+    Ok(ExecutableIdentity {
+        digest: *hasher.finalize().as_bytes(),
+    })
 }
 
 fn managed_codex_file_name() -> &'static str {

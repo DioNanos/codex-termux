@@ -7,7 +7,6 @@ use super::WorldStateSection;
 use crate::context::ContextualUserFragment;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::openai_models::ModelMessageTextTooLong;
-use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::validate_model_message_text;
 use serde::Deserialize;
 use serde::Serialize;
@@ -52,11 +51,11 @@ pub(crate) struct PersistentModeSnapshot {
 impl PersistentModeState {
     pub(crate) fn new(
         model_slug: &str,
-        reasoning_effort: Option<&ReasoningEffort>,
+        enabled: bool,
         instructions_template: &str,
         send_user_message_async_available: bool,
     ) -> Result<Self, ModelMessageTextTooLong> {
-        let instructions = if reasoning_effort == Some(&ReasoningEffort::Persistent) {
+        let instructions = if enabled {
             let source = instructions_template;
             validate_model_message_text(model_slug, "persistent_instructions", source)?;
             let rendered = source.trim().replace(

@@ -264,7 +264,24 @@ async fn remote_disconnect_retires_voice_before_reconnecting() -> Result<()> {
         thread_id, /*attempt_id*/ 0, /*input_generation*/ 0
     ));
 
-    assert!(app.begin_reconnect());
+    let (replacement, _, _, _) = make_chatwidget_manual_with_sender().await;
+    app.replace_chat_widget(replacement);
+    app.active_thread_id = None;
+    let (mut session, _, proxy) =
+        super::session_lifecycle_requests::start_recording_remote_app_server(&app.config).await?;
+    proxy.abort();
+    assert!(proxy.await.unwrap_err().is_cancelled());
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.handle_event(
+        &mut tui,
+        &mut session,
+        AppEvent::CodexOp(Op::RealtimeConversationStop { thread_id }),
+    )
+    .await?;
+    assert_eq!(
+        (app.voice_owner_thread_id(), app.active_thread_id),
+        (None, None)
+    );
     assert_eq!(
         (
             app.reconnect.offline,
@@ -278,6 +295,7 @@ async fn remote_disconnect_retires_voice_before_reconnecting() -> Result<()> {
     assert!(!app.chat_widget.is_current_realtime_attempt(
         thread_id, /*attempt_id*/ 0, /*input_generation*/ 0
     ));
+    session.shutdown().await?;
     Ok(())
 }
 
@@ -306,6 +324,7 @@ where
             "model/list" => Some(json!({"result": {"data": [], "nextCursor": null}})),
             "collaborationMode/list" => Some(json!({"result": {"data": []}})),
             "configRequirements/read" => Some(json!({"result": {"requirements": null}})),
+            "config/read" => Some(json!({"error": {"code": -32601, "message": "unsupported"}})),
             _ => respond(request).await,
         };
         let Some(mut response) = response else {
@@ -350,6 +369,7 @@ async fn lost_initial_thread_reply_keeps_startup_draft_offline() -> Result<()> {
             ThreadParamsMode::Remote,
             /*remote_cwd_override*/ None,
             session.thread_tool_transport(),
+            /*model_provider_override*/ None,
         )
         .await;
         let mut tui = crate::tui::test_support::make_test_tui()?;

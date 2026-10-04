@@ -302,7 +302,7 @@ async fn run_remote_compact_task_inner_impl(
         owned_client_session: _owned_client_session,
     } = attempt;
     if let Some(token_usage) = token_usage {
-        sess.record_rollout_budget_usage(&token_usage)?;
+        sess.record_rollout_budget_usage(&token_usage).await?;
         analytics_details.active_context_tokens_before = Some(token_usage.input_tokens);
         analytics_details.compaction_summary_tokens = Some(token_usage.output_tokens);
         analytics_details.cached_input_tokens = Some(token_usage.cached_input_tokens);
@@ -342,10 +342,9 @@ async fn run_remote_compact_task_inner_impl(
             replacement_history: &replacement_history,
         });
     }
-    let reviewer_compaction_hash = if sess.enabled(Feature::GuardianThreadContext)
-        && crate::context::GuardianContextMode::from_history(
-            sess.conversation_history_snapshot().await.as_ref(),
-        ) == crate::context::GuardianContextMode::Legacy
+    let reviewer_compaction_hash = if crate::context::GuardianContextMode::from_history(
+        sess.conversation_history_snapshot().await.as_ref(),
+    ) == crate::context::GuardianContextMode::Legacy
         && let Some(review_turn) = sess.turn_context_for_sub_id(&turn_context.sub_id).await
     {
         // Previous-model compaction must remain compatible with the continuing turn's
@@ -429,7 +428,7 @@ async fn run_remote_compaction_request_v2(
                     err,
                     client_session,
                     sess,
-                    turn_context,
+                    step_context,
                     ResponsesStreamRequest::RemoteCompactionV2,
                 )
                 .await?;
@@ -572,6 +571,7 @@ fn is_retained_for_remote_compaction_v2(
                 content.first(),
                 Some(AgentMessageInputContent::InputText { text })
                     if text.starts_with("Message Type: MESSAGE\n")
+                        || text.starts_with("Message Type: CHANNEL_POST\n")
             );
         let is_completion = matches!(
             content.first(),
@@ -774,6 +774,9 @@ fn truncate_message_text_to_token_budget(
     }
 
     set_annotated_content(&mut envelope.item, truncated_content)?;
+    if let Some(metadata) = &mut envelope.metadata {
+        metadata.mark_retained_sources_incomplete();
+    }
     Some(envelope)
 }
 
@@ -842,6 +845,7 @@ mod tests {
         drop(tx_event);
         ResponseStream {
             rx_event,
+            interrupt: None,
             consumer_dropped: CancellationToken::new(),
         }
     }
@@ -1107,7 +1111,31 @@ mod tests {
             ),
         };
 
-        let truncated = truncate_without_metadata(vec![item], /*max_tokens*/ 3);
+        let source = codex_history::RetainedSource {
+            id: codex_history::RetainedSourceId {
+                message_id: "original".to_owned(),
+                turn_id: "parent".to_owned(),
+                role: codex_history::RetainedSourceRole::User,
+            },
+            revision: codex_protocol::ResponseItemId::from_server("revision-1".to_owned()),
+            complete: true,
+        };
+        let mut metadata = CodexHarnessMetadata {
+            retained_source: Some(source.clone()),
+            guardian_sources: vec![source],
+            ..Default::default()
+        };
+        let truncated = truncate_message_text_to_token_budget(
+            ResponseItemEnvelope {
+                item,
+                metadata: Some(metadata.clone()),
+            },
+            /*max_tokens*/ 3,
+        )
+        .unwrap();
+        metadata.mark_retained_sources_incomplete();
+        assert_eq!(truncated.metadata, Some(metadata));
+        let truncated = vec![truncated.item];
 
         assert_eq!(
             truncated,

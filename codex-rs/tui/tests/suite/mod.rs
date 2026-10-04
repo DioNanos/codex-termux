@@ -6,6 +6,8 @@ mod directory_trust;
 #[cfg(unix)]
 mod focus_palette;
 #[cfg(unix)]
+mod provider_defaults;
+#[cfg(unix)]
 mod reconnect;
 mod resize_reflow;
 #[cfg(unix)]
@@ -15,3 +17,6 @@ mod vt100_history;
 mod vt100_live_commit;
 #[cfg(unix)]
 mod worktree_stack;
+
+#[cfg(unix)]
+mod nexuscrew_context;

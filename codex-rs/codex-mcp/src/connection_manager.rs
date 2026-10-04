@@ -62,6 +62,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use codex_config::McpServerTransportConfig;
+use codex_config::McpStartupReadiness;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
 use codex_protocol::mcp::CallToolResult;
@@ -161,6 +162,7 @@ impl Drop for McpServerConnection {
 struct McpServerView {
     connection: Arc<McpServerConnection>,
     protocol_mode: crate::McpProtocolMode,
+    startup_readiness: McpStartupReadiness,
     metadata: McpServerMetadata,
     tool_filter: ToolFilter,
     tool_timeout: Option<Duration>,
@@ -168,6 +170,28 @@ struct McpServerView {
 }
 
 impl McpServerView {
+    fn allows_cached_startup(&self) -> bool {
+        self.startup_readiness == McpStartupReadiness::Catalog
+            || self.connection.startup_is_dormant()
+    }
+
+    fn cached_startup_tools(&self, fallback: Option<Vec<ToolInfo>>) -> Option<Vec<ToolInfo>> {
+        self.connection
+            .client
+            .cached_tools_or(fallback)
+            .filter(|tools| self.accepts_cached_tools(tools))
+    }
+
+    fn accepts_cached_tools(&self, tools: &[ToolInfo]) -> bool {
+        self.connection.client.is_codex_apps_mcp_server
+            || match self.startup_readiness {
+                McpStartupReadiness::Connection => !tools.is_empty(),
+                McpStartupReadiness::Catalog => tools.iter().any(|tool| {
+                    self.tool_filter.allows(&tool.tool.name) && tool_is_model_visible(tool)
+                }),
+            }
+    }
+
     async fn listed_tools(
         &self,
         tool_plugin_context: &ToolPluginContext,
@@ -496,6 +520,7 @@ impl McpConnectionSet {
                         McpServerView {
                             connection,
                             protocol_mode,
+                            startup_readiness: configured_config.startup_readiness,
                             metadata,
                             tool_filter: configured_tool_filter,
                             tool_timeout: configured_tool_timeout,
@@ -633,6 +658,7 @@ impl McpConnectionSet {
                         _diagnostics_guard: LIVE_CONNECTIONS.track(),
                     }),
                     protocol_mode,
+                    startup_readiness: configured_config.startup_readiness,
                     metadata,
                     tool_filter: configured_tool_filter,
                     tool_timeout: configured_tool_timeout,
@@ -1023,9 +1049,12 @@ impl McpConnectionSet {
     /// Returns presentation metadata from the current connection.
     /// Codex Apps metadata may come from its existing cache; regular MCP server information is
     /// connection-specific, so pending regular clients are awaited.
-    pub(crate) async fn list_available_server_infos(&self) -> HashMap<String, McpServerInfo> {
+    pub(crate) async fn list_available_server_infos(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+    ) -> HashMap<String, McpServerInfo> {
         let mut server_infos = HashMap::new();
-        for (server_name, view) in &self.servers {
+        for (server_name, view) in self.servers.iter().filter(|(name, _)| include_server(name)) {
             let client = &view.connection.client;
             if !client.startup_complete.load(Ordering::Acquire)
                 && let Some(server_info) = client.cached_server_info.clone()

@@ -26,6 +26,12 @@ pub struct InstallRequest {
 
 /// Prepare a missing package while the caller holds the daemon operation lock.
 pub(super) async fn prepare(daemon: &Daemon, settings: &DaemonSettings) -> Result<()> {
+    // Termux's npm launcher selects its bundled ELF through CODEX_SELF_EXE.
+    // It intentionally lives outside packages/app-server-daemon, and npm owns
+    // its updates. Do not feed that selection into standalone package staging.
+    if cfg!(target_os = "android") {
+        return daemon.ensure_managed_codex_bin();
+    }
     let source = InstallContext::current().package_layout.as_ref();
     // Keep package replacement state out of the CLI dispatcher's async stack frame.
     Box::pin(prepare_from_package(
@@ -96,7 +102,7 @@ async fn prepare_from_package(
         .and_then(Path::parent)
         .context("daemon settings path has no Codex home")?;
     let previous_root = managed_install::package_root(home);
-    let root = home.join("packages/app-server-daemon");
+    let root = home.join("packages/app-server-daemon-termux");
     anyhow::ensure!(
         daemon.managed_codex_bin.starts_with(&previous_root),
         "daemon package location changed; retry the command"
@@ -110,7 +116,7 @@ async fn prepare_from_package(
         }
         if !matches!(root.join("current").symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
             || ["daemon.pid", "daemon.stderr.log", "daemon-updater.pid", "daemon-updater.stderr.log"]
-                .iter().any(|name| !matches!(home.join("app-server-daemon").join(name).symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound))
+                .iter().any(|name| !matches!(home.join(crate::STATE_DIR_NAME).join(name).symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound))
         {
             daemon.ensure_managed_codex_bin()?;
             return Ok(true);
@@ -135,6 +141,9 @@ async fn prepare_from_package(
     let previous_release = previous_root.join("current").canonicalize().ok();
     if mode == InstallMode::Missing {
         if selected.is_file() {
+            // codex-termux fork (L1): never execute a managed binary staged by
+            // upstream (or the other fork) instead of reinstalling our own.
+            managed_install::ensure_selected_variant_is_fork(&selected)?;
             return Ok(true);
         }
         anyhow::ensure!(
@@ -184,10 +193,10 @@ async fn prepare_from_package(
             return Ok(false);
         }
     } else {
-        eprintln!(
+        daemon.diagnostic(format_args!(
             "Installing daemon from CLI version {version} into {}...",
             root.display()
-        );
+        ));
     }
     // Confirmation must not block lifecycle commands. Recheck the approved
     // selection and running state once this operation owns both locks.
@@ -472,6 +481,10 @@ fn validate_package(root: &Path) -> Result<()> {
 
 fn platform_target() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
+        // Termux/Android: the npm package ships the aarch64-linux-android
+        // triple, so a daemon start that reaches the packaged layout there
+        // must match the manifest the fork's own build produced.
+        ("android", "aarch64") => Ok("aarch64-linux-android"),
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
         ("linux", "aarch64") if cfg!(target_env = "gnu") => Ok("aarch64-unknown-linux-gnu"),

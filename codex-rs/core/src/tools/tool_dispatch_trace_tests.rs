@@ -80,6 +80,7 @@ impl codex_code_mode::CodeModeSession for MissingCellCodeModeSession {
         &'a self,
         _request: codex_code_mode::ExecuteRequest,
         _delegate: Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
+        _preempt: Option<CancellationToken>,
     ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::StartedCell> {
         Box::pin(async { Err("test session cannot execute cells".to_string()) })
     }
@@ -87,6 +88,7 @@ impl codex_code_mode::CodeModeSession for MissingCellCodeModeSession {
     fn wait<'a>(
         &'a self,
         request: codex_code_mode::WaitRequest,
+        _preempt: Option<CancellationToken>,
     ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome> {
         self.terminate(request.cell_id)
     }
@@ -287,7 +289,9 @@ async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Resu
     );
     attach_test_trace(&mut session, &turn, temp.path())?;
 
-    let registry = ToolRegistry::with_handler_for_test(Arc::new(CodeModeWaitHandler));
+    let registry = ToolRegistry::with_handler_for_test(Arc::new(CodeModeWaitHandler::new(
+        /*description_override*/ None, /*parameters_override*/ None,
+    )));
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 

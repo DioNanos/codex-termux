@@ -28,6 +28,9 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
 
+#[path = "multi_agent_restore_tests.rs"]
+mod restore_tests;
+
 const COLLABORATION_NAMESPACE: &str = "collaboration";
 const SPAWN_CALL_ID: &str = "spawn-worker";
 const NESTED_CALL_ID: &str = "spawn-grandchild";
@@ -146,7 +149,8 @@ fn configure_multi_agent_v2_with_role(
         .expect("test config should allow feature update");
     config.multi_agent_v2.subagent_developer_instructions =
         Some(SUBAGENT_DEVELOPER_INSTRUCTIONS.to_string());
-    config.multi_agent_v2.max_concurrent_threads_per_session = 3;
+    // Keep the root, worker, grandchild, and sibling resident until explicit shutdown.
+    config.multi_agent_v2.max_concurrent_threads_per_session = 4;
     let role_path = config.codex_home.join("durable-worker-role.toml");
     std::fs::write(
         &role_path,

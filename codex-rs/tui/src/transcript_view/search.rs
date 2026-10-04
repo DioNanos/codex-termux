@@ -111,6 +111,8 @@ impl TranscriptView {
         }
         self.search.editor.set_keymap_bindings(keymap);
         self.disclosure.keymap = keymap.clone();
+        self.cache.clear();
+        self.live_key = None;
     }
 
     pub(crate) fn is_search_active(&self) -> bool {

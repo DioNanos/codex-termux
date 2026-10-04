@@ -23,11 +23,39 @@
 
 ### Termux (Android ARM64)
 
+Refresh the Termux package index.
+
 ```bash
-pkg update && pkg upgrade -y
+pkg update
+```
+
+Upgrade installed Termux packages.
+
+```bash
+pkg upgrade -y
+```
+
+Install Node.js LTS.
+
+```bash
 pkg install nodejs-lts -y
-npm install -g @mmmbuto/codex-cli-termux@latest
+```
+
+Install the latest release and allow its launcher postinstall script on npm 11 and later.
+
+```bash
+npm install -g @mmmbuto/codex-cli-termux@latest --allow-scripts=@mmmbuto/codex-cli-termux
+```
+
+Check the installed version.
+
+```bash
 codex --version
+```
+
+Sign in to Codex.
+
+```bash
 codex login
 ```
 
@@ -66,8 +94,8 @@ What this fork does not do:
 ## Releases and Updates
 
 - Latest GitHub release: [releases/latest](https://github.com/DioNanos/codex-termux/releases/latest)
-- Upstream base: OpenAI Codex `rust-v0.155.0`, published as `0.155.0` on the npm
-  `latest` channel with a matching GitHub tag and release.
+- Upstream base: OpenAI Codex `rust-v0.160.0`, published as `0.160.0-termux.2` on
+  the npm `latest` channel with a matching GitHub tag and release.
 - npm package: [`@mmmbuto/codex-cli-termux`](https://www.npmjs.com/package/@mmmbuto/codex-cli-termux)
 - Legacy `@mmmbuto/codex-cli-lts` (OpenAI Codex 0.80.x) is archived; current builds live in this package or in [`@mmmbuto/codex-vl`](https://www.npmjs.com/package/@mmmbuto/codex-vl) (multi-platform).
 

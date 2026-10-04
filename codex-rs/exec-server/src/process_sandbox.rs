@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(windows)]
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::process_telemetry::ProcessTelemetry;
@@ -30,12 +32,15 @@ use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
 use codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides;
 use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 use codex_sandboxing::with_managed_mitm_ca_readable_root;
+#[cfg(windows)]
+use codex_shell_command::shell_detect::fallback_powershell_shell_for_windows_sandbox;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 
 #[cfg(unix)]
 use crate::CODEX_ARG0_EXEC_HELPER_ARG1;
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
+use crate::process_telemetry::trace_process_id;
 use crate::protocol::ExecParams;
 use crate::rpc::internal_error;
 use crate::rpc::invalid_params;
@@ -77,10 +82,15 @@ impl PreparedExecRequest {
     }
 }
 
+#[tracing::instrument(
+    name = "codex.exec_server.process_prepare_sandbox",
+    skip_all,
+    fields(process.id = trace_process_id(params.process_id.as_str())),
+)]
 pub(crate) async fn prepare_exec_request_with_telemetry(
     params: &ExecParams,
     env: HashMap<String, String>,
-    runtime_paths: Option<&ExecServerRuntimePaths>,
+    runtime_paths: Option<&ExecServerRuntimeOptions>,
     network_policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     network_policy_audit_observer: Option<NetworkPolicyAuditObserver>,
     telemetry: &ProcessTelemetry,
@@ -117,15 +127,9 @@ pub(crate) async fn prepare_exec_request_with_telemetry(
 
     let (env, managed_network, network_proxy_handle, network_proxy_restricting_sid) =
         prepare_managed_network(
-            params.managed_network.as_ref(),
+            params,
             network_proxy,
-            if params.sandbox.as_ref().is_some_and(|sandbox| {
-                sandbox.windows_sandbox_selection == WindowsSandboxSelection::Mxc
-            }) {
-                ManagedProxyRouting::DedicatedListeners
-            } else {
-                ManagedProxyRouting::SharedIngress
-            },
+            runtime_paths.is_some_and(|paths| paths.proxy_private_ips_via_upstream),
             env,
             network_policy_decider,
             network_policy_audit_observer,
@@ -205,7 +209,8 @@ pub(crate) async fn prepare_exec_request_with_telemetry(
         &file_system_policy,
         network_policy,
     );
-    let sandbox_manager = SandboxManager::new();
+    let sandbox_manager = SandboxManager::new()
+        .with_linux_sandbox_pid_namespace(runtime_paths.linux_sandbox_pid_namespace);
     #[cfg(target_os = "macos")]
     let sandbox_manager = sandbox_manager
         .with_allowed_symlinked_codex_home(runtime_paths.allowed_symlinked_codex_home.clone());
@@ -244,6 +249,20 @@ pub(crate) async fn prepare_exec_request_with_telemetry(
     );
     #[cfg(not(unix))]
     let (program, args) = (program.into(), args.to_vec());
+    #[cfg(windows)]
+    let program = if matches!(
+        sandbox_context.windows_sandbox_selection,
+        WindowsSandboxSelection::Elevated | WindowsSandboxSelection::Mxc
+    ) && Path::new(&program).file_stem().is_some_and(|name| {
+        name.eq_ignore_ascii_case("pwsh") || name.eq_ignore_ascii_case("powershell")
+    }) && let Some(fallback) =
+        fallback_powershell_shell_for_windows_sandbox(Path::new(&program))
+    {
+        // Remote controllers cannot resolve a sandbox-compatible shell on this host.
+        fallback.shell_path.into_os_string()
+    } else {
+        program
+    };
     let transform_request = SandboxDirectSpawnTransformRequest {
         workspace_roots,
         windows_sandbox_proxy_settings_mode,
@@ -325,9 +344,9 @@ pub(crate) async fn prepare_exec_request_with_telemetry(
 }
 
 async fn prepare_managed_network(
-    managed_network: Option<&ManagedNetworkSandboxContext>,
+    params: &ExecParams,
     network_proxy: Option<&RemoteNetworkProxyLaunchConfig>,
-    routing: ManagedProxyRouting,
+    proxy_private_ips_via_upstream: bool,
     env: HashMap<String, String>,
     network_policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     network_policy_audit_observer: Option<NetworkPolicyAuditObserver>,
@@ -342,13 +361,22 @@ async fn prepare_managed_network(
     JSONRPCErrorError,
 > {
     let Some(network_proxy) = network_proxy.cloned() else {
-        return Ok((env, managed_network.cloned(), None, None));
+        return Ok((env, params.managed_network.clone(), None, None));
     };
+    let routing =
+        if params.sandbox.as_ref().is_some_and(|sandbox| {
+            sandbox.windows_sandbox_selection == WindowsSandboxSelection::Mxc
+        }) {
+            ManagedProxyRouting::DedicatedListeners
+        } else {
+            ManagedProxyRouting::SharedIngress
+        };
     let mut state = NetworkProxyState::from_remote_launch_config(
         network_proxy,
         codex_utils_path_uri::Platform::native(),
     )
     .map_err(|err| invalid_params(format!("invalid network proxy config: {err}")))?;
+    state.set_proxy_private_ips_via_upstream(proxy_private_ips_via_upstream);
     if let Some(observer) = network_policy_audit_observer {
         state.set_policy_audit_observer(observer);
     }

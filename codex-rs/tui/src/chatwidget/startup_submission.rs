@@ -54,6 +54,7 @@ impl ChatWidget {
             || self.input_queue.suppress_queue_autosend
             || self.input_queue.rate_limit_recovery_pending
             || self.input_queue.recovered_queue
+            || self.input_queue.has_unconfirmed_messages()
         {
             return;
         }
@@ -91,7 +92,7 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn handle_startup_submission_key(&mut self, key: KeyEvent) -> bool {
+    pub(crate) fn handle_startup_submission_key(&mut self, key: KeyEvent) -> bool {
         if self.input_queue.startup_submission.is_none()
             || self.startup_submission_has_protected_input()
             || !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)

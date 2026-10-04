@@ -106,7 +106,8 @@ pub(crate) fn provision(
                 &mut pins,
             )?;
             logon_existing_sandbox_account(&identity.codex_home, account)
-        })?;
+        })
+        .with_context(|| format!("log on managed runtime account {account:?}"))?;
         let expected = record
             .runtime()?
             .accounts
@@ -116,8 +117,10 @@ pub(crate) fn provision(
             token,
             account,
             expected.map(|entry| entry.user_sid.as_str()),
-        )?;
-        let installed = registered_packages(&profile.user_sid, &family)?;
+        )
+        .with_context(|| format!("prepare managed runtime profile for {account:?}"))?;
+        let installed = registered_packages(&profile.user_sid, &family)
+            .with_context(|| format!("query existing runtime packages for {account:?}"))?;
         if expected.is_none() {
             ensure!(
                 installed.is_empty(),
@@ -128,7 +131,8 @@ pub(crate) fn provision(
             profile.token.as_raw_handle() as _,
             &FOLDERID_LocalAppData,
             /*flags*/ 0,
-        )?
+        )
+        .with_context(|| format!("resolve runtime alias location for {account:?}"))?
         .join(r"Microsoft\WindowsApps")
         .join(&family)
         .join(APP_CORE_RUNNER_ALIAS);
@@ -148,7 +152,8 @@ pub(crate) fn provision(
     record.runtime_mut()?.accounts = accounts;
     if !receipt_current {
         record.runtime_mut()?.ready_package = None;
-        crate::installation_record::save_runtime(record)?;
+        crate::installation_record::save_runtime(record)
+            .context("persist managed runtime account registration")?;
     }
     for (mut profile, installed) in profiles {
         if !installed {
@@ -158,7 +163,8 @@ pub(crate) fn provision(
                     None,
                     DeploymentOptions::None,
                 )?)
-            })?;
+            })
+            .context("start managed runtime package registration")?;
             // As with provisioning, retain the request's resources until Windows finishes.
             // A client timeout or an unreadable status cannot safely release the profile.
             let mut status_error_logged = false;
@@ -188,18 +194,26 @@ pub(crate) fn provision(
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            operation.GetResults()?.ExtendedErrorCode()?.ok()?;
+            operation
+                .GetResults()
+                .and_then(|result| result.ExtendedErrorCode())
+                .and_then(windows::core::HRESULT::ok)
+                .context("finish managed runtime package registration")?;
             ensure!(
-                registered_packages(&profile.user_sid, &family)?.contains(full_name),
+                registered_packages(&profile.user_sid, &family)
+                    .context("verify managed runtime package registration")?
+                    .contains(full_name),
                 "runtime registration completed without the expected package"
             );
         }
-        metadata::grant(identity.token.0, &profile.user_sid, record)?;
+        metadata::grant(identity.token.0, &profile.user_sid, record)
+            .context("grant managed runtime metadata permissions")?;
         profile.unload_profile()?;
     }
     if !receipt_current {
         record.runtime_mut()?.ready_package = Some(full_name.to_string());
-        crate::installation_record::save_runtime(record)?;
+        crate::installation_record::save_runtime(record)
+            .context("persist completed managed runtime registration")?;
     }
     Ok(())
 }

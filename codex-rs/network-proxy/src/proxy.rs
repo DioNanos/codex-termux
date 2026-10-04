@@ -450,7 +450,13 @@ impl NetworkProxyRuntimeSettings {
     fn from_config(config: &config::NetworkProxyConfig) -> Result<Self> {
         let mitm_ca_trust_bundle = if config.mitm {
             let env = crate::certs::ca_env_from_process();
-            Some(crate::certs::managed_ca_trust_bundle(&env)?)
+            Some(match config.mitm_ca.as_ref() {
+                Some(ca) => crate::certs::managed_ca_trust_bundle_for_external_cert_path(
+                    std::path::Path::new(&ca.certificate_file),
+                    &env,
+                )?,
+                None => crate::certs::managed_ca_trust_bundle(&env)?,
+            })
         } else {
             None
         };
@@ -969,14 +975,14 @@ impl NetworkProxy {
             config.enabled &= !broker_only;
             config.credential_broker = false;
             config.dangerously_allow_plaintext_credential_injection = false;
-            if config.mitm && config.mitm_hooks.is_empty() {
+            if config.mitm && config.mitm_hooks.is_empty() && config.mitm_ca.is_none() {
                 config.mitm = false;
             }
         }
-        config.allow_local_binding = Some(local_binding_policy.resolve(&config));
         if let Some(policy) = environment_policy {
             policy.apply_to(&mut config);
         }
+        config.allow_local_binding = Some(local_binding_policy.resolve(&config));
         anyhow::ensure!(
             environment_policy.is_none() || config.enabled,
             "environment network policy requires an enabled executor proxy"

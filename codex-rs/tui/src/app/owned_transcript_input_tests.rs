@@ -3,8 +3,18 @@
 use super::*;
 use crate::app::tests::make_test_app_with_channels;
 use crate::chatwidget::tests::helpers::normalize_snapshot_paths;
+use crate::chatwidget::tests::helpers::render_bottom_popup;
 use crate::history_cell::HistoryRenderMode;
 use crate::history_cell::PlainHistoryCell;
+use codex_app_server_protocol::ItemCompletedNotification;
+use codex_app_server_protocol::Turn;
+use codex_app_server_protocol::TurnCompletedNotification;
+use codex_app_server_protocol::TurnItemsView;
+use codex_app_server_protocol::TurnStartedNotification;
+use codex_protocol::config_types::ModeKind;
+use crossterm::event::MouseButton;
+use crossterm::event::MouseEvent;
+use crossterm::event::MouseEventKind;
 use pretty_assertions::assert_eq;
 
 async fn select_transcript(
@@ -69,6 +79,210 @@ fn screen(tui: &tui::Tui) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     normalize_snapshot_paths(rendered)
+}
+
+fn complete_plan_turn(app: &mut App) {
+    app.chat_widget
+        .set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+    app.chat_widget.set_collaboration_mask(
+        crate::collaboration_modes::plan_mask(app.model_catalog.as_ref()).unwrap(),
+    );
+    let thread_id = ThreadId::new().to_string();
+    let turn = Turn {
+        id: "plan-turn".into(),
+        items_view: TurnItemsView::Full,
+        items: Vec::new(),
+        status: TurnStatus::InProgress,
+        error: None,
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
+    };
+    for notification in [
+        ServerNotification::TurnStarted(TurnStartedNotification {
+            thread_id: thread_id.clone(),
+            turn: turn.clone(),
+        }),
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: thread_id.clone(),
+            turn_id: turn.id.clone(),
+            completed_at_ms: 0,
+            item: ThreadItem::Plan {
+                id: "plan".into(),
+                text: (1..=40)
+                    .map(|row| format!("- Plan step {row:02}\n"))
+                    .collect(),
+            },
+        }),
+        ServerNotification::TurnCompleted(TurnCompletedNotification {
+            thread_id,
+            turn: Turn {
+                status: TurnStatus::Completed,
+                ..turn
+            },
+        }),
+    ] {
+        app.chat_widget
+            .handle_server_notification(notification, /*replay_kind*/ None);
+    }
+    assert!(app.chat_widget.has_active_modal());
+}
+
+fn pointer_event(kind: MouseEventKind, column: u16, row: u16) -> TuiEvent {
+    TuiEvent::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+#[tokio::test]
+async fn plan_menu_allows_transcript_wheel_scrolling_and_keeps_keyboard_ownership() -> Result<()> {
+    for close in [KeyCode::Esc, KeyCode::Enter] {
+        let (mut app, mut events, _operations) = make_test_app_with_channels().await;
+        let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        tui.set_owned_screen(/*owned*/ true)?;
+        let size = tui.terminal.size()?;
+        complete_plan_turn(&mut app);
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, AppEvent::InsertHistoryCell(_)) {
+                app.handle_event(&mut tui, &mut server, event).await?;
+            }
+        }
+        let bottom = app.render_owned_transcript(&mut tui, size)?;
+        let latest = screen(&tui);
+        let menu = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+        for kind in [
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollUp,
+        ] {
+            app.handle_tui_event(
+                &mut tui,
+                &mut server,
+                pointer_event(kind, /*column*/ 1, /*row*/ 1),
+            )
+            .await?;
+            app.render_owned_transcript(&mut tui, size)?;
+            assert_eq!(render_bottom_popup(&app.chat_widget, /*width*/ 80), menu);
+            if kind == MouseEventKind::ScrollDown {
+                assert_eq!(screen(&tui), latest);
+                assert!(app.transcript_view.is_following());
+            } else {
+                assert_ne!(screen(&tui), latest);
+                assert!(!app.transcript_view.is_following());
+            }
+        }
+        let scrolled = screen(&tui);
+        if close == KeyCode::Esc {
+            insta::assert_snapshot!("plan_prompt_scrolled", scrolled);
+        }
+        for (key, selected) in [(KeyCode::PageDown, "› 3."), (KeyCode::PageUp, "› 1.")] {
+            app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(key.into()))
+                .await?;
+            app.render_owned_transcript(&mut tui, size)?;
+            assert!(render_bottom_popup(&app.chat_widget, /*width*/ 80).contains(selected));
+            assert_eq!(
+                screen(&tui)
+                    .lines()
+                    .take(usize::from(bottom.y))
+                    .collect::<Vec<_>>(),
+                scrolled
+                    .lines()
+                    .take(usize::from(bottom.y))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        while events.try_recv().is_ok() {}
+        app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(close.into()))
+            .await?;
+        assert!(!app.chat_widget.has_active_modal());
+        assert!(!app.transcript_view.is_following());
+        let mut follows = 0;
+        let mut submissions = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                AppEvent::FollowTranscript => follows += 1,
+                AppEvent::SubmitUserMessageWithMode {
+                    text,
+                    collaboration_mode,
+                } => {
+                    submissions.push((text, collaboration_mode.mode));
+                }
+                _ => {}
+            }
+        }
+        let expected = if close == KeyCode::Enter {
+            (
+                1,
+                vec![("Implement the plan.".to_string(), Some(ModeKind::Default))],
+            )
+        } else {
+            (0, Vec::new())
+        };
+        assert_eq!((follows, submissions), expected);
+        tui.set_owned_screen(/*owned*/ false)?;
+        server.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn plan_menu_wheel_scrolling_respects_modal_and_completion_popup_bounds() -> Result<()> {
+    let (mut app, mut events, _operations) = make_test_app_with_channels().await;
+    let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    let size = tui.terminal.size()?;
+    complete_plan_turn(&mut app);
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, AppEvent::InsertHistoryCell(_)) {
+            app.handle_event(&mut tui, &mut server, event).await?;
+        }
+    }
+    let bottom = app.render_owned_transcript(&mut tui, size)?;
+    let before = screen(&tui);
+    for (kind, column, row) in [
+        (MouseEventKind::ScrollUp, 1, bottom.y),
+        (MouseEventKind::ScrollDown, 1, bottom.y),
+        (MouseEventKind::ScrollUp, size.width, 1),
+        (MouseEventKind::Down(MouseButton::Left), 1, 1),
+        (MouseEventKind::Drag(MouseButton::Left), 6, 1),
+        (MouseEventKind::Up(MouseButton::Left), 6, 1),
+    ] {
+        app.handle_tui_event(&mut tui, &mut server, pointer_event(kind, column, row))
+            .await?;
+        app.render_owned_transcript(&mut tui, size)?;
+        assert_eq!(screen(&tui), before);
+        assert!(!app.transcript_view.has_active_interaction());
+    }
+    app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Esc.into()))
+        .await?;
+    app.chat_widget.apply_external_edit("/m".to_string());
+    app.render_owned_transcript(&mut tui, size)?;
+    let popup = screen(&tui);
+    let popup_row = popup
+        .lines()
+        .position(|line| line.contains("› /model"))
+        .unwrap() as u16;
+    assert!(!app.chat_widget.has_active_modal());
+    assert!(!app.chat_widget.no_modal_or_popup_active());
+    for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+        app.handle_tui_event(
+            &mut tui,
+            &mut server,
+            pointer_event(kind, /*column*/ 1, popup_row),
+        )
+        .await?;
+        app.render_owned_transcript(&mut tui, size)?;
+        assert_eq!(screen(&tui), popup);
+        assert!(app.transcript_view.is_following());
+    }
+    tui.set_owned_screen(/*owned*/ false)?;
+    server.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]

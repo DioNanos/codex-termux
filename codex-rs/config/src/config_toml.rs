@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use crate::HooksToml;
@@ -55,7 +56,6 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_path::normalize_for_path_comparison;
 use codex_utils_path_uri::Platform;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -140,14 +140,23 @@ of strings; comma-separated strings are not supported. Use \
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct OrchestratorToml {
-    pub skills: Option<OrchestratorFeatureToml>,
-    pub mcp: Option<OrchestratorFeatureToml>,
+    /// Legacy no-op setting retained for compatibility. Use `cloud.skills` to configure cloud skills.
+    pub skills: Option<FeatureToggleToml>,
+    pub mcp: Option<FeatureToggleToml>,
 }
 
-/// Settings for a feature owned by the orchestrator.
+/// Cloud-owned feature settings.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
-pub struct OrchestratorFeatureToml {
+pub struct CloudToml {
+    /// Cloud skills are permitted by default; the host must supply a cloud provider.
+    pub skills: Option<FeatureToggleToml>,
+}
+
+/// Optional enablement of a configured feature.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct FeatureToggleToml {
     pub enabled: Option<bool>,
 }
 
@@ -409,6 +418,9 @@ pub struct ConfigToml {
     /// Orchestrator-owned feature settings.
     pub orchestrator: Option<OrchestratorToml>,
 
+    /// Cloud-owned feature settings.
+    pub cloud: Option<CloudToml>,
+
     /// Base URL override for the built-in `openai` model provider.
     pub openai_base_url: Option<String>,
 
@@ -558,10 +570,32 @@ pub enum ThreadStoreToml {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 pub struct AutoReviewToml {
+    /// Controls whether circuit-breaker interruptions include a structured error.
+    /// Strict mode writes structured errors that older clients may not
+    /// recognize when reading shared history. Defaults to `default`.
+    pub circuit_break_action: Option<CircuitBreakAction>,
     /// Additional policy instructions inserted into the guardian prompt.
     pub policy: Option<String>,
+    /// Additional policy text inserted into the Guardian template's `{{ extra_policy }}` slot.
+    pub extra_policy: Option<String>,
     /// Experimental full Guardian prompt template containing the tenant policy placeholder.
     pub experimental_policy_template: Option<String>,
+    /// Experimental replacement for the history-retrieval instructions when history tools
+    /// and Apps are enabled. Omitted or blank values use the built-in prompt.
+    pub experimental_conversation_history_prompt: Option<String>,
+    /// Maximum estimated tokens per Guardian history-tool response, before the standard
+    /// serialization allowance. Defaults to 4,000; stricter parent tool limits still apply.
+    pub conversation_history_max_output_tokens: Option<NonZeroUsize>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CircuitBreakAction {
+    /// Emit the warning and interrupt without structured error details.
+    #[default]
+    Default,
+    /// Emit the same warning and interruption, with structured error details.
+    Strict,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
@@ -852,70 +886,16 @@ impl ConfigToml {
         resolved_cwd: &Path,
         repo_root: Option<&Path>,
     ) -> Option<ProjectConfig> {
-        let projects = self.projects.as_ref()?;
-
-        for normalized_cwd in normalized_project_lookup_keys(resolved_cwd) {
-            if let Some(project_config) = project_config_for_lookup_key(projects, &normalized_cwd) {
-                return Some(project_config);
-            }
-        }
-
-        if let Some(repo_root) = repo_root {
-            for normalized_repo_root in normalized_project_lookup_keys(repo_root) {
-                if let Some(project_config_for_root) =
-                    project_config_for_lookup_key(projects, &normalized_repo_root)
-                {
-                    return Some(project_config_for_root);
-                }
-            }
-        }
-
-        None
+        self.projects.as_ref()?;
+        // Only canonicalize the repository root when neither cwd key matches.
+        std::iter::once(resolved_cwd)
+            .chain(repo_root)
+            .find_map(|path| {
+                self.get_active_project_for_lookup(&crate::ProjectTrustLookup::from_native_path(
+                    path,
+                ))
+            })
     }
-}
-
-/// Canonicalize the path and convert it to a string to be used as a key in the
-/// projects trust map. On Windows, strips UNC, when possible, to try to ensure
-/// that different paths that point to the same location have the same key.
-fn normalized_project_lookup_keys(path: &Path) -> Vec<String> {
-    let normalized_path = normalize_project_lookup_key(path.to_string_lossy().to_string());
-    let normalized_canonical_path = normalize_project_lookup_key(
-        normalize_for_path_comparison(path)
-            .unwrap_or_else(|_| path.to_path_buf())
-            .to_string_lossy()
-            .to_string(),
-    );
-    if normalized_path == normalized_canonical_path {
-        vec![normalized_canonical_path]
-    } else {
-        vec![normalized_canonical_path, normalized_path]
-    }
-}
-
-fn normalize_project_lookup_key(key: String) -> String {
-    if cfg!(windows) {
-        key.to_ascii_lowercase()
-    } else {
-        key
-    }
-}
-
-fn project_config_for_lookup_key(
-    projects: &HashMap<String, ProjectConfig>,
-    lookup_key: &str,
-) -> Option<ProjectConfig> {
-    if let Some(project_config) = projects.get(lookup_key) {
-        return Some(project_config.clone());
-    }
-
-    let mut normalized_matches: Vec<_> = projects
-        .iter()
-        .filter(|(key, _)| normalize_project_lookup_key((*key).clone()) == lookup_key)
-        .collect();
-    normalized_matches.sort_by_key(|(key, _)| *key);
-    normalized_matches
-        .first()
-        .map(|(_, project_config)| (**project_config).clone())
 }
 
 pub fn validate_reserved_model_provider_ids(

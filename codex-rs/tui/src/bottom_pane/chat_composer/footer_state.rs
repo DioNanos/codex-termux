@@ -19,7 +19,7 @@ use super::super::footer::shows_passive_footer_line;
 use super::ActivePopup;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Stylize;
+use ratatui::style::Styled;
 use ratatui::text::Line;
 use ratatui::text::Text;
 use ratatui::widgets::Paragraph;
@@ -30,6 +30,7 @@ use crate::bottom_pane::footer::FooterMode;
 use crate::bottom_pane::footer::GoalStatusIndicator;
 use crate::key_hint::KeyBinding;
 use crate::key_hint::ShortcutHint;
+use crate::style::secondary_text_style;
 use std::time::Duration;
 
 /// Resolved rectangles shared by painting and cursor placement, without retained layout state.
@@ -62,6 +63,9 @@ pub(crate) enum CommandPopupPlacement {
 /// A borrowed presentation shared by measurement, painting, and cursor placement.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ComposerRenderOptions<'a> {
+    /// Reserve a shared hint row independently of whether it currently contains a notice.
+    pub(crate) composer_gap: Option<&'a crate::bottom_pane::ComposerGap>,
+    pub(crate) working_tip: Option<&'a crate::turn_tip::TurnTip>,
     pub(crate) warning_count: usize,
     pub(crate) textarea_right_reserve: u16,
     /// Keep configured status below the composer while hints occupy the final row.
@@ -77,6 +81,7 @@ impl super::ChatComposer {
         use crate::empty_state_animation::ComposerState;
 
         let composer = match self.footer_mode() {
+            FooterMode::ComposerEmpty if self.is_in_paste_burst() => Some(ComposerState::Draft),
             FooterMode::ComposerEmpty => Some(ComposerState::Empty),
             FooterMode::ComposerHasDraft => Some(ComposerState::Draft),
             FooterMode::HistorySearch
@@ -173,10 +178,10 @@ impl super::ChatComposer {
         {
             let mut shortcuts = Line::default();
             if line.width() > 0 {
-                shortcuts.push_span(" · ".dim());
+                shortcuts.push_span(" · ".set_style(secondary_text_style()));
             }
             shortcuts.extend(key.spans());
-            shortcuts.push_span(" shortcuts".dim());
+            shortcuts.push_span(" shortcuts".set_style(secondary_text_style()));
             if line.width() + shortcuts.width() <= usize::from(hint_area.width) {
                 line.extend(shortcuts.spans);
             }
@@ -220,12 +225,14 @@ pub(super) struct FooterState {
     pub(super) show_warnings_key: Option<ShortcutHint>,
     pub(super) warning_notice_area: std::cell::Cell<Option<Rect>>,
     pub(super) find_transcript_key: Option<ShortcutHint>,
+    pub(super) focus_activity_key: Option<ShortcutHint>,
     pub(super) insert_newline_key: Option<ShortcutHint>,
     pub(super) queue_key: Option<ShortcutHint>,
     pub(super) toggle_shortcuts_key: Option<ShortcutHint>,
     pub(super) history_search_key: Option<ShortcutHint>,
     pub(super) reasoning_down_key: Option<ShortcutHint>,
     pub(super) reasoning_up_key: Option<ShortcutHint>,
+    pub(super) toggle_voice_key: Option<ShortcutHint>,
 }
 
 #[derive(Clone, Debug)]

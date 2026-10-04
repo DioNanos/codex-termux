@@ -11,7 +11,7 @@ use chrono::NaiveDate;
 ///
 /// The timestamp records when the turn actually finished, including when restored from history.
 /// Times use the host's clock preference; other local days include the date and other years the year.
-/// Durations are shown only above sixty seconds; shorter turns still show their timestamp.
+/// Known durations are always shown; sub-second durations display as less than one second.
 /// Absent metadata occupies no transcript rows.
 /// The display date is fixed at construction so crossing midnight cannot invalidate cached heights;
 /// restoring the conversation constructs new cells and refreshes whether the timestamp needs a date.
@@ -58,7 +58,7 @@ impl FinalMessageSeparator {
 
     fn label(&self, today: NaiveDate) -> Option<String> {
         let mut label_parts = Vec::new();
-        if let Some(elapsed_seconds) = self.elapsed_seconds.filter(|seconds| *seconds > 60) {
+        if let Some(elapsed_seconds) = self.elapsed_seconds {
             let hours = elapsed_seconds / 3_600;
             let minutes = (elapsed_seconds % 3_600) / 60;
             let seconds = elapsed_seconds % 60;
@@ -66,6 +66,8 @@ impl FinalMessageSeparator {
                 format!("{hours}h {minutes}m {seconds}s")
             } else if minutes > 0 {
                 format!("{minutes}m {seconds}s")
+            } else if seconds == 0 {
+                "<1s".to_string()
             } else {
                 format!("{seconds}s")
             };
@@ -88,7 +90,7 @@ impl FinalMessageSeparator {
         if let Some(metrics_label) = self.runtime_metrics.and_then(runtime_metrics_label) {
             label_parts.push(metrics_label);
         }
-        (!label_parts.is_empty()).then(|| label_parts.join(" · "))
+        (!label_parts.is_empty()).then(|| label_parts.join(" • "))
     }
 }
 impl HistoryCell for FinalMessageSeparator {

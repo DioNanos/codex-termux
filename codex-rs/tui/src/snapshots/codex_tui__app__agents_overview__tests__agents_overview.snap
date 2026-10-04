@@ -7,7 +7,7 @@ expression: "render_bottom_popup(&app.chat_widget,\n96).replace(&format!(\"{proj
   ────────────────────────────────────────────────────────────────────────────────────────────
       Tasks                                           │ Task details
   /tmp/project  3                                     │
-  › ● Build the dashboard                   current   │ Build the dashboard
+  › ● Build the dashboard                             │ Build the dashboard
     ● Repair authentication                           │ ● Needs input
     ○ Review yesterday's changes                      │
                                                       │ Agent: Inspect keyboard shortcuts

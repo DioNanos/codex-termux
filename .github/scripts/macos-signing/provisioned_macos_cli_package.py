@@ -141,8 +141,9 @@ def prepare(package, reports, configuration: ProfileConfiguration):
         plistlib.dumps(
             {
                 "CFBundleIdentifier": BUNDLE_ID,
+                "CFBundleDisplayName": "ChatGPT",
                 "CFBundleExecutable": "codex",
-                "CFBundleName": "Codex CLI",
+                "CFBundleName": "ChatGPT",
                 "CFBundlePackageType": "APPL",
                 "CFBundleVersion": "1",
             }

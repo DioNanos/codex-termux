@@ -19,7 +19,7 @@ fn completed_at() -> DateTime<Local> {
 }
 
 #[test]
-fn completion_label_shows_duration_only_above_sixty_seconds() {
+fn completion_label_shows_known_durations_including_short_turns() {
     let completed_at = completed_at();
     let labels = [
         None,
@@ -41,12 +41,12 @@ fn completion_label_shows_duration_only_above_sixty_seconds() {
 
     insta::assert_snapshot!(labels.join("\n"), @"
     2:32 PM
-    2:32 PM
-    2:32 PM
-    2:32 PM
-    Worked for 1m 1s · 2:32 PM
-    Worked for 2m 5s · 2:32 PM
-    Worked for 1h 0m 5s · 2:32 PM
+    Worked for <1s • 2:32 PM
+    Worked for 12s • 2:32 PM
+    Worked for 1m 0s • 2:32 PM
+    Worked for 1m 1s • 2:32 PM
+    Worked for 2m 5s • 2:32 PM
+    Worked for 1h 0m 5s • 2:32 PM
     ");
 }
 
@@ -60,9 +60,9 @@ fn completion_label_includes_date_when_viewed_on_another_day() {
     .with_completed_at(completed_at, ClockFormat::TwelveHour);
     let tomorrow = completed_at.date_naive().succ_opt().expect("next day");
 
-    insta::assert_snapshot!(cell.label(tomorrow).expect("completion label"), @"Worked for 2m 5s · Sep 6 at 2:32 PM");
+    insta::assert_snapshot!(cell.label(tomorrow).expect("completion label"), @"Worked for 2m 5s • Sep 6 at 2:32 PM");
     let next_year = tomorrow.with_year(/*year*/ 2001).expect("valid next year");
-    insta::assert_snapshot!(cell.label(next_year).expect("completion label"), @"Worked for 2m 5s · Sep 6, 2000 at 2:32 PM");
+    insta::assert_snapshot!(cell.label(next_year).expect("completion label"), @"Worked for 2m 5s • Sep 6, 2000 at 2:32 PM");
 }
 
 #[test]
@@ -149,12 +149,12 @@ fn completion_wraps_metadata_and_preserves_unwrapped_raw_text() {
     let rendered = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
 
     insta::assert_snapshot!(rendered.join("\n"), @r"
-    Worked for 2m 5s · Sep
-    6, 2000 at 2:32 PM ·
+    Worked for 2m 5s • Sep
+    6, 2000 at 2:32 PM •
     Local tools: 3 calls
     (2.5s)
     ");
-    insta::assert_snapshot!(cell.raw_lines()[0].to_string(), @"Worked for 2m 5s · Sep 6, 2000 at 2:32 PM · Local tools: 3 calls (2.5s)");
+    insta::assert_snapshot!(cell.raw_lines()[0].to_string(), @"Worked for 2m 5s • Sep 6, 2000 at 2:32 PM • Local tools: 3 calls (2.5s)");
     for width in [0, 1, 5, 24] {
         assert!(
             cell.display_lines(width)

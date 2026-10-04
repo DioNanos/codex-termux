@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
 use tokio::sync::OwnedSemaphorePermit;
@@ -30,6 +31,7 @@ use crate::ExecServerClient;
 use crate::ExecServerError;
 use crate::client::NoiseInitializeContext;
 use crate::client::accepted::AcceptedConnectionSource;
+use crate::client::is_environment_offline_error;
 use crate::client::is_retryable_registry_error;
 use crate::client::registry_recovery_retry_delay;
 use crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT;
@@ -50,10 +52,12 @@ use crate::noise_relay::noise_relay_websocket_config;
 use crate::relay::harness_connection_from_websocket;
 use crate::trace_context::current_rendezvous_headers;
 
+const MAX_STDIO_STDERR_LOG_LINE_LEN: u64 = 8 * 1024;
 const ENVIRONMENT_CLIENT_NAME: &str = "codex-environment";
 const INITIAL_REGISTRY_MAX_RETRIES: u32 = 4;
 const INITIAL_REGISTRY_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 const INITIAL_REGISTRY_OPERATION_TIMEOUT: Duration = Duration::from_secs(14);
+const PROVISIONED_ENVIRONMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 pub(crate) async fn connect_websocket_request(
     request: http::Request<()>,
@@ -335,7 +339,7 @@ impl ExecServerClient {
             transport_params => (transport_params, None),
         };
 
-        if let Some(mut readiness) = deferred_readiness {
+        let provisioning_deadline = if let Some(mut readiness) = deferred_readiness {
             let provisioning_result = readiness
                 .wait_for(Option::is_some)
                 .await
@@ -353,7 +357,10 @@ impl ExecServerClient {
                     )
                 })?;
             provisioning_result.map_err(ExecServerError::ProvisioningFailed)?;
-        }
+            Some(Instant::now() + PROVISIONED_ENVIRONMENT_CONNECT_TIMEOUT)
+        } else {
+            None
+        };
 
         let websocket = match transport_params {
             ExecServerTransportParams::Deferred(_) => {
@@ -377,6 +384,7 @@ impl ExecServerClient {
                     &provider,
                     &identity,
                     http_client_factory.clone(),
+                    provisioning_deadline,
                 )
                 .await?;
                 let reconnect_strategy = ExecServerReconnectStrategy::NoiseRendezvous {
@@ -429,6 +437,7 @@ impl ExecServerClient {
         provider: &Arc<dyn NoiseRendezvousConnectProvider>,
         identity: &NoiseChannelIdentity,
         http_client_factory: HttpClientFactory,
+        provisioning_deadline: Option<Instant>,
     ) -> Result<(ReadyNoiseRendezvousConnection, crate::NoiseChannelPublicKey), ExecServerError>
     {
         let open_connection = |bundle: NoiseRendezvousConnectBundle| {
@@ -462,14 +471,22 @@ impl ExecServerClient {
         loop {
             let bundle = match result {
                 Ok(bundle) => bundle,
-                Err(error)
-                    if is_retryable_registry_error(&error)
-                        && retries < INITIAL_REGISTRY_MAX_RETRIES =>
-                {
+                Err(error) => {
+                    // A provisioned executor may be resuming after an earlier ready
+                    // report. Only offline responses get the longer, fixed deadline.
+                    let retry_deadline = match provisioning_deadline {
+                        Some(deadline) if is_environment_offline_error(&error) => deadline,
+                        _ if is_retryable_registry_error(&error)
+                            && retries < INITIAL_REGISTRY_MAX_RETRIES =>
+                        {
+                            deadline
+                        }
+                        _ => return Err(error),
+                    };
                     // Session resumption owns its separate recovery deadline.
                     let delay = registry_recovery_retry_delay(&retry_key, retries);
                     retries += 1;
-                    result = match timeout_at(deadline, async {
+                    result = match timeout_at(retry_deadline, async {
                         sleep(delay).await;
                         connect_bundle().await
                     })
@@ -480,7 +497,6 @@ impl ExecServerClient {
                     };
                     continue;
                 }
-                Err(error) => return Err(error),
             };
             let executor_public_key = bundle.executor_public_key.clone();
             match open_connection(bundle).await {
@@ -773,11 +789,22 @@ impl ExecServerClient {
         })?;
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
+                let mut reader = BufReader::new(stderr);
+                let mut line = Vec::new();
                 loop {
-                    match lines.next_line().await {
-                        Ok(Some(line)) => debug!("exec-server stdio stderr: {line}"),
-                        Ok(None) => break,
+                    line.clear();
+                    match (&mut reader)
+                        .take(MAX_STDIO_STDERR_LOG_LINE_LEN)
+                        .read_until(b'\n', &mut line)
+                        .await
+                    {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let line = line.strip_suffix(b"\n").unwrap_or(&line);
+                            let line = line.strip_suffix(b"\r").unwrap_or(line);
+                            let line = String::from_utf8_lossy(line);
+                            debug!("exec-server stdio stderr: {line}");
+                        }
                         Err(err) => {
                             warn!("failed to read exec-server stdio stderr: {err}");
                             break;
@@ -788,8 +815,12 @@ impl ExecServerClient {
         }
 
         Self::connect(
-            JsonRpcConnection::from_stdio(stdout, stdin, "exec-server stdio command".to_string())
-                .with_child_process(child),
+            JsonRpcConnection::client_from_stdio(
+                stdout,
+                stdin,
+                "exec-server stdio command".to_string(),
+            )
+            .with_child_process(child),
             args.into(),
         )
         .await
@@ -807,7 +838,9 @@ fn is_rendezvous_harness_url(websocket_url: &str) -> bool {
 }
 
 fn stdio_command_process(stdio_command: &StdioExecServerCommand) -> Command {
-    let mut command = Command::new(&stdio_command.program);
+    let mut command = Command::from(codex_utils_process::background_command(
+        &stdio_command.program,
+    ));
     command.args(&stdio_command.args);
     command.envs(&stdio_command.env);
     scrub_non_inheritable_env_vars(command.as_std_mut());

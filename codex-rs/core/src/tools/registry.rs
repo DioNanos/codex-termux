@@ -13,6 +13,7 @@ use crate::memory_usage::shell_script_for_invocation;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolCallState;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -65,7 +66,10 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
     }
 
     /// Returns lazily cached Code Mode definitions owned by this runtime.
-    fn cached_code_mode_definitions(&self) -> Option<&[codex_code_mode::ToolDefinition]> {
+    fn cached_code_mode_definitions(
+        &self,
+        _code_mode_input_schema_max_bytes: Option<usize>,
+    ) -> Option<&[codex_code_mode::ToolDefinition]> {
         None
     }
 
@@ -430,6 +434,13 @@ impl ToolRegistry {
         self.tools.values_mut()
     }
 
+    /// Returns configured MCP server names and their registered callable namespaces.
+    pub(crate) fn mcp_namespaces(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.tools.iter().filter_map(|(name, tool)| {
+            Some((tool.runtime.mcp_server_name()?, name.namespace.as_deref()?))
+        })
+    }
+
     pub(crate) fn deferred_tool_namespaces(&self) -> BTreeMap<String, String> {
         let mut namespaces = BTreeMap::<String, String>::new();
         for (name, tool) in &self.tools {
@@ -520,7 +531,11 @@ impl ToolRegistry {
     ) -> Result<AnyToolResult, FunctionCallError> {
         let tool_name = invocation.tool_name.clone();
         let call_id_owned = invocation.call_id.clone();
-        let otel = invocation.step_context.session_telemetry.clone();
+        let otel = invocation
+            .step_context
+            .session_telemetry
+            .clone()
+            .with_product_sku(invocation.turn.config.apps_mcp_product_sku.as_deref());
         // TODO(anp): Reconcile these tags with TurnEnvironment::sandbox_context
         // instead of reporting the thread-wide backend for environment-scoped tools.
         let sandbox_tags = invocation.turn.turn_metadata_state.sandbox_tags;
@@ -802,12 +817,7 @@ async fn handle_any_tool(
         result: output,
         post_tool_use_payload,
     };
-    // Capture confirmed delivery before any further await, including post-tool hooks.
-    if let Some(call_state) = call_state
-        && let Some(text) = result.delivered_assistant_message()
-    {
-        let _ = call_state.delivered_assistant_message.set(text);
-    }
+    super::user_messaging::capture_delivery(&result, call_state);
     if result.result.contains_external_context()
         && invocation.turn.config.memories.disable_on_external_context
     {

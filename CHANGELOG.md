@@ -1,3 +1,75 @@
+# [0.160.0-termux.2] - 2026-10-04
+
+## Codex Termux 0.160.0-termux.2 — upstream rust-v0.160.0
+
+- Terminal cleanup and exit reporting tolerate disconnected stdout and stderr
+  without triggering another panic; fatal errors still exit with status 1.
+- Cell sessions keep their own process identity instead of starting or reusing
+  the shared background server. Remote and agents launches with an unbound
+  cell context report a clear error before contacting that server.
+- Android npm payload and upstream Rust version remain unchanged in shape.
+
+# [0.160.0-termux.1] - 2026-10-02
+
+## Codex Termux 0.160.0-termux.1 — upstream rust-v0.160.0
+
+- Merges upstream tag `rust-v0.160.0` into the Termux fork (56 upstream commits
+  over `rust-v0.159.3`).
+- TUI: projectless sessions with workspace defaults, app-server provider defaults
+  honored in the TUI, explicit provider model catalogs treated as authoritative,
+  server reasoning summary and verbosity settings preserved, quoted copy without
+  blockquote markers, plus separator dropped from key hints.
+- Platform: Windows console windows suppressed for background subprocesses;
+  maintenance-line catalog and security reminder updates backported upstream.
+- npm payload unchanged in shape: `bin/` launchers, `codex.bin`,
+  `codex-code-mode-host`, `libc++_shared.so` and the static `codex-package.json`
+  manifest (`variant: "codex-termux"`).
+
+# [0.159.3-termux.1] - 2026-10-01
+
+## Codex Termux 0.159.3-termux.1 — upstream rust-v0.159.3
+
+- Merges upstream tags `rust-v0.159.2` and `rust-v0.159.3` into the Termux fork.
+- npm payload ships a static `codex-package.json` manifest (`layoutVersion: 1`,
+  `variant: "codex-termux"`, `target: "aarch64-linux-android"`,
+  `entrypoint: "bin/codex.bin"`) beside `bin/` (npm launchers, `codex.bin`,
+  `codex-code-mode-host`, `libc++_shared.so`), so the daemon's variant check
+  passes and `remote-control start` works from npm: on Android `prepare()`
+  reuses the launcher-selected binary (`CODEX_SELF_EXE`, PR #28) instead of
+  staging a standalone package, so the "no complete local package" failure
+  cannot occur on that path.
+- Daemon isolation with a shared `~/.codex`: the daemon only executes a managed
+  binary with `variant: "codex-termux"`, and owns `packages/app-server-daemon-termux`,
+  `app-server-daemon-termux/` and `app-server-control-termux/` — no shared
+  packages, pid, lock or control socket with upstream.
+- `platform_target()` knows `aarch64-linux-android`; the Android branch keeps the
+  npm-launcher selection as the last-resort managed install.
+
+# [0.158.0-termux.1] - 2026-09-29
+
+## Codex Termux 0.158.0-termux.1 — upstream rust-v0.158.0
+
+- Merges upstream tag `rust-v0.158.0` into the Termux fork: 333 upstream commits
+  over the merge base, covering `rust-v0.157.0`, `rust-v0.157.1` and the
+  `rust-v0.158.0` release.
+- Termux: restore native daemon startup and private sockets (#28, thanks @PeiPei233)
+  — app-private socket directory on Android, npm-launcher binary reuse in
+  `prepare()`, and PID records read from `/proc/<pid>/stat` instead of `ps`.
+- TUI: configurable right-click paste in the fullscreen view, composer support
+  for prompt suggestions, and Mermaid flowcharts that accept quoted labels and
+  ampersands.
+- Agent message boards ship in this build: the in-memory board for ephemeral
+  sessions, the HTTP client for remote boards and the model-specific tool
+  descriptions, with the new `agent-message-board-client` crate.
+- The guardian model-message cap keeps its fail-closed call shape after the
+  upstream signature change, and the test the fork had added is aligned to the
+  new signature.
+- The cross-fork ENOTSUP lock inventory is re-verified on the merged tree: every
+  call site degrades by runtime error kind, never through a
+  `cfg!(target_os = "android")` gate.
+- Android V8 is unchanged (`v8 = "=150.4.0"` with its sandbox profile), so this
+  merge produces no new prebuilt.
+
 # [0.156.1-termux.1] - 2026-09-24
 
 ## Codex Termux 0.156.1-termux.1 — upstream rust-v0.156.1

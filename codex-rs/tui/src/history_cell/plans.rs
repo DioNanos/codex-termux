@@ -207,8 +207,9 @@ impl HistoryCell for PlanUpdateCell {
         vec![self.activity_id.clone()]
     }
 
-    fn has_hidden_activity_details(&self, width: u16) -> bool {
-        self.explanation
+    fn activity_disclosure(&self, width: u16) -> Option<super::ActivityDisclosure> {
+        (self
+            .explanation
             .as_ref()
             .is_some_and(|explanation| !explanation.trim().is_empty())
             || self.plan.len() > super::activity_preview::DETAIL_PREVIEW_LINES
@@ -216,7 +217,8 @@ impl HistoryCell for PlanUpdateCell {
                 let step = item.step.split_whitespace().collect::<Vec<_>>().join(" ");
                 // The compact row reserves four columns for indentation and two for its marker.
                 Line::from(step).width() + 6 > usize::from(width)
-            })
+            }))
+        .then_some(super::ActivityDisclosure::Generic)
     }
 
     fn compact_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {

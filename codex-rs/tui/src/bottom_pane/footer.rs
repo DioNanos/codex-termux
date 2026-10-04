@@ -120,9 +120,11 @@ pub(crate) struct FooterKeyHints {
     pub(crate) edit_previous: Option<ShortcutHint>,
     pub(crate) show_transcript: Option<ShortcutHint>,
     pub(crate) find_transcript: Option<ShortcutHint>,
+    pub(crate) focus_activity: Option<ShortcutHint>,
     pub(crate) history_search: Option<ShortcutHint>,
     pub(crate) reasoning_down: Option<ShortcutHint>,
     pub(crate) reasoning_up: Option<ShortcutHint>,
+    pub(crate) toggle_voice: Option<ShortcutHint>,
 }
 
 impl FooterKeyHints {
@@ -137,9 +139,11 @@ impl FooterKeyHints {
             edit_previous: Some(key_hint::plain(KeyCode::Esc).into()),
             show_transcript: Some(key_hint::ctrl(KeyCode::Char('t')).into()),
             find_transcript: Some(key_hint::plain(KeyCode::F(3)).into()),
+            focus_activity: Some(key_hint::plain(KeyCode::F(4)).into()),
             history_search: Some(key_hint::ctrl(KeyCode::Char('r')).into()),
             reasoning_down: Some(key_hint::alt(KeyCode::Char(',')).into()),
             reasoning_up: Some(key_hint::alt(KeyCode::Char('.')).into()),
+            toggle_voice: Some(key_hint::plain(KeyCode::F(8)).into()),
         }
     }
 }

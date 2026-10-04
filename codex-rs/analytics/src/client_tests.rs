@@ -4,7 +4,6 @@ use super::AnalyticsEventsQueue;
 use super::AnalyticsEventsQueueMessage;
 #[cfg(debug_assertions)]
 use super::capture_track_events_request;
-#[cfg(debug_assertions)]
 use super::send_track_events;
 #[cfg(debug_assertions)]
 use super::send_track_events_request;
@@ -60,6 +59,8 @@ use crate::facts::InvocationType;
 use crate::facts::PluginMeasurementRow;
 use crate::facts::PluginMeasurementsInput;
 use crate::facts::TrackEventsContext;
+#[cfg(debug_assertions)]
+use crate::product_attribution::ThreadProducts;
 use crate::reducer::MAX_PLUGIN_MEASUREMENTS_PER_BATCH;
 use codex_app_server_protocol::ApprovalsReviewer as AppServerApprovalsReviewer;
 use codex_app_server_protocol::AskForApproval as AppServerAskForApproval;
@@ -88,6 +89,8 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 #[cfg(debug_assertions)]
 use codex_login::AuthManager;
 use codex_utils_absolute_path::test_support::PathBufExt;
@@ -105,6 +108,9 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
+
+#[path = "client_product_tests.rs"]
+mod product_tests;
 
 #[cfg(debug_assertions)]
 impl AnalyticsEventsClient {
@@ -161,6 +167,7 @@ fn sample_skill_track_event(thread_id: &str, plugin_id: Option<&str>) -> TrackEv
 fn sample_artifact_operation_event(thread_id: &str) -> TrackEventRequest {
     TrackEventRequest::ArtifactOperation(codex_artifact_operation_event_request(
         TrackEventsContext {
+            turn_metadata: None,
             model_slug: "gpt-5.1-codex".to_string(),
             thread_id: thread_id.to_string(),
             turn_id: "turn-1".to_string(),
@@ -286,6 +293,7 @@ fn client_with_receiver() -> (
     let (sender, receiver) = mpsc::channel(8);
     let queue = AnalyticsEventsQueue {
         sender,
+        product_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
         plugin_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
     };
@@ -366,7 +374,15 @@ async fn capture_file_writes_exact_serialized_request() {
     let expected_event = serde_json::to_value(&event).expect("serialize expected event");
     let auth = codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing();
 
-    send_track_events_request(&auth, &destination, vec![event]).await;
+    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+    send_track_events_request(
+        &auth,
+        &destination,
+        vec![event],
+        &factory,
+        /*product_sku*/ None,
+    )
+    .await;
 
     let contents = fs::read_to_string(&capture_path).expect("read capture file");
     let lines = contents.lines().collect::<Vec<_>>();
@@ -393,7 +409,15 @@ async fn capture_file_writes_final_batches_as_separate_lines() {
     ];
 
     for batch in track_event_request_batches(events) {
-        send_track_events_request(&auth, &destination, batch).await;
+        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+        send_track_events_request(
+            &auth,
+            &destination,
+            batch,
+            &factory,
+            /*product_sku*/ None,
+        )
+        .await;
     }
 
     let contents = fs::read_to_string(&capture_path).expect("read capture file");
@@ -469,6 +493,7 @@ async fn api_key_auth_sends_only_plugin_events_to_codex_backend() {
             sample_artifact_operation_event("plugin-artifact"),
             plugin_measurement("plugin-measurement", "sample@test"),
         ],
+        &ThreadProducts::default(),
     )
     .await;
 
@@ -922,6 +947,7 @@ async fn flush_is_noop_when_analytics_is_disabled() {
 fn app_used_preserves_first_classification_and_emits_again_next_turn() {
     let (client, mut receiver) = client_with_receiver();
     let tracking = TrackEventsContext {
+        turn_metadata: None,
         model_slug: "gpt-5".to_string(),
         thread_id: "thread-1".to_string(),
         turn_id: "turn-1".to_string(),

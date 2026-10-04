@@ -46,8 +46,16 @@ pub(super) fn line(
         message
     };
     Some(truncate_line_with_ellipsis_if_overflow(
-        Line::from(message).style(crate::style::history_prompt_style()),
-        usize::from(width),
+        Line::from(vec![
+            if prompt.spoken {
+                "› ".red().bold()
+            } else {
+                "› ".bold().dim()
+            },
+            message.into(),
+        ])
+        .style(crate::style::history_prompt_style()),
+        usize::from(width.saturating_sub(1)),
     ))
 }
 

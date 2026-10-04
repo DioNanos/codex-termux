@@ -53,6 +53,11 @@ async fn owned_clear_resets_navigation_and_retains_one_fresh_header() -> Result<
         app.transcript_cells[0].display_lines(/*width*/ 80),
         app.clear_ui_header_lines(/*width*/ 80),
     );
+    app.chat_widget.set_raw_output_mode(/*enabled*/ true);
+    assert_eq!(
+        app.transcript_cells[0].raw_lines(),
+        app.clear_ui_header_lines(/*width*/ 80),
+    );
     assert!(app.transcript_view.is_following());
     assert!(tui.pending_history_lines_for_test().is_empty());
     tui.set_owned_screen(/*owned*/ false)?;

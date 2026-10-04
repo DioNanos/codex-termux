@@ -27,7 +27,9 @@ use codex_state::SqliteConfig;
 use pretty_assertions::assert_eq;
 use pretty_assertions::assert_ne;
 
-async fn history_fixture(item_counts: &[usize]) -> Result<(App, tempfile::TempDir, SessionTarget)> {
+async fn history_fixture(
+    item_counts: &[usize],
+) -> Result<(Box<App>, tempfile::TempDir, SessionTarget)> {
     let mut app = make_test_app().await;
     let codex_home = tempdir()?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
@@ -242,6 +244,7 @@ async fn history_hydration_archived_retry_uses_first_attempt_runtime_settings() 
     for action in [
         SessionStartAction::Resume(
             crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+            crate::resume_permissions::ResumePermissions::default(),
         ),
         SessionStartAction::Fork(crate::app_server_session::ForkPermissionMode::InheritSaved),
     ] {
@@ -265,7 +268,7 @@ async fn history_hydration_archived_retry_uses_first_attempt_runtime_settings() 
             )
             .await?;
             let initial = match action {
-                SessionStartAction::Resume(settings) => {
+                SessionStartAction::Resume(settings, _) => {
                     server
                         .resume_thread(
                             &app.local_settings,

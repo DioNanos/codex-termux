@@ -123,6 +123,7 @@ mod startup_warnings;
 mod warnings;
 
 pub(crate) use activity_details::ActivityDetails;
+pub(crate) use activity_preview::ActivityDisclosure;
 pub(crate) use approvals::*;
 pub(crate) use base::*;
 pub(crate) use dynamic::DynamicToolCallCell;
@@ -254,10 +255,10 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
         self.transcript_hyperlink_lines(width)
     }
 
-    /// Whether an activity offers details beyond its compact presentation.
+    /// Details an activity offers beyond its compact presentation, if any.
     /// Prefer source metadata so collapsed rendering does not materialize hidden content.
-    fn has_hidden_activity_details(&self, _width: u16) -> bool {
-        true
+    fn activity_disclosure(&self, _width: u16) -> Option<ActivityDisclosure> {
+        Some(ActivityDisclosure::Generic)
     }
 
     fn display_lines_for_mode(&self, width: u16, mode: HistoryRenderMode) -> Vec<Line<'static>> {

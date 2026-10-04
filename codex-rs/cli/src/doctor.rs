@@ -2100,36 +2100,56 @@ async fn state_check(config: &Config, command: &DoctorCommand) -> DoctorCheck {
     path_readiness(&mut details, "CODEX_HOME", &config.codex_home);
     path_readiness(&mut details, "log dir", &config.log_dir);
     path_readiness(&mut details, "sqlite home", config.sqlite_config().home());
+
     let mut status = CheckStatus::Ok;
+    let mut failed_databases = Vec::new();
     for db in config.sqlite_config().runtime_db_paths() {
         path_readiness(&mut details, db.label, &db.path);
         // Feedback collection gives each database its own budget; direct runs scan fully.
         let deadline = command
             .feedback
             .then(|| Instant::now() + Duration::from_secs(1));
-        status = status.max(
-            sqlite_integrity_detail(
-                config.sqlite_config(),
-                &mut details,
-                db.label,
-                &db.path,
-                deadline,
-            )
-            .await,
-        );
+        let db_status = sqlite_integrity_detail(
+            config.sqlite_config(),
+            &mut details,
+            db.label,
+            &db.path,
+            deadline,
+        )
+        .await;
+        if db_status == CheckStatus::Fail {
+            failed_databases.push(db.path.display().to_string());
+        }
+        status = status.max(db_status);
     }
     rollout_stats_details(&mut details, &config.codex_home);
     standalone_release_cache_details(&mut details);
 
     let summary = match status {
-        CheckStatus::Ok => "state paths and databases are inspectable",
-        CheckStatus::Warning => "some database integrity checks exceeded their time limit",
-        CheckStatus::Fail => "state database integrity check failed",
+        CheckStatus::Ok => "state paths and databases are inspectable".to_string(),
+        CheckStatus::Warning => {
+            "some database integrity checks exceeded their time limit".to_string()
+        }
+        CheckStatus::Fail => "state database integrity check failed".to_string(),
     };
     let mut check = DoctorCheck::new("state.paths", "state", status, summary).details(details);
     if status == CheckStatus::Fail {
-        check = check.remediation(
-            "Move the damaged SQLite database aside, then restart the interactive CLI or app server so it can rebuild that runtime database from saved data. Other entry points may not rebuild automatically.",
+        let noun = if failed_databases.len() == 1 {
+            "database"
+        } else {
+            "databases"
+        };
+        check = check.issue(
+            DoctorIssue::new(
+                CheckStatus::Fail,
+                format!(
+                    "{} {noun} failed integrity check",
+                    failed_databases.join(", ")
+                ),
+            )
+            .remedy(
+                "Move the damaged SQLite database aside, then restart the interactive CLI or app server so it can rebuild that runtime database from saved data. Other entry points may not rebuild automatically.",
+            ),
         );
     }
     check
@@ -2413,17 +2433,20 @@ fn websocket_error_detail(err: &ApiError) -> String {
             format!("handshake API error: {status} {message}")
         }
         ApiError::Stream(message) => format!("handshake stream error: {message}"),
-        ApiError::ContextWindowExceeded
+        ApiError::ContentFilter
+        | ApiError::ContextWindowExceeded
         | ApiError::QuotaExceeded
         | ApiError::UsageNotIncluded
         | ApiError::Retryable { .. }
         | ApiError::RateLimitExceeded { .. }
         | ApiError::RateLimit(_)
         | ApiError::InvalidRequest { .. }
+        | ApiError::InvalidPrompt { .. }
         | ApiError::CyberPolicy { .. }
         | ApiError::BioPolicy { .. }
         | ApiError::MisalignmentPolicyViolation { .. }
-        | ApiError::ServerOverloaded => format!("handshake error: {err}"),
+        | ApiError::FlexUnavailable
+        | ApiError::ServerOverloaded { .. } => format!("handshake error: {err}"),
     }
 }
 

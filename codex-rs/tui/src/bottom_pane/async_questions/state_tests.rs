@@ -17,7 +17,6 @@ fn editor() -> AsyncQuestions {
         /*disable_paste_burst*/ true,
         RuntimeKeymap::defaults(),
     );
-    editor.next_hint = Some(crate::key_hint::alt(KeyCode::Up).into());
     editor.append(
         "message",
         &[
@@ -26,6 +25,25 @@ fn editor() -> AsyncQuestions {
         ],
     );
     editor
+}
+
+#[test]
+fn taking_pending_drafts_preserves_order_expands_pastes_and_skips_blank_drafts() {
+    let mut editor = editor();
+    editor.set_expanded(/*expanded*/ true);
+    let large_answer = "typed answer ".repeat(/*n*/ 200);
+    editor.handle_paste(large_answer.clone());
+    editor.navigate(/*forward*/ true);
+    editor.handle_key_event(KeyEvent::from(KeyCode::Char('2')));
+    editor.handle_paste(" other answer ".into());
+    editor.append("blank", &[question("Blank?", /*options*/ None)]);
+
+    assert_eq!(
+        editor.take_pending_drafts(),
+        vec![large_answer.trim().to_string(), "other answer".to_string()]
+    );
+    assert_eq!((editor.unanswered_count(), editor.expanded), (0, false));
+    assert!(editor.submission.is_none());
 }
 
 #[test]
@@ -427,7 +445,7 @@ fn existing_cross_context_keymaps_load_without_misleading_submit_hints() {
         let mut editor = editor();
         editor.navigate(/*forward*/ true);
         editor.set_keymap(&keymap);
-        insta::allow_duplicates! { insta::assert_snapshot!(editor.footer_lines(/*width*/ 100, /*option_tip*/ None)[0].to_string(), @"ctrl+] skip   ⌥+↓ prev question"); }
+        insta::allow_duplicates! { insta::assert_snapshot!(editor.footer_lines(/*width*/ 100, /*option_tip*/ None)[0].to_string(), @"ctrl+] skip   shift+→ prev question"); }
         editor.handle_key_event(KeyEvent::from(KeyCode::F(12)));
         assert!(editor.submission.is_none());
     }

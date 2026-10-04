@@ -14,6 +14,7 @@ use super::LoadedPlugin;
 use super::PluginLoadOutcome;
 use crate::PluginGitMode;
 use crate::app_mcp_routing::apply_app_mcp_routing_policy;
+use crate::http_client_selector::HttpClientSelector;
 use crate::installed_marketplaces::installed_marketplace_roots_from_layer_stack;
 use crate::is_openai_curated_marketplace_name;
 use crate::loaded_cache_metrics;
@@ -38,8 +39,6 @@ use crate::loader::refresh_non_curated_plugin_cache_force_reinstall_detailed;
 use crate::loader::remote_installed_plugins_to_config;
 use crate::manifest::PluginManifestFormat;
 use crate::manifest::PluginManifestInterface;
-use crate::manifest::load_plugin_manifest;
-use crate::manifest::load_plugin_manifest_with_format;
 use crate::marketplace::MarketplaceError;
 use crate::marketplace::MarketplaceInterface;
 use crate::marketplace::MarketplaceListError;
@@ -52,7 +51,7 @@ use crate::marketplace::ResolvedMarketplacePlugin;
 use crate::marketplace::find_installable_marketplace_plugin;
 use crate::marketplace::find_marketplace_plugin;
 use crate::marketplace::home_dir;
-use crate::marketplace::list_marketplaces_with_home;
+use crate::marketplace::list_marketplaces_with_cache;
 use crate::marketplace::plugin_interface_with_marketplace_category;
 use crate::marketplace_policy::MarketplacePolicy;
 use crate::marketplace_policy::configured_plugins_from_stack;
@@ -60,6 +59,7 @@ use crate::marketplace_upgrade::ConfigLayerReload;
 use crate::marketplace_upgrade::ConfiguredMarketplaceUpgradeError;
 use crate::marketplace_upgrade::ConfiguredMarketplaceUpgradeOutcome;
 use crate::marketplace_upgrade::upgrade_configured_git_marketplaces_with_mode;
+use crate::remote::CODEX_PRODUCT_SKU;
 use crate::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
 use crate::remote::RecommendedPluginsMode;
 use crate::remote::RemoteInstalledPlugin;
@@ -100,7 +100,9 @@ use codex_config::types::ToolSuggestDiscoverableType;
 use codex_connectors::ConnectorSnapshot;
 use codex_connectors::PluginConnectorSource;
 use codex_hooks::plugin_hook_declarations;
+use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_plugin::AppConnectorId;
@@ -130,6 +132,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -157,7 +160,9 @@ pub struct PluginsConfigInput {
     pub plugins_enabled: bool,
     pub remote_plugin_enabled: bool,
     pub chatgpt_base_url: String,
+    pub product_sku: Option<String>,
     http_client_factory: HttpClientFactory,
+    remote_http_clients: Arc<OnceLock<Arc<dyn HttpClientSelector>>>,
 }
 
 impl PluginsConfigInput {
@@ -168,6 +173,7 @@ impl PluginsConfigInput {
         remote_plugin_enabled: bool,
         chatgpt_base_url: String,
         http_client_factory: HttpClientFactory,
+        product_sku: Option<String>,
     ) -> Self {
         Self {
             config_layer_stack,
@@ -176,15 +182,30 @@ impl PluginsConfigInput {
             remote_plugin_enabled,
             chatgpt_base_url,
             http_client_factory,
+            product_sku,
+            remote_http_clients: Arc::new(OnceLock::new()),
         }
     }
 
-    /// Builds route-aware service state for remote plugin requests.
+    /// Shares a lazy route-aware connection pool across this input and its clones.
+    /// Request metadata remains current; new config inputs own a new pool.
     pub fn remote_plugin_service_config(&self) -> RemotePluginServiceConfig {
-        RemotePluginServiceConfig::new(
-            self.chatgpt_base_url.clone(),
-            self.http_client_factory.clone(),
-        )
+        let http_clients = self.remote_http_clients.get_or_init(|| {
+            Arc::new(
+                RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_request_logging(
+                    self.http_client_factory.clone(),
+                    ClientRouteClass::Api,
+                ),
+            )
+        });
+        RemotePluginServiceConfig {
+            chatgpt_base_url: self.chatgpt_base_url.clone(),
+            product_sku: self
+                .product_sku
+                .clone()
+                .unwrap_or_else(|| CODEX_PRODUCT_SKU.to_string()),
+            http_clients: Arc::clone(http_clients),
+        }
     }
 }
 
@@ -560,20 +581,26 @@ struct LoadedPluginsCacheEntry {
 struct LoadedPluginsCache {
     generation: u64,
     // Most recently used first.
-    entries: VecDeque<LoadedPluginsCacheEntry>,
+    entries: VecDeque<Arc<LoadedPluginsCacheEntry>>,
 }
 
 impl LoadedPluginsCache {
     fn get(
-        &mut self,
+        cache: &Mutex<Self>,
         key: &PluginLoadCacheKey,
         store: &PluginStore,
-    ) -> Option<&LoadedPluginsCacheEntry> {
-        let index = self.entries.iter().position(|entry| &entry.key == key)?;
-        let entry = self.entries.remove(index)?;
+    ) -> Option<Arc<LoadedPluginsCacheEntry>> {
+        let (generation, entry) = {
+            let cache = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = cache.entries.iter().find(|entry| &entry.key == key)?;
+            (cache.generation, Arc::clone(entry))
+        };
         // Another process can replace installed versions without invalidating this manager.
         // Keep the parsed skills paired with the installation whose paths they advertise.
-        if entry.plugins.iter().any(|plugin| {
+        // Validate outside the cache lock so filesystem work does not block other cache keys.
+        let stale = entry.plugins.iter().any(|plugin| {
             let Ok(plugin_id) = PluginId::parse(&plugin.config_name) else {
                 return false;
             };
@@ -581,11 +608,24 @@ impl LoadedPluginsCache {
                 .active_plugin_root(&plugin_id)
                 .unwrap_or_else(|| store.plugin_base_root(&plugin_id));
             installed_root != plugin.root
-        }) {
+        });
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.generation != generation {
             return None;
         }
-        self.entries.push_front(entry);
-        self.entries.front()
+        // A load can replace this key without changing the cache generation.
+        let index = cache
+            .entries
+            .iter()
+            .position(|current| Arc::ptr_eq(current, &entry))?;
+        let current = cache.entries.remove(index)?;
+        if stale {
+            return None;
+        }
+        cache.entries.push_front(current);
+        Some(entry)
     }
 }
 
@@ -654,9 +694,12 @@ impl PluginsManager {
         // This assumes a single CODEX_HOME is only used by one product.
         let remote_installed_plugin_bundle_sync_gate =
             crate::remote::remote_installed_plugin_bundle_sync_gate(&codex_home);
+        let store = PluginStore::new(codex_home.clone());
+        let tool_suggest_metadata_cache =
+            ToolSuggestMetadataCache::new(Arc::clone(&store.manifest_cache));
         Self {
-            codex_home: codex_home.clone(),
-            store: PluginStore::new(codex_home),
+            codex_home,
+            store,
             featured_plugin_ids_cache: RwLock::new(None),
             recommended_plugins_cache: RwLock::new(HashMap::new()),
             recommended_plugins_refreshes: RwLock::new(HashMap::new()),
@@ -672,7 +715,7 @@ impl PluginsManager {
             loaded_plugins_cache: Mutex::new(LoadedPluginsCache::default()),
             loaded_plugins_load_semaphore: Semaphore::new(/*permits*/ 1),
             skill_root_loader,
-            tool_suggest_metadata_cache: ToolSuggestMetadataCache::new(),
+            tool_suggest_metadata_cache,
             remote_installed_plugins_cache: RwLock::new(RemoteInstalledPluginsCache::default()),
             remote_installed_plugin_bundle_sync_gate,
             remote_installed_plugins_cache_refresh_state: RwLock::new(
@@ -753,10 +796,7 @@ impl PluginsManager {
             self.remote_global_catalog_active(config),
             RemoteInstalledPluginsAuthIdentity::from_auth(auth.as_ref()),
         );
-        self.loaded_plugins_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key, &self.store)
+        LoadedPluginsCache::get(&self.loaded_plugins_cache, &key, &self.store)
             .map(|cached| cached.plugin_skill_snapshots.clone())
     }
 
@@ -971,10 +1011,7 @@ impl PluginsManager {
     }
 
     fn cached_loaded_plugins(&self, key: &PluginLoadCacheKey) -> Option<Vec<LoadedPlugin>> {
-        self.loaded_plugins_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(key, &self.store)
+        LoadedPluginsCache::get(&self.loaded_plugins_cache, key, &self.store)
             .map(|cached| cached.plugins.clone())
     }
 
@@ -1000,11 +1037,11 @@ impl PluginsManager {
             return;
         }
         cache.entries.retain(|entry| entry.key != key);
-        cache.entries.push_front(LoadedPluginsCacheEntry {
+        cache.entries.push_front(Arc::new(LoadedPluginsCacheEntry {
             key,
             plugins,
             plugin_skill_snapshots,
-        });
+        }));
         let evicted = cache.entries.len() > LOADED_PLUGINS_CACHE_CAPACITY;
         cache.entries.truncate(LOADED_PLUGINS_CACHE_CAPACITY);
         drop(cache);
@@ -1130,6 +1167,7 @@ impl PluginsManager {
                     plugin_id,
                     &plugin_root,
                     self.skill_root_loader.as_ref(),
+                    &self.store.manifest_cache,
                 )
                 .await
             }
@@ -1151,6 +1189,7 @@ impl PluginsManager {
                     plugin_id,
                     &plugin_root,
                     self.skill_root_loader.as_ref(),
+                    &self.store.manifest_cache,
                 )
                 .await
             }
@@ -2408,7 +2447,11 @@ impl PluginsManager {
                             && plugin.source.is_install_materialized()
                             && let Some(plugin_id) = plugin_id.as_ref()
                             && let Some(plugin_root) = self.store.active_plugin_root(plugin_id)
-                            && let Some(manifest) = load_plugin_manifest(plugin_root.as_path())
+                            && let Some(manifest) = self
+                                .store
+                                .manifest_cache
+                                .load(plugin_root.as_path())
+                                .map(|loaded| loaded.manifest)
                         {
                             local_version = manifest.version.clone();
                             let marketplace_category = interface
@@ -2639,7 +2682,7 @@ impl PluginsManager {
         }
         let loaded_manifest =
             if codex_utils_plugins::find_plugin_manifest_path(source_path.as_path()).is_some() {
-                load_plugin_manifest_with_format(source_path.as_path())
+                self.store.manifest_cache.load(source_path.as_path())
             } else {
                 plugin
                     .manifest_fallback
@@ -3583,7 +3626,8 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         roots: &[AbsolutePathBuf],
     ) -> Result<MarketplaceListOutcome, MarketplaceError> {
-        let mut outcome = list_marketplaces_with_home(roots, home_dir().as_deref())?;
+        let mut outcome =
+            list_marketplaces_with_cache(roots, home_dir().as_deref(), &self.store.manifest_cache)?;
         let policy = MarketplacePolicy::from_requirements(config.config_layer_stack.requirements());
         outcome.marketplaces.retain(|marketplace| {
             policy
@@ -3786,3 +3830,7 @@ impl PluginUninstallError {
 #[cfg(test)]
 #[path = "manager_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "plugins_config_input_tests.rs"]
+mod plugins_config_input_tests;

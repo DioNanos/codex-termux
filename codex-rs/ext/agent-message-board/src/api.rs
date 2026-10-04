@@ -21,14 +21,15 @@ use uuid::Uuid;
 // Local and remote implementations must remain usable through the same handle.
 const _: Option<&dyn AgentMessageBoard> = None;
 
-/// Stores discussions and subscriptions for one persistent agent tree.
+/// Stores discussions and subscriptions for one agent tree.
 ///
 /// Every operation validates caller membership. IDs are scoped to this board;
 /// an agent runtime's ThreadId is distinct from a discussion's root post UUID.
 /// Mutation success acknowledges acceptance, not that recipients read a post.
 /// Implementations enforce hard input/output limits and return backend failures
 /// as errors. They own atomic subscription changes, posting and recipient
-/// selection. Notification delivery must neither wake finalized agents nor
+/// selection, excluding the post author even when explicitly targeted.
+/// Notification delivery must neither wake finalized agents nor
 /// leave notifications for a later turn.
 ///
 /// Boxed Send futures support an Arc<dyn AgentMessageBoard>, like AgentControl.
@@ -50,6 +51,7 @@ pub trait AgentMessageBoard: Send + Sync {
     /// Uses the caller's configured clock; clock failures must not create a post.
     /// The request ID identifies a logical call across retries. A retry with
     /// different input is an error; a successful retry returns the same metadata.
+    /// Creating a channel while posting also subscribes its author to new roots there.
     fn post(&self, caller: ThreadId, request: PostRequest) -> BoxFuture<'_, Result<PostMetadata>>;
 
     fn list_threads(
@@ -78,7 +80,8 @@ pub trait AgentMessageBoard: Send + Sync {
 
     /// Channel subscriptions concern new roots; thread subscriptions concern
     /// replies. Changing one does not change the other. Any member may change
-    /// another member's subscription. Posting subscribes its author to the thread.
+    /// another member's subscription. Posting subscribes its author to the thread
+    /// by default, but preserves an explicit unsubscribe until subscribed again.
     fn set_subscription(
         &self,
         caller: ThreadId,
@@ -113,7 +116,7 @@ pub enum SubscriptionChange {
     Unsubscribe,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateChannelRequest {
     pub channel_name: String,
     pub subscription: SubscriptionChange,
@@ -177,7 +180,7 @@ pub struct ReadThreadRequest {
     pub max_chars_per_post: NonZeroU32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReadPostRequest {
     pub message_id: Uuid,
     /// Offsets and lengths count Unicode scalar values, not UTF-8 bytes.
@@ -191,7 +194,7 @@ pub enum SubscriptionTarget {
     Thread(Uuid),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubscriptionRequest {
     pub target: SubscriptionTarget,
     /// None changes the caller's subscription.

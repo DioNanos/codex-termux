@@ -1,6 +1,7 @@
 use super::*;
 use crate::unified_exec::clamp_yield_time;
 use codex_network_proxy::ManagedNetworkSandboxContext;
+use core_test_support::assert_regex_match;
 use pretty_assertions::assert_eq;
 use tokio::sync::Notify;
 use tokio::time::Duration;
@@ -249,7 +250,11 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
     };
     let params = params_for_request(&request);
 
-    assert_eq!(params.process_id.as_str(), "123");
+    assert_regex_match(
+        r"^123-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$",
+        params.process_id.as_str(),
+    );
+    assert_ne!(params.process_id, params_for_request(&request).process_id);
     assert_eq!(params.metadata, None);
     assert_eq!(params.cwd, request.cwd);
     assert!(params.enforce_managed_network);
@@ -336,7 +341,7 @@ fn initial_exec_yield_time_has_no_platform_floor() {
 #[tokio::test]
 async fn output_collection_stays_bounded_across_repeated_drains() {
     let chunks: [&[u8]; 4] = [b"01234567", b"89ABCDEF", b"ghijklmnopq", b"rs"];
-    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::<10>::default()));
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(OutputBuffers::<10>::default()));
     let output_notify = Arc::new(Notify::new());
     let output_closed = Arc::new(AtomicBool::new(false));
     let output_closed_notify = Arc::new(Notify::new());
@@ -360,7 +365,7 @@ async fn output_collection_stays_bounded_across_repeated_drains() {
             output_notify.notify_one();
             tokio::time::timeout(Duration::from_secs(1), async {
                 loop {
-                    if output_buffer.lock().await.retained_bytes() == 0 {
+                    if output_buffer.lock().await.pending.retained_bytes() == 0 {
                         break;
                     }
                     tokio::task::yield_now().await;
@@ -382,11 +387,12 @@ async fn output_collection_stays_bounded_across_repeated_drains() {
         expected.push_chunk(chunk);
     }
     assert_eq!(collected, expected);
+    assert_eq!(output_buffer.lock().await.transcript, expected);
 }
 
 #[tokio::test]
 async fn output_collection_preserves_omissions_from_drained_buffer() {
-    let mut buffered_output = HeadTailBuffer::<10>::default();
+    let mut buffered_output = OutputBuffers::<10>::default();
     buffered_output.push_chunk(&[b'a'; 10]);
     buffered_output.push_chunk(b"overflow");
     let mut expected = HeadTailBuffer::<10>::default();
@@ -477,17 +483,18 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         prefix_rule: None,
     };
 
-    let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
-    transcript.lock().await.push_chunk(b"PARTIAL_TRANSCRIPT");
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(OutputBuffers::default()));
+    output_buffer.lock().await.push_chunk(b"PARTIAL_TRANSCRIPT");
 
     emit_failed_initial_exec_end_if_unstored(
         /*process_started_alive*/ false,
+        Some(codex_protocol::sandbox::SandboxType::WindowsMxc),
         &context,
         &request,
         #[allow(deprecated)]
         turn.cwd.clone().into(),
         /*plugin_attribution*/ None,
-        transcript,
+        output_buffer,
         "PRE_DENIAL_MARKER".to_string(),
         "Network access denied".to_string(),
         Duration::from_millis(7),
@@ -505,6 +512,10 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         panic!("expected CommandExecution item");
     };
     assert_eq!(item.id, "call-unified-denied");
+    assert_eq!(
+        item.sandbox_type,
+        Some(codex_protocol::sandbox::SandboxType::WindowsMxc)
+    );
     assert_eq!(
         item.status,
         codex_protocol::items::CommandExecutionStatus::Failed

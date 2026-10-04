@@ -6,6 +6,59 @@ use tokio::io::AsyncWriteExt;
 
 use super::*;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn shared_daemon_directory_accepts_full_length_socket_names() {
+    use std::os::unix::fs::MetadataExt;
+
+    let directory = prepare_shared_daemon_socket_directory().expect("private daemon directory");
+    let metadata = std::fs::symlink_metadata(&directory).expect("daemon directory metadata");
+    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    assert_eq!(metadata.mode() & 0o777, 0o700);
+
+    // The app-server names physical sockets with the full hex SHA-256 digest.
+    // A longer Android temporary root can otherwise pass directory creation
+    // and still fail at bind with an overlong sockaddr_un path.
+    let socket_path = directory.join(format!("{:064x}", std::process::id()));
+    let listener = UnixListener::bind(&socket_path)
+        .await
+        .expect("bind a full-length daemon socket");
+    let client = UnixStream::connect(&socket_path)
+        .await
+        .expect("connect to daemon socket");
+    drop(client);
+    drop(listener);
+    std::fs::remove_file(socket_path).expect("remove test socket");
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_daemon_directory_uses_the_termux_variant_namespace() {
+    let uid = unsafe { libc::geteuid() };
+    let directory = shared_daemon_socket_directory().expect("daemon directory");
+    let name = directory
+        .file_name()
+        .expect("directory name")
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(target_os = "android")]
+    let expected = format!("cdx-termux-{uid}");
+    #[cfg(not(target_os = "android"))]
+    let expected = format!("codex-daemon-termux-{uid}");
+    assert_eq!(name, expected);
+    // codex-vl owns the cdx-vl- and codex-daemon-vl- namespaces on a shared
+    // device: a termux daemon must never collide with them.
+    assert!(!name.contains("-vl"));
+    // The full socket path still fits sockaddr_un.sun_path with the 64-character
+    // socket hash appended.
+    let sun_path_limit =
+        std::mem::size_of::<libc::sockaddr_un>() - std::mem::size_of::<libc::sa_family_t>();
+    assert!(
+        directory.to_string_lossy().len() + 1 + 64 <= sun_path_limit,
+        "daemon directory {directory:?} leaves no sun_path room for a socket hash"
+    );
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn private_directory_rejects_volume_roots() {

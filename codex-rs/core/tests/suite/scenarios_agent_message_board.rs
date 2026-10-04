@@ -1,9 +1,12 @@
 //! Exercises board tools through the runtime, including resume and active-only notices.
 
 use anyhow::Context;
+use codex_agent_message_board_extension::PostMetadata;
 use codex_core::TurnInputRequest;
 use codex_features::Feature;
+use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
@@ -13,12 +16,18 @@ use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call_with_namespace;
+use core_test_support::responses::ev_message_item_added;
+use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use tokio::sync::oneshot;
 
 enum BoardClock {
     Available,
@@ -123,8 +132,12 @@ async fn board_requires_persistent_v2_runtime(
     Ok(())
 }
 
+#[test_case::test_case(false; "disk")]
+#[test_case::test_case(true; "in_memory")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn board_active_notice_and_reads_reach_model_context() -> anyhow::Result<()> {
+async fn board_post_and_reads_reach_model_context_without_self_notices(
+    in_memory: bool,
+) -> anyhow::Result<()> {
     let server = responses::start_mock_server().await;
     let mock = responses::mount_sse_sequence(&server, vec![
         tool("post-decision", "post", json!({"new_channel_name":"design", "text":"A shared decision.", "agents_to_notify":["/root"]})),
@@ -132,8 +145,9 @@ async fn board_active_notice_and_reads_reach_model_context() -> anyhow::Result<(
         done(),
     ]).await;
     let test = test_codex()
-        .with_config(|config| {
+        .with_config(move |config| {
             configure(config);
+            config.multi_agent_v2.message_board_in_memory = in_memory;
             config.current_time_reminder = Some(codex_core::config::CurrentTimeReminderConfig {
                 clock_source: codex_features::CurrentTimeSource::External,
                 ..Default::default()
@@ -163,13 +177,11 @@ async fn board_active_notice_and_reads_reach_model_context() -> anyhow::Result<(
             .expect("search result"),
     )?;
     assert_eq!(result["results"][0]["text_preview"], "A shared decision.");
-    let notice = requests[1]
-        .message_input_texts("user")
-        .into_iter()
-        .find(|text| text.contains("<agent_message_board_notification>"))
-        .expect("active notification");
-    assert!(notice.contains(post["message_id"].as_str().expect("post id")));
-    assert!(!notice.contains("A shared decision."));
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.body_contains_text("Message Type: CHANNEL_POST"))
+    );
     // Cargo and Bazel can enable different serde_json ordering features. Normalize only
     // the snapshot copies so the assertion compares JSON content, not object key order.
     let mut bodies = requests
@@ -189,7 +201,7 @@ async fn board_active_notice_and_reads_reach_model_context() -> anyhow::Result<(
     insta::assert_snapshot!(
         "agent_message_board_context",
         context_snapshot::format_context_snapshot(
-            "An active agent posts a shared decision, receives an ID-only notice, and fetches the text.",
+            "An active agent posts a shared decision and fetches the text without a self-notification.",
             &bodies.iter().map(SnapshotEntry::body).collect::<Vec<_>>(),
             &ContextSnapshotOptions::default().rewrite_known_segments(),
         )
@@ -197,11 +209,18 @@ async fn board_active_notice_and_reads_reach_model_context() -> anyhow::Result<(
     Ok(())
 }
 
+#[test_case::test_case(false; "disk")]
+#[test_case::test_case(true; "in_memory")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn board_is_shared_with_children_survives_resume_and_skips_idle_notices() -> anyhow::Result<()>
-{
+async fn board_is_shared_with_children_and_skips_idle_notices(
+    in_memory: bool,
+) -> anyhow::Result<()> {
     let server = responses::start_mock_server().await;
-    let mut builder = test_codex().with_config(configure);
+    let mut builder = test_codex().with_config(move |config| {
+        configure(config);
+        config.multi_agent_v2.message_board_in_memory = in_memory;
+        config.ephemeral = in_memory;
+    });
     let root = builder.build_with_auto_env(&server).await?;
     responses::mount_sse_sequence(
         &server,
@@ -287,7 +306,7 @@ async fn board_is_shared_with_children_survives_resume_and_skips_idle_notices() 
     assert!(
         read.requests()
             .iter()
-            .all(|request| !request.body_contains_text("<agent_message_board_notification>"))
+            .all(|request| !request.body_contains_text("Message Type: CHANNEL_POST"))
     );
     let output = read.requests()[1]
         .function_call_output_text("root-read")
@@ -296,6 +315,17 @@ async fn board_is_shared_with_children_survives_resume_and_skips_idle_notices() 
         serde_json::from_str(&output).with_context(|| format!("root read result: {output}"))?;
     assert_eq!(result["results"][0]["message_id"], post["message_id"]);
     child.shutdown_and_wait().await?;
+    if in_memory {
+        assert!(
+            !root
+                .config
+                .sqlite_config()
+                .home()
+                .join("agent_message_board_1.sqlite")
+                .exists()
+        );
+        return Ok(());
+    }
     let resumed = test_codex()
         .with_config(configure)
         .restart(&server, &root)
@@ -320,6 +350,501 @@ async fn board_is_shared_with_children_survives_resume_and_skips_idle_notices() 
         serde_json::from_str(&output).with_context(|| format!("resumed read result: {output}"))?;
     assert_eq!(result["text"], "Worker's durable decision.");
     assert_eq!(result["author"], "/root/worker");
+    Ok(())
+}
+
+#[test_case::test_case(false; "before_final")]
+#[test_case::test_case(true; "after_final")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_notifications_do_not_reopen_a_final_answer(after_final: bool) -> anyhow::Result<()> {
+    let response = |body| vec![StreamingSseChunk { gate: None, body }];
+    let (release_final, final_gate) = oneshot::channel();
+    let (release_child, child_gate) = oneshot::channel();
+    let final_phase = |mut event: Value| {
+        event["item"]["phase"] = json!("final_answer");
+        event
+    };
+    let started = final_phase(ev_message_item_added("root-final", ""));
+    let finished = final_phase(ev_assistant_message("root-final", "Finished."));
+    let (before_gate, after_gate) = if after_final {
+        // Starting an empty item confirms the answer was processed without adding mailbox work.
+        (
+            vec![
+                started,
+                finished,
+                final_phase(ev_message_item_added("after-final", "")),
+            ],
+            vec![final_phase(ev_assistant_message("after-final", ""))],
+        )
+    } else {
+        (vec![started], vec![finished])
+    };
+    let (streaming, _) = start_streaming_sse_server(vec![
+        response(tool(
+            "create",
+            "create_channel",
+            json!({"channel_name":"design"}),
+        )),
+        response(tool(
+            "spawn",
+            "spawn_agent",
+            json!({"task_name":"worker","message":"Say ready.","fork_turns":"none"}),
+        )),
+        response(done()),
+        response(done()),
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: sse([vec![ev_response_created("root")], before_gate].concat()),
+            },
+            StreamingSseChunk {
+                gate: Some(final_gate),
+                body: sse([after_gate, vec![ev_completed("root")]].concat()),
+            },
+        ],
+        response(tool(
+            "worker-post",
+            "post",
+            json!({"channel_name":"design","text":"Late update."}),
+        )),
+        vec![StreamingSseChunk {
+            gate: Some(child_gate),
+            body: done(),
+        }],
+        response(done()),
+        response(done()),
+    ])
+    .await;
+    let server = responses::start_mock_server().await;
+    let base_url = format!("{}/v1", streaming.uri());
+    let root = test_codex()
+        .with_config(move |config| {
+            configure(config);
+            config.model_provider.base_url = Some(base_url);
+            config
+                .features
+                .disable(Feature::EnableRequestCompression)
+                .expect("read raw requests");
+        })
+        .with_model_info_override("gpt-5.5", |model| {
+            model.multi_agent_version = Some(MultiAgentVersion::V2);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    root.submit_turn("Create the channel and spawn a worker.")
+        .await?;
+    let child_id = root
+        .thread_manager
+        .list_thread_ids()
+        .await
+        .into_iter()
+        .find(|id| *id != root.session_configured.thread_id)
+        .context("child runtime")?;
+    let child = root.thread_manager.get_thread(child_id).await?;
+    wait_for_event(&child, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    root.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Finish your answer.".into(),
+            text_elements: vec![],
+        }]))
+        .await?;
+    let target_turn = wait_for_event_match(&root.codex, |event| match event {
+        EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+    wait_for_event(&root.codex, |event| match event {
+        EventMsg::ItemStarted(event) => match &event.item {
+            TurnItem::AgentMessage(message) => {
+                message.id
+                    == if after_final {
+                        "after-final"
+                    } else {
+                        "root-final"
+                    }
+            }
+            _ => false,
+        },
+        _ => false,
+    })
+    .await;
+    child
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Post an update.".into(),
+            text_elements: vec![],
+        }]))
+        .await?;
+    // The child's follow-up confirms fanout completed, but its final would separately notify root.
+    streaming.wait_for_request_count(/*count*/ 7).await;
+    let requests = streaming.requests().await;
+    let request: Value = serde_json::from_slice(requests.last().context("child follow-up")?)?;
+    let post = request["input"]
+        .as_array()
+        .context("child follow-up input")?
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "worker-post")
+        .context("child post result")?;
+    let post: PostMetadata = serde_json::from_str(post["output"].as_str().context("post output")?)?;
+    assert_eq!(post.author.as_str(), "/root/worker");
+    release_final.send(()).expect("release root response");
+    wait_for_event(&root.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    release_child.send(()).expect("release child response");
+    wait_for_event(&child, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    root.submit_turn("Start another turn.").await?;
+
+    let requests = streaming
+        .requests()
+        .await
+        .into_iter()
+        .map(|body| serde_json::from_slice::<Value>(&body))
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    let notification = format!("Message ID: {}", post.message_id);
+    let next_turn = requests.last().context("next root request")?["client_metadata"]["turn_id"]
+        .as_str()
+        .context("next root turn ID")?;
+    for (turn, notified) in [(target_turn.as_str(), false), (next_turn, !after_final)] {
+        let requests = requests
+            .iter()
+            .filter(|request| request["client_metadata"]["turn_id"] == turn)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests.len(),
+            1,
+            "recipient must not sample again after its final"
+        );
+        assert_eq!(
+            requests[0]["input"].to_string().contains(&notification),
+            notified
+        );
+    }
+    child.shutdown_and_wait().await?;
+    root.codex.shutdown_and_wait().await?;
+    streaming.shutdown().await;
+    Ok(())
+}
+
+#[test_case::test_case(false; "direct_messages")]
+#[test_case::test_case(true; "channels_only")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_unsubscribe_survives_post_and_resume_until_resubscribed(
+    disable_direct_message: bool,
+) -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let root = test_codex()
+        .with_config(move |config| {
+            configure(config);
+            config.multi_agent_v2.disable_direct_message = disable_direct_message;
+        })
+        .with_model_info_override("gpt-5.5", |model| {
+            model.multi_agent_version = Some(MultiAgentVersion::V2);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let posted = responses::mount_sse_sequence(
+        &server,
+        vec![
+            tool(
+                "start-discussion",
+                "post",
+                json!({"new_channel_name":"design","text":"A shared decision."}),
+            ),
+            tool(
+                "read-discussion",
+                "search_posts",
+                json!({"channel_name":"design"}),
+            ),
+            done(),
+        ],
+    )
+    .await;
+    root.submit_turn("Start a discussion.").await?;
+    let post: Value = serde_json::from_str(
+        &posted
+            .function_call_output_text("start-discussion")
+            .context("initial post result")?,
+    )?;
+    let read: Value = serde_json::from_str(
+        &posted
+            .function_call_output_text("read-discussion")
+            .context("read result")?,
+    )?;
+    assert_eq!(read["results"][0]["message_id"], post["message_id"]);
+    let thread_id = &post["thread_id"];
+    let opted_out = responses::mount_sse_sequence(
+        &server,
+        vec![
+            tool("opt-out", "unsubscribe", json!({"thread_id":thread_id})),
+            tool(
+                "last-detail",
+                "post",
+                json!({"thread_id":thread_id,"text":"One last detail."}),
+            ),
+            done(),
+        ],
+    )
+    .await;
+    root.submit_turn("Unsubscribe and add one last detail.")
+        .await?;
+    let subscription: Value = serde_json::from_str(
+        &opted_out
+            .function_call_output_text("opt-out")
+            .context("unsubscribe result")?,
+    )?;
+    assert_eq!(subscription["enabled"], false);
+    let _: PostMetadata = serde_json::from_str(
+        &opted_out
+            .function_call_output_text("last-detail")
+            .context("post after unsubscribe")?,
+    )?;
+
+    let response = |body| vec![StreamingSseChunk { gate: None, body }];
+    let (release_wait, wait_gate) = oneshot::channel();
+    let mut streams = vec![
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: sse(vec![ev_function_call_with_namespace(
+                    "spawn-worker",
+                    "collaboration",
+                    "spawn_agent",
+                    &json!({"task_name":"worker","message":"Say ready.","fork_turns":"none"})
+                        .to_string(),
+                )]),
+            },
+            StreamingSseChunk {
+                // Dispatch wait only after spawn, while keeping the completion in this batch.
+                gate: Some(wait_gate),
+                body: sse(vec![
+                    ev_function_call_with_namespace(
+                        "settle-worker",
+                        "collaboration",
+                        "wait_agent",
+                        "{}",
+                    ),
+                    ev_completed("spawn-and-wait"),
+                ]),
+            },
+        ],
+        response(done()),
+        response(done()),
+    ];
+    let mut phases = Vec::new();
+    for (phase, subscribed) in [("opted-out", false), ("resubscribed", true)] {
+        if subscribed {
+            streams.push(response(tool(
+                "opt-in",
+                "subscribe",
+                json!({"thread_id":thread_id}),
+            )));
+        }
+        let (release, gate) = oneshot::channel();
+        let mut working = ev_assistant_message(phase, "Waiting for the worker's reply.");
+        working["item"]["phase"] = json!("commentary");
+        streams.push(vec![
+            StreamingSseChunk {
+                gate: None,
+                body: sse(vec![ev_response_created(phase), working]),
+            },
+            StreamingSseChunk {
+                gate: Some(gate),
+                // TurnComplete precedes parent notification. Drain the worker's final mail
+                // before advancing phases, and force a follow-up so silence is observable.
+                body: tool(&format!("checkpoint-{phase}"), "wait_agent", json!({})),
+            },
+        ]);
+        streams.push(response(tool(
+            &format!("reply-{phase}"),
+            "post",
+            json!({"thread_id":thread_id,"text":format!("Reply while {phase}.")}),
+        )));
+        streams.push(response(done()));
+        streams.push(response(done()));
+        phases.push((phase, subscribed, release));
+    }
+    let (streaming, _) = start_streaming_sse_server(streams).await;
+    let base_url = format!("{}/v1", streaming.uri());
+    let resumed = test_codex()
+        .with_config(move |config| {
+            configure(config);
+            config.multi_agent_v2.disable_direct_message = disable_direct_message;
+            config.model_provider.base_url = Some(base_url);
+            config
+                .features
+                .disable(Feature::EnableRequestCompression)
+                .expect("read raw request bodies from the gated mock");
+        })
+        .with_model_info_override("gpt-5.5", |model| {
+            model.multi_agent_version = Some(MultiAgentVersion::V2);
+        })
+        .restart(&server, &root)
+        .await?;
+    resumed
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Spawn a worker and finish your turn.".into(),
+            text_elements: vec![],
+        }]))
+        .await?;
+    let child_id = wait_for_event_match(&resumed.codex, |event| match event {
+        EventMsg::ItemCompleted(event) => match &event.item {
+            TurnItem::SubAgentActivity(activity) if activity.id == "spawn-worker" => {
+                Some(activity.agent_thread_id)
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+    release_wait.send(()).expect("release wait after spawn");
+    wait_for_event(&resumed.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let child = resumed.thread_manager.get_thread(child_id).await?;
+    wait_for_event(&child, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert!(
+        streaming
+            .requests()
+            .await
+            .iter()
+            .any(|body| { String::from_utf8_lossy(body).contains("Message Type: FINAL_ANSWER") })
+    );
+
+    for (phase_index, (phase, subscribed, release)) in phases.into_iter().enumerate() {
+        resumed
+            .codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: format!("Observe the discussion while {phase}."),
+                text_elements: vec![],
+            }]))
+            .await?;
+        let turn_id = wait_for_event_match(&resumed.codex, |event| match event {
+            EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+            _ => None,
+        })
+        .await;
+        // The gate keeps the recipient active until the child's post and fanout finish.
+        wait_for_event(&resumed.codex, |event| {
+            matches!(event, EventMsg::ItemCompleted(event)
+                if matches!(&event.item, TurnItem::AgentMessage(message) if message.id == phase))
+        })
+        .await;
+        child
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: format!("Reply to the discussion while {phase}."),
+                text_elements: vec![],
+            }]))
+            .await?;
+        wait_for_event(&child, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        let requests = streaming
+            .requests()
+            .await
+            .iter()
+            .map(|body| serde_json::from_slice::<Value>(body))
+            .collect::<serde_json::Result<Vec<_>>>()?;
+        let reply_call = format!("reply-{phase}");
+        let output = requests
+            .iter()
+            .filter_map(|request| request["input"].as_array())
+            .flatten()
+            .find(|item| item["type"] == "function_call_output" && item["call_id"] == reply_call)
+            .context("child post output")?;
+        let reply: PostMetadata =
+            serde_json::from_str(output["output"].as_str().context("child post result")?)?;
+        assert_eq!(reply.author.as_str(), "/root/worker");
+        release.send(()).expect("release active recipient");
+        wait_for_event(&resumed.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+
+        let requests = streaming
+            .requests()
+            .await
+            .iter()
+            .map(|body| serde_json::from_slice::<Value>(body))
+            .collect::<serde_json::Result<Vec<_>>>()?;
+        // A delivered notice can start the recipient's next request before the child finishes.
+        let request = requests
+            .iter()
+            .rfind(|request| request["client_metadata"]["turn_id"] == turn_id)
+            .context("recipient request")?;
+        let input = request["input"].as_array().context("recipient input")?;
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| {
+                    item["type"] == "agent_message"
+                        && item["author"] == "/root/worker"
+                        && item["content"]
+                            .to_string()
+                            .contains("Message Type: FINAL_ANSWER")
+                })
+                .count(),
+            phase_index + 2,
+            "worker completion must be drained before leaving phase: {phase}"
+        );
+        let notices = input
+            .iter()
+            .filter(|item| {
+                item["type"] == "agent_message"
+                    && item["content"]
+                        .to_string()
+                        .contains("Message Type: CHANNEL_POST")
+            })
+            .map(|item| {
+                (
+                    item["author"].clone(),
+                    item["recipient"].clone(),
+                    item["content"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = if subscribed {
+            vec![(
+                json!("/root/worker"),
+                json!("/root"),
+                json!([{"type":"input_text","text":format!(
+                    "Message Type: CHANNEL_POST\nSender: /root/worker\nChannel: design\nMessage ID: {}\nThread ID: {}\nPayload:\nReply while {phase}.",
+                    reply.message_id, reply.thread_id,
+                )}]),
+            )]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(notices, expected, "phase: {phase}");
+    }
+    let requests = streaming.requests().await;
+    for body in &requests {
+        let request: Value = serde_json::from_slice(body)?;
+        for name in ["send_message", "followup_task"] {
+            assert_eq!(
+                responses::namespace_child_tool(&request, "collaboration", name).is_some(),
+                !disable_direct_message,
+                "{name}",
+            );
+        }
+        for name in [
+            "spawn_agent",
+            "wait_agent",
+            "interrupt_agent",
+            "list_agents",
+            "post",
+        ] {
+            assert!(
+                responses::namespace_child_tool(&request, "collaboration", name).is_some(),
+                "{name}"
+            );
+        }
+    }
+    child.shutdown_and_wait().await?;
+    resumed.codex.shutdown_and_wait().await?;
+    streaming.shutdown().await;
     Ok(())
 }
 

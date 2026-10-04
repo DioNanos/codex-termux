@@ -2,10 +2,13 @@
 
 mod backend;
 #[cfg(windows)]
+pub use backend::windows::DetachedLaunchRestricted;
+#[cfg(windows)]
 use backend::windows::try_lock_file;
 mod client;
 mod install_lock;
 mod launch;
+pub use launch::restart_with_features;
 pub use launch::start_with_features;
 mod managed_install;
 mod prepare_install;
@@ -50,7 +53,9 @@ const DAEMON_PID_FILE_NAME: &str = "daemon.pid";
 const DAEMON_UPDATE_PID_FILE_NAME: &str = "daemon-updater.pid";
 const OPERATION_LOCK_FILE_NAME: &str = "daemon.lock";
 const SETTINGS_FILE_NAME: &str = "settings.json";
-const STATE_DIR_NAME: &str = "app-server-daemon";
+// codex-termux fork (L2): dedicated state namespace so pid/lock/settings/logs of
+// this daemon never mix with the upstream daemon's (or the other fork's).
+const STATE_DIR_NAME: &str = "app-server-daemon-termux";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleCommand {
@@ -322,6 +327,9 @@ fn ensure_supported_platform() -> Result<()> {
 
 #[derive(Clone)]
 struct Daemon {
+    // Feature-aware TUI startup owns a live terminal. Direct lifecycle commands
+    // must still report their diagnostics to stderr.
+    log_diagnostics: bool,
     socket_path: PathBuf,
     pid_file: PathBuf,
     update_pid_file: PathBuf,
@@ -346,6 +354,7 @@ impl Daemon {
                 (DAEMON_PID_FILE_NAME, DAEMON_UPDATE_PID_FILE_NAME)
             };
         Ok(Self {
+            log_diagnostics: false,
             socket_path,
             pid_file: state_dir.join(pid_file),
             update_pid_file: state_dir.join(update_pid_file),
@@ -353,6 +362,14 @@ impl Daemon {
             settings_file: state_dir.join(SETTINGS_FILE_NAME),
             managed_codex_bin,
         })
+    }
+
+    fn diagnostic(&self, message: std::fmt::Arguments<'_>) {
+        if self.log_diagnostics {
+            tracing::info!("{message}");
+        } else {
+            eprintln!("{message}");
+        }
     }
 
     fn recovery_file(&self) -> Result<PathBuf> {
@@ -427,7 +444,9 @@ impl Daemon {
         } else {
             // A fresh start must ignore snapshots left by older stop clients.
             if let Err(err) = thread_recovery::discard_pending(self) {
-                eprintln!("warning: failed to clear stale daemon recovery before start: {err}");
+                self.diagnostic(format_args!(
+                    "warning: failed to clear stale daemon recovery before start: {err}"
+                ));
             }
             prepare_install::prepare(self, &settings).await?;
             managed.managed_codex_bin = self.current_managed_codex_bin()?;
@@ -449,15 +468,16 @@ impl Daemon {
         if backend.is_some()
             && let Err(err) = managed.ensure_managed_updater(&settings).await
         {
-            eprintln!("warning: failed to ensure managed updater after app-server start: {err:#}");
+            self.diagnostic(format_args!(
+                "warning: failed to ensure managed updater after app-server start: {err:#}"
+            ));
         }
         Ok(managed
             .output(status, backend, pid, Some(info.app_server_version))
             .await)
     }
 
-    async fn restart(&self) -> Result<LifecycleOutput> {
-        let settings = self.load_settings().await?;
+    async fn restart_with_settings(&self, settings: DaemonSettings) -> Result<LifecycleOutput> {
         if client::probe(&self.socket_path).await.is_ok()
             && self.running_backend(&settings).await?.is_none()
         {
@@ -484,6 +504,11 @@ impl Daemon {
                 .await?;
         }
 
+        // Persist changed launch settings only after the old process has stopped.
+        // A failed or interrupted drain must not make an unapplied change look current.
+        if self.load_settings().await? != settings {
+            settings.save(&self.settings_file).await?;
+        }
         let pid = managed.start_managed_backend(&settings).await?;
         let info = self.wait_until_ready().await?;
         if let Err(err) = managed.ensure_managed_updater(&settings).await {
@@ -922,6 +947,9 @@ impl Daemon {
         if self.managed_codex_bin.is_file() {
             #[cfg(windows)]
             backend::windows::ensure_detached_launch(&self.managed_codex_bin)?;
+            // codex-termux fork (L1): never execute a managed binary staged by
+            // upstream (or the other fork) instead of our own selection.
+            managed_install::ensure_selected_variant_is_fork(&self.managed_codex_bin)?;
             return Ok(());
         }
 
@@ -1280,6 +1308,7 @@ mod tests {
         let legacy = home.path().join("packages/standalone/current");
         std::fs::create_dir_all(&legacy).expect("legacy selection");
         let daemon = Daemon {
+            log_diagnostics: false,
             socket_path: home.path().join("server.sock"),
             pid_file: state.join(super::LEGACY_PID_FILE_NAME),
             update_pid_file: state.join(super::LEGACY_UPDATE_PID_FILE_NAME),
@@ -1313,6 +1342,7 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let state = temp.path().join("missing-home").join("daemon-state");
         let daemon = Daemon {
+            log_diagnostics: false,
             socket_path: state.join("server.sock"),
             pid_file: state.join("server.pid"),
             update_pid_file: state.join("updater.pid"),
@@ -1338,6 +1368,7 @@ mod tests {
             .await
             .expect("private state directory");
         let daemon = Daemon {
+            log_diagnostics: false,
             socket_path: home.path().join("server.sock"),
             pid_file: state.join("server.pid"),
             update_pid_file: state.join("updater.pid"),
@@ -1392,6 +1423,7 @@ mod tests {
             .expect("current local build");
         let state = home.path().join("app-server-daemon");
         let daemon = Daemon {
+            log_diagnostics: false,
             socket_path: home
                 .path()
                 .join("app-server-control/app-server-control.sock"),
@@ -1419,6 +1451,7 @@ mod tests {
     async fn not_ready_context_reports_daemon_app_server_before_stderr() {
         let temp_dir = TempDir::new().expect("temp dir");
         let daemon = Daemon {
+            log_diagnostics: false,
             socket_path: temp_dir.path().join("app-server-control.sock"),
             pid_file: temp_dir.path().join("app-server.pid"),
             update_pid_file: temp_dir.path().join("app-server-updater.pid"),

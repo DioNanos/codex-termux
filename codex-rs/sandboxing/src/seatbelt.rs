@@ -20,6 +20,9 @@ use url::Url;
 
 const MACOS_SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_base_policy.sbpl");
 const MACOS_SEATBELT_NETWORK_POLICY: &str = include_str!("seatbelt_network_policy.sbpl");
+// System libcurl needs this service for TLS; keep it out of Unix-only profiles.
+const MACOS_SEATBELT_TLS_TRUST_POLICY: &str =
+    "(allow mach-lookup (global-name \"com.apple.TrustEvaluationAgent\"))\n";
 const MACOS_SEATBELT_PREFERENCES_POLICY: &str = include_str!("seatbelt_preferences_policy.sbpl");
 const MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS: &str =
     include_str!("seatbelt_read_only_platform_defaults.sbpl");
@@ -343,6 +346,9 @@ fn dynamic_network_policy_for_network(
                 "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
             ));
         }
+        if proxy.allow_local_binding || !proxy.ports.is_empty() {
+            policy.push_str(MACOS_SEATBELT_TLS_TRUST_POLICY);
+        }
         let unix_socket_policy = unix_socket_policy(proxy);
         if !unix_socket_policy.is_empty() {
             policy.push_str("; allow unix domain sockets for local IPC\n");
@@ -371,7 +377,7 @@ fn dynamic_network_policy_for_network(
             policy.push_str("; allow unix domain sockets for local IPC\n");
             policy.push_str(&unix_socket_policy);
         }
-        format!("{policy}{MACOS_SEATBELT_NETWORK_POLICY}")
+        format!("{policy}{MACOS_SEATBELT_NETWORK_POLICY}{MACOS_SEATBELT_TLS_TRUST_POLICY}")
     } else {
         String::new()
     }
@@ -423,30 +429,7 @@ fn nested_symlink_component(path: &Path) -> Option<&Path> {
 fn normalize_top_level_alias_for_sandbox(
     path: AbsolutePathBuf,
 ) -> Result<AbsolutePathBuf, SeatbeltPreparationError> {
-    let Some(top_level) = path.as_path().ancestors().find(|ancestor| {
-        ancestor.parent().is_some() && ancestor.parent().and_then(Path::parent).is_none()
-    }) else {
-        return Ok(path);
-    };
-    if !std::fs::symlink_metadata(top_level).is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Ok(path);
-    }
-
-    let canonical_top_level = top_level.canonicalize().map_err(|err| {
-        SeatbeltPreparationError::FileSystem(format!(
-            "failed to normalize top-level alias {} for Seatbelt: {err}",
-            top_level.display()
-        ))
-    })?;
-    let suffix = path.as_path().strip_prefix(top_level).map_err(|err| {
-        SeatbeltPreparationError::FileSystem(format!(
-            "failed to preserve path {} after normalizing {}: {err}",
-            path.display(),
-            top_level.display()
-        ))
-    })?;
-    AbsolutePathBuf::from_absolute_path(canonical_top_level.join(suffix)).map_err(|err| {
+    path.normalize_system_aliases().map_err(|err| {
         SeatbeltPreparationError::FileSystem(format!(
             "failed to normalize top-level alias for path {}: {err}",
             path.display()
@@ -661,12 +644,28 @@ fn build_seatbelt_unreadable_glob_policy(
             patterns.insert(pattern);
         }
         for pattern in patterns {
-            let Some(regex) = seatbelt_regex_for_unreadable_glob(&pattern) else {
+            // A root-anchored recursive literal basename remains denied after any
+            // ancestor move, including for files created after policy generation.
+            // Scoped or multi-component patterns still need ancestor protection.
+            let global_literal_basename = pattern.strip_prefix("/**/").is_some_and(|name| {
+                !matches!(name, "" | "." | "..")
+                    && !name.contains(['/', '*', '?', '[', ']', '{', '}', '\\'])
+            });
+            let Some(mut regex) = seatbelt_regex_for_unreadable_glob(&pattern) else {
                 continue;
             };
+            if global_literal_basename {
+                // Replace the compiler's end anchor to also protect descendants
+                // when the matching basename belongs to a directory.
+                regex.pop();
+                regex.push_str("(/.*)?$");
+            }
             let regex = regex.replace('"', "\\\"");
             policy_components.push(format!(r#"(deny file-read* (regex #"{regex}"))"#));
             policy_components.push(format!(r#"(deny file-write* (regex #"{regex}"))"#));
+            if global_literal_basename {
+                continue;
+            }
             for ancestor in Path::new(&pattern).ancestors().skip(1) {
                 let Some(regex) = ancestor
                     .to_str()
@@ -1120,3 +1119,7 @@ mod daemon_socket_tests;
 #[cfg(test)]
 #[path = "seatbelt_fcntl_tests.rs"]
 mod fcntl_tests;
+
+#[cfg(test)]
+#[path = "seatbelt_tls_tests.rs"]
+mod tls_tests;

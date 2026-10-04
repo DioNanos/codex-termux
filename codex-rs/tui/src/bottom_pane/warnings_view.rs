@@ -1,23 +1,31 @@
 //! A frozen set of warnings, shown one at a time without changing the retained draft.
+//! On intentional close, dismiss only warnings actually drawn, unless the user kept them.
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::history_cell::WarningEntry;
+use crate::key_hint;
 use crate::key_hint::KeyBindingListExt;
 use crate::keymap::KeymapContext;
 use crate::keymap::KeymapContextSet;
 use crate::keymap::ListAction;
 use crate::keymap::RuntimeKeymap;
+use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use std::cell::Cell;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 #[path = "warnings_view_render.rs"]
 mod render;
 
 pub(super) struct WarningsView {
     entries: Vec<WarningEntry>,
+    transcript: Arc<()>,
     current: usize,
+    visited: Vec<Cell<bool>>,
+    kept: BTreeSet<usize>,
     offset: Cell<usize>,
     page_size: Cell<usize>,
     max_offset: Cell<usize>,
@@ -30,12 +38,16 @@ pub(super) struct WarningsView {
 impl WarningsView {
     pub(super) fn new(
         entries: Vec<WarningEntry>,
+        transcript: Arc<()>,
         keymap: RuntimeKeymap,
         tx: AppEventSender,
     ) -> Self {
         Self {
+            visited: vec![Cell::new(/*value*/ false); entries.len()],
             entries,
+            transcript,
             current: 0,
+            kept: BTreeSet::new(),
             offset: Cell::new(/*value*/ 0),
             page_size: Cell::new(/*value*/ 1),
             max_offset: Cell::new(/*value*/ 0),
@@ -54,19 +66,46 @@ impl WarningsView {
         KeymapContextSet::warnings()
     }
 
+    pub(super) fn close(self) {
+        let mut dismissed = Vec::new();
+        let mut kept = Vec::new();
+        for (index, (entry, visited)) in self.entries.into_iter().zip(self.visited).enumerate() {
+            if self.kept.contains(&index) {
+                kept.push(entry);
+            } else if visited.get() {
+                dismissed.push(entry);
+            }
+        }
+        if !dismissed.is_empty() || !kept.is_empty() {
+            self.tx.send(AppEvent::UpdateWarnings {
+                transcript: self.transcript,
+                dismissed,
+                kept,
+            });
+        }
+    }
+
     /// Returns true when the user closes the viewer. No key is forwarded to the draft.
     pub(super) fn handle_key(&mut self, event: KeyEvent) -> bool {
         if event.kind == KeyEventKind::Release {
             return false;
         }
-        let action = self
-            .keymap
-            .list
-            .action_for(event)
-            .filter(|action| *action != ListAction::Accept);
-        if action.is_none() && self.keymap.app.open_warnings.is_pressed(event)
-            || self.keymap.list.cancel.is_pressed(event)
-        {
+        let action = if key_hint::plain(KeyCode::Char('k')).is_press(event) {
+            if event.kind != KeyEventKind::Press {
+                return false;
+            }
+            self.kept.insert(self.current);
+            if self.current + 1 >= self.entries.len() {
+                return true;
+            }
+            Some(ListAction::MoveRight)
+        } else {
+            self.keymap
+                .list
+                .action_for(event)
+                .filter(|action| *action != ListAction::Accept)
+        };
+        if action.is_none() && self.keymap.app.open_warnings.is_pressed(event) {
             return true;
         }
         if action.is_none() && self.keymap.app.copy.is_pressed(event) {

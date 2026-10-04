@@ -9,6 +9,7 @@ mod apply_patch;
 mod apps;
 mod client;
 mod client_common;
+mod model_request;
 mod realtime_context;
 mod realtime_conversation;
 mod realtime_history;
@@ -57,17 +58,11 @@ pub use agent::api::AgentConfigUpdate;
 pub use agent::api::AgentControl;
 pub use agent::api::AgentInfo;
 pub use agent::api::AgentInput;
-pub use agent::api::AgentPage;
-pub use agent::api::AgentQuery;
-pub use agent::api::AgentScope;
 pub use agent::api::AgentTarget;
 pub use agent::api::AgentTurnOutcome;
-pub use agent::api::AgentVisibility;
-pub use agent::api::ControlIdentity;
 pub use agent::api::DeliveryReceipt;
 pub use agent::api::SendRequest;
 pub use agent::api::SpawnRequest;
-pub use agent::api::StatusSubscription;
 pub use agent::types::AgentExecutionGuard;
 pub use agent::types::AgentMessage;
 pub use agent::types::AgentMetadata;
@@ -133,7 +128,6 @@ pub(crate) mod mentions {
 mod sandbox_tags;
 pub mod sandboxing;
 mod session_prefix;
-mod session_startup_prewarm;
 mod skills;
 pub(crate) use skills::maybe_emit_implicit_skill_invocation;
 pub(crate) use skills::skills_load_input_from_config;
@@ -249,3 +243,4 @@ pub mod otel_init;
 
 // Captured environment bindings can be passed back to ThreadManager by internal reviewers.
 pub use environment_selection::TurnEnvironmentSnapshot;
+pub use environment_selection::validate_environment_ids_and_cwds;

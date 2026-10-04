@@ -5,6 +5,8 @@
 //! [`crate::rmcp_client`] and connection-set behavior lives in
 //! [`crate::connection_manager`].
 
+mod status;
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -49,6 +51,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::McpConfig;
 use crate::binding::McpBinding;
+use crate::binding::PreparedMcpCall;
 use crate::client_tool_catalog::CodexAppsToolSnapshot;
 use crate::connection_manager::BindingCatalogRevision;
 use crate::connection_manager::McpConnectionSet;
@@ -417,12 +420,13 @@ impl McpRuntime {
         required_servers: &[String],
         required_plugins: &HashSet<String>,
     ) -> Option<Arc<McpBinding>> {
-        Self::binding_from_published_runtime(
-            self.current.load_full(),
+        let current = self.current.load_full();
+        current.connections.record_startup_readiness(
+            "model_binding",
             required_servers,
             required_plugins,
-        )
-        .await
+        );
+        Self::binding_from_published_runtime(current, required_servers, required_plugins).await
     }
 
     async fn binding_from_published_runtime(
@@ -532,6 +536,16 @@ impl McpRuntime {
             .connections
             .wait_for_server_startup(server)
             .await;
+    }
+
+    /// Prepares one advertised tool against this publication's current client and policy.
+    /// Its model-visible name stays fixed while execution metadata comes from the live catalog.
+    pub async fn prepare_call(&self, advertised_tool: &ToolInfo) -> Option<PreparedMcpCall> {
+        let current = self.current.load_full();
+        current
+            .connections
+            .prepare_call_for_tool(Arc::clone(current.config.as_ref()?), advertised_tool)
+            .await
     }
 
     /// Captures the current runtime after its selected server has finished startup.
@@ -948,7 +962,9 @@ mod tests {
             environment_id: environment_id.to_string(),
             enabled: true,
             required: false,
+            startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,

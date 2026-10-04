@@ -262,6 +262,7 @@ pub struct NetworkProxyState {
     state: Arc<RwLock<ConfigState>>,
     /// Belongs to this proxy; config retains omission for launches on other executors.
     pub(crate) local_binding_policy: LocalBindingPolicy,
+    pub(crate) proxy_private_ips_via_upstream: bool,
     reloader: Arc<dyn ConfigReloader>,
     blocked_request_observer: Arc<RwLock<Option<Arc<dyn BlockedRequestObserver>>>>,
     pub(crate) policy_audit_observer: Option<NetworkPolicyAuditObserver>,
@@ -300,6 +301,7 @@ impl Clone for NetworkProxyState {
         Self {
             state: self.state.clone(),
             local_binding_policy: self.local_binding_policy,
+            proxy_private_ips_via_upstream: self.proxy_private_ips_via_upstream,
             reloader: self.reloader.clone(),
             blocked_request_observer: self.blocked_request_observer.clone(),
             policy_audit_observer: self.policy_audit_observer.clone(),
@@ -315,6 +317,12 @@ impl Clone for NetworkProxyState {
 }
 
 impl NetworkProxyState {
+    /// Selects routing for permitted private IPs without changing destination policy.
+    /// Set by the execution host, independently of reloadable or remote policy.
+    pub fn set_proxy_private_ips_via_upstream(&mut self, enabled: bool) {
+        self.proxy_private_ips_via_upstream = enabled;
+    }
+
     /// Builds runtime state for one executor-local proxy launch.
     /// The launching executor supplies its own OS; the wire policy cannot override it.
     pub fn from_remote_launch_config(
@@ -397,6 +405,7 @@ impl NetworkProxyState {
             credential_broker,
             state: Arc::new(RwLock::new(state)),
             local_binding_policy,
+            proxy_private_ips_via_upstream: false,
             reloader,
             blocked_request_observer: Arc::new(RwLock::new(blocked_request_observer)),
             policy_audit_observer: None,

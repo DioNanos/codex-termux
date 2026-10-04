@@ -12,6 +12,7 @@ use std::path::PathBuf;
 fn daemon(home: &std::path::Path) -> crate::Daemon {
     let state = home.join("app-server-daemon");
     crate::Daemon {
+        log_diagnostics: false,
         socket_path: state.join("app-server.sock"),
         pid_file: state.join("app-server.pid"),
         update_pid_file: state.join("app-server-updater.pid"),
@@ -19,6 +20,54 @@ fn daemon(home: &std::path::Path) -> crate::Daemon {
         settings_file: state.join("settings.json"),
         managed_codex_bin: crate::managed_install::managed_codex_bin(home),
     }
+}
+
+#[cfg(target_os = "android")]
+#[tokio::test]
+async fn prepare_reuses_termux_binary_outside_managed_packages() {
+    let temp = tempfile::TempDir::new().expect("temp");
+    let home = temp.path().join("home");
+    let npm_bin = temp.path().join("npm/bin/codex.bin");
+    std::fs::create_dir_all(npm_bin.parent().unwrap()).expect("npm bin directory");
+    std::fs::write(&npm_bin, b"bundled ELF").expect("npm binary");
+    // L1 (ensure_selected_variant_is_fork) reads codex-package.json beside the
+    // npm package root before reusing the launcher-selected binary, so the
+    // packaged manifest must travel with the tarball.
+    std::fs::write(
+        npm_bin
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("codex-package.json"),
+        serde_json::json!({
+            "layoutVersion": 1,
+            "variant": "codex-termux",
+            "target": "aarch64-linux-android",
+            "entrypoint": "bin/codex.bin"
+        })
+        .to_string(),
+    )
+    .expect("npm package manifest");
+    let mut daemon = daemon(&home);
+    daemon.managed_codex_bin = npm_bin.clone();
+
+    super::prepare(&daemon, &DaemonSettings::default())
+        .await
+        .expect("reuse npm binary with the packaged variant manifest");
+    assert!(!home.join("packages").exists());
+    assert_eq!(std::fs::read(&npm_bin).unwrap(), b"bundled ELF");
+
+    std::fs::remove_file(&npm_bin).expect("remove npm binary");
+    let error = super::prepare(&daemon, &DaemonSettings::default())
+        .await
+        .expect_err("missing npm binary must still fail");
+    assert!(
+        error
+            .to_string()
+            .contains("managed Codex Termux install not found")
+    );
+    assert!(!home.join("packages").exists());
 }
 
 fn package(root: &Path, version: &str) -> PathBuf {
@@ -52,7 +101,7 @@ fn package(root: &Path, version: &str) -> PathBuf {
     std::fs::write(
         root.join("codex-package.json"),
         serde_json::json!({
-            "version": version, "target": target, "entrypoint": "bin/codex"
+            "version": version, "target": target, "variant": "codex-termux", "entrypoint": "bin/codex"
         })
         .to_string(),
     )

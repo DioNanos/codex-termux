@@ -500,7 +500,7 @@ async fn completed_plan_table_tail_skips_provisional_history_insert() {
 async fn configured_pet_load_is_deferred_until_after_construction() {
     let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
     let tx = AppEventSender::new(tx_raw);
-    let mut cfg = test_config().await;
+    let (_codex_home, mut cfg) = test_config().await;
     cfg.tui_pet = Some(crate::pets::DEFAULT_PET_ID.to_string());
     crate::pets::write_test_pack(&cfg.codex_home);
     let resolved_model = get_model_offline_for_tests(cfg.model.as_deref());
@@ -2377,47 +2377,6 @@ async fn commentary_completion_restores_status_indicator_before_exec_begin() {
     assert_eq!(chat.bottom_pane.status_indicator_visible(), true);
 }
 
-#[tokio::test]
-async fn fast_status_indicator_requires_chatgpt_auth() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
-    set_fast_mode_test_catalog(&mut chat);
-    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
-    chat.set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
-
-    assert!(!chat.should_show_fast_status(chat.current_model(), chat.current_service_tier(),));
-
-    set_chatgpt_auth(&mut chat);
-    set_fast_mode_test_catalog(&mut chat);
-    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
-
-    assert!(chat.should_show_fast_status(chat.current_model(), chat.current_service_tier(),));
-}
-
-#[tokio::test]
-async fn fast_status_indicator_is_hidden_for_models_without_fast_support() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
-    set_fast_mode_test_catalog(&mut chat);
-    assert!(!get_available_model(&chat, "gpt-5.2").supports_fast_mode());
-    chat.set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
-    set_chatgpt_auth(&mut chat);
-    set_fast_mode_test_catalog(&mut chat);
-    assert!(!get_available_model(&chat, "gpt-5.2").supports_fast_mode());
-
-    assert!(!chat.should_show_fast_status(chat.current_model(), chat.current_service_tier(),));
-}
-
-#[tokio::test]
-async fn fast_status_indicator_is_hidden_when_fast_mode_is_off() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
-    set_fast_mode_test_catalog(&mut chat);
-    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
-    set_chatgpt_auth(&mut chat);
-    set_fast_mode_test_catalog(&mut chat);
-    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
-
-    assert!(!chat.should_show_fast_status(chat.current_model(), chat.current_service_tier(),));
-}
-
 // Snapshot test: ChatWidget at very small heights (idle)
 // Ensures overall layout behaves when terminal height is extremely constrained.
 #[tokio::test]
@@ -4023,7 +3982,7 @@ async fn status_line_model_with_reasoning_includes_fast_for_fast_capable_models(
 
 #[tokio::test]
 async fn terminal_title_model_updates_on_model_change_without_manual_refresh() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.local_settings.tui.terminal_title = Some(vec!["model".to_string()]);
     chat.refresh_terminal_title();
 
@@ -4228,7 +4187,7 @@ async fn status_line_goal_active_token_budget_footer_snapshot() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.set_feature_enabled(Feature::Goals, /*enabled*/ true);
     chat.show_welcome_banner = false;
     chat.local_settings.tui.status_line = Some(vec!["model-name".to_string()]);
@@ -4265,7 +4224,7 @@ async fn status_line_goal_complete_elapsed_footer_snapshot() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.set_feature_enabled(Feature::Goals, /*enabled*/ true);
     chat.show_welcome_banner = false;
     chat.local_settings.tui.status_line = Some(vec!["model-name".to_string()]);
@@ -5678,6 +5637,7 @@ async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
         &mut chat,
         AppServerThreadItem::CommandExecution {
             model_context: None,
+            sandbox_type: None,
             id: "c1".into(),
             command: codex_shell_command::parse_command::shlex_join(&command),
             cwd: cwd.clone().into(),
@@ -5696,6 +5656,7 @@ async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
         &mut chat,
         AppServerThreadItem::CommandExecution {
             model_context: None,
+            sandbox_type: None,
             id: "c1".into(),
             command: codex_shell_command::parse_command::shlex_join(&command),
             cwd: cwd.into(),

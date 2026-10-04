@@ -38,7 +38,10 @@ impl ReviewAction {
         let category = action.guardian_scope();
         let original = serde_json::to_value(&action).map_err(|error| error.to_string());
         match action.into_guardian_request(exec_command_cwd_convention) {
-            Ok(request) => Self::from(request),
+            Ok(request) => Self {
+                category,
+                ..Self::from(request)
+            },
             Err(error) => Self {
                 action: original,
                 category,
@@ -58,13 +61,7 @@ impl ReviewAction {
             tracing::error!(%error, "failed to build automatic approval action");
             ReviewDecision::denied("automatic approval review could not prepare the action")
         })?;
-        let environment_id =
-            if let GuardianApprovalRequest::WriteStdin { environment_id, .. } = request {
-                Some(environment_id.as_str())
-            } else {
-                request.background_environment_id()
-            };
-        if let Some(environment_id) = environment_id
+        if let Some(environment_id) = request.target_environment_id()
             && !context
                 .environments()
                 .turn_environments()

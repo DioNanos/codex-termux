@@ -1,4 +1,3 @@
-use super::step_context::StepInputs;
 use super::step_settings::ResolvedStepSettings;
 use super::token_budget::has_explicit_settings;
 use super::token_budget::resolve_token_budget;
@@ -26,7 +25,6 @@ use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::openai_models::MODEL_SPECIALTY_CYBER;
 use codex_protocol::openai_models::ModelInfo;
-use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::permissions::RawFileSystemSandboxPolicy;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
@@ -197,7 +195,9 @@ impl TurnEnvironment {
             }
             None
         } else {
-            self.shell_snapshot.peek()?.clone()
+            self.shell_snapshot.peek()?.clone().filter(|snapshot| {
+                &snapshot.shell_environment_policy == self.shell_environment_policy()
+            })
         }
     }
 
@@ -306,6 +306,7 @@ pub(crate) struct NewTurnContextOptions {
 pub struct TurnContext {
     pub(crate) sub_id: String,
     pub(crate) trace_id: Option<String>,
+    /// Call state at turn creation; model requests use the `StepContext` snapshot.
     pub(crate) realtime_active: bool,
     pub(crate) code_mode_available: bool,
     /// Turn-scoped configuration. Read step-specific settings such as service tier and
@@ -322,8 +323,8 @@ pub struct TurnContext {
     /// Thread-owned plugin selection captured when this turn was admitted.
     pub(crate) disabled_plugin_ids: Vec<String>,
     pub(super) active_host_plugin_identities: Option<Vec<PluginIdentity>>,
-    /// Inputs for the next step; request consumers use their captured StepContext.
-    pub(super) next_step_input: ArcSwap<StepInputs>,
+    /// Settings for the next step; environments are owned by `ThreadEnvironments`.
+    pub(super) next_step_settings: ArcSwap<ResolvedStepSettings>,
     /// Turn-wide telemetry; model-attributed step work should use `StepContext::session_telemetry`.
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) provider: SharedModelProvider,
@@ -332,7 +333,7 @@ pub struct TurnContext {
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) originator: String,
     /// Initial selection retained for legacy turn consumers. Step work uses StepContext.
-    // TODO(sayan): Migrate all remaining consumers to next_step_input's environments.
+    // TODO(sayan): Migrate remaining step consumers to their StepContext's environments.
     pub(crate) initial_environments: TurnEnvironmentSnapshot,
     /// The session's absolute working directory. All relative paths provided
     /// by the model as well as sandbox policies are resolved against this path
@@ -373,16 +374,15 @@ enum TurnContextBuildMode {
     /// shared model/multi-agent metadata.
     StartupPrewarm,
 
-    /// Resolves and stores model/multi-agent metadata but skips skill discovery.
-    /// Only for injecting items into an initialized thread; must not initialize
-    /// context or capture an execution step.
+    /// Captures recording settings without updating shared model/multi-agent metadata
+    /// or discovering skills. Must not initialize context or capture an execution step.
     InjectItems,
 }
 
 impl TurnContext {
     /// Captures current model metadata without preparing a step.
     pub(crate) fn capture_current_model_info(&self) -> Arc<ModelInfo> {
-        Arc::clone(&self.next_step_input.load().settings.model_info)
+        Arc::clone(&self.next_step_settings.load().model_info)
     }
 
     /// Legacy: returns the frozen initial-turn model metadata.
@@ -693,10 +693,7 @@ impl TurnContext {
             initial_settings: Arc::clone(&step_settings),
             disabled_plugin_ids: self.disabled_plugin_ids.clone(),
             active_host_plugin_identities: self.active_host_plugin_identities.clone(),
-            next_step_input: ArcSwap::from_pointee(StepInputs {
-                settings: step_settings,
-                environments: self.initial_environments.clone(),
-            }),
+            next_step_settings: ArcSwap::from(step_settings),
             session_telemetry,
             provider: self.provider.clone(),
             session_source: self.session_source.clone(),
@@ -958,7 +955,10 @@ impl Session {
             use_model_token_budget_defaults,
             model_info,
         );
-        if step_settings.reasoning_effort() == Some(&ReasoningEffort::Persistent) {
+        if per_turn_config
+            .features
+            .persistent_execution_enabled(step_settings.reasoning_effort())
+        {
             super::time_reminder::apply_persistent_defaults(&mut per_turn_config);
         }
         per_turn_config.service_tier = step_settings.service_tier.clone();
@@ -1012,10 +1012,7 @@ impl Session {
             initial_settings: Arc::clone(&step_settings),
             disabled_plugin_ids: session_configuration.disabled_plugin_ids.clone(),
             active_host_plugin_identities: None,
-            next_step_input: ArcSwap::from_pointee(StepInputs {
-                settings: step_settings,
-                environments: environments.clone(),
-            }),
+            next_step_settings: ArcSwap::from(step_settings),
             session_telemetry: session_telemetry_for_context,
             provider,
             session_source,
@@ -1183,17 +1180,19 @@ impl Session {
             )
             .await;
         let multi_agent_version = match build_mode {
-            TurnContextBuildMode::Full | TurnContextBuildMode::InjectItems => {
-                // A background preview must not overwrite a newer turn's model metadata.
+            TurnContextBuildMode::Full => {
+                // Only execution and initial context creation publish model metadata.
                 self.services
                     .thread_extension_data
                     .insert(model_info.clone());
                 self.resolve_multi_agent_version_for_model(&model_info, &per_turn_config)
             }
-            TurnContextBuildMode::StartupPrewarm => per_turn_config.multi_agent_version_for_model(
-                self.multi_agent_version()
-                    .or(model_info.multi_agent_version),
-            ),
+            TurnContextBuildMode::StartupPrewarm | TurnContextBuildMode::InjectItems => {
+                per_turn_config.multi_agent_version_for_model(
+                    self.multi_agent_version()
+                        .or(model_info.multi_agent_version),
+                )
+            }
         };
         let plugins_input = per_turn_config.plugins_config_input();
         let plugin_outcome = self

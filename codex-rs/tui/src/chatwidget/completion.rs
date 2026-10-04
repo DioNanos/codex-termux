@@ -28,8 +28,7 @@ impl ChatWidget {
                 } else {
                     None
                 }
-            })
-            .filter(|seconds| *seconds > 60);
+            });
         let completed_at = turn
             .completed_at
             .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, /*nsecs*/ 0))

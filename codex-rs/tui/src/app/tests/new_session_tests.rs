@@ -30,7 +30,7 @@ async fn new_session_preserves_vim_line_yank() -> Result<()> {
     )
     .await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    app.start_fresh_session_with_summary_hint(
+    app.start_fresh_session(
         &mut tui,
         &mut server,
         /*session_start_source*/ None,
@@ -148,7 +148,7 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
             _ => {}
         }
         let mut tui = crate::tui::test_support::make_test_tui()?;
-        app.start_fresh_session_with_summary_hint(
+        app.start_fresh_session(
             &mut tui,
             &mut server,
             /*session_start_source*/ None,
@@ -170,7 +170,9 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
         );
         assert_eq!(
             recorded_params(&requests, "config/read"),
-            vec![serde_json::json!({"cwd": server_config.cwd.display().to_string()})],
+            vec![
+                serde_json::json!({"cwd": server_config.cwd.display().to_string(), "includeLayers": true})
+            ],
         );
         if explicit == "saved" {
             let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 80)
@@ -215,7 +217,7 @@ async fn replacement_failure_keeps_current_task_and_restores_input() -> Result<(
             std::fs::write(home.path().join("config.toml"), "invalid = [")?;
         }
         let mut tui = crate::tui::test_support::make_test_tui()?;
-        app.start_fresh_session_with_summary_hint(
+        app.start_fresh_session(
             &mut tui,
             &mut server,
             /*session_start_source*/ None,
@@ -283,7 +285,7 @@ async fn replacement_preserves_remote_launch_paths_and_older_servers() -> Result
         .await?;
         let mut server = server.with_remote_cwd_override(remote_cwd.clone());
         let mut tui = crate::tui::test_support::make_test_tui()?;
-        app.start_fresh_session_with_summary_hint(
+        app.start_fresh_session(
             &mut tui,
             &mut server,
             /*session_start_source*/ None,
@@ -293,7 +295,7 @@ async fn replacement_preserves_remote_launch_paths_and_older_servers() -> Result
         .await;
         assert_eq!(
             recorded_params(&requests, "config/read"),
-            vec![serde_json::json!({"cwd": "."}),]
+            vec![serde_json::json!({"cwd": ".", "includeLayers": true}),]
         );
         let starts = recorded_params(&requests, "thread/start");
         assert_eq!(starts.len(), 1);

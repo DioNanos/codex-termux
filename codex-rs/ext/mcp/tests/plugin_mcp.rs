@@ -21,8 +21,8 @@ use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ExtensionRegistryBuilder;
-use codex_extension_api::McpServerContribution;
 use codex_extension_api::McpServerContributionContext;
+use codex_extension_api::SelectedPluginContribution;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_mcp_extension::PluginProviders;
@@ -60,6 +60,7 @@ struct ContributionSummary {
     name: String,
     plugin_id: String,
     plugin_display_name: String,
+    source_environment_id: String,
     selection_order: usize,
     enabled: bool,
 }
@@ -68,6 +69,7 @@ struct ContributionSummary {
 struct PackageSummary {
     plugin_id: String,
     plugin_display_name: String,
+    source_environment_id: String,
     connector_ids: Vec<String>,
 }
 
@@ -120,6 +122,7 @@ command = "expected-command"
                 name: "allowed".to_string(),
                 plugin_id: "selected-root".to_string(),
                 plugin_display_name: "Selected Demo".to_string(),
+                source_environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                 selection_order: 0,
                 enabled: true,
             },
@@ -127,6 +130,7 @@ command = "expected-command"
                 name: "mismatched".to_string(),
                 plugin_id: "selected-root".to_string(),
                 plugin_display_name: "Selected Demo".to_string(),
+                source_environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                 selection_order: 0,
                 enabled: false,
             },
@@ -134,6 +138,7 @@ command = "expected-command"
                 name: "unlisted".to_string(),
                 plugin_id: "selected-root".to_string(),
                 plugin_display_name: "Selected Demo".to_string(),
+                source_environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                 selection_order: 0,
                 enabled: false,
             },
@@ -163,28 +168,22 @@ async fn selected_plugin_package_is_contributed_without_servers_or_connectors() 
         .await?;
 
     let contributions = raw_selected_plugin_contributions(&config, plugin_root.path()).await?;
-    let package = contributions.into_iter().find_map(|contribution| {
-        let McpServerContribution::SelectedPluginPackage {
+    let package = contributions
+        .into_iter()
+        .next()
+        .map(|(_, plugin_id, contribution)| PackageSummary {
             plugin_id,
-            plugin_display_name,
-            connector_ids,
-            ..
-        } = contribution
-        else {
-            return None;
-        };
-        Some(PackageSummary {
-            plugin_id,
-            plugin_display_name,
-            connector_ids,
-        })
-    });
+            plugin_display_name: contribution.plugin_display_name,
+            source_environment_id: contribution.source_environment_id,
+            connector_ids: contribution.connector_ids,
+        });
 
     assert_eq!(
         package,
         Some(PackageSummary {
             plugin_id: "selected-root".to_string(),
             plugin_display_name: "Skill Only".to_string(),
+            source_environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
             connector_ids: Vec::new(),
         })
     );
@@ -223,8 +222,10 @@ plugins = false
     assert!(
         matches!(
             direct.as_slice(),
-            [McpServerContribution::SelectedPluginPackage { selected_root_id, .. }]
+            [(selected_root_id, _, contribution)]
                 if selected_root_id == "selected-root"
+                    && contribution.source_environment_id == LOCAL_ENVIRONMENT_ID
+                    && contribution.servers.is_empty()
         ),
         "managed Plugins disable should preserve only the direct selected-root identity"
     );
@@ -237,8 +238,10 @@ plugins = false
     assert!(
         matches!(
             discovered.as_slice(),
-            [McpServerContribution::SelectedPluginPackage { selected_root_id, .. }]
+            [(selected_root_id, _, contribution)]
                 if selected_root_id == "selected-root"
+                    && contribution.source_environment_id == LOCAL_ENVIRONMENT_ID
+                    && contribution.servers.is_empty()
         ),
         "managed Plugins disable should preserve only the discovered selected-root identity"
     );
@@ -310,10 +313,7 @@ default_tools_approval_mode = "auto"
     let mut servers = raw_selected_plugin_contributions(&config, plugin_root.path())
         .await?
         .into_iter()
-        .filter_map(|contribution| match contribution {
-            McpServerContribution::SelectedPlugin { name, config, .. } => Some((name, config)),
-            _ => None,
-        })
+        .flat_map(|(_, _, contribution)| contribution.servers)
         .collect::<HashMap<_, _>>();
     let server = servers
         .remove("first")
@@ -373,6 +373,13 @@ default_tools_approval_mode = "auto"
         .expect("test config should allow feature update");
     let high_level = selected_plugin_contributions(&config, plugin_root.path()).await?;
 
+    assert_eq!(
+        existing
+            .iter()
+            .map(|contribution| contribution.source_environment_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![LOCAL_ENVIRONMENT_ID, LOCAL_ENVIRONMENT_ID]
+    );
     assert_eq!(high_level, existing);
     Ok(())
 }
@@ -384,27 +391,19 @@ async fn selected_plugin_contributions(
     Ok(raw_selected_plugin_contributions(config, plugin_root)
         .await?
         .into_iter()
-        .filter_map(|contribution| match contribution {
-            McpServerContribution::SelectedPlugin {
-                name,
-                plugin_id,
-                plugin_display_name,
-                selection_order,
-                config,
-            } => Some(ContributionSummary {
-                name,
-                plugin_id,
-                plugin_display_name,
-                selection_order,
-                enabled: config.enabled,
-            }),
-            McpServerContribution::SelectedPluginPackage { .. } => None,
-            McpServerContribution::Set { .. }
-            | McpServerContribution::SetWithProtocolMode { .. }
-            | McpServerContribution::HostedApps { .. }
-            | McpServerContribution::Remove { .. } => {
-                panic!("expected selected plugin contribution")
-            }
+        .enumerate()
+        .flat_map(|(selection_order, (_, plugin_id, contribution))| {
+            contribution
+                .servers
+                .into_iter()
+                .map(move |(name, config)| ContributionSummary {
+                    name,
+                    plugin_id: plugin_id.clone(),
+                    plugin_display_name: contribution.plugin_display_name.clone(),
+                    source_environment_id: contribution.source_environment_id.clone(),
+                    selection_order,
+                    enabled: config.enabled,
+                })
         })
         .collect())
 }
@@ -412,7 +411,7 @@ async fn selected_plugin_contributions(
 async fn raw_selected_plugin_contributions(
     config: &Config,
     plugin_root: &std::path::Path,
-) -> Result<Vec<McpServerContribution>, Box<dyn std::error::Error>> {
+) -> Result<Vec<(String, String, SelectedPluginContribution)>, Box<dyn std::error::Error>> {
     let mut builder = ExtensionRegistryBuilder::new();
     let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
     codex_mcp_extension::install_plugins(&mut builder, Arc::clone(&environment_manager));
@@ -439,8 +438,8 @@ async fn raw_selected_plugin_contributions(
         None
     };
 
-    let contributions = registry.mcp_server_contributors()[0]
-        .contribute(McpServerContributionContext::for_step(
+    let selected = registry.mcp_server_contributors()[0]
+        .selected_plugins(McpServerContributionContext::for_step(
             config,
             &thread_init,
             &thread_store,
@@ -449,6 +448,10 @@ async fn raw_selected_plugin_contributions(
             executor_capability_discovery.as_ref(),
         ))
         .await;
+    let mut contributions = Vec::new();
+    for plugin in selected {
+        contributions.push((plugin.selected_root_id, plugin.plugin_id, plugin.mcp.await));
+    }
     Ok(contributions)
 }
 

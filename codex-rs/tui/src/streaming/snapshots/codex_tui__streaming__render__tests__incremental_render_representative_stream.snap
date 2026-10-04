@@ -53,14 +53,14 @@ expression: render.lines
     },
     HyperlinkLine {
         line: Line::from_iter([
-            Span::from("1. ").fg(Color::Rgb(99, 168, 248)),
+            Span::from("1. ").light_blue(),
             Span::from("First item"),
         ]),
         hyperlinks: [],
     },
     HyperlinkLine {
         line: Line::from_iter([
-            Span::from("2. ").fg(Color::Rgb(99, 168, 248)),
+            Span::from("2. ").light_blue(),
             Span::from("Second item"),
         ]),
         hyperlinks: [],

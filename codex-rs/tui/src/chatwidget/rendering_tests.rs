@@ -86,6 +86,8 @@ async fn owned_bottom_pane_preserves_draft_cursor_and_read_only_notice() {
         let bottom = widget.bottom_pane_renderable(
             /*footer*/ None,
             crate::bottom_pane::CommandPopupPlacement::Overlay,
+            /*composer_gap*/ None,
+            /*working_tip*/ None,
         );
         let mut buffer = Buffer::empty(area);
         bottom.render(area, &mut buffer);
@@ -265,6 +267,35 @@ async fn external_writer_view_shows_notice_instead_of_composer() {
 }
 
 #[tokio::test]
+async fn external_writer_fork_progress_restores_the_previous_view() {
+    let (mut widget, _sender, _events, _operations) = make_chatwidget_manual_with_sender().await;
+    for locked in [false, true] {
+        widget.external_writer_view = locked;
+        let previous = render_frame(&widget, /*width*/ 60);
+        widget.fork_in_progress = true;
+        let frame = render_frame(&widget, /*width*/ 60);
+        let rows = frame
+            .content
+            .chunks(usize::from(frame.area.width))
+            .map(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        insta::assert_snapshot!(
+            "fork_pending",
+            rows.iter()
+                .map(|row| row.trim_end())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        widget.fork_in_progress = false;
+        assert_eq!(render_frame(&widget, /*width*/ 60), previous);
+    }
+}
+
+#[tokio::test]
 async fn external_writer_notice_uses_current_transcript_shortcut() {
     let (mut widget, _sender, _events, _operations) = make_chatwidget_manual_with_sender().await;
     let mut keymap = crate::keymap::RuntimeKeymap::defaults();
@@ -355,7 +386,7 @@ async fn initial_session_header_starts_at_the_top_of_the_viewport() {
     let header = frame
         .content
         .chunks(usize::from(frame.area.width))
-        .take(/*n*/ 6)
+        .take(/*n*/ 3)
         .map(|row| {
             row.iter()
                 .map(ratatui::buffer::Cell::symbol)
@@ -368,15 +399,10 @@ async fn initial_session_header_starts_at_the_top_of_the_viewport() {
         .replace(crate::version::CODEX_CLI_VERSION, "<VERSION>");
 
     let cwd = widget.config.cwd.as_path().display().to_string();
-    let normalized_cwd = format!("{:<width$}", "/tmp/project", width = cwd.len());
 
-    insta::assert_snapshot!(header.replace(&cwd, &normalized_cwd), @r"
-    ╭───────────────────────────────────────╮
-    │ >_ OpenAI Codex (v<VERSION>)              │
-    │                                       │
-    │ model:     loading   /model to change │
-    │ directory: /tmp/project               │
-    ╰───────────────────────────────────────╯
+    insta::assert_snapshot!(header.replace(&cwd, "/tmp/project"), @r"
+      >_ OpenAI Codex (v<VERSION>)
+         /tmp/project
     ");
 }
 

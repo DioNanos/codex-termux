@@ -3,7 +3,7 @@
 //! This crate defines the feature registry plus the logic used to resolve an
 //! effective feature set from config-like inputs.
 
-use codex_otel::SessionTelemetry;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
@@ -109,9 +109,10 @@ pub enum Feature {
     /// Store CLI auth in the encrypted local secrets backend when keyring storage is selected.
     SecretAuthStorage,
 
-    // Experimental
     /// Automatically start the shared local daemon for eligible interactive launches.
     DaemonAutoStart,
+
+    // Experimental
     /// Send per-content-entry classifications in internal Responses metadata.
     ContentItemKinds,
     /// Record model-attempted tool calls in internal Responses metadata.
@@ -205,6 +206,11 @@ pub enum Feature {
     Collab,
     /// Enable task-path-based multi-agent routing.
     MultiAgentV2,
+    /// Keep sampling through reasoning and commentary boundaries when agent mail arrives.
+    /// Pending mail is delivered at the next normal input boundary instead.
+    DeferMailboxPreemption,
+    /// Preempt responses and yield foreground code-mode observations on new user input.
+    InstantInterrupt,
     /// Enable shared discussion tools for an agent tree.
     AgentMessageBoard,
     /// Removed compatibility flag retained as a no-op.
@@ -319,15 +325,19 @@ pub enum Feature {
     SendMessageToUserAsync,
     /// Enable automatic review for approval prompts.
     GuardianApproval,
-    /// Select thread-owned context for both Guardian reviewers.
-    /// Read once from the thread's fixed feature set when Guardian evidence is initialized.
+    /// Removed compatibility flag for always-on thread-owned Guardian context.
     GuardianThreadContext,
     /// Reuse encrypted parent compaction when restarting Guardian review sessions.
+    /// When disabled, retain an independent review transcript across parent compaction.
     GuardianReuseParentCompaction,
+    /// Limit worker Guardian root evidence to preceding root communication windows.
+    GuardianRootHandoffContext,
     /// Include completed node_repl or cua_repl Code Mode responses in Guardian reviews.
     GuardianEnhancedNodeReplTranscripts,
     /// Include completed node_repl or cua_repl Code Mode response images in Guardian reviews.
     GuardianNodeReplTranscriptImages,
+    /// Give Guardian access to the root conversation's message history tools.
+    GuardianConversationHistoryTools,
     /// Enable Guardian V2 automatic approval reviews.
     GuardianV2,
     /// Removed compatibility flag for the unused Guardian extension prototype.
@@ -396,6 +406,8 @@ pub enum Feature {
     WindowsSandboxElevated,
     /// Attempt elevated Windows sandbox provisioning through the installed service.
     WindowsSandboxService,
+    /// Prefer the local native Windows sandbox when available, retaining legacy fallback.
+    PreferMxc,
     /// Legacy remote models flag kept for backward compatibility.
     RemoteModels,
     /// Removed legacy git commit attribution guidance flag.
@@ -507,6 +519,11 @@ impl Features {
         self.enabled.contains(&f)
     }
 
+    /// Returns whether persistent execution is enabled for the selected effort.
+    pub fn persistent_execution_enabled(&self, reasoning_effort: Option<&ReasoningEffort>) -> bool {
+        reasoning_effort == Some(&ReasoningEffort::Persistent)
+    }
+
     pub fn apps_enabled_for_auth(&self, has_chatgpt_auth: bool) -> bool {
         self.enabled(Feature::Apps) && has_chatgpt_auth
     }
@@ -558,24 +575,6 @@ impl Features {
 
     pub fn legacy_feature_usages(&self) -> impl Iterator<Item = &LegacyFeatureUsage> + '_ {
         self.legacy_usages.iter()
-    }
-
-    pub fn emit_metrics(&self, otel: &SessionTelemetry) {
-        for feature in FEATURES {
-            if matches!(feature.stage, Stage::Removed) {
-                continue;
-            }
-            if self.enabled(feature.id) != feature.default_enabled {
-                otel.counter(
-                    "codex.feature.state",
-                    /*inc*/ 1,
-                    &[
-                        ("feature", feature.key),
-                        ("value", &self.enabled(feature.id).to_string()),
-                    ],
-                );
-            }
-        }
     }
 
     /// Apply a table of key -> bool toggles (e.g. from TOML).
@@ -636,6 +635,13 @@ impl Features {
                         "features.use_legacy_landlock",
                         Feature::UseLegacyLandlock,
                     );
+                }
+                "guardianv2.thread_context" => {
+                    self.record_legacy_usage_force(
+                        "features.guardianv2.thread_context",
+                        Feature::GuardianThreadContext,
+                    );
+                    continue;
                 }
                 _ => {}
             }
@@ -702,6 +708,10 @@ impl Features {
 fn legacy_usage_notice(alias: &str, feature: Feature) -> (String, Option<String>) {
     let canonical = feature.key();
     match feature {
+        Feature::GuardianThreadContext => (
+            "`[features.guardianv2].thread_context` is deprecated and ignored.".to_string(),
+            Some("Thread-owned Guardian context is always enabled. Remove `thread_context` from [features.guardianv2] in config.toml, including profile overrides.".to_string()),
+        ),
         Feature::TranscriptV2 => (
             "`[features].transcript_v2` is deprecated and ignored.".to_string(),
             Some("Use `[tui].fullscreen_transcript` in config.toml instead.".to_string()),
@@ -937,12 +947,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::DaemonAutoStart,
         key: "daemon_auto_start",
-        stage: Stage::Experimental {
-            name: "Automatically start the background server",
-            menu_description: "Use the shared local server for new, resumed, and forked sessions. Takes effect next launch.",
-            announcement: "Automatic background server startup can now be enabled from /experimental.",
-        },
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::TranscriptV2,
@@ -1084,6 +1090,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::InstantInterrupt,
+        key: "instant_interrupt",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::CodeModeOnly,
         key: "code_mode_only",
         stage: Stage::UnderDevelopment,
@@ -1206,8 +1218,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::WriteStdinApproval,
         key: "write_stdin_approval",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::CodexHooks,
@@ -1254,6 +1266,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::WindowsSandboxService,
         key: "windows_sandbox_service",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::PreferMxc,
+        key: "prefer_mxc",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -1319,6 +1337,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::MultiAgentV2,
         key: "multi_agent_v2",
         stage: Stage::Stable,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::DeferMailboxPreemption,
+        key: "defer_mailbox_preemption",
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1630,7 +1654,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GuardianThreadContext,
         key: "guardianv2.thread_context",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1638,6 +1662,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "guardian_reuse_parent_compaction",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::GuardianRootHandoffContext,
+        key: "guardian_root_handoff_context",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::GuardianEnhancedNodeReplTranscripts,
@@ -1648,6 +1678,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GuardianNodeReplTranscriptImages,
         key: "guardian_node_repl_transcript_images",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::GuardianConversationHistoryTools,
+        key: "guardian_conversation_history_tools",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

@@ -55,6 +55,48 @@ fn listen_unix_socket_accepts_relative_custom_path() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn long_control_socket_paths_connect_to_distinct_daemons() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let long_parent = temp_dir.path().join("x".repeat(120));
+    let mut sockets = Vec::new();
+    let mut acceptors = Vec::new();
+
+    for name in ["first", "second"] {
+        let codex_home = long_parent.join(name);
+        std::fs::create_dir_all(&codex_home).expect("codex home");
+        let socket_path = app_server_control_socket_path(&codex_home).expect("socket path");
+        let (transport_event_tx, _transport_event_rx) =
+            mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+        let shutdown_token = CancellationToken::new();
+        let acceptor = start_control_socket_acceptor(
+            socket_path.clone(),
+            transport_event_tx,
+            shutdown_token.clone(),
+            DaemonShutdownAccess::Disabled,
+        )
+        .await
+        .expect("control socket acceptor should start");
+        sockets.push(socket_path);
+        acceptors.push((shutdown_token, acceptor));
+    }
+
+    assert_ne!(
+        std::fs::read_link(sockets[0].as_path()).expect("first socket target"),
+        std::fs::read_link(sockets[1].as_path()).expect("second socket target")
+    );
+    for socket in &sockets {
+        connect_to_socket(socket.as_path())
+            .await
+            .expect("client should connect through long path");
+    }
+    for (shutdown_token, acceptor) in acceptors {
+        shutdown_token.cancel();
+        acceptor.await.expect("acceptor should stop");
+    }
+}
+
 #[tokio::test]
 async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_and_pings() {
     let temp_dir = tempfile::TempDir::new().expect("temp dir");

@@ -390,8 +390,30 @@
     },
     "AutoReviewToml": {
       "properties": {
+        "circuit_break_action": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CircuitBreakAction"
+            }
+          ],
+          "description": "Controls whether circuit-breaker interruptions include a structured error. Strict mode writes structured errors that older clients may not recognize when reading shared history. Defaults to `default`."
+        },
+        "conversation_history_max_output_tokens": {
+          "description": "Maximum estimated tokens per Guardian history-tool response, before the standard serialization allowance. Defaults to 4,000; stricter parent tool limits still apply.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "experimental_conversation_history_prompt": {
+          "description": "Experimental replacement for the history-retrieval instructions when history tools and Apps are enabled. Omitted or blank values use the built-in prompt.",
+          "type": "string"
+        },
         "experimental_policy_template": {
           "description": "Experimental full Guardian prompt template containing the tenant policy placeholder.",
+          "type": "string"
+        },
+        "extra_policy": {
+          "description": "Additional policy text inserted into the Guardian template's `{{ extra_policy }}` slot.",
           "type": "string"
         },
         "policy": {
@@ -505,6 +527,39 @@
       },
       "type": "object"
     },
+    "CircuitBreakAction": {
+      "oneOf": [
+        {
+          "description": "Emit the warning and interrupt without structured error details.",
+          "enum": [
+            "default"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Emit the same warning and interruption, with structured error details.",
+          "enum": [
+            "strict"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "CloudToml": {
+      "additionalProperties": false,
+      "description": "Cloud-owned feature settings.",
+      "properties": {
+        "skills": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/FeatureToggleToml"
+            }
+          ],
+          "description": "Cloud skills are permitted by default; the host must supply a cloud provider."
+        }
+      },
+      "type": "object"
+    },
     "CodeModeConfigToml": {
       "additionalProperties": false,
       "properties": {
@@ -534,6 +589,12 @@
         "experimental_show_cell_overhead": {
           "description": "Show handler duration, code-mode host duration, and harness overhead in each code-mode cell response. Experimental: this option and the response format may change or be removed.",
           "type": "boolean"
+        },
+        "tool_input_schema_max_bytes": {
+          "description": "Maximum UTF-8 bytes per rendered tool input type, with a 16,000-byte minimum and default. For ordinary MCP tools, this is also at least their server's explicitly configured input limit.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -770,6 +831,9 @@
             "default_mode_request_user_input": {
               "type": "boolean"
             },
+            "defer_mailbox_preemption": {
+              "type": "boolean"
+            },
             "deferred_executor": {
               "type": "boolean"
             },
@@ -821,6 +885,9 @@
             "guardian_approval": {
               "type": "boolean"
             },
+            "guardian_conversation_history_tools": {
+              "type": "boolean"
+            },
             "guardian_enhanced_node_repl_transcripts": {
               "type": "boolean"
             },
@@ -831,6 +898,9 @@
               "type": "boolean"
             },
             "guardian_reuse_parent_compaction": {
+              "type": "boolean"
+            },
+            "guardian_root_handoff_context": {
               "type": "boolean"
             },
             "guardianv2": {
@@ -864,6 +934,9 @@
               "type": "boolean"
             },
             "in_app_updates": {
+              "type": "boolean"
+            },
+            "instant_interrupt": {
               "type": "boolean"
             },
             "item_ids": {
@@ -930,6 +1003,9 @@
               "type": "boolean"
             },
             "powershell_shell_version": {
+              "type": "boolean"
+            },
+            "prefer_mxc": {
               "type": "boolean"
             },
             "prevent_idle_sleep": {
@@ -1240,6 +1316,32 @@
       },
       "type": "object"
     },
+    "CopyOnSelect": {
+      "description": "When transcript mouse selections are copied on release.",
+      "oneOf": [
+        {
+          "description": "Use the terminal-specific default.",
+          "enum": [
+            "auto"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Copy every nonempty transcript mouse selection on release.",
+          "enum": [
+            "always"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Require an explicit copy action.",
+          "enum": [
+            "never"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "CredentialAuthMethod": {
       "description": "Authentication formats supported by declarative credential providers.",
       "enum": [
@@ -1385,6 +1487,16 @@
           "default": {},
           "description": "Tracks which project paths have opted out of external config migration prompts.",
           "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "FeatureToggleToml": {
+      "additionalProperties": false,
+      "description": "Optional enablement of a configured feature.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -1779,7 +1891,7 @@
           "type": "number"
         },
         "thread_context": {
-          "description": "Use thread-owned context for sync and async Guardian. Defaults to false. Independent of the Guardian v2 `enabled` toggle.",
+          "description": "Deprecated and ignored; thread-owned Guardian context is always enabled.",
           "type": "boolean"
         },
         "transcript": {
@@ -2303,6 +2415,10 @@
         "client_id": {
           "description": "Explicit OAuth client identifier to present during authorization and token exchange.",
           "type": "string"
+        },
+        "client_secret": {
+          "description": "OAuth client secret used for token exchange with a pre-registered client.",
+          "type": "string"
         }
       },
       "type": "object"
@@ -2327,6 +2443,25 @@
         }
       },
       "type": "object"
+    },
+    "McpStartupReadiness": {
+      "description": "Readiness needed before startup can expose this server's tools to the model.",
+      "oneOf": [
+        {
+          "description": "Use the live connection to determine startup readiness.",
+          "enum": [
+            "connection"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Allow a valid cached tool catalog while the live connection starts. Tool execution still requires the current connection.",
+          "enum": [
+            "catalog"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "MemoriesToml": {
       "additionalProperties": false,
@@ -2579,7 +2714,7 @@
         },
         "requires_openai_auth": {
           "default": false,
-          "description": "Does this provider require an OpenAI API Key or ChatGPT login token? If true, user is presented with login screen on first run, and login preference and token/key are stored in auth.json. If false (which is the default), login screen is skipped, and API key (if needed) comes from the \"env_key\" environment variable.",
+          "description": "Does this provider require an OpenAI API key or ChatGPT login token? If true, the user is presented with a login screen on first run, and credentials are stored using the backend selected by `cli_auth_credentials_store`. If false (the default), the login screen is skipped, and the API key (if needed) comes from the environment variable specified by `env_key`.",
           "type": "boolean"
         },
         "stream_idle_timeout_ms": {
@@ -2631,6 +2766,10 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "disable_direct_message": {
+          "description": "Disable the model's direct-message tools; spawning and automatic child results remain available.",
+          "type": "boolean"
+        },
         "enabled": {
           "type": "boolean"
         },
@@ -2651,6 +2790,10 @@
           "maximum": 3600000.0,
           "minimum": 0.0,
           "type": "integer"
+        },
+        "message_board_in_memory": {
+          "description": "Keep the message board in memory for a training session, including ephemeral sessions.",
+          "type": "boolean"
         },
         "min_wait_timeout_ms": {
           "format": "int64",
@@ -3091,25 +3234,20 @@
         }
       ]
     },
-    "OrchestratorFeatureToml": {
-      "additionalProperties": false,
-      "description": "Settings for a feature owned by the orchestrator.",
-      "properties": {
-        "enabled": {
-          "type": "boolean"
-        }
-      },
-      "type": "object"
-    },
     "OrchestratorToml": {
       "additionalProperties": false,
       "description": "Orchestrator-owned feature settings.",
       "properties": {
         "mcp": {
-          "$ref": "#/definitions/OrchestratorFeatureToml"
+          "$ref": "#/definitions/FeatureToggleToml"
         },
         "skills": {
-          "$ref": "#/definitions/OrchestratorFeatureToml"
+          "allOf": [
+            {
+              "$ref": "#/definitions/FeatureToggleToml"
+            }
+          ],
+          "description": "Legacy no-op setting retained for compatibility. Use `cloud.skills` to configure cloud skills."
         }
       },
       "type": "object"
@@ -3129,6 +3267,14 @@
             }
           ],
           "description": "Optional log exporter"
+        },
+        "log_agent_responses": {
+          "description": "Opt in to logging final main-agent and spawned-subagent responses to an OTLP log exporter. Defaults to false. Response text can be sensitive and is capped at 64 KiB.",
+          "type": "boolean"
+        },
+        "log_guardian_assessments": {
+          "description": "Opt in to logging completed Guardian assessments to an OTLP log exporter. Defaults to false. Rationales can be sensitive and are capped at 64 KiB.",
+          "type": "boolean"
         },
         "log_user_prompt": {
           "description": "Log user prompt in traces",
@@ -3587,6 +3733,15 @@
           },
           "type": "array"
         },
+        "startup_readiness": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/McpStartupReadiness"
+            }
+          ],
+          "default": null,
+          "description": "Whether startup requires a live connection or can use a valid cached tool catalog."
+        },
         "startup_timeout_ms": {
           "default": null,
           "format": "uint64",
@@ -3601,6 +3756,13 @@
         "supports_parallel_tool_calls": {
           "default": null,
           "type": "boolean"
+        },
+        "tool_input_schema_max_bytes": {
+          "default": null,
+          "description": "UTF-8 byte threshold for compacting each ordinary MCP tool input schema. Defaults to 5,000 bytes. Code Mode also uses an explicitly configured limit when rendering each tool's input type. Larger limits preserve more parameter descriptions.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
         },
         "tool_timeout_sec": {
           "default": null,
@@ -3735,6 +3897,32 @@
           "description": "Use the latest working directory recorded in the selected session.",
           "enum": [
             "session"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RightClickPaste": {
+      "description": "Right-click text paste when the fullscreen TUI has no selection.",
+      "oneOf": [
+        {
+          "description": "Enable on Windows/WSL/Linux, except recognized terminal-owned paste paths.",
+          "enum": [
+            "auto"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Enable on supported local platforms; selection and terminal-owned paste still win.",
+          "enum": [
+            "on"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Leave right-click paste to the terminal.",
+          "enum": [
+            "off"
           ],
           "type": "string"
         }
@@ -4209,6 +4397,15 @@
           "description": "Generate automatic conversation recaps when the terminal is unfocused. Defaults to `true`. Disabling this leaves `/recap` available on demand.",
           "type": "boolean"
         },
+        "copy_on_select": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CopyOnSelect"
+            }
+          ],
+          "default": "auto",
+          "description": "Copy selected transcript text when the mouse button is released. Defaults to `auto`: enabled except in direct terminals known to forward their native copy shortcut (Ghostty 1.2+, Kitty on macOS, Windows Terminal, and VS Code on Windows). Unknown terminals, Ghostty without a recognized version, and tmux/Zellij default to copying."
+        },
         "disable_paste_burst": {
           "description": "When true, disables burst-paste detection for typed input entirely. All characters are inserted as they are received, and no buffering or placeholder replacement will occur for fast keypress bursts. Overrides the legacy top-level `disable_paste_burst` setting. Defaults to `false`.",
           "type": "boolean"
@@ -4230,8 +4427,8 @@
           "description": "Individual visual effects. Each also requires animations to be enabled."
         },
         "fullscreen_transcript": {
-          "default": false,
-          "description": "Own the fullscreen transcript, including scrolling, selection, and search. Defaults to `false`; alternate-screen restrictions take precedence.",
+          "default": true,
+          "description": "Own the fullscreen transcript, including scrolling, selection, and search. Defaults to `true`; alternate-screen restrictions take precedence.",
           "type": "boolean"
         },
         "keymap": {
@@ -4489,6 +4686,7 @@
             }
           ],
           "default": {
+            "lists": true,
             "math": true,
             "mermaid": true,
             "tables": true
@@ -4503,6 +4701,15 @@
           ],
           "default": null,
           "description": "Working directory to use when resuming or forking a session. When unset, prompt if the current and session directories differ."
+        },
+        "right_click_paste": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RightClickPaste"
+            }
+          ],
+          "default": "auto",
+          "description": "Right-click text paste fallback. Defaults to `auto` (Windows/WSL/Linux). `on` also enables macOS; neither mode reads over SSH or in recognized VS Code terminals. This controls the fullscreen fallback, not the terminal's own paste binding."
         },
         "screen_reader_detection_done": {
           "description": "Records the one-time screen-reader detection attempt. Either value skips detection.",
@@ -5632,6 +5839,11 @@
       "additionalProperties": false,
       "description": "Optional rich renderers. Disabled renderers preserve the original source.",
       "properties": {
+        "lists": {
+          "default": true,
+          "description": "Render Markdown bullets and task-list markers as Unicode symbols.",
+          "type": "boolean"
+        },
         "math": {
           "default": true,
           "description": "Render math expressions using Unicode notation.",
@@ -6454,6 +6666,14 @@
       "default": null,
       "description": "Preferred backend for storing CLI auth credentials. file (default): Use a file in the Codex home directory. keyring: Use an OS-specific keyring service. auto: Use the keyring if available, otherwise use a file."
     },
+    "cloud": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CloudToml"
+        }
+      ],
+      "description": "Cloud-owned feature settings."
+    },
     "compact_prompt": {
       "description": "Compact prompt used for history compaction.",
       "type": "string"
@@ -6647,6 +6867,9 @@
         "default_mode_request_user_input": {
           "type": "boolean"
         },
+        "defer_mailbox_preemption": {
+          "type": "boolean"
+        },
         "deferred_executor": {
           "type": "boolean"
         },
@@ -6698,6 +6921,9 @@
         "guardian_approval": {
           "type": "boolean"
         },
+        "guardian_conversation_history_tools": {
+          "type": "boolean"
+        },
         "guardian_enhanced_node_repl_transcripts": {
           "type": "boolean"
         },
@@ -6708,6 +6934,9 @@
           "type": "boolean"
         },
         "guardian_reuse_parent_compaction": {
+          "type": "boolean"
+        },
+        "guardian_root_handoff_context": {
           "type": "boolean"
         },
         "guardianv2": {
@@ -6741,6 +6970,9 @@
           "type": "boolean"
         },
         "in_app_updates": {
+          "type": "boolean"
+        },
+        "instant_interrupt": {
           "type": "boolean"
         },
         "item_ids": {
@@ -6807,6 +7039,9 @@
           "type": "boolean"
         },
         "powershell_shell_version": {
+          "type": "boolean"
+        },
+        "prefer_mxc": {
           "type": "boolean"
         },
         "prevent_idle_sleep": {

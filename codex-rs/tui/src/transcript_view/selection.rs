@@ -6,14 +6,32 @@ use ratatui::layout::Position as ScreenPosition;
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::*;
+use crate::clipboard_copy::CopyFormat;
+use crate::clipboard_copy::worker::CopyDestination;
+use crate::clipboard_copy::worker::CopyResult;
 use crate::text_selection::SelectionUnit;
+use crate::tui::Tui;
+
+struct PendingCopy {
+    id: u64,
+    start: Anchor,
+    end: Anchor,
+    position: Position,
+    detailed: bool,
+    follow: bool,
+    clear_selection: bool,
+}
 
 pub(super) struct Selection {
+    pending_copy: Option<PendingCopy>,
+    primary_owner: Option<Arc<()>>,
     pub(super) snapshot: ViewSnapshot,
     pub(super) start: Anchor,
     pub(super) end: Anchor,
     pub(super) dragging: bool,
     pub(super) moved: bool,
+    moved_vertically: bool,
+    pointer_origin_row: u16,
     pub(super) resume_on_empty: bool,
     pub(super) pointer: Option<ScreenPosition>,
     pub(super) pressed_link: Option<String>,
@@ -48,6 +66,8 @@ impl TranscriptView {
         };
         let was_following = self.is_following();
         self.selection = Some(Selection {
+            pending_copy: None,
+            primary_owner: None,
             snapshot,
             start,
             end,
@@ -56,6 +76,8 @@ impl TranscriptView {
             preferred_column: None,
             dragging: true,
             moved: false,
+            moved_vertically: false,
+            pointer_origin_row: row,
             resume_on_empty: was_following,
             pointer: Some(ScreenPosition::new(column, row)),
             pressed_link: None,
@@ -111,11 +133,17 @@ impl TranscriptView {
         let Some(mut selection) = self.selection.take() else {
             return;
         };
+        // A Shift-click starts a new pointer gesture while retaining the text anchor.
+        if !selection.dragging {
+            selection.pointer_origin_row = row;
+            selection.moved_vertically = false;
+        }
         let cells = Arc::clone(&selection.snapshot.cells);
         let range = selection.unit.range(layout.text(), end.offset);
         let origin = selection.origin;
         let backwards = (self.resolve(&cells, end), end.offset)
             < (self.resolve(&cells, origin.0), origin.0.offset);
+        let previous = (selection.start, selection.end);
         selection.start = if backwards { origin.1 } else { origin.0 };
         selection.end = Anchor {
             offset: if backwards { range.start } else { range.end },
@@ -123,9 +151,13 @@ impl TranscriptView {
         };
         selection.snapshot.pinned.entry(end.key).or_insert(layout);
         selection.moved = true;
+        selection.moved_vertically |= selection.pointer_origin_row != row;
         selection.pointer = Some(ScreenPosition::new(column, row));
         selection.preferred_column = None;
         self.pin_selection_range(&cells, &mut selection);
+        if previous != (selection.start, selection.end) {
+            selection.primary_owner = None;
+        }
         self.selection = Some(selection);
     }
 
@@ -137,7 +169,10 @@ impl TranscriptView {
         })
     }
 
-    pub(crate) fn selected_text(&mut self, cells: &[Arc<dyn HistoryCell>]) -> Option<String> {
+    fn selected_ranges(
+        &mut self,
+        cells: &[Arc<dyn HistoryCell>],
+    ) -> Option<Vec<(Arc<TextLayout>, std::ops::Range<usize>)>> {
         if !self.has_selection_range() {
             return None;
         }
@@ -154,15 +189,11 @@ impl TranscriptView {
         if start == end {
             return None;
         }
-        let mut text = String::new();
-        let mut previous: Option<Arc<TextLayout>> = None;
+        let mut ranges = Vec::new();
         for index in start.index..=end.index {
             let layout = self.layout(cells, index)?;
             if layout.row_count() == 0 {
                 continue;
-            }
-            if let Some(previous) = &previous {
-                text.push_str(previous.separator_after(&layout));
             }
             let begin = if index == start.index {
                 start.offset
@@ -174,37 +205,195 @@ impl TranscriptView {
             } else {
                 layout.text().len()
             };
-            text.push_str(layout.text().get(begin..finish)?);
+            ranges.push((layout, begin..finish));
+        }
+        Some(ranges)
+    }
+
+    pub(crate) fn selected_text(&mut self, cells: &[Arc<dyn HistoryCell>]) -> Option<String> {
+        let mut text = String::new();
+        let mut previous: Option<Arc<TextLayout>> = None;
+        for (layout, range) in self.selected_ranges(cells)? {
+            if let Some(previous) = &previous {
+                text.push_str(previous.separator_after(&layout));
+            }
+            text.push_str(layout.text().get(range)?);
             previous = Some(layout);
         }
         text.retain(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'));
         Some(text)
     }
 
-    /// Release selection after confirmed delivery. Failed or unacknowledged terminal writes
-    /// retain the selected revision so the user can verify pasting and retry.
+    /// A PRIMARY write is silent: it neither claims CLIPBOARD was copied nor ends selection.
+    pub(crate) fn publish_primary(&mut self, tui: &mut Tui, text: &str) {
+        let (_, owner) = tui.clipboard.select(
+            text.into(),
+            CopyFormat::PlainText,
+            CopyDestination::Primary,
+            tui.frame_requester(),
+        );
+        if let Some(selection) = &mut self.selection {
+            selection.primary_owner = Some(owner);
+        }
+    }
+
+    /// Both transcript surfaces honor the same automatic-copy and plaintext PRIMARY semantics.
+    pub(crate) fn copy_selected_text(
+        &mut self,
+        tui: &mut Tui,
+        cells: &[Arc<dyn HistoryCell>],
+        text: &str,
+        clear_selection: bool,
+    ) -> CopyResult {
+        let publish_primary = !clear_selection && self.primary_selection;
+        let mut primary_owner = None;
+        let result =
+            self.copy_selected_text_with(cells, text, clear_selection, |copy_text, format| {
+                if publish_primary {
+                    let (result, owner) = tui.clipboard.select(
+                        copy_text.into(),
+                        format,
+                        CopyDestination::ClipboardAndPrimary(text.into()),
+                        tui.frame_requester(),
+                    );
+                    primary_owner = Some(owner);
+                    result
+                } else {
+                    tui.clipboard
+                        .copy(copy_text.into(), format, tui.frame_requester())
+                }
+            });
+        if publish_primary && let Some(selection) = &mut self.selection {
+            selection.primary_owner = primary_owner;
+        }
+        result
+    }
+
+    /// Hide or cancel deferred publication without relinquishing the existing X11 selection.
+    pub(crate) fn cancel_primary(&mut self) {
+        if let Some(selection) = &mut self.selection {
+            selection.primary_owner = None;
+        }
+    }
+
+    /// Track delivery for the current selection. Explicit copies release it on confirmation;
+    /// automatic copies, failures, and unacknowledged terminal writes retain the revision.
     pub(crate) fn copy_selected_text_with(
         &mut self,
         cells: &[Arc<dyn HistoryCell>],
         text: &str,
-        copy: impl FnOnce(&str) -> Result<crate::clipboard_copy::CopyStatus, String>,
+        clear_selection: bool,
+        copy: impl FnOnce(
+            &str,
+            crate::clipboard_copy::CopyFormat,
+        ) -> Result<crate::clipboard_copy::CopyStatus, String>,
     ) -> Result<crate::clipboard_copy::CopyStatus, String> {
-        let result = copy(text);
-        if matches!(result, Ok(crate::clipboard_copy::CopyStatus::Confirmed)) {
-            self.end_selection(cells);
+        let mut lines = Vec::new();
+        let mut previous: Option<Arc<TextLayout>> = None;
+        for (layout, range) in self.selected_ranges(cells).unwrap_or_default() {
+            let separator = previous
+                .as_ref()
+                .map_or("", |previous| previous.separator_after(&layout));
+            layout.copy_lines(range, separator, &mut lines);
+            previous = Some(layout);
+        }
+        let (text, format) = crate::markdown_copy::selection(&lines, text);
+        let result = copy(&text, format);
+        match result {
+            Ok(crate::clipboard_copy::CopyStatus::Confirmed) => {
+                if clear_selection {
+                    self.end_selection(cells);
+                }
+            }
+            Ok(crate::clipboard_copy::CopyStatus::Pending(id)) => {
+                if let Some(selection) = &mut self.selection {
+                    selection.pending_copy = Some(PendingCopy {
+                        id,
+                        start: selection.start,
+                        end: selection.end,
+                        position: self.position,
+                        detailed: self.detailed,
+                        follow: false,
+                        clear_selection,
+                    });
+                }
+            }
+            Ok(
+                crate::clipboard_copy::CopyStatus::Unconfirmed
+                | crate::clipboard_copy::CopyStatus::Busy,
+            )
+            | Err(_) => {}
         }
         result
+    }
+
+    pub(crate) fn follow_pending_copy(&mut self) {
+        if let Some(pending) = self
+            .selection
+            .as_mut()
+            .and_then(|s| s.pending_copy.as_mut())
+        {
+            pending.follow = true;
+        }
+    }
+
+    /// A replaced selection has no ticket; moved endpoints cannot consume an old completion.
+    pub(crate) fn finish_copy(
+        &mut self,
+        cells: &[Arc<dyn HistoryCell>],
+        completion: &(u64, crate::clipboard_copy::worker::CopyResult),
+        current: bool,
+    ) -> Option<bool> {
+        // Feedback also belongs to composer copies and survives selection changes. Complete
+        // its matching ticket even when the selection can no longer consume the result.
+        if let Some(feedback) = &self.copy_feedback
+            && let Ok(crate::clipboard_copy::CopyStatus::Pending(id)) = feedback.result
+        {
+            if id == completion.0 {
+                self.show_copy_feedback(&completion.1, feedback.characters);
+            } else if id < completion.0 {
+                // A picker can consume this result and start another copy while the view
+                // is hidden. A newer completion proves the older request is no longer pending.
+                self.copy_feedback = None;
+            }
+        }
+        let selection = self.selection.as_mut()?;
+        if selection.pending_copy.as_ref()?.id != completion.0 {
+            return None;
+        }
+        let pending = selection.pending_copy.take()?;
+        if !current
+            || (pending.start, pending.end) != (selection.start, selection.end)
+            || pending.position != self.position
+            || pending.detailed != self.detailed
+        {
+            return None;
+        }
+        let characters = self
+            .selected_text(cells)
+            .map_or(/*default*/ 0, |text| text.chars().count());
+        if pending.clear_selection
+            && completion.1 == Ok(crate::clipboard_copy::CopyStatus::Confirmed)
+        {
+            self.end_selection(cells);
+        }
+        self.show_copy_feedback(&completion.1, characters);
+        Some(pending.follow && completion.1 == Ok(crate::clipboard_copy::CopyStatus::Confirmed))
+    }
+
+    /// A stationary click begun at Latest still belongs to the fresh screen until it selects text.
+    pub(crate) fn has_pending_latest_selection(&self) -> bool {
+        !self.has_selection_range()
+            && self
+                .selection
+                .as_ref()
+                .is_some_and(|selection| selection.dragging && selection.resume_on_empty)
     }
 
     /// End the pointer gesture without discarding selected text when input ownership changes.
     pub(crate) fn end_drag(&mut self) {
         self.follow_control = Default::default();
-        if !self.has_selection_range()
-            && self
-                .selection
-                .as_ref()
-                .is_some_and(|selection| selection.dragging && selection.resume_on_empty)
-        {
+        if self.has_pending_latest_selection() {
             self.position = Position::Latest;
             self.selection = None;
             self.release_live_reading();
@@ -243,6 +432,9 @@ impl TranscriptView {
             return true;
         };
         if let Some(mut selection) = self.selection.take() {
+            if selection.end != next {
+                selection.primary_owner = None;
+            }
             selection.end = next;
             selection.dragging = false;
             selection.preferred_column = column;
@@ -272,7 +464,8 @@ impl TranscriptView {
         let Some(selection) = self
             .selection
             .as_ref()
-            .filter(|selection| selection.dragging && selection.moved)
+            // Horizontal selection on an edge row must not move the text under the pointer.
+            .filter(|selection| selection.dragging && selection.moved_vertically)
         else {
             return false;
         };
@@ -332,9 +525,21 @@ impl TranscriptView {
                 self.area.width,
                 /*height*/ 1,
             );
-            visible
-                .layout
-                .highlight(begin..finish, area, buf, visible.row);
+            let next = (visible.index + 1..=end.index)
+                .filter_map(|index| {
+                    selection
+                        .snapshot
+                        .pinned
+                        .get(&self.entry_key(&selection.snapshot.cells, index))
+                })
+                .find(|layout| layout.row_count() > 0);
+            visible.layout.highlight_selection(
+                begin..finish,
+                next.map(AsRef::as_ref),
+                area,
+                buf,
+                visible.row,
+            );
         }
     }
 

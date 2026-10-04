@@ -1,4 +1,3 @@
-use super::step_context::StepInputs;
 use super::step_settings::ResolvedStepSettings;
 use super::*;
 use arc_swap::ArcSwap;
@@ -122,7 +121,9 @@ pub(super) async fn spawn_review_thread(
         .map(TurnEnvironment::windows_sandbox_selection_for_turn_metadata)
         .unwrap_or_else(|| {
             crate::tools::sandboxing::configured_windows_sandbox_selection(
-                parent_turn_context.config.permissions.windows_sandbox_type,
+                parent_turn_context
+                    .config
+                    .effective_local_windows_sandbox_type(),
                 parent_turn_context.windows_sandbox_level,
                 &codex_utils_path_uri::PathUri::from_abs_path(&parent_turn_context.cwd),
             )
@@ -162,10 +163,7 @@ pub(super) async fn spawn_review_thread(
         initial_settings: Arc::clone(&step_settings),
         disabled_plugin_ids: parent_turn_context.disabled_plugin_ids.clone(),
         active_host_plugin_identities: None,
-        next_step_input: ArcSwap::from_pointee(StepInputs {
-            settings: step_settings,
-            environments: parent_turn_context.initial_environments.clone(),
-        }),
+        next_step_settings: ArcSwap::from(step_settings),
         session_telemetry: session_telemetry_for_context,
         provider: provider_for_context,
         session_source,
@@ -197,7 +195,7 @@ pub(super) async fn spawn_review_thread(
 
     // Seed the child task with the review prompt as the initial user message.
     let input = vec![TurnInput::UserInput {
-        acceptance_order: None,
+        metadata: Default::default(),
         content: vec![UserInput::Text {
             text: review_prompt,
             // Review prompt is synthesized; no UI element ranges to preserve.
