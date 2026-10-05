@@ -487,13 +487,90 @@ async fn read_log_tail(path: &Path, byte_limit: u64) -> Result<Option<String>> {
     Ok(Some(contents))
 }
 
+/// Outcome of the `kill(pid, 0)` liveness probe.
 #[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KillProbe {
+    /// The probe found the process: it exists and belongs to this user.
+    Alive,
+    /// `kill(pid, 0)` only failed with EPERM: the PID belongs to another user.
+    Foreign,
+    /// The PID does not exist, or cannot be probed at all.
+    Gone,
+}
+
+#[cfg(unix)]
+fn probe_kill(pid: u32) -> KillProbe {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
+        return KillProbe::Gone;
     };
-    let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return KillProbe::Alive;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EPERM) => KillProbe::Foreign,
+        _ => KillProbe::Gone,
+    }
+}
+
+/// Classified result of reading a process description for a live PID.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailsOutcome {
+    /// The description was read.
+    Read,
+    /// The description is missing (`ENOENT`).
+    NotFound,
+    /// The description is not readable (`EACCES`).
+    PermissionDenied,
+    /// Any other failure; propagated unchanged.
+    Other,
+}
+
+/// Verdict for a PID record from the liveness probe and the details read.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeVerdict {
+    /// The process may still be ours; keep evaluating the record.
+    Active,
+    /// The record cannot describe our daemon anymore; drop it.
+    Stale,
+    /// The probe failed in a way we cannot classify; surface the error.
+    Propagate,
+}
+
+/// Classify the details-read failure found anywhere in an error chain.
+#[cfg(unix)]
+fn details_outcome(err: &anyhow::Error) -> DetailsOutcome {
+    for cause in err.chain() {
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+            match io_error.kind() {
+                std::io::ErrorKind::NotFound => return DetailsOutcome::NotFound,
+                std::io::ErrorKind::PermissionDenied => return DetailsOutcome::PermissionDenied,
+                _ => {}
+            }
+        }
+    }
+    DetailsOutcome::Other
+}
+
+/// Decide what a liveness probe and a details read mean for a PID record.
+///
+/// Our daemon always runs as the current user, so its process description
+/// stays visible to us: a PID that only answers `kill(pid, 0)` with EPERM
+/// belongs to another user, and its missing or forbidden description proves
+/// the record stale. A gone PID is stale as before, and read failures for
+/// processes we can signal stay surfaced.
+#[cfg(unix)]
+fn classify_probe(probe: KillProbe, details: DetailsOutcome) -> ProbeVerdict {
+    match (probe, details) {
+        (KillProbe::Gone, _) => ProbeVerdict::Stale,
+        (_, DetailsOutcome::Read) => ProbeVerdict::Active,
+        (KillProbe::Foreign, DetailsOutcome::NotFound | DetailsOutcome::PermissionDenied) => {
+            ProbeVerdict::Stale
+        }
+        _ => ProbeVerdict::Propagate,
+    }
 }
 
 #[cfg(unix)]
@@ -573,7 +650,18 @@ fn force_terminate_process_group(_pid: u32) -> Result<()> {
 
 #[cfg(unix)]
 async fn process_matches_record(record: &PidRecord) -> Result<bool> {
-    if !process_exists(record.pid) {
+    process_matches_record_with_probe(record, || probe_kill(record.pid)).await
+}
+
+/// Shared implementation; the probe is injected so tests can simulate a process
+/// that vanishes between the liveness probe and the details read.
+#[cfg(unix)]
+async fn process_matches_record_with_probe(
+    record: &PidRecord,
+    mut probe: impl FnMut() -> KillProbe,
+) -> Result<bool> {
+    let liveness = probe();
+    if liveness == KillProbe::Gone {
         return Ok(false);
     }
 
@@ -609,8 +697,14 @@ async fn process_matches_record(record: &PidRecord) -> Result<bool> {
             }
             Ok(matches)
         }
-        Err(_err) if !process_exists(record.pid) => Ok(false),
-        Err(err) => Err(err),
+        Err(err) => {
+            // The process may have exited between the first probe and the failed
+            // details read: re-probe so a vanished daemon still looks stale.
+            match classify_probe(probe(), details_outcome(&err)) {
+                ProbeVerdict::Stale => Ok(false),
+                ProbeVerdict::Active | ProbeVerdict::Propagate => Err(err),
+            }
+        }
     }
 }
 

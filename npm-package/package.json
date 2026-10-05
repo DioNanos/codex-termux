@@ -1,6 +1,6 @@
 {
   "name": "@mmmbuto/codex-cli-termux",
-  "version": "0.160.0-termux.2",
+  "version": "0.160.0-termux.3",
   "description": "OpenAI Codex CLI upstream rust-v0.160.0 packaged for Android Termux (ARM64), with GPT-6 Astra/Sol/Luna catalog support, upstream daemon-managed update flow fail-closed for the fork, AGENTS.md discovery, background-terminal status, remote-attachment and sandbox-approval compatibility fixes, RUNPATH=$ORIGIN hardening for direct native invocation, and fork-owned update diagnostics. Ships the codex-package layout manifest (variant codex-termux) and a daemon-isolated state namespace (packages/app-server-daemon-termux, app-server-control-termux).",
   "type": "module",
   "main": "bin/codex.js",

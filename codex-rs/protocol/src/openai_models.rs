@@ -1214,6 +1214,7 @@ mod tests {
             token_budget: None,
             guardian_v2: None,
             confirmation_policies: None,
+            content_filter_guidance: None,
         };
         assert!(validate_model_messages(&test_model(Some(empty))).is_ok());
         let exact = ModelMessages {
@@ -1229,6 +1230,7 @@ mod tests {
             token_budget: None,
             guardian_v2: None,
             confirmation_policies: None,
+            content_filter_guidance: None,
         };
         assert!(validate_model_messages(&test_model(Some(exact))).is_ok());
     }

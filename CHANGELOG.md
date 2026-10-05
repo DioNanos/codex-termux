@@ -1,3 +1,9 @@
+# [0.160.0-termux.3] - 2026-10-05
+
+## Codex Termux 0.160.0-termux.3 — upstream rust-v0.160.0
+
+- Recover from a stale daemon PID record when the PID belongs to another user.
+
 # [0.160.0-termux.2] - 2026-10-04
 
 ## Codex Termux 0.160.0-termux.2 — upstream rust-v0.160.0
