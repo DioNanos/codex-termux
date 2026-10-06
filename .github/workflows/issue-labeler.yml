@@ -33,9 +33,8 @@ jobs:
 
             - Ground every statement in the provided input: never assert
               anything you cannot verify from it. If the input does not give
-              enough evidence for a specific label, say "undetermined" in
-              your reasoning and fall back to the documented default instead
-              of inventing facts.
+              enough evidence for a specific label, fall back to the
+              documented default instead of inventing facts.
 
             - Add one (and only one) of the following three labels to distinguish the type of issue. Default to "bug" if unsure.
             1. bug — Reproducible defects in Codex products (CLI, VS Code extension, web, auth).
