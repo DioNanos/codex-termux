@@ -114,6 +114,7 @@ Maintainer publish flow:
 
 - [Changelog](./CHANGELOG.md)
 - [Patch inventory](./patches/README.md)
+- [Continuous integration](./docs/ci.md)
 - [Building from source](./BUILDING.md)
 - [Install docs](./docs/install.md)
 - [Authentication](./docs/authentication.md)

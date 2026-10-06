@@ -43,6 +43,12 @@ jobs:
           # - os: ubuntu-24.04-arm
           #   target: aarch64-unknown-linux-gnu
 
+        exclude:
+          # Disabled on this fork: the macOS legs need paid GitHub runners and
+          # the account spending limit stops them from starting at all. The
+          # Linux legs are unaffected. Remove this exclude to restore them.
+          - os: macos-15-xlarge
+
     runs-on: ${{ matrix.os }}
 
     # Configure a human readable name for each job
@@ -133,6 +139,11 @@ jobs:
     # Split the Windows Bazel test leg across separate Windows hosts. Jobs with
     # BuildBuddy credentials use Linux RBE for build actions; test execution
     # remains on a Windows runner.
+    # Disabled on this fork: this leg requires the upstream-only private runner
+    # group below (`codex-termux-runners`), which does not exist here, so the
+    # jobs fail to schedule at all. Re-enable by removing the `if` and setting
+    # up the runner group.
+    if: false
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -234,7 +245,9 @@ jobs:
   test-windows:
     # Preserve the existing required-check surface while the real work happens
     # in the sharded Windows jobs above.
-    if: always()
+    # Disabled on this fork together with the shards: this job only re-checks
+    # the shard results, and would fail on their skipped outcome.
+    if: false
     needs: test-windows-shard
     runs-on: ubuntu-24.04
     name: Bazel test on windows-latest for x86_64-pc-windows-gnullvm
@@ -252,7 +265,10 @@ jobs:
     # Native Windows Bazel tests are slower and frequently approach the
     # 30-minute PR budget. Run this only for post-merge commits to main and give
     # it a larger timeout.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Disabled on this fork: it requires the upstream-only private runner group
+    # below (`codex-termux-runners`), which does not exist here. Re-enable by
+    # removing the `if` and setting up the runner group.
+    if: false
     timeout-minutes: 40
     runs-on:
       group: ${{ github.event.repository.name }}-runners
@@ -348,6 +364,14 @@ jobs:
             runs_on:
               group: ${{ github.event.repository.name }}-runners
               labels: ${{ github.event.repository.name }}-windows-x64
+
+        exclude:
+          # Disabled on this fork: the macOS leg needs paid GitHub runners and
+          # the Windows leg requires the upstream-only private runner group
+          # above. The Linux leg is unaffected. Remove this exclude to restore
+          # both legs.
+          - os: macos-15-xlarge
+          - os: windows-latest
     runs-on: ${{ matrix.runs_on || matrix.os }}
     name: Bazel clippy on ${{ matrix.os }} for ${{ matrix.target }}
     environment:
@@ -447,6 +471,14 @@ jobs:
             runs_on:
               group: ${{ github.event.repository.name }}-runners
               labels: ${{ github.event.repository.name }}-windows-x64
+
+        exclude:
+          # Disabled on this fork: the macOS leg needs paid GitHub runners and
+          # the Windows leg requires the upstream-only private runner group
+          # above. The Linux leg is unaffected. Remove this exclude to restore
+          # both legs.
+          - os: macos-15-xlarge
+          - os: windows-latest
     runs-on: ${{ matrix.runs_on || matrix.os }}
     name: Verify release build on ${{ matrix.os }} for ${{ matrix.target }}
     environment:

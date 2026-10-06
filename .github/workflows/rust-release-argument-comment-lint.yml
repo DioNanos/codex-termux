@@ -60,6 +60,14 @@ jobs:
               group: ${{ github.event.repository.name }}-runners
               labels: ${{ github.event.repository.name }}-windows-x64
 
+        exclude:
+          # Disabled on this fork: the macOS leg needs paid GitHub runners and
+          # the Windows leg requires the upstream-only private runner group
+          # above, so neither can run here. The Linux legs are unaffected.
+          # Remove this exclude to restore them.
+          - runner: macos-15-xlarge
+          - runner: windows-x64
+
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
