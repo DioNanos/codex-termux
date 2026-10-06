@@ -23,12 +23,10 @@ jobs:
     # This fork has no upstream remote cache and no upstream runners, so a
     # cold Linux run needs more than the upstream 30 minutes. Restore 30
     # when that cache or those runners are available.
-    # Disabled on this fork: there is no upstream remote cache, so the
-    # GitHub-hosted runner runs out of disk during bazel test, and the
-    # exec-server and git-utils tests need a runtime environment this
-    # runner does not provide. The Linux gnu and musl matrix entries stay
-    # listed below and do not run. Clippy and verify-release-build stay
-    # on. Re-enable by removing this `if`.
+    # Disabled on this fork. Bazel is upstream's build system and uses a
+    # remote cache with credentials this fork does not have. This fork
+    # publishes with cargo and the Termux gate. Re-enable by removing
+    # this `if`.
     if: false
     timeout-minutes: 60
     strategy:
@@ -355,6 +353,11 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   clippy:
+    # Disabled on this fork. Bazel is upstream's build system and uses a
+    # remote cache with credentials this fork does not have. This fork
+    # publishes with cargo and the Termux gate. Re-enable by removing
+    # this `if`.
+    if: false
     # This fork has no upstream remote cache and no upstream runners, so a
     # cold Linux run needs more than the upstream 30 minutes. Restore 30
     # when that cache or those runners are available.
@@ -387,29 +390,6 @@ jobs:
       deployment: false
 
     steps:
-      # This fork has no upstream remote cache, so this Linux job fills the
-      # GitHub-hosted runner disk. Same cleanup as "Free up disk before the
-      # V8 build" in rusty-v8-android-release.yml. Same list; nothing added.
-      - name: Free up disk before the V8 build
-        shell: bash
-        run: |
-          set -euo pipefail
-          df -h "$RUNNER_TEMP" / || true
-          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          # The Android SDK under ANDROID_HOME used to be deleted wholesale
-          # here, which took sdkmanager with it and left the next step unable to
-          # install the NDK. chromium's Android configuration reads an SDK as
-          # well as an NDK, so keep the SDK and drop only what no build here
-          # touches: emulator images and any preinstalled NDK, this job
-          # installing the version it pins.
-          : "${ANDROID_HOME:?ANDROID_HOME must be set on the GitHub runner}"
-          if [ -d "${ANDROID_HOME}" ]; then
-            sudo rm -rf "${ANDROID_HOME}/system-images" "${ANDROID_HOME}/emulator" \
-              "${ANDROID_HOME}/ndk" "${ANDROID_HOME}/ndk-bundle" || true
-          fi
-          sudo apt-get clean || true
-          df -h "$RUNNER_TEMP" / || true
-
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -488,6 +468,11 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   verify-release-build:
+    # Disabled on this fork. Bazel is upstream's build system and uses a
+    # remote cache with credentials this fork does not have. This fork
+    # publishes with cargo and the Termux gate. Re-enable by removing
+    # this `if`.
+    if: false
     # This fork has no upstream remote cache and no upstream runners, so a
     # cold Linux run needs more than the upstream 30 minutes. Restore 30
     # when that cache or those runners are available.
@@ -519,29 +504,6 @@ jobs:
       deployment: false
 
     steps:
-      # This fork has no upstream remote cache, so this Linux job fills the
-      # GitHub-hosted runner disk. Same cleanup as "Free up disk before the
-      # V8 build" in rusty-v8-android-release.yml. Same list; nothing added.
-      - name: Free up disk before the V8 build
-        shell: bash
-        run: |
-          set -euo pipefail
-          df -h "$RUNNER_TEMP" / || true
-          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          # The Android SDK under ANDROID_HOME used to be deleted wholesale
-          # here, which took sdkmanager with it and left the next step unable to
-          # install the NDK. chromium's Android configuration reads an SDK as
-          # well as an NDK, so keep the SDK and drop only what no build here
-          # touches: emulator images and any preinstalled NDK, this job
-          # installing the version it pins.
-          : "${ANDROID_HOME:?ANDROID_HOME must be set on the GitHub runner}"
-          if [ -d "${ANDROID_HOME}" ]; then
-            sudo rm -rf "${ANDROID_HOME}/system-images" "${ANDROID_HOME}/emulator" \
-              "${ANDROID_HOME}/ndk" "${ANDROID_HOME}/ndk-bundle" || true
-          fi
-          sudo apt-get clean || true
-          df -h "$RUNNER_TEMP" / || true
-
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false

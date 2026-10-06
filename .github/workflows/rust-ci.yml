@@ -162,6 +162,11 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   argument_comment_lint_prebuilt:
+    # Disabled on this fork. Bazel is upstream's build system and uses a
+    # remote cache with credentials this fork does not have. This fork
+    # publishes with cargo and the Termux gate. Re-enable by removing
+    # this `if`.
+    if: false
     name: Argument comment lint - ${{ matrix.name }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
@@ -255,9 +260,10 @@ jobs:
             [[ '${{ needs.argument_comment_lint_package.result }}' == 'success' ]] || { echo 'argument_comment_lint_package failed'; exit 1; }
           fi
 
-          if [[ "${NEEDS_CHANGED_OUTPUTS_ARGUMENT_COMMENT_LINT}" == 'true' || "${NEEDS_CHANGED_OUTPUTS_WORKFLOWS}" == 'true' ]]; then
-            [[ '${{ needs.argument_comment_lint_prebuilt.result }}' == 'success' ]] || { echo 'argument_comment_lint_prebuilt failed'; exit 1; }
-          fi
+          # The Bazel prebuilt lint job is disabled on this fork. Bazel is
+          # upstream's build and needs a remote cache with credentials.
+          # Re-enable by removing that job's `if`, then require success
+          # here again. Cargo general and shear stay strict.
 
           if [[ "${NEEDS_CHANGED_OUTPUTS_CODEX}" == 'true' || "${NEEDS_CHANGED_OUTPUTS_WORKFLOWS}" == 'true' ]]; then
             [[ '${{ needs.general.result }}' == 'success' ]] || { echo 'general failed'; exit 1; }
