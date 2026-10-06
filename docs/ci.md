@@ -46,14 +46,13 @@ Per workflow:
   Remove the `if` to restore it. `CI results` does not require that job.
   The cargo package job and the cargo general and shear checks stay
   strict. The macOS and Windows legs stay commented out.
-- **`rust-ci-full.yml`** (called by postmerge-ci): the Linux x64 (remote)
-  and arm64 test jobs stay strict in the `results` gate. The macOS test
-  job (paid runners) and the two Windows test jobs (`codex-termux-runners`)
-  are turned off with `if: false`, and the gate accepts `skipped` only for
-  those three; the macOS and Windows legs of the prebuilt
-  argument-comment lint and of the `lint_build` job are commented out of
-  the `matrix: include:` lists — `lint_build` keeps running on its Linux
-  legs, so the `results` gate keeps requiring it.
+- **`rust-ci-full.yml`** (called by postmerge-ci): `lint_build` and the
+  Linux x64 and arm64 test jobs ask for the private runner group
+  `<repo>-runners`, which is upstream's and does not exist on this fork.
+  They are turned off with `if: false`. The macOS and Windows test jobs
+  stay off too. The results gate accepts `skipped` for those jobs and
+  still requires success from general, cargo shear, and both
+  argument-comment lint jobs. Remove the `if` to restore a job.
 - **`v8-canary.yml`** (called by postmerge-ci): only the Linux legs (x64
   and arm64, release and ptrcomp-sandbox variants) run; the four macOS
   legs (paid GitHub runners) are commented out of the `matrix: include:`
@@ -66,7 +65,6 @@ Per workflow:
 
 ## Known postmerge limitation
 
-`postmerge-ci` currently reports `startup_failure` with zero jobs. The two
-workflows it calls are active and their YAML parses cleanly, so the likely
-cause is the same account-level scheduling limit that blocks the macOS legs.
-Rerunning the workflow manually shows whether it clears.
+`postmerge-ci` starts and creates jobs. `v8-canary` uses GitHub-hosted
+Linux runners. The `rust-ci-full` jobs that need the private runner group
+are disabled, as listed above.

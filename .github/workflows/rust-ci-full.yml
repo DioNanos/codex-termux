@@ -158,6 +158,10 @@ jobs:
 
   # --- CI to validate on different os/targets --------------------------------
   lint_build:
+    # Disabled on this fork. Every live leg asks for the private runner
+    # group `<repo>-runners`, which is upstream's and does not exist here.
+    # Remove this `if` to restore the job.
+    if: false
     name: Lint/Build — ${{ matrix.runner }} - ${{ matrix.target }}${{ matrix.profile == 'release' && ' (release)' || '' }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
     timeout-minutes: 30
@@ -492,6 +496,11 @@ jobs:
     secrets: inherit
 
   tests_linux_x64_remote:
+    # Disabled on this fork. This leg asks for the private runner group
+    # `<repo>-runners`, which is upstream's and does not exist here.
+    # The `results` gate accepts `skipped` for it. Remove this `if` to
+    # restore it.
+    if: false
     name: Tests — ubuntu-24.04 - x86_64-unknown-linux-gnu (remote)
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
@@ -506,6 +515,11 @@ jobs:
     secrets: inherit
 
   tests_linux_arm64:
+    # Disabled on this fork. This leg asks for the private runner group
+    # `<repo>-runners`, which is upstream's and does not exist here.
+    # The `results` gate accepts `skipped` for it. Remove this `if` to
+    # restore it.
+    if: false
     name: Tests — ubuntu-24.04-arm - aarch64-unknown-linux-gnu
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
@@ -594,13 +608,15 @@ jobs:
           [[ '${{ needs.argument_comment_lint_prebuilt.result }}' == 'success' ]] || { echo 'argument_comment_lint_prebuilt failed'; exit 1; }
           [[ '${{ needs.general.result }}' == 'success' ]] || { echo 'general failed'; exit 1; }
           [[ '${{ needs.cargo_shear.result }}' == 'success' ]] || { echo 'cargo_shear failed'; exit 1; }
-          [[ '${{ needs.lint_build.result }}' == 'success' ]] || { echo 'lint_build failed'; exit 1; }
-          # The disabled macOS and Windows test legs are `skipped` on this
-          # fork, so the gate accepts `success` or `skipped` for those three
-          # only. The Linux legs stay strict: they must be `success`.
+          # lint_build and the Linux test legs ask for the private runner
+          # group `<repo>-runners`, which does not exist on this fork, so
+          # they are disabled and the gate accepts `skipped`. Remove their
+          # `if` and require `success` again to restore them. The argument
+          # comment jobs, general, and cargo shear stay strict.
+          [[ '${{ needs.lint_build.result }}' == 'success' || '${{ needs.lint_build.result }}' == 'skipped' ]] || { echo 'lint_build failed'; exit 1; }
           [[ '${{ needs.tests_macos_aarch64.result }}' == 'success' || '${{ needs.tests_macos_aarch64.result }}' == 'skipped' ]] || { echo 'tests_macos_aarch64 failed'; exit 1; }
-          [[ '${{ needs.tests_linux_x64_remote.result }}' == 'success' ]] || { echo 'tests_linux_x64_remote failed'; exit 1; }
-          [[ '${{ needs.tests_linux_arm64.result }}' == 'success' ]] || { echo 'tests_linux_arm64 failed'; exit 1; }
+          [[ '${{ needs.tests_linux_x64_remote.result }}' == 'success' || '${{ needs.tests_linux_x64_remote.result }}' == 'skipped' ]] || { echo 'tests_linux_x64_remote failed'; exit 1; }
+          [[ '${{ needs.tests_linux_arm64.result }}' == 'success' || '${{ needs.tests_linux_arm64.result }}' == 'skipped' ]] || { echo 'tests_linux_arm64 failed'; exit 1; }
           [[ '${{ needs.tests_windows_x64.result }}' == 'success' || '${{ needs.tests_windows_x64.result }}' == 'skipped' ]] || { echo 'tests_windows_x64 failed'; exit 1; }
           [[ '${{ needs.tests_windows_arm64.result }}' == 'success' || '${{ needs.tests_windows_arm64.result }}' == 'skipped' ]] || { echo 'tests_windows_arm64 failed'; exit 1; }
 
