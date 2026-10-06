@@ -51,7 +51,10 @@ jobs:
     # required check can appear successful instead of reporting the failure.
     if: ${{ always() }}
     needs:
-      - bazel
+      # `bazel` is disabled on this fork. Bazel is upstream's build system
+      # and uses a remote cache with credentials this fork does not have.
+      # The fork publishes with cargo and the Termux gate. Add `bazel` back
+      # here when those jobs are re-enabled by removing their `if`.
       - blob-size-policy
       - cargo-deny
       - codespell
