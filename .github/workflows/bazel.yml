@@ -20,7 +20,10 @@ jobs:
     # signal without putting PR latency back on the critical path. When
     # Code-mode unit tests run on every Bazel target. When authenticated RBE
     # is available, the Windows-cross shards exercise the source-built V8 path.
-    timeout-minutes: 30
+    # This fork has no upstream remote cache and no upstream runners, so a
+    # cold Linux run needs more than the upstream 30 minutes. Restore 30
+    # when that cache or those runners are available.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -345,7 +348,10 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   clippy:
-    timeout-minutes: 30
+    # This fork has no upstream remote cache and no upstream runners, so a
+    # cold Linux run needs more than the upstream 30 minutes. Restore 30
+    # when that cache or those runners are available.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -452,7 +458,10 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   verify-release-build:
-    timeout-minutes: 30
+    # This fork has no upstream remote cache and no upstream runners, so a
+    # cold Linux run needs more than the upstream 30 minutes. Restore 30
+    # when that cache or those runners are available.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
