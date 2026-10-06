@@ -317,7 +317,7 @@ mod tests {
             "fetched_at": Utc::now(),
             "client_version": "0.153.3",
             "models": [
-                model_json_with_slug_and_instructions("cache-ok-1", 0),
+                model_json_with_slug_and_instructions("cache-ok-1", /*len*/ 0),
                 model_json_with_slug_and_instructions("cache-too-long", 8 * 1024 + 1),
                 model_json_with_slug_and_instructions("cache-ok-2", 8 * 1024),
             ]

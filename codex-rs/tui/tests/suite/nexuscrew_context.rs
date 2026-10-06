@@ -91,7 +91,7 @@ async fn request(
 async fn observe_daemon(socket_path: &Path) -> Result<Value> {
     let stream = UnixStream::connect(socket_path).await?;
     let (mut socket, _) = tokio_tungstenite::client_async("ws://localhost", stream).await?;
-    request(&mut socket, 1, "initialize", json!({"clientInfo":{"name":"identity-probe", "version":"0.0.0"}, "capabilities":{"experimentalApi":true}})).await?;
+    request(&mut socket, /*id*/ 1, "initialize", json!({"clientInfo":{"name":"identity-probe", "version":"0.0.0"}, "capabilities":{"experimentalApi":true}})).await?;
     socket
         .send(Message::Text(
             json!({"jsonrpc":"2.0", "method":"initialized"})
@@ -99,8 +99,8 @@ async fn observe_daemon(socket_path: &Path) -> Result<Value> {
                 .into(),
         ))
         .await?;
-    let thread = request(&mut socket, 2, "thread/start", json!({})).await?;
-    let response = request(&mut socket, 3, "mcpServer/tool/call", json!({"threadId":thread["thread"]["id"], "server":"identity", "tool":"identity", "arguments":{}})).await?;
+    let thread = request(&mut socket, /*id*/ 2, "thread/start", json!({})).await?;
+    let response = request(&mut socket, /*id*/ 3, "mcpServer/tool/call", json!({"threadId":thread["thread"]["id"], "server":"identity", "tool":"identity", "arguments":{}})).await?;
     let text = response["content"][0]["text"]
         .as_str()
         .context("identity result")?;
@@ -406,7 +406,14 @@ fn cell_context_rejects_agents_before_daemon_start_with_pty() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incomplete_cell_context_does_not_borrow_daemon_identity() -> Result<()> {
-    identity_scenario("new", "cell-a", "missing-pane", false, false).await
+    identity_scenario(
+        "new",
+        "cell-a",
+        "missing-pane",
+        /*fd_only*/ false,
+        /*concurrent*/ false,
+    )
+    .await
 }
 
 #[test]

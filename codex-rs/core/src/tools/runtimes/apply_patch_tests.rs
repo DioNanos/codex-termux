@@ -593,7 +593,11 @@ async fn delete_preverification_reads_host_files_when_no_sandbox_can_exist() {
         "*** Begin Patch\n*** Delete File: target.txt\n*** End Patch",
         &cwd,
     );
-    let context = preverify_context(PermissionProfile::read_only(), /*platform*/ true, &cwd);
+    let context = preverify_context(
+        PermissionProfile::read_only(),
+        /*sandbox_unavailable_by_construction*/ true,
+        &cwd,
+    );
     let backend = codex_exec_server::LocalFileSystem::unsandboxed();
 
     let verified = codex_apply_patch::verify_apply_patch_args_with_mode(
@@ -629,7 +633,11 @@ async fn update_preverification_reads_host_files_when_no_sandbox_can_exist() {
         "*** Begin Patch\n*** Update File: source.txt\n@@\n-alpha\n+ALPHA\n*** End Patch",
         &cwd,
     );
-    let context = preverify_context(PermissionProfile::read_only(), /*platform*/ true, &cwd);
+    let context = preverify_context(
+        PermissionProfile::read_only(),
+        /*sandbox_unavailable_by_construction*/ true,
+        &cwd,
+    );
     let backend = codex_exec_server::LocalFileSystem::unsandboxed();
 
     let verified = codex_apply_patch::verify_apply_patch_args_with_mode(
@@ -670,7 +678,7 @@ async fn denied_read_policy_keeps_preverification_fail_closed_when_no_sandbox_ca
     // host fallback must stay locked so the denial keeps being enforced.
     let context = preverify_context(
         denied_read_profile(&denied.abs()),
-        /*platform*/ true,
+        /*sandbox_unavailable_by_construction*/ true,
         &cwd,
     );
     let backend = codex_exec_server::LocalFileSystem::unsandboxed();
@@ -706,7 +714,7 @@ async fn linux_platform_keeps_preverification_on_the_sandboxed_routing() {
     // before the read fallback existed.
     let context = preverify_context(
         PermissionProfile::read_only(),
-        /*platform*/ false,
+        /*sandbox_unavailable_by_construction*/ false,
         &cwd,
     );
     let backend = codex_exec_server::LocalFileSystem::unsandboxed();

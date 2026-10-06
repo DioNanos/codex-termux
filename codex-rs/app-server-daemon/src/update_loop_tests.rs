@@ -543,7 +543,7 @@ async fn test_control_server(
 #[cfg(unix)]
 #[tokio::test]
 async fn manual_update_restarts_managed_daemon_with_automatic_updates_disabled() {
-    check_manual_update_restart(false).await;
+    check_manual_update_restart(/*local_package*/ false).await;
 }
 
 #[cfg(unix)]
@@ -693,7 +693,7 @@ async fn confirmed_feature_restart_preserves_ownership_and_skips_matching_settin
 #[cfg(unix)]
 #[tokio::test]
 async fn manual_update_restarts_local_daemon_with_automatic_updates_disabled() {
-    check_manual_update_restart(true).await;
+    check_manual_update_restart(/*local_package*/ true).await;
 }
 
 #[cfg(unix)]

@@ -900,8 +900,9 @@ mod tests {
     #[test]
     fn resolve_codex_self_exe_falls_back_to_current_exe() {
         let current_exe = PathBuf::from("/tmp/current-exe");
-        let resolved = resolve_codex_self_exe_with(None, Some(current_exe.clone()))
-            .expect("resolve codex self exe");
+        let resolved =
+            resolve_codex_self_exe_with(/*override_path*/ None, Some(current_exe.clone()))
+                .expect("resolve codex self exe");
         assert_eq!(resolved, current_exe);
     }
 
