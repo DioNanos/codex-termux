@@ -318,7 +318,9 @@ impl PtyCodex {
         extra_env: &[(&str, &str)],
     ) -> Result<Self> {
         let codex = codex_utils_cargo_bin::cargo_bin("codex")?;
-        Self::start_binary_with_env(&codex, repo_root, codex_home, extra_args, None, extra_env)
+        Self::start_binary_with_env(
+            &codex, repo_root, codex_home, extra_args, /*editor*/ None, extra_env,
+        )
     }
 
     fn start_binary(

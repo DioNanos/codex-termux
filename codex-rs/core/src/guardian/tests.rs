@@ -4227,8 +4227,8 @@ async fn guardian_oversized_node_repl_policy_fails_closed_without_model_or_tool_
             approval: Some("execute the requested command".to_string()),
             retry: None,
         },
-        None,
-        1,
+        /*external_cancel*/ None,
+        /*max_attempts*/ 1,
     )
     .await;
 

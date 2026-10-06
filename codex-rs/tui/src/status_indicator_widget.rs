@@ -382,19 +382,31 @@ mod tests {
         // Without the waiting-background branch a waiting-only status falls
         // back to the 1 s idle ticker and progress re-renders at 32 ms.
         assert_eq!(
-            frame_interval_for_state(false, true),
+            frame_interval_for_state(
+                /*animations_with_progress_or_shimmer*/ false,
+                /*waiting_on_background_terminal*/ true
+            ),
             Duration::from_millis(200)
         );
         assert_eq!(
-            frame_interval_for_state(true, true),
+            frame_interval_for_state(
+                /*animations_with_progress_or_shimmer*/ true,
+                /*waiting_on_background_terminal*/ true
+            ),
             Duration::from_millis(32)
         );
         assert_eq!(
-            frame_interval_for_state(true, false),
+            frame_interval_for_state(
+                /*animations_with_progress_or_shimmer*/ true,
+                /*waiting_on_background_terminal*/ false
+            ),
             Duration::from_millis(32)
         );
         assert_eq!(
-            frame_interval_for_state(false, false),
+            frame_interval_for_state(
+                /*animations_with_progress_or_shimmer*/ false,
+                /*waiting_on_background_terminal*/ false
+            ),
             Duration::from_millis(1_000)
         );
     }

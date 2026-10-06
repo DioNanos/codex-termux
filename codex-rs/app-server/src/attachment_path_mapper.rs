@@ -84,7 +84,7 @@ mod tests {
     fn non_termux_paths_are_unchanged() {
         let path = Path::new("/tmp/codex-remote-attachments/image.png");
 
-        assert_eq!(map_client_path(path, None), path);
-        assert_eq!(map_host_path(path, None), path);
+        assert_eq!(map_client_path(path, /*temp_dir*/ None), path);
+        assert_eq!(map_host_path(path, /*temp_dir*/ None), path);
     }
 }

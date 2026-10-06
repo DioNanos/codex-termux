@@ -486,7 +486,7 @@ mod tests {
         // compilato nel binario — dove i modelli nuovi non ci sono.
         let response = ModelsResponse {
             models: vec![
-                model_with_slug_and_instructions("gpt-ok-1", 0),
+                model_with_slug_and_instructions("gpt-ok-1", /*len*/ 0),
                 model_with_slug_and_instructions("gpt-too-long", 8 * 1024 + 1),
                 model_with_slug_and_instructions("gpt-ok-2", 8 * 1024),
             ],

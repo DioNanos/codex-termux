@@ -1194,7 +1194,7 @@ mod tests {
 
     #[test]
     fn model_message_text_cap_accepts_none_empty_and_exact_limit() {
-        assert!(validate_model_messages(&test_model(None)).is_ok());
+        assert!(validate_model_messages(&test_model(/*spec*/ None)).is_ok());
         let empty = ModelMessages {
             persistent_instructions: Some(String::new()),
             tools: None,
