@@ -15,22 +15,38 @@ disabled, and why:
 
 ## What is disabled, and why
 
-Two groups of inherited jobs cannot run on this fork's GitHub account, so
-they are disabled at the workflow level instead of showing permanent red:
+Several inherited legs cannot run on this fork's GitHub account, so they
+are disabled instead of showing permanent red. GitHub applies
+`matrix: include:` entries after `matrix: exclude:` entries, so an
+`exclude:` cannot remove an `include:` entry; the unrunnable matrix legs
+are therefore commented out of the `include:` lists (the same pattern the
+arm64 Bazel entries already used), while fully inherited jobs are turned
+off with `if: false` at the job level. Every disabled block carries a
+comment with the reason and how to re-enable it. The Linux and Android
+legs are untouched.
 
-- **Windows legs** (Bazel test shards, Bazel clippy, verify-release-build,
-  and the Windows argument-comment lint): they require the upstream-only
-  private runner group `codex-termux-runners`, which does not exist on this
-  fork. The jobs fail to schedule at all.
-- **macOS legs** (Bazel test/clippy/verify and the macOS argument-comment
-  lint): they need paid GitHub runners, and the account spending limit stops
-  them from starting.
+Per workflow:
 
-Both groups are marked with `matrix: exclude:` blocks or `if: false` in
-`.github/workflows/bazel.yml` and
-`.github/workflows/rust-release-argument-comment-lint.yml`, each with a
-comment explaining the reason and how to re-enable them. The Linux and
-Android legs are untouched.
+- **`bazel.yml`, Bazel test job**: the two Linux x64 legs (gnu and musl)
+  run. The two macOS legs (paid GitHub runners; the account spending
+  limit stops them from starting) and the two arm64 Linux legs (flaky in
+  CI, see the note in the file) are commented out in the
+  `matrix: include:` list.
+- **`bazel.yml`, Bazel clippy and verify-release-build jobs**: the Linux
+  x64 leg runs. The macOS leg (paid GitHub runners) and the Windows
+  gnullvm leg (it requires the upstream-only private runner group
+  `codex-termux-runners`, which does not exist on this fork, so the job
+  cannot schedule at all) are commented out in the `matrix: include:`
+  lists.
+- **`rust-release-argument-comment-lint.yml`**: the two Linux legs (x64
+  and arm64) build the lint library. The macOS leg (paid GitHub runners)
+  and the Windows leg (`codex-termux-runners`) are commented out in the
+  `matrix: include:` list.
+- **`rust-ci.yml`, PR argument-comment lint**: the Linux leg runs. The
+  macOS and Windows legs are commented out in the `matrix: include:` list,
+  same reasons as above.
+- **Three inherited Bazel jobs in `bazel.yml`**: turned off with
+  `if: false` at the job level; they show up as skipped checks.
 
 ## Known postmerge limitation
 
