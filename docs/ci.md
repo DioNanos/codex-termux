@@ -52,11 +52,15 @@ Per workflow:
   job (paid runners) and the two Windows test jobs (`codex-termux-runners`)
   are turned off with `if: false`, and the gate accepts `skipped` only for
   those three; the macOS and Windows legs of the prebuilt
-  argument-comment lint are commented out of the `matrix: include:` list.
+  argument-comment lint and of the `lint_build` job are commented out of
+  the `matrix: include:` lists — `lint_build` keeps running on its Linux
+  legs, so the `results` gate keeps requiring it.
 - **`v8-canary.yml`** (called by postmerge-ci): only the Linux legs (x64
   and arm64, release and ptrcomp-sandbox variants) run; the four macOS
   legs (paid GitHub runners) are commented out of the `matrix: include:`
-  list.
+  list. The `build-windows-source` job keeps its upstream conditional
+  gate (`windows_source_required`), so it runs only when the metadata job
+  asks for it.
 - **Three inherited Bazel jobs in `bazel.yml`**: turned off with
   `if: false` at the job level; they show up as skipped checks.
 

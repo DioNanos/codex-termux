@@ -176,12 +176,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15-xlarge
-            target: aarch64-apple-darwin
-            profile: dev
-          - runner: macos-15-xlarge
-            target: x86_64-apple-darwin
-            profile: dev
+          # macOS
+          # Disabled on this fork: these legs need paid GitHub runners and the
+          # account spending limit stops them from starting. GitHub applies
+          # `include` entries after `exclude` entries, so an exclude cannot
+          # remove these legs; they are commented out instead. Uncomment them
+          # to restore them.
+          # - runner: macos-15-xlarge
+          #   target: aarch64-apple-darwin
+          #   profile: dev
+          # - runner: macos-15-xlarge
+          #   target: x86_64-apple-darwin
+          #   profile: dev
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             profile: dev
@@ -206,26 +212,32 @@ jobs:
             runs_on:
               group: ${{ github.event.repository.name }}-runners
               labels: ${{ github.event.repository.name }}-linux-arm64
-          - runner: windows-x64
-            target: x86_64-pc-windows-msvc
-            profile: dev
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-x64
-          - runner: windows-arm64
-            target: aarch64-pc-windows-msvc
-            profile: dev
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-arm64
+          # Windows
+          # Disabled on this fork: these legs require the upstream-only
+          # private runner group `codex-termux-runners`, so they cannot be
+          # scheduled here. Uncomment them to restore them.
+          # - runner: windows-x64
+          #   target: x86_64-pc-windows-msvc
+          #   profile: dev
+          #   runs_on:
+          #     group: ${{ github.event.repository.name }}-runners
+          #     labels: ${{ github.event.repository.name }}-windows-x64
+          # - runner: windows-arm64
+          #   target: aarch64-pc-windows-msvc
+          #   profile: dev
+          #   runs_on:
+          #     group: ${{ github.event.repository.name }}-runners
+          #     labels: ${{ github.event.repository.name }}-windows-arm64
 
           # Also run representative release builds on Mac and Linux because
           # there could be release-only build errors we want to catch.
           # Hopefully this also pre-populates the build cache to speed up
-          # releases.
-          - runner: macos-15-xlarge
-            target: aarch64-apple-darwin
-            profile: release
+          # releases. (The macOS and Windows entries below are disabled on
+          # this fork, same reasons as above; uncomment them to restore
+          # them.)
+          # - runner: macos-15-xlarge
+          #   target: aarch64-apple-darwin
+          #   profile: release
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             profile: release
@@ -238,18 +250,18 @@ jobs:
             runs_on:
               group: ${{ github.event.repository.name }}-runners
               labels: ${{ github.event.repository.name }}-linux-arm64
-          - runner: windows-x64
-            target: x86_64-pc-windows-msvc
-            profile: release
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-x64
-          - runner: windows-arm64
-            target: aarch64-pc-windows-msvc
-            profile: release
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-arm64
+          # - runner: windows-x64
+          #   target: x86_64-pc-windows-msvc
+          #   profile: release
+          #   runs_on:
+          #     group: ${{ github.event.repository.name }}-runners
+          #     labels: ${{ github.event.repository.name }}-windows-x64
+          # - runner: windows-arm64
+          #   target: aarch64-pc-windows-msvc
+          #   profile: release
+          #   runs_on:
+          #     group: ${{ github.event.repository.name }}-runners
+          #     labels: ${{ github.event.repository.name }}-windows-arm64
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
