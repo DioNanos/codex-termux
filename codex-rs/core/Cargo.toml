@@ -178,4 +178,10 @@ zstd = { workspace = true }
 
 [package.metadata.cargo-shear]
 ignored = ["openssl-sys"]
-ignored-paths = ["tests/remote_env_windows/*.rs"]
+# scenarios_read_only_mcp.rs is an upstream stub with no module include.
+# cargo-shear 1.11.2 reports it on this fork and on openai/codex. Keep the
+# file so the fork does not grow a deletion that upstream has not made.
+ignored-paths = [
+    "tests/remote_env_windows/*.rs",
+    "tests/suite/scenarios_read_only_mcp.rs",
+]
