@@ -113,34 +113,40 @@ jobs:
             target: aarch64-unknown-linux-gnu
             v8_cpu: arm64
             variant: ptrcomp-sandbox
-          - runner: macos-15-xlarge
-            bazel_config: ci-macos
-            platform: macos_amd64
-            sandbox: false
-            target: x86_64-apple-darwin
-            v8_cpu: x64
-            variant: release
-          - runner: macos-15-xlarge
-            bazel_config: ci-macos
-            platform: macos_amd64
-            sandbox: true
-            target: x86_64-apple-darwin
-            v8_cpu: x64
-            variant: ptrcomp-sandbox
-          - runner: macos-15-xlarge
-            bazel_config: ci-macos
-            platform: macos_arm64
-            sandbox: false
-            target: aarch64-apple-darwin
-            v8_cpu: arm64
-            variant: release
-          - runner: macos-15-xlarge
-            bazel_config: ci-macos
-            platform: macos_arm64
-            sandbox: true
-            target: aarch64-apple-darwin
-            v8_cpu: arm64
-            variant: ptrcomp-sandbox
+          # macOS
+          # Disabled on this fork: these legs need paid GitHub runners and the
+          # account spending limit stops them from starting. GitHub applies
+          # `include` entries after `exclude` entries, so an exclude cannot
+          # remove these legs; they are commented out instead. Uncomment all
+          # four entries to restore them.
+          # - runner: macos-15-xlarge
+          #   bazel_config: ci-macos
+          #   platform: macos_amd64
+          #   sandbox: false
+          #   target: x86_64-apple-darwin
+          #   v8_cpu: x64
+          #   variant: release
+          # - runner: macos-15-xlarge
+          #   bazel_config: ci-macos
+          #   platform: macos_amd64
+          #   sandbox: true
+          #   target: x86_64-apple-darwin
+          #   v8_cpu: x64
+          #   variant: ptrcomp-sandbox
+          # - runner: macos-15-xlarge
+          #   bazel_config: ci-macos
+          #   platform: macos_arm64
+          #   sandbox: false
+          #   target: aarch64-apple-darwin
+          #   v8_cpu: arm64
+          #   variant: release
+          # - runner: macos-15-xlarge
+          #   bazel_config: ci-macos
+          #   platform: macos_arm64
+          #   sandbox: true
+          #   target: aarch64-apple-darwin
+          #   v8_cpu: arm64
+          #   variant: ptrcomp-sandbox
           - runner: ubuntu-24.04
             bazel_config: ci-v8
             platform: linux_amd64_musl

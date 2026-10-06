@@ -102,13 +102,20 @@ jobs:
         include:
           - name: Linux
             runner: ubuntu-24.04
-          - name: macOS
-            runner: macos-15-xlarge
-          - name: Windows
-            runner: windows-x64
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-x64
+          # macOS and Windows
+          # Disabled on this fork: the macOS leg needs paid GitHub runners and
+          # the Windows leg requires the upstream-only private runner group
+          # `codex-termux-runners`, so neither can run here. GitHub applies
+          # `include` entries after `exclude` entries, so an exclude cannot
+          # remove these legs; they are commented out instead. Uncomment both
+          # entries to restore them.
+          # - name: macOS
+          #   runner: macos-15-xlarge
+          # - name: Windows
+          #   runner: windows-x64
+          #   runs_on:
+          #     group: ${{ github.event.repository.name }}-runners
+          #     labels: ${{ github.event.repository.name }}-windows-x64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -458,6 +465,10 @@ jobs:
           key: apt-${{ matrix.runner }}-${{ matrix.target }}-v1
 
   tests_macos_aarch64:
+    # Disabled on this fork: this leg needs paid GitHub runners and the
+    # account spending limit stops it from starting. The `results` gate below
+    # accepts `skipped` for it. Remove this `if` to restore it.
+    if: false
     name: Tests — macos-15-xlarge - aarch64-apple-darwin
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
@@ -496,6 +507,11 @@ jobs:
     secrets: inherit
 
   tests_windows_x64:
+    # Disabled on this fork: this leg requires the upstream-only private
+    # runner group `codex-termux-runners`, so it cannot be scheduled here.
+    # The `results` gate below accepts `skipped` for it. Remove this `if` to
+    # restore it.
+    if: false
     name: Tests — windows-x64 - x86_64-pc-windows-msvc
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
@@ -509,6 +525,11 @@ jobs:
     secrets: inherit
 
   tests_windows_arm64:
+    # Disabled on this fork: this leg and its archive leg require the
+    # upstream-only private runner group `codex-termux-runners`, so they
+    # cannot be scheduled here. The `results` gate below accepts `skipped`
+    # for it. Remove this `if` to restore it.
+    if: false
     name: Tests — windows-arm64 - aarch64-pc-windows-msvc
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
@@ -562,11 +583,14 @@ jobs:
           [[ '${{ needs.general.result }}' == 'success' ]] || { echo 'general failed'; exit 1; }
           [[ '${{ needs.cargo_shear.result }}' == 'success' ]] || { echo 'cargo_shear failed'; exit 1; }
           [[ '${{ needs.lint_build.result }}' == 'success' ]] || { echo 'lint_build failed'; exit 1; }
-          [[ '${{ needs.tests_macos_aarch64.result }}' == 'success' ]] || { echo 'tests_macos_aarch64 failed'; exit 1; }
+          # The disabled macOS and Windows test legs are `skipped` on this
+          # fork, so the gate accepts `success` or `skipped` for those three
+          # only. The Linux legs stay strict: they must be `success`.
+          [[ '${{ needs.tests_macos_aarch64.result }}' == 'success' || '${{ needs.tests_macos_aarch64.result }}' == 'skipped' ]] || { echo 'tests_macos_aarch64 failed'; exit 1; }
           [[ '${{ needs.tests_linux_x64_remote.result }}' == 'success' ]] || { echo 'tests_linux_x64_remote failed'; exit 1; }
           [[ '${{ needs.tests_linux_arm64.result }}' == 'success' ]] || { echo 'tests_linux_arm64 failed'; exit 1; }
-          [[ '${{ needs.tests_windows_x64.result }}' == 'success' ]] || { echo 'tests_windows_x64 failed'; exit 1; }
-          [[ '${{ needs.tests_windows_arm64.result }}' == 'success' ]] || { echo 'tests_windows_arm64 failed'; exit 1; }
+          [[ '${{ needs.tests_windows_x64.result }}' == 'success' || '${{ needs.tests_windows_x64.result }}' == 'skipped' ]] || { echo 'tests_windows_x64 failed'; exit 1; }
+          [[ '${{ needs.tests_windows_arm64.result }}' == 'success' || '${{ needs.tests_windows_arm64.result }}' == 'skipped' ]] || { echo 'tests_windows_arm64 failed'; exit 1; }
 
       - name: sccache summary note
         if: always()
