@@ -152,14 +152,6 @@ def test_root_format_driver_covers_all_formatter_groups(
 ) -> None:
     """The shared driver should retain every formatter in both modes."""
     script = _load_root_format_script_module()
-    for name in (
-        "bazel/rules/example.rs",
-        "codex-rs/src/lib.rs",
-        "codex-rs/new file.rs",
-    ):
-        path = tmp_path / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("")
     git_ls_files_args = [
         "git",
         "ls-files",
@@ -172,11 +164,6 @@ def test_root_format_driver_covers_all_formatter_groups(
     # The Python SDK CI image has no Git; keep discovery mocked at the process boundary.
     def fake_check_output(args, *, cwd):
         assert cwd == tmp_path
-        if args == git_ls_files_args + ["--", "*.rs"]:
-            return (
-                b"codex-rs/src/lib.rs\0bazel/rules/example.rs\0"
-                b"codex-rs/new file.rs\0codex-rs/deleted.rs\0"
-            )
         assert args == git_ls_files_args
         return b"MODULE.bazel\0README.md\0third_party/v8/libcxx.BUILD.bazel\0"
 
@@ -238,25 +225,16 @@ def test_root_format_driver_covers_all_formatter_groups(
     )
     assert formatters[0].commands[-1].args == ("just", "--unstable", "--fmt")
     assert checks[0].commands[-1].args == ("just", "--unstable", "--fmt", "--check")
-    rustfmt_args = (
-        "rustfmt",
-        "--edition",
-        "2024",
-        "--config-path",
-        str(tmp_path / "codex-rs/rustfmt.toml"),
+    cargo_fmt_args = (
+        "cargo",
+        "fmt",
+        "--",
         "--config",
-        "imports_granularity=Item,skip_children=true",
+        "imports_granularity=Item",
     )
-    rust_files = (
-        os.path.join("..", "bazel", "rules", "example.rs"),
-        "new file.rs",
-        os.path.join("src", "lib.rs"),
-    )
-    assert formatters[1].commands == (
-        script.Command(rustfmt_args + rust_files, tmp_path / "codex-rs"),
-    )
+    assert formatters[1].commands == (script.Command(cargo_fmt_args, tmp_path / "codex-rs"),)
     assert checks[1].commands == (
-        script.Command(rustfmt_args + ("--check",) + rust_files, tmp_path / "codex-rs"),
+        script.Command(cargo_fmt_args + ("--check",), tmp_path / "codex-rs"),
     )
     format_buildifier_args = formatters[2].commands[-1].args
     check_buildifier_args = checks[2].commands[-1].args
