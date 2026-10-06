@@ -4,8 +4,8 @@ This fork tracks upstream OpenAI Codex and keeps only the compatibility delta
 required to publish a working Android Termux package.
 
 - Fork repo: `DioNanos/codex-termux`
-- Upstream base for this release: `rust-v0.147.0`
-- Current fork release target: `v0.147.0`
+- Upstream base for this release: `rust-v0.160.0`
+- Current fork release target: `0.160.0-termux.3`
 
 ## Runtime patches
 
@@ -341,3 +341,50 @@ CI leaves it unset so the cargo-backed guard still runs there.
   compilation signal at all**. The package builds; `rg` breaks at runtime on the device.
   The check is deliberately version-agnostic: pinning it to a ripgrep version would make
   it go stale at the next bump and stop guarding anything.
+
+## Delta areas outside the numbered patches
+
+These areas are part of the fork delta against `rust-v0.160.0` but are not
+single-site patches: they span several files and are kept in sync with upstream
+on every rebase rather than anchored at one location.
+
+### Guardian and tool hardening
+
+- Files: `codex-rs/core/src/guardian/review.rs` (+ tests),
+  `codex-rs/core/src/tools/sandboxing.rs`,
+  `codex-rs/core/src/tools/orchestrator.rs`,
+  `codex-rs/core/src/tools/runtimes/apply_patch.rs` (+ tests),
+  `codex-rs/core/src/session/turn_context.rs`
+- Guardian review carries an explicit Node REPL policy resolved from the
+  reviewed model messages instead of an implicit default, so a review that
+  allows shell-backed Node stays a visible decision.
+- Sandboxing adds a `sandbox_unavailable_by_construction` predicate for
+  Android/Termux builds, where no sandbox backend is compiled in. On those
+  platforms an approved `apply_patch`/exec command takes the unsandboxed path
+  on purpose (the approval is the gate), failed runs are classified as sandbox
+  denials only with real evidence, and the session turn context carries the
+  same predicate.
+
+### Catalog and model hardening
+
+- Files: `codex-rs/models-manager/src/cache.rs` (+ tests),
+  `codex-rs/models-manager/src/model_info.rs`
+- Complements patch #26 on the models-manager side: a cached or partially
+  readable catalog no longer poisons the whole cache entry (tolerant split with
+  a logged warning), and custom providers configured with an empty instruction
+  still receive the bundled instruction template, so the provider degrades in
+  quality rather than failing to start.
+
+### NexusCrew session startup and context
+
+- Files: `codex-rs/tui/src/daemon_startup.rs`,
+  `codex-rs/tui/src/startup_orchestration.rs`,
+  `codex-rs/tui/src/lib.rs`,
+  `codex-rs/tui/tests/suite/nexuscrew_context.rs`,
+  `codex-rs/cli/src/main.rs`
+- When the CLI is started inside a NexusCrew cell, the daemon startup banner
+  names the cell context, and startup orchestration requires the embedded
+  server for cell identity: `--remote` and agents-overview refuse to run until
+  shared servers support per-connection identity binding, instead of silently
+  attaching to the wrong identity. A dedicated test suite covers the context
+  detection.
