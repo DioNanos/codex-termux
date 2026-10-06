@@ -23,6 +23,13 @@ jobs:
     # This fork has no upstream remote cache and no upstream runners, so a
     # cold Linux run needs more than the upstream 30 minutes. Restore 30
     # when that cache or those runners are available.
+    # Disabled on this fork: there is no upstream remote cache, so the
+    # GitHub-hosted runner runs out of disk during bazel test, and the
+    # exec-server and git-utils tests need a runtime environment this
+    # runner does not provide. The Linux gnu and musl matrix entries stay
+    # listed below and do not run. Clippy and verify-release-build stay
+    # on. Re-enable by removing this `if`.
+    if: false
     timeout-minutes: 60
     strategy:
       fail-fast: false
