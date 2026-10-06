@@ -387,6 +387,29 @@ jobs:
       deployment: false
 
     steps:
+      # This fork has no upstream remote cache, so this Linux job fills the
+      # GitHub-hosted runner disk. Same cleanup as "Free up disk before the
+      # V8 build" in rusty-v8-android-release.yml. Same list; nothing added.
+      - name: Free up disk before the V8 build
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h "$RUNNER_TEMP" / || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          # The Android SDK under ANDROID_HOME used to be deleted wholesale
+          # here, which took sdkmanager with it and left the next step unable to
+          # install the NDK. chromium's Android configuration reads an SDK as
+          # well as an NDK, so keep the SDK and drop only what no build here
+          # touches: emulator images and any preinstalled NDK, this job
+          # installing the version it pins.
+          : "${ANDROID_HOME:?ANDROID_HOME must be set on the GitHub runner}"
+          if [ -d "${ANDROID_HOME}" ]; then
+            sudo rm -rf "${ANDROID_HOME}/system-images" "${ANDROID_HOME}/emulator" \
+              "${ANDROID_HOME}/ndk" "${ANDROID_HOME}/ndk-bundle" || true
+          fi
+          sudo apt-get clean || true
+          df -h "$RUNNER_TEMP" / || true
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -496,6 +519,29 @@ jobs:
       deployment: false
 
     steps:
+      # This fork has no upstream remote cache, so this Linux job fills the
+      # GitHub-hosted runner disk. Same cleanup as "Free up disk before the
+      # V8 build" in rusty-v8-android-release.yml. Same list; nothing added.
+      - name: Free up disk before the V8 build
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h "$RUNNER_TEMP" / || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          # The Android SDK under ANDROID_HOME used to be deleted wholesale
+          # here, which took sdkmanager with it and left the next step unable to
+          # install the NDK. chromium's Android configuration reads an SDK as
+          # well as an NDK, so keep the SDK and drop only what no build here
+          # touches: emulator images and any preinstalled NDK, this job
+          # installing the version it pins.
+          : "${ANDROID_HOME:?ANDROID_HOME must be set on the GitHub runner}"
+          if [ -d "${ANDROID_HOME}" ]; then
+            sudo rm -rf "${ANDROID_HOME}/system-images" "${ANDROID_HOME}/emulator" \
+              "${ANDROID_HOME}/ndk" "${ANDROID_HOME}/ndk-bundle" || true
+          fi
+          sudo apt-get clean || true
+          df -h "$RUNNER_TEMP" / || true
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
