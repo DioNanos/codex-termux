@@ -308,9 +308,9 @@ mod tests {
 
     #[tokio::test]
     async fn file_cache_loader_keeps_the_valid_models_when_one_is_oversized() {
-        // La cache e' il ripiego di quando la rete non risponde: una voce fuori
-        // misura non deve rendere illeggibile l'intero file, o il ripiego non
-        // esiste proprio nel momento in cui serve.
+        // The cache is the fallback when the network does not answer: one
+        // oversized entry must not make the whole file unreadable, or that
+        // fallback does not exist when it is needed.
         let dir = tempdir().expect("cache tempdir");
         let path = dir.path().join("models.json");
         let payload = json!({
