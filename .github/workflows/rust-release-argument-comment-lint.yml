@@ -32,12 +32,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15-xlarge
-            target: aarch64-apple-darwin
-            archive_name: argument-comment-lint-aarch64-apple-darwin.tar.gz
-            lib_name: libargument_comment_lint@nightly-2025-09-18-aarch64-apple-darwin.dylib
-            runner_binary: argument-comment-lint
-            cargo_dylint_binary: cargo-dylint
+          # macOS
+          # Disabled on this fork: the macOS leg needs paid GitHub runners and
+          # the account spending limit stops it from starting. GitHub applies
+          # `include` entries after `exclude` entries, so an exclude cannot
+          # remove this leg; it is commented out instead. Uncomment it to
+          # restore it.
+          # - runner: macos-15-xlarge
+          #   target: aarch64-apple-darwin
+          #   archive_name: argument-comment-lint-aarch64-apple-darwin.tar.gz
+          #   lib_name: libargument_comment_lint@nightly-2025-09-18-aarch64-apple-darwin.dylib
+          #   runner_binary: argument-comment-lint
+          #   cargo_dylint_binary: cargo-dylint
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive_name: argument-comment-lint-x86_64-unknown-linux-gnu.tar.gz
@@ -50,23 +56,22 @@ jobs:
             lib_name: libargument_comment_lint@nightly-2025-09-18-aarch64-unknown-linux-gnu.so
             runner_binary: argument-comment-lint
             cargo_dylint_binary: cargo-dylint
-          - runner: windows-x64
-            target: x86_64-pc-windows-msvc
-            archive_name: argument-comment-lint-x86_64-pc-windows-msvc.zip
-            lib_name: argument_comment_lint@nightly-2025-09-18-x86_64-pc-windows-msvc.dll
-            runner_binary: argument-comment-lint.exe
-            cargo_dylint_binary: cargo-dylint.exe
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-x64
 
-        exclude:
-          # Disabled on this fork: the macOS leg needs paid GitHub runners and
-          # the Windows leg requires the upstream-only private runner group
-          # above, so neither can run here. The Linux legs are unaffected.
-          # Remove this exclude to restore them.
-          - runner: macos-15-xlarge
-          - runner: windows-x64
+          # Windows
+          # Disabled on this fork: this leg requires the upstream-only private
+          # runner group `codex-termux-runners`, so it cannot run here. GitHub
+          # applies `include` entries after `exclude` entries, so an exclude
+          # cannot remove this leg; it is commented out instead. Uncomment it
+          # to restore it.
+          # - runner: windows-x64
+          #   target: x86_64-pc-windows-msvc
+          #   archive_name: argument-comment-lint-x86_64-pc-windows-msvc.zip
+          #   lib_name: argument_comment_lint@nightly-2025-09-18-x86_64-pc-windows-msvc.dll
+          #   runner_binary: argument-comment-lint.exe
+          #   cargo_dylint_binary: cargo-dylint.exe
+          #   runs_on:
+          #     group: ${{ github.event.repository.name }}-runners
+          #     labels: ${{ github.event.repository.name }}-windows-x64
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

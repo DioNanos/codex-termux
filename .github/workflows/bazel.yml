@@ -25,12 +25,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS
-          - os: macos-15-xlarge
-            target: aarch64-apple-darwin
-          - os: macos-15-xlarge
-            target: x86_64-apple-darwin
-
           # Linux
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
@@ -43,11 +37,16 @@ jobs:
           # - os: ubuntu-24.04-arm
           #   target: aarch64-unknown-linux-gnu
 
-        exclude:
+          # macOS
           # Disabled on this fork: the macOS legs need paid GitHub runners and
-          # the account spending limit stops them from starting at all. The
-          # Linux legs are unaffected. Remove this exclude to restore them.
-          - os: macos-15-xlarge
+          # the account spending limit stops them from starting at all.
+          # GitHub applies `include` entries after `exclude` entries, so an
+          # exclude cannot remove these legs; they are commented out instead.
+          # Uncomment both entries to restore them.
+          # - os: macos-15-xlarge
+          #   target: aarch64-apple-darwin
+          # - os: macos-15-xlarge
+          #   target: x86_64-apple-darwin
 
     runs-on: ${{ matrix.os }}
 
@@ -351,27 +350,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Keep Linux lint coverage on x64 and add the arm64 macOS path that
-          # the Bazel test job already exercises. Add Windows gnullvm as well
-          # so PRs get Bazel-native lint signal on the same Windows toolchain
-          # that the Bazel test job uses.
+          # Keep Linux lint coverage on x64.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - os: macos-15-xlarge
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-gnullvm
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-x64
 
-        exclude:
+          # macOS and Windows
           # Disabled on this fork: the macOS leg needs paid GitHub runners and
           # the Windows leg requires the upstream-only private runner group
-          # above. The Linux leg is unaffected. Remove this exclude to restore
-          # both legs.
-          - os: macos-15-xlarge
-          - os: windows-latest
+          # `codex-termux-runners`. GitHub applies `include` entries after
+          # `exclude` entries, so an exclude cannot remove these legs; they
+          # are commented out instead. Uncomment both entries to restore them.
+          # - os: macos-15-xlarge
+          #   target: aarch64-apple-darwin
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-gnullvm
+          #   runs_on:
+          #     group: ${{ github.event.repository.name }}-runners
+          #     labels: ${{ github.event.repository.name }}-windows-x64
     runs-on: ${{ matrix.runs_on || matrix.os }}
     name: Bazel clippy on ${{ matrix.os }} for ${{ matrix.target }}
     environment:
@@ -464,21 +459,20 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - os: macos-15-xlarge
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-gnullvm
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-x64
 
-        exclude:
+          # macOS and Windows
           # Disabled on this fork: the macOS leg needs paid GitHub runners and
           # the Windows leg requires the upstream-only private runner group
-          # above. The Linux leg is unaffected. Remove this exclude to restore
-          # both legs.
-          - os: macos-15-xlarge
-          - os: windows-latest
+          # `codex-termux-runners`. GitHub applies `include` entries after
+          # `exclude` entries, so an exclude cannot remove these legs; they
+          # are commented out instead. Uncomment both entries to restore them.
+          # - os: macos-15-xlarge
+          #   target: aarch64-apple-darwin
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-gnullvm
+          #   runs_on:
+          #     group: ${{ github.event.repository.name }}-runners
+          #     labels: ${{ github.event.repository.name }}-windows-x64
     runs-on: ${{ matrix.runs_on || matrix.os }}
     name: Verify release build on ${{ matrix.os }} for ${{ matrix.target }}
     environment:
