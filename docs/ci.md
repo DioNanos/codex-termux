@@ -10,8 +10,10 @@ disabled, and why:
   (`repo-checks`, including the V8 sandbox-archive guard for the package
   builder). The Android release build and the npm payload checks run in
   `termux-npm-build-publish` and stay green on main.
-- **postmerge-ci** (pushes to main): Linux-only signal via reusable
-  workflows, plus codespell.
+- **postmerge-ci** (pushes to main): calls the `rust-ci-full.yml` and
+  `v8-canary.yml` reusable workflows. On this fork only their Linux legs
+  run (see "What is disabled, and why"); codespell runs in `blocking-ci`,
+  not in postmerge.
 
 ## What is disabled, and why
 
@@ -45,12 +47,22 @@ Per workflow:
 - **`rust-ci.yml`, PR argument-comment lint**: the Linux leg runs. The
   macOS and Windows legs are commented out in the `matrix: include:` list,
   same reasons as above.
+- **`rust-ci-full.yml`** (called by postmerge-ci): the Linux x64 (remote)
+  and arm64 test jobs stay strict in the `results` gate. The macOS test
+  job (paid runners) and the two Windows test jobs (`codex-termux-runners`)
+  are turned off with `if: false`, and the gate accepts `skipped` only for
+  those three; the macOS and Windows legs of the prebuilt
+  argument-comment lint are commented out of the `matrix: include:` list.
+- **`v8-canary.yml`** (called by postmerge-ci): only the Linux legs (x64
+  and arm64, release and ptrcomp-sandbox variants) run; the four macOS
+  legs (paid GitHub runners) are commented out of the `matrix: include:`
+  list.
 - **Three inherited Bazel jobs in `bazel.yml`**: turned off with
   `if: false` at the job level; they show up as skipped checks.
 
 ## Known postmerge limitation
 
-`postmerge-ci` currently reports `startup_failure` with zero jobs. The three
+`postmerge-ci` currently reports `startup_failure` with zero jobs. The two
 workflows it calls are active and their YAML parses cleanly, so the likely
 cause is the same account-level scheduling limit that blocks the macOS legs.
 Rerunning the workflow manually shows whether it clears.
