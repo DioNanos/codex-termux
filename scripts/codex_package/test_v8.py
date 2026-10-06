@@ -1,5 +1,6 @@
 import hashlib
 import io
+import struct
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,85 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from codex_package import v8
 from codex_package.targets import TARGET_SPECS, TargetSpec
+
+
+def write_sandbox_archive(path: Path) -> None:
+    """Write a tiny x86-64 archive whose sandbox wrapper returns true.
+
+    The guard judges whatever `RUSTY_V8_ARCHIVE` names before a package build
+    accepts it. This object is only a fixture: `mov $1, %eax; ret` under the
+    linkable name `v8__V8__IsSandboxEnabled`. It is not a V8 library.
+    """
+    text = b"\xb8\x01\x00\x00\x00\xc3"
+    strtab = b"\0v8__V8__IsSandboxEnabled\0"
+    # Offsets: .text 1, .strtab 7, .symtab 15, .shstrtab 23.
+    shstrtab = b"\0.text\0.strtab\0.symtab\0.shstrtab\0"
+    symtab = b"\0" * 24 + struct.pack("<IBBHQQ", 1, 0x12, 0, 1, 0, len(text))
+    bodies = (text, strtab, symtab, shstrtab)
+    offsets = []
+    cursor = 64
+    for body in bodies:
+        offsets.append(cursor)
+        cursor += len(body)
+    shoff = cursor
+
+    def section(
+        name: int,
+        kind: int,
+        body: bytes,
+        offset: int,
+        link: int = 0,
+        info: int = 0,
+        entsize: int = 0,
+    ) -> bytes:
+        return struct.pack(
+            "<IIQQQQIIQQ",
+            name,
+            kind,
+            0,
+            0,
+            offset,
+            len(body),
+            link,
+            info,
+            1,
+            entsize,
+        )
+
+    headers = b"\0" * 64
+    headers += section(1, 1, text, offsets[0])
+    headers += section(7, 3, strtab, offsets[1])
+    headers += section(15, 2, symtab, offsets[2], link=2, info=1, entsize=24)
+    headers += section(23, 3, shstrtab, offsets[3])
+    elf = bytearray(64)
+    elf[0:4] = b"\x7fELF"
+    elf[4] = 2
+    elf[5] = 1
+    elf[6] = 1
+    struct.pack_into(
+        "<HHIQQQIHHHHHH",
+        elf,
+        16,
+        1,
+        0x3E,
+        1,
+        0,
+        0,
+        shoff,
+        0,
+        64,
+        0,
+        0,
+        64,
+        5,
+        4,
+    )
+    blob = bytes(elf) + b"".join(bodies) + headers
+    name = b"sandbox.o/".ljust(16)
+    header = name + b"0".rjust(12) + b"0".rjust(6) + b"0".rjust(6) + b"100644".rjust(8)
+    header += str(len(blob)).encode().rjust(10) + b"`\n"
+    padding = b"\n" if len(blob) % 2 else b""
+    path.write_bytes(b"!<arch>\n" + header + blob + padding)
 
 
 class FetchCodexV8ArtifactsTest(unittest.TestCase):
@@ -287,11 +367,15 @@ class FetchCodexV8ArtifactsTest(unittest.TestCase):
 
     def test_source_and_paired_overrides_do_not_touch_cache(self) -> None:
         spec = TARGET_SPECS["x86_64-unknown-linux-gnu"]
+        archive = self.root / "archive.a"
+        binding = self.root / "binding.rs"
+        write_sandbox_archive(archive)
+        binding.write_bytes(b"")
         for environ in (
             {"V8_FROM_SOURCE": "1"},
             {
-                "RUSTY_V8_ARCHIVE": "archive.a",
-                "RUSTY_V8_SRC_BINDING_PATH": "binding.rs",
+                "RUSTY_V8_ARCHIVE": str(archive),
+                "RUSTY_V8_SRC_BINDING_PATH": str(binding),
             },
         ):
             with (
