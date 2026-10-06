@@ -1,4 +1,5 @@
 > [!NOTE]
+>
 > ## Release policy
 >
 > This project is active and follows a **big releases only** policy.
@@ -7,6 +8,7 @@
 > Existing releases remain available and installable.
 > For day-to-day Android/Termux improvements and multi-platform builds, see
 > [codex-vl](https://github.com/DioNanos/codex-vl).
+
 # Codex Termux
 
 > Native Codex CLI for **Termux / Android ARM64**.
@@ -141,7 +143,7 @@ To report a vulnerability, see [SECURITY.md](./SECURITY.md).
 
 - [OpenAI Codex CLI on Android via Termux](https://timharbakon.com/openai-codex-cli-android-termux/)
   - independent third-party walkthrough covering Termux setup, the Bionic-libc incompatibility
-  this package solves, and a small Hono test project.
+    this package solves, and a small Hono test project.
 
 ## License
 
