@@ -1,5 +1,7 @@
 use super::PreviousSectionState;
+use super::SectionTransition;
 use super::WorldStateSection;
+use super::WorldStateUpdate;
 use crate::context::AvailablePluginsInstructions;
 use crate::context::ContextualUserFragment;
 
@@ -19,10 +21,6 @@ impl WorldStateSection for PluginsInstructionsState {
     const ID: &'static str = "plugins_instructions";
     type Snapshot = bool;
 
-    fn snapshot(&self) -> Self::Snapshot {
-        self.available
-    }
-
     fn matches_legacy_fragment(role: &str, text: &str) -> bool {
         role == "developer" && AvailablePluginsInstructions::matches_text(text)
     }
@@ -38,15 +36,19 @@ impl WorldStateSection for PluginsInstructionsState {
     fn render_diff(
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn ContextualUserFragment>> {
+    ) -> SectionTransition<Self::Snapshot> {
+        let current = self.available;
         if !self.available
             || matches!(previous, PreviousSectionState::Known(previous) if *previous)
             || matches!(previous, PreviousSectionState::Unknown)
         {
-            return None;
+            return (Some(current), Vec::new());
         }
 
-        Some(Box::new(AvailablePluginsInstructions))
+        (
+            Some(current),
+            vec![WorldStateUpdate::fragment(AvailablePluginsInstructions)],
+        )
     }
 }
 

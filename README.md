@@ -49,6 +49,13 @@ Install the latest release and allow its launcher postinstall script on npm 11 a
 npm install -g @mmmbuto/codex-cli-termux@latest --allow-scripts=@mmmbuto/codex-cli-termux
 ```
 
+On Termux, also install ripgrep (the Android package resolves `rg` from PATH
+and does not bundle it):
+
+```bash
+pkg install ripgrep
+```
+
 Check the installed version.
 
 ```bash

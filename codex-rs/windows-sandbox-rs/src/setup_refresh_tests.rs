@@ -19,7 +19,7 @@ const HOME_ENV: &str = "CODEX_TEST_REFRESH_CONSOLE_HOME";
 #[test]
 fn refresh_helper_has_no_console() -> Result<()> {
     if let Some(home) = std::env::var_os(HOME_ENV).map(PathBuf::from) {
-        assert_eq!(unsafe { GetConsoleWindow() }, 0);
+        assert!(unsafe { GetConsoleWindow() }.is_null());
         run_setup_refresh_payload(HELPER_TEST, &home)?;
         assert_eq!(fs::read(home.join("probe"))?, b"no console");
         return Ok(());
@@ -30,10 +30,10 @@ fn refresh_helper_has_no_console() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let executable = std::env::current_exe()?;
     let detached = temporary.path().join("detached.exe");
-    fs::copy(&executable, &detached)?;
-    fs::copy(
+    codex_utils_cargo_bin::copy_executable(&executable, &detached)?;
+    codex_utils_cargo_bin::copy_executable(
         &executable,
-        temporary.path().join("codex-windows-sandbox-setup.exe"),
+        &temporary.path().join("codex-windows-sandbox-setup.exe"),
     )?;
     let output = Command::new(detached)
         .args(["--exact", DETACHED_TEST, "--nocapture"])
@@ -58,7 +58,7 @@ fn refresh_console_probe() -> Result<()> {
         return Ok(());
     }
     let home = PathBuf::from(std::env::var_os(HOME_ENV).expect("detached probe home"));
-    assert_eq!(unsafe { GetConsoleWindow() }, 0);
+    assert!(unsafe { GetConsoleWindow() }.is_null());
     fs::write(home.join("probe"), b"no console")?;
     Ok(())
 }

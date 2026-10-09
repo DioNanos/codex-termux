@@ -8,6 +8,14 @@ on:
         required: false
         default: ""
         type: string
+      daemon_suite:
+        description: "Daemon crate tests: named (the fork contract tests) or full (the whole crate)"
+        required: false
+        default: named
+        type: choice
+        options:
+          - named
+          - full
 
 permissions:
   contents: read
@@ -265,3 +273,214 @@ jobs:
           grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-model-protocol-caps.out
           grep -F 'model_message_text_cap_reports_field_slug_size_and_no_content ... ok' termux-gate-model-protocol-caps.out
           grep -F 'model_message_text_cap_counts_utf8_bytes_without_truncating ... ok' termux-gate-model-protocol-caps.out
+
+  workspace-tests-compile:
+    name: workspace tests compile
+    runs-on: ubuntu-24.04
+    env:
+      RUST_MIN_STACK: "8388608"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - name: Checkout source ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Free disk space on hosted runner
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          docker image prune -af || true
+          df -h /
+      - name: Read Rust toolchain
+        id: rust_toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
+      - name: Install the system libraries the build scripts look for
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+      - name: Type-check every workspace target including tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo check without --tests never sees fork test fixtures that upstream
+          # builds exhaustively. The V8 crates need the profile-specific prebuilt
+          # archive and the voice helper needs the packaged GStreamer SDK: the
+          # packaging workflows build and check them.
+          cargo check --workspace --tests --locked --keep-going \
+            --exclude codex-code-mode-host \
+            --exclude codex-code-mode-runtime \
+            --exclude codex-v8-poc \
+            --exclude codex-voice-host
+
+  schema-fixtures:
+    name: schema fixtures
+    runs-on: ubuntu-24.04
+    env:
+      RUST_MIN_STACK: "8388608"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - name: Checkout source ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Free disk space on hosted runner
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          docker image prune -af || true
+          df -h /
+      - name: Read Rust toolchain
+        id: rust_toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
+      - name: Regenerate the checked-in schemas from source
+        shell: bash
+        run: |
+          set -euo pipefail
+          schema_root="$PWD/app-server-protocol/schema"
+          CODEX_APP_SERVER_SCHEMA_ROOT="$schema_root" CODEX_APP_SERVER_SCHEMA_EXPERIMENTAL=0 \
+            cargo test -p codex-app-server-protocol --lib schema_fixtures_tests::write_schema_fixtures_from_env -- --exact --ignored
+          CODEX_APP_SERVER_SCHEMA_ROOT="$schema_root" CODEX_APP_SERVER_SCHEMA_EXPERIMENTAL=1 \
+            cargo test -p codex-app-server-protocol --lib schema_fixtures_tests::write_schema_fixtures_from_env -- --exact --ignored
+          cargo run -p codex-config-schema --bin codex-write-config-schema
+          cargo run -p codex-hooks --bin write_hooks_schema_fixtures
+      - name: Collect the regenerated files
+        if: always()
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          git status --short
+          git diff --binary > "$RUNNER_TEMP/schema-fixtures.patch"
+          wc -c "$RUNNER_TEMP/schema-fixtures.patch"
+      - name: Upload the regeneration patch
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: schema-fixtures-patch
+          path: ${{ runner.temp }}/schema-fixtures.patch
+          if-no-files-found: ignore
+      - name: Fail when a checked-in schema is stale
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: git diff --exit-code
+
+  crate-tests:
+    name: crate tests
+    runs-on: ubuntu-24.04
+    env:
+      RUST_MIN_STACK: "8388608"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - name: Checkout source ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Free disk space on hosted runner
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          docker image prune -af || true
+          df -h /
+      - name: Read Rust toolchain
+        id: rust_toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
+      - name: Test the startup lock guards, rollout policy and config
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p codex-app-server-transport --lib 2>&1 | sed -E 's#/home/[^[:space:])]+#<path>#g' | tee termux-gate-transport.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-transport.out
+          grep -F 'unsupported_lock_helper_tests::unsupported_kind_is_classified_as_unsupported_lock_error ... ok' termux-gate-transport.out
+          cargo test -p codex-model-provider --lib 2>&1 | sed -E 's#/home/[^[:space:])]+#<path>#g' | tee termux-gate-model-provider.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-model-provider.out
+          cargo test -p codex-rollout --lib 2>&1 | sed -E 's#/home/[^[:space:])]+#<path>#g' | tee termux-gate-rollout.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-rollout.out
+          cargo test -p codex-config --lib 2>&1 | sed -E 's#/home/[^[:space:])]+#<path>#g' | tee termux-gate-config.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-config.out
+      - name: Test the Android SELinux context export
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # termux-exec's execve() hook can deadlock a forked child when
+          # TERMUX__SE_PROCESS_CONTEXT is unset; the validator guards the export.
+          cargo test -p codex-arg0 --lib se_process_context 2>&1 | sed -E 's#/home/[^[:space:])]+#<path>#g' | tee termux-gate-arg0-se-context.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-arg0-se-context.out
+          grep -F 'accepts_contexts_with_zero_two_and_four_categories ... ok' termux-gate-arg0-se-context.out
+          grep -F 'rejects_labels_that_are_not_android_process_contexts ... ok' termux-gate-arg0-se-context.out
+          grep -F 'rejects_malformed_category_lists ... ok' termux-gate-arg0-se-context.out
+          grep -F 'proc_contents_lose_trailing_nul_and_newline_before_validation ... ok' termux-gate-arg0-se-context.out
+      - name: Test the socket helpers
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p codex-uds --lib 2>&1 | sed -E 's#/home/[^[:space:])]+#<path>#g' | tee termux-gate-uds.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-uds.out
+          grep -F 'binding_beyond_sockaddr_un_names_the_path_and_limit ... ok' termux-gate-uds.out
+      - name: Test the managed daemon and its updater
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # "named" runs the tests that pin this fork's daemon contract (the
+          # standalone updater refusal, the updater pid record and the Android
+          # package validation); "full" runs the whole crate suite.
+          filters="-- exiting_updater_removes_its_own_pid_record scheduled_refusal_stops_the_update_loop package_manager_installs_never_start_the_standalone_updater android_package_without_bundled_ripgrep_is_valid install_latest_standalone_is_disabled_in_fork"
+          if [ "${{ inputs.daemon_suite }}" = full ]; then filters=""; fi
+          cargo test -p codex-app-server-daemon --lib $filters 2>&1 | sed -E 's#/home/[^[:space:])]+#<path>#g' | tee termux-gate-daemon.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-daemon.out
+          grep -F 'exiting_updater_removes_its_own_pid_record ... ok' termux-gate-daemon.out
+          grep -F 'scheduled_refusal_stops_the_update_loop ... ok' termux-gate-daemon.out
+          grep -F 'package_manager_installs_never_start_the_standalone_updater ... ok' termux-gate-daemon.out
+          grep -F 'android_package_without_bundled_ripgrep_is_valid ... ok' termux-gate-daemon.out
+          grep -F 'install_latest_standalone_is_disabled_in_fork ... ok' termux-gate-daemon.out

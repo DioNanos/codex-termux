@@ -101,11 +101,13 @@ async fn browsing_search_and_selection_consume_escape_before_mode_exit() -> Resu
     app.transcript_view.begin_search();
     app.handle_tui_event(&mut tui, &mut server, TuiEvent::Paste("first".to_string()))
         .await?;
-    app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Esc.into()))
+    app.handle_tui_event(&mut tui, &mut server, TuiEvent::Draw)
+        .await?;
+    app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Enter.into()))
         .await?;
     assert_eq!(
         (
-            app.transcript_view.is_search_active(),
+            app.transcript_view.is_search_editing(),
             app.backtrack.overlay_preview_active
         ),
         (false, true)
@@ -120,6 +122,9 @@ async fn browsing_search_and_selection_consume_escape_before_mode_exit() -> Resu
     }
     assert!(app.transcript_view.has_active_interaction());
     assert_eq!(app.backtrack.nth_user_message, 1);
+    app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Esc.into()))
+        .await?;
+    assert!(app.transcript_view.has_active_interaction());
     app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Esc.into()))
         .await?;
     assert_eq!(
@@ -260,7 +265,7 @@ async fn browsing_details_use_the_remapped_chord_without_cancelling_preview() ->
                 .expect("footer")
                 .text
                 .to_string()
-                .contains("ctrl+x ctrl+t")
+                .contains("⌃x ⌃t")
         );
         for (keys, expected_details) in [
             (

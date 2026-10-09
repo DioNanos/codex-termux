@@ -387,13 +387,30 @@ impl RequestUserInputOverlay {
             .is_some_and(|answer| answer.notes_visible || self.notes_has_content(idx))
     }
 
-    pub(super) fn wrapped_question_lines(&self, width: u16) -> Vec<String> {
+    pub(super) fn wrapped_question_lines(
+        &self,
+        width: u16,
+    ) -> Vec<crate::terminal_hyperlinks::HyperlinkLine> {
         self.current_question()
             .map(|q| {
-                textwrap::wrap(&q.question, width.max(1) as usize)
-                    .into_iter()
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>()
+                q.question
+                    .split('\n')
+                    .flat_map(|text| {
+                        let source = crate::terminal_hyperlinks::annotate_web_urls_in_line(
+                            text.to_owned().into(),
+                        );
+                        let wrapped =
+                            crate::wrapping::wrap_ranges_trim(text, usize::from(width.max(1)))
+                                .into_iter()
+                                .map(|range| crate::wrapping::WrappedLine {
+                                    line: (&text[range.clone()]).into(),
+                                    range,
+                                    prefix_bytes: 0,
+                                })
+                                .collect();
+                        crate::terminal_hyperlinks::remap_source_wrapped_line(&source, wrapped)
+                    })
+                    .collect()
             })
             .unwrap_or_default()
     }
@@ -612,7 +629,14 @@ impl RequestUserInputOverlay {
             if self.has_options() && !self.focus_is_notes() {
                 tips.push(shortcut("←/→", "to navigate questions"));
             } else if !self.has_options() {
-                tips.push(shortcut("ctrl+p / ctrl+n", "change question"));
+                tips.push(shortcut(
+                    &format!(
+                        "{} / {}",
+                        crate::key_hint::ctrl(KeyCode::Char('p')).display_label(),
+                        crate::key_hint::ctrl(KeyCode::Char('n')).display_label()
+                    ),
+                    "change question",
+                ));
             }
         }
         if let Some(interrupt_key) = self.interrupt_turn_hint
@@ -2477,7 +2501,7 @@ mod tests {
             tip_texts,
             vec![
                 "enter to submit all",
-                "ctrl+p / ctrl+n change question",
+                "⌃p / ⌃n change question",
                 "esc to interrupt",
             ]
         );
@@ -2499,10 +2523,7 @@ mod tests {
 
         let tips = overlay.footer_tips();
         let tip_texts = tips.iter().map(ToString::to_string).collect::<Vec<_>>();
-        assert_eq!(
-            tip_texts,
-            vec!["ctrl+j to submit answer", "esc to interrupt"]
-        );
+        assert_eq!(tip_texts, vec!["⌃j to submit answer", "esc to interrupt"]);
     }
 
     #[test]
@@ -2510,21 +2531,21 @@ mod tests {
         for (specs, expected_tips) in [
             (
                 KeybindingsSpec::One(KeybindingSpec("ctrl-x enter".to_string())),
-                vec!["ctrl+x enter to submit answer", "esc to interrupt"],
+                vec!["⌃x enter to submit answer", "esc to interrupt"],
             ),
             (
                 KeybindingsSpec::Many(vec![
                     KeybindingSpec("ctrl-enter".to_string()),
                     KeybindingSpec("ctrl-x enter".to_string()),
                 ]),
-                vec!["ctrl+enter to submit answer", "esc to interrupt"],
+                vec!["⌃enter to submit answer", "esc to interrupt"],
             ),
             (
                 KeybindingsSpec::Many(vec![
                     KeybindingSpec("ctrl-x enter".to_string()),
                     KeybindingSpec("ctrl-enter".to_string()),
                 ]),
-                vec!["ctrl+x enter to submit answer", "esc to interrupt"],
+                vec!["⌃x enter to submit answer", "esc to interrupt"],
             ),
         ] {
             let (tx, _rx) = test_sender();
@@ -3706,6 +3727,47 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_question_preserves_the_complete_url_destination() {
+        let url = "https://github.com/openai/codex/pull/12345?diff=split";
+        let (tx, _rx) = test_sender();
+        let mut question = question_without_options("q1", "Release");
+        question.question = format!("Review the release\n\nReview {url} before choosing.");
+        let overlay = RequestUserInputOverlay::new(
+            request_event("turn-1", vec![question]),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+        let area = Rect::new(0, 0, 40, 18);
+        let mut buf = Buffer::empty(area);
+        overlay.render(area, &mut buf);
+        let linked = buf
+            .content
+            .iter()
+            .filter(|cell| cell.symbol().contains("\x1b]8;;"))
+            .map(|cell| {
+                assert!(cell.symbol().starts_with(&format!("\x1b]8;;{url}\x07")));
+                crate::terminal_hyperlinks::strip_osc8(cell.symbol())
+            })
+            .collect::<String>();
+        assert_eq!(linked, url);
+        let visible = buf
+            .content
+            .chunks(40)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| crate::terminal_hyperlinks::strip_osc8(cell.symbol()))
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        insta::assert_snapshot!("request_user_input_wrapped_url", visible);
+    }
+
+    #[test]
     fn request_user_input_freeform_snapshot() {
         let (tx, _rx) = test_sender();
         let overlay = RequestUserInputOverlay::new(
@@ -3747,16 +3809,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        insta::assert_snapshot!(snapshot, @r"
+        insta::assert_snapshot!(snapshot, @"
 
-          Question 1/1 (1 unanswered)
-          Share details.
+        Question 1/1 (1 unanswered)
+        Share details.
 
-          › Type your answer (optional)
+        › Type your answer (optional)
 
 
 
-          ctrl+x enter to submit answer | esc to interrupt
+        ⌃x enter to submit answer | esc to interrupt
         ");
     }
 

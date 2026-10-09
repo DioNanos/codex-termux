@@ -2,11 +2,25 @@ use crate::FeatureConfig;
 use crate::FeatureToml;
 use codex_network_proxy::CredentialProviderConfig;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_utils_redacted_string::RedactedString;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+
+/// Connection to a board provisioned by the research host.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteMessageBoardConfigToml {
+    pub url: String,
+    /// Board credential supplied directly by a runtime config override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<RedactedString>,
+    /// Read the credential from this environment variable instead of bearer_token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token_env_var: Option<String>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -135,6 +149,17 @@ pub struct GuardianV2ReviewScopeConfigToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GuardianV2ConfigToml {
+    /// Transcript encoding for synchronous Guardian review and asynchronous scoring. Defaults to line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_mode: Option<codex_protocol::TranscriptFormat>,
+    /// Classifier experiment override. Otherwise use the model default, then snapshots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub async_classifier_mode: Option<codex_protocol::openai_models::AsyncClassifierMode>,
+    /// Reset retained async history when the next request exceeds this token estimate.
+    /// Defaults to 100,000. Fresh requests remain subject to the model's input limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub async_classifier_conversation_token_limit: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Legacy setting retained for config compatibility; the backend now controls Guardian billing.
@@ -201,6 +226,11 @@ where
     }
 
     let transcript = config.transcript.as_ref();
+    if config.async_classifier_conversation_token_limit == Some(0) {
+        return Err(serde::de::Error::custom(
+            "Guardian v2 async_classifier_conversation_token_limit must be positive",
+        ));
+    }
     let message_entry = transcript.and_then(|value| value.max_message_entry_tokens);
     let tool_entry = transcript.and_then(|value| value.max_tool_entry_tokens);
     let message_total = transcript.and_then(|value| value.max_message_transcript_tokens);
@@ -303,6 +333,9 @@ pub struct MultiAgentV2ConfigToml {
     /// Keep the message board in memory for a training session, including ephemeral sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_board_in_memory: Option<bool>,
+    /// Use a session-scoped remote board instead of local storage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_board_remote: Option<RemoteMessageBoardConfigToml>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_code_mode_only: Option<bool>,
 }

@@ -226,6 +226,7 @@ async fn resume(test: &TestCodex, thread: &CodexThread) -> Result<Arc<CodexThrea
         .resume_thread_with_history(
             test.config.clone(),
             InitialHistory::Resumed(ResumedHistory {
+                history_revision: None,
                 conversation_id: thread_id,
                 history: Arc::new(items),
                 rollout_path: None,
@@ -293,11 +294,12 @@ async fn streamed_question_precedes_reply_across_resume(
         .with_model("gpt-5.4")
         .with_history_mode(ThreadHistoryMode::Paginated)
         .with_config(|config| {
-            config.experimental_thread_store = ThreadStoreConfig::Local;
+            // This fixture retains the question by allowing its response to finish.
             config
                 .features
-                .enable(Feature::GuardianThreadContext)
-                .expect("enable retained context");
+                .disable(Feature::InstantInterrupt)
+                .expect("disable InstantInterrupt feature");
+            config.experimental_thread_store = ThreadStoreConfig::Local;
         })
         .build_with_streaming_server(&server)
         .await?;
@@ -923,6 +925,7 @@ async fn standalone_fork_retains_inherited_user_instructions(
                 ForkSnapshot::Interrupted,
                 codex_core::StartThreadOptions::new(test.config.clone()),
                 InitialHistory::Resumed(ResumedHistory {
+                    history_revision: None,
                     conversation_id: worker.startup_metadata().thread_id,
                     history: Arc::new(load_context(&test, &worker).await?),
                     rollout_path: None,

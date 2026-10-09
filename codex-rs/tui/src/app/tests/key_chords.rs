@@ -110,11 +110,11 @@ async fn global_chord_keeps_hints_and_completes_before_deadline() -> Result<()> 
     insta::assert_snapshot!(
         render_bottom_popup(&app.chat_widget, /*width*/ 80)
             .replace(&test_path_display("/tmp/project"), "/tmp/project"),
-        @r"
-        › Ask Codex to do anything
+        @"
+    › Ask Codex to do anything
 
-          ctrl+x then · ctrl+t open transcript · ctrl+u interrupt turn · esc cancel
-        "
+      ⌃x then · ⌃t open transcript · ⌃u interrupt turn · esc cancel
+    "
     );
 
     press(&mut app, &mut tui, &mut app_server, ctrl('t')).await?;
@@ -693,7 +693,7 @@ async fn dashboard_chord_hint_survives_refresh_and_clears_on_cancel() -> Result<
     let _ = app.agents_overview_view(Vec::new(), /*selected_thread_id*/ None);
     insta::assert_snapshot!(
         render_bottom_popup(&app.chat_widget, /*width*/ 80).lines().last().unwrap(),
-        @"  ctrl+x then  n new task  esc cancel"
+        @"  ⌃x then  n new task  esc cancel"
     );
     assert_eq!(
         app.route_key_chord_event(&mut tui, KeyCode::Esc.into()),
@@ -713,7 +713,7 @@ async fn command_center_chords_do_not_capture_search_text() -> Result<()> {
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let view = app.agents_overview_view(Vec::new(), /*selected_thread_id*/ None);
     app.chat_widget.show_bottom_pane_view(Box::new(view));
-    app.chat_widget.handle_key_event(KeyCode::Char('f').into());
+    app.chat_widget.handle_key_event(KeyCode::Char('/').into());
     for key in "new".chars() {
         let event = KeyCode::Char(key).into();
         assert_eq!(app.route_key_chord_event(&mut tui, event), Some(event));

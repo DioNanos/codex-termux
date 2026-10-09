@@ -94,6 +94,14 @@ pub(super) async fn update_thread_metadata(
         None
     };
     let paginated = matches!(history_mode, Some(ThreadHistoryMode::Paginated));
+    if paginated
+        && patch.name.is_some()
+        && live_writer::rollout_path(store, thread_id).await.is_ok()
+    {
+        // Naming saves a new thread even before its first turn. Persist its live recorder before
+        // updating SQLite so the named thread can be resumed immediately or after a restart.
+        live_writer::persist_thread(store, thread_id).await?;
+    }
     let needs_rollout_compat = requires_rollout_compat || patch.name.is_some();
     // Reject competing writers before committing any part of a legacy rollout patch to SQLite.
     let writer_lock = if !paginated
@@ -1287,6 +1295,7 @@ mod tests {
         let path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid)?;
         store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(path.clone()),
                 history: None,
@@ -1506,6 +1515,7 @@ mod tests {
 
         store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(path.clone()),
                 history: None,
@@ -2393,6 +2403,7 @@ mod tests {
         .await;
         store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(archived_path.clone()),
                 history: None,

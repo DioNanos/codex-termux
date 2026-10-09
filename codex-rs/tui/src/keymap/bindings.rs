@@ -164,7 +164,7 @@ macro_rules! define_runtime_action_bindings {
         }
 
         /// Return the configured slot for one runtime action, including global fallbacks.
-        pub(super) fn configured_binding_for_action(
+        pub(crate) fn configured_binding_for_action(
             keymap: &TuiKeymap,
             action: KeymapActionId,
         ) -> Option<&Option<KeybindingsSpec>> {
@@ -422,11 +422,13 @@ define_runtime_action_bindings! {
         search,
         new_task,
         new_worktree,
+        fork,
         rename,
         stop,
         archive,
         delete,
         hide,
+        toggle_pin,
         toggle_grouping,
     ],
     "approval" => Approval, approval, approval [

@@ -280,12 +280,20 @@ impl Session {
         };
         let TurnSettingsUpdate {
             approvals_reviewer,
-            environments,
+            environments: environment_requests,
             model,
             effort,
             summary,
             service_tier,
         } = update;
+        let environments = environment_requests.map(|requests| {
+            requests
+                .into_iter()
+                .map(|request| {
+                    TurnEnvironmentSelection::new(request, &self.services.selected_capability_roots)
+                })
+                .collect::<Vec<_>>()
+        });
         let updates_step_settings = updates_model_settings || approvals_reviewer.is_some();
         let update = StepSettingsUpdate {
             approvals_reviewer,
@@ -345,7 +353,9 @@ impl Session {
             if let Some(configs) = environment_config_validation {
                 validate_environment_ids_and_cwds(
                     &self.services.turn_environments.environment_manager(),
-                    proposed,
+                    proposed
+                        .iter()
+                        .map(|selection| (selection.environment_id.as_str(), &selection.cwd)),
                 )
                 .map_err(|error| error.to_string())?;
                 ensure_configs_stay_owner_provided(&current_environments, proposed)
@@ -419,7 +429,7 @@ impl Session {
                 &constraints,
                 self.services.models_manager.as_ref(),
                 &overrides,
-                self.features.enabled(Feature::FastMode),
+                &self.features,
             )
             .await
             .map_err(|error| error.to_string())

@@ -1,5 +1,7 @@
 use super::PreviousSectionState;
+use super::SectionTransition;
 use super::WorldStateSection;
+use super::WorldStateUpdate;
 use crate::context::ContextualUserFragment;
 use crate::context::RealtimeEndInstructions;
 use crate::context::RealtimeStartInstructions;
@@ -58,10 +60,6 @@ impl WorldStateSection for RealtimeState {
     const ID: &'static str = "realtime";
     type Snapshot = RealtimeSnapshot;
 
-    fn snapshot(&self) -> Self::Snapshot {
-        self.snapshot.clone()
-    }
-
     fn matches_legacy_fragment(role: &str, text: &str) -> bool {
         role == "developer" && RealtimeStartInstructions::matches_text(text)
     }
@@ -77,9 +75,11 @@ impl WorldStateSection for RealtimeState {
     fn render_diff(
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn ContextualUserFragment>> {
-        match previous {
-            PreviousSectionState::Known(previous) if previous == &self.snapshot => None,
+    ) -> SectionTransition<Self::Snapshot> {
+        let fragment = match previous {
+            PreviousSectionState::Known(previous) if previous == &self.snapshot => {
+                return (None, Vec::new());
+            }
             PreviousSectionState::Known(previous) => self.render_transition(previous.active),
             PreviousSectionState::Absent | PreviousSectionState::Unknown
                 if self.snapshot.active =>
@@ -87,7 +87,11 @@ impl WorldStateSection for RealtimeState {
                 Some(self.render_start())
             }
             PreviousSectionState::Absent | PreviousSectionState::Unknown => None,
-        }
+        };
+        (
+            Some(self.snapshot.clone()),
+            WorldStateUpdate::optional_boxed_fragment(fragment),
+        )
     }
 }
 

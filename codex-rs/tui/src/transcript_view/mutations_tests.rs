@@ -378,6 +378,7 @@ fn folding_a_reasoning_only_page_retains_its_find_and_copy_revision() {
     };
     let current = Turn {
         id: "turn".to_owned(),
+        root_turn_id: None,
         items: vec![call, reasoning],
         items_view: TurnItemsView::Full,
         status: TurnStatus::Completed,
@@ -418,7 +419,7 @@ fn folding_a_reasoning_only_page_retains_its_find_and_copy_revision() {
                 view.search
                     .status_line(/*width*/ 80, view.history)
                     .to_string()
-                    .starts_with("enter next")
+                    .starts_with("enter accept")
             );
         }
         let before = render(&mut view, &cells, /*width*/ 30);
@@ -444,7 +445,7 @@ fn folding_a_reasoning_only_page_retains_its_find_and_copy_revision() {
                 view.search
                     .status_line(/*width*/ 80, view.history)
                     .to_string()
-                    .starts_with("enter next")
+                    .starts_with("enter accept")
             );
         }
     }

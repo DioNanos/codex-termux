@@ -55,7 +55,7 @@ use core_test_support::skip_if_remote;
 #[cfg(unix)]
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::TestCodexHarness;
-use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::local_requests;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -63,8 +63,6 @@ use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::HashMap;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::fs;
@@ -203,7 +201,7 @@ async fn run_snapshot_command_with_options(
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd)),
+                environments: Some(local_requests(cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -279,7 +277,7 @@ async fn run_tool_turn_on_harness(
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd)),
+                environments: Some(local_requests(cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -697,10 +695,10 @@ async fn shell_snapshot_v2_guardian_uses_its_resolved_permissions_and_tools(
         ],
     )
     .await;
-    let mut environments = local_selections(test.config.cwd.clone());
-    environments.environments[0].config = EnvironmentConfigState::Ready(EnvironmentConfig {
+    let mut requests = local_requests(test.config.cwd.clone());
+    requests.environment_requests[0].config = EnvironmentConfigState::Ready(EnvironmentConfig {
         allow_login_shell: true,
-        workspace_roots: environments.environments[0].workspace_roots.clone(),
+        workspace_roots: requests.environment_requests[0].workspace_roots.clone(),
         permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
         shell_environment_policy: test.config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
@@ -718,7 +716,7 @@ async fn shell_snapshot_v2_guardian_uses_its_resolved_permissions_and_tools(
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(environments),
+                environments: Some(requests),
                 ..Default::default()
             }),
         )
@@ -763,7 +761,7 @@ async fn legacy_snapshot_omits_filtered_and_overridden_exports() -> Result<()> {
     let home = tempfile::tempdir()?;
     let shell_path = home.path().join("bash");
     // Seed the capture shell without changing the test process environment. Replay uses -c.
-    fs::write(
+    codex_utils_cargo_bin::write_executable(
         &shell_path,
         r#"#!/bin/sh
 if [ "$1" = -lc ]; then
@@ -777,9 +775,7 @@ second'
 fi
 exec /bin/bash --noprofile --norc "$@"
 "#,
-    )
-    .await?;
-    fs::set_permissions(&shell_path, std::fs::Permissions::from_mode(/*mode*/ 0o755)).await?;
+    )?;
     let builder = test_codex()
         .with_user_shell(
             codex_shell_command::shell_detect::DetectedShell {
@@ -909,7 +905,7 @@ async fn shell_snapshot_v2_filters_profile_secrets_without_creating_files() -> R
 
         assert_eq!(end.exit_code, 0);
         assert_eq!(
-            normalize_newlines(&end.stdout).trim(),
+            normalize_newlines(&end.aggregated_output).trim(),
             "helper|path|policy|missing"
         );
     }
@@ -957,7 +953,7 @@ async fn shell_snapshot_v2_preserves_legacy_snapshots_for_user_shell() -> Result
     .await;
 
     assert_eq!(end.exit_code, 0);
-    assert_eq!(normalize_newlines(&end.stdout).trim(), "legacy");
+    assert_eq!(normalize_newlines(&end.aggregated_output).trim(), "legacy");
     Ok(())
 }
 
@@ -966,7 +962,7 @@ async fn shell_snapshot_v2_preserves_legacy_snapshots_for_user_shell() -> Result
 async fn linux_unified_exec_uses_shell_snapshot() -> Result<()> {
     let command = "echo snapshot-linux";
     let run = run_snapshot_command(command).await?;
-    let stdout = normalize_newlines(&run.end.stdout);
+    let output = normalize_newlines(&run.end.aggregated_output);
 
     assert_eq!(run.begin.command.get(1).map(String::as_str), Some("-lc"));
     assert_eq!(run.begin.command.get(2).map(String::as_str), Some(command));
@@ -975,8 +971,8 @@ async fn linux_unified_exec_uses_shell_snapshot() -> Result<()> {
     assert_posix_snapshot_sections(&run.snapshot_content);
     assert_eq!(run.end.exit_code, 0);
     assert!(
-        stdout.contains("snapshot-linux"),
-        "stdout should contain snapshot marker; stdout={stdout:?}"
+        output.contains("snapshot-linux"),
+        "output should contain snapshot marker; output={output:?}"
     );
 
     Ok(())
@@ -1022,7 +1018,7 @@ async fn unified_exec_snapshot_preserves_shell_environment_policy_set() -> Resul
     .await?;
 
     assert_eq!(
-        normalize_newlines(&end.stdout).trim(),
+        normalize_newlines(&end.aggregated_output).trim(),
         POLICY_SUCCESS_OUTPUT
     );
     assert_eq!(end.exit_code, 0);
@@ -1081,7 +1077,7 @@ async fn unified_exec_snapshot_still_intercepts_apply_patch() -> Result<()> {
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd.clone())),
+                environments: Some(local_requests(cwd.clone())),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -1206,10 +1202,7 @@ async fn macos_unified_exec_resolves_command_from_tied_path_snapshot(
         .join("bin");
     fs::create_dir_all(&command_dir).await?;
     let command_path = command_dir.join("snapshot-only-command");
-    fs::write(&command_path, "#!/bin/sh\nprintf tied-path-command").await?;
-    let mut permissions = fs::metadata(&command_path).await?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&command_path, permissions).await?;
+    codex_utils_cargo_bin::write_executable(&command_path, "#!/bin/sh\nprintf tied-path-command")?;
 
     run_tool_turn_on_harness(
         &harness,
@@ -1246,10 +1239,13 @@ async fn macos_unified_exec_resolves_command_from_tied_path_snapshot(
 
     assert_eq!(
         end.exit_code, 0,
-        "tied-path command failed: stderr={:?}",
-        end.stderr
+        "tied-path command failed: output={:?}",
+        end.aggregated_output
     );
-    assert_eq!(normalize_newlines(&end.stdout).trim(), "tied-path-command");
+    assert_eq!(
+        normalize_newlines(&end.aggregated_output).trim(),
+        "tied-path-command"
+    );
 
     Ok(())
 }
@@ -1281,7 +1277,10 @@ async fn macos_unified_exec_uses_shell_snapshot() -> Result<()> {
 
     assert!(run.snapshot_path.starts_with(&run.codex_home));
     assert_posix_snapshot_sections(&run.snapshot_content);
-    assert_eq!(normalize_newlines(&run.end.stdout).trim(), "snapshot-macos");
+    assert_eq!(
+        normalize_newlines(&run.end.aggregated_output).trim(),
+        "snapshot-macos"
+    );
     assert_eq!(run.end.exit_code, 0);
 
     Ok(())
@@ -1315,7 +1314,7 @@ async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
     assert!(run.snapshot_content.contains("# aliases "));
     assert!(run.snapshot_content.contains("# exports "));
     assert_eq!(
-        normalize_newlines(&run.end.stdout).trim(),
+        normalize_newlines(&run.end.aggregated_output).trim(),
         "snapshot-windows"
     );
     assert_eq!(run.end.exit_code, 0);

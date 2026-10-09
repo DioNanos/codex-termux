@@ -1,5 +1,4 @@
 use super::*;
-use crate::compact::InitialContextInjection;
 use crate::config::Constrained;
 use crate::exec_policy::ExecPolicyManager;
 use crate::guardian::GUARDIAN_REVIEWER_NAME;
@@ -204,7 +203,6 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
     update_turn_settings_for_test(&mut turn_context_raw, |settings| {
         Arc::make_mut(&mut settings.model_info).node_repl_auto_review_required = true;
     });
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
     Arc::make_mut(&mut turn_context_raw.config)
         .permissions
         .approval_policy
@@ -244,6 +242,16 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
     evidence.record("js", "cell", "image", vec![image]);
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
+    session
+        .start_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            super::NeverEndingTask {
+                kind: crate::state::TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
 
     let requested_permissions = RequestPermissionProfile {
@@ -297,9 +305,7 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
         .await;
     assert_eq!(second_response, response);
     assert_eq!(
-        session
-            .granted_turn_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID)
-            .await,
+        turn_context.granted_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID),
         Some(requested_permissions.into())
     );
 
@@ -414,7 +420,8 @@ async fn request_permissions_guardian_review_stops_when_cancelled(
     .await;
 
     let (mut session, mut turn_context, rx_event) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    let active_turn = ActiveTurn::default();
+    *session.active_turn.lock().await = Some(active_turn);
     let turn_context_raw = Arc::get_mut(&mut turn_context).expect("single turn context ref");
     Arc::make_mut(&mut turn_context_raw.config)
         .permissions
@@ -523,9 +530,7 @@ async fn request_permissions_guardian_review_stops_when_cancelled(
             .expect("parent shutdown must finish reviewer cleanup");
     }
     assert_eq!(
-        session
-            .granted_turn_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID)
-            .await,
+        turn_context.granted_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID),
         None
     );
 }
@@ -658,25 +663,20 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
     .await;
 
     let (mut session, mut turn_context_raw) = make_session_and_context().await;
-    let active_turn = crate::state::ActiveTurn::default();
-    let originating_turn_state = Arc::clone(&active_turn.turn_state);
-    *session.active_turn.lock().await = Some(active_turn);
-    session
-        .record_granted_request_permissions_for_turn(
-            &RequestPermissionsResponse {
-                permissions: RequestPermissionProfile {
-                    network: Some(NetworkPermissions {
-                        enabled: Some(true),
-                    }),
-                    ..Default::default()
-                },
-                scope: PermissionGrantScope::Turn,
-                strict_auto_review: true,
+    session.record_granted_request_permissions_for_turn(
+        &RequestPermissionsResponse {
+            permissions: RequestPermissionProfile {
+                network: Some(NetworkPermissions {
+                    enabled: Some(true),
+                }),
+                ..Default::default()
             },
-            codex_exec_server::LOCAL_ENVIRONMENT_ID,
-            Some(&originating_turn_state),
-        )
-        .await;
+            scope: PermissionGrantScope::Turn,
+            strict_auto_review: true,
+        },
+        codex_exec_server::LOCAL_ENVIRONMENT_ID,
+        &turn_context_raw,
+    );
 
     Arc::make_mut(&mut turn_context_raw.config)
         .permissions
@@ -1113,29 +1113,27 @@ async fn compaction_initial_context_preserves_separate_guardian_developer_messag
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
     let world_state = Arc::new(
         session
-            .build_world_state_for_step(&step_context)
+            .build_world_state_for_step(&step_context, /*new_window*/ true)
             .await
             .expect("world state should build"),
     );
-    let initial_context_injection = InitialContextInjection::BeforeLastUserMessage {
-        world_state,
-        step_context,
-    };
-
-    let (refreshed, _) =
-        crate::compact::build_compaction_initial_context(&session, &initial_context_injection)
-            .await;
+    let (refreshed, _) = crate::compact::build_compaction_replacement_history(
+        &session,
+        &step_context,
+        &world_state,
+        Vec::new(),
+    )
+    .await;
 
     let developer_messages = refreshed
         .iter()
-        .filter_map(|envelope| match &envelope.item {
+        .map(|item| &item.item)
+        .filter_map(|item| match item {
             ResponseItem::Message { role, content, .. } if role == "developer" => {
                 crate::content_items_to_text(content).map(|text| {
                     (
                         text,
-                        envelope
-                            .item
-                            .executed_tool_call_metadata()
+                        item.executed_tool_call_metadata()
                             .and_then(|metadata| metadata.content_item_kinds.clone()),
                     )
                 })
@@ -1162,32 +1160,22 @@ async fn compaction_initial_context_preserves_separate_guardian_developer_messag
 
 #[tokio::test]
 #[cfg(unix)]
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "test mutates active turn state directly to seed granted permissions"
-)]
 async fn exec_command_allows_sticky_turn_permissions_without_inline_request_permissions_feature() {
     let (mut session, turn_context_raw) = make_session_and_context().await;
     session
         .features
         .enable(Feature::RequestPermissionsTool)
         .expect("test setup should allow enabling request permissions tool");
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
-    {
-        let mut active_turn = session.active_turn.lock().await;
-        let active_turn = active_turn.as_mut().expect("active turn");
-        let mut turn_state = active_turn.turn_state.lock().await;
-        turn_state.record_granted_permissions(
-            codex_exec_server::LOCAL_ENVIRONMENT_ID,
-            PermissionProfile {
-                network: Some(NetworkPermissions {
-                    enabled: Some(true),
-                }),
-                ..Default::default()
-            },
-        );
-    }
-
+    turn_context_raw.record_granted_permissions(
+        codex_exec_server::LOCAL_ENVIRONMENT_ID,
+        PermissionProfile {
+            network: Some(NetworkPermissions {
+                enabled: Some(true),
+            }),
+            ..Default::default()
+        },
+        /*strict_auto_review*/ false,
+    );
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
 
@@ -1333,8 +1321,9 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
-        environment_selections: Vec::new(),
+        environment_requests: Vec::new(),
         thread_extension_init,
+        turn_extension_init: Default::default(),
         client_mcp_extensions: ClientMcpExtensions::default(),
         reserved_thread_id: None,
         analytics_events_client: None,

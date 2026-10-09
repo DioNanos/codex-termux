@@ -1,10 +1,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::Weak;
 
-use codex_exec_server::Environment;
-use codex_exec_server::FileSystemSandboxContext;
+use codex_exec_server::EnvironmentAccessKey;
 use codex_extension_api::ExtensionMetrics;
 use codex_mcp::McpResourceClient;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -20,6 +18,7 @@ use crate::catalog::SkillProviderResult;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillSourceKind;
 use crate::provider::SkillListQuery;
+use crate::provider::SkillReadContext;
 use crate::provider::SkillReadRequest;
 use crate::shadow_selection_experiment::RecentSkillInvocations;
 use crate::shadow_selection_experiment::ShadowSelectionTurnState;
@@ -28,7 +27,6 @@ use crate::skills_extension_state::CachedExecutorCatalog;
 use crate::skills_extension_state::CachedExecutorDiscoveryCatalog;
 use crate::skills_extension_state::CloudResourceCache;
 use crate::skills_extension_state::CloudSkillGeneration;
-use crate::skills_extension_state::ExecutorCatalogSelection;
 use crate::skills_extension_state::SkillReadCacheKey;
 use crate::sources::SkillProviders;
 
@@ -118,7 +116,7 @@ impl SkillsThreadState {
             .map(|turn| Arc::clone(&turn.state))
     }
 
-    /// Refreshes the current step's executor catalog in the existing caches.
+    /// Returns the catalog for these exact roots, using the existing thread caches.
     #[tracing::instrument(
         name = "skills.executor.refresh_executor_catalog",
         level = "info",
@@ -129,57 +127,27 @@ impl SkillsThreadState {
         &self,
         providers: &SkillProviders,
         mut query: SkillListQuery,
-    ) {
-        let selection = if query.executor_capability_discovery.is_some() {
+    ) -> SkillCatalog {
+        if query.executor_capability_discovery.is_some() {
             // High-level discovery is enabled: reuse or project its discovery snapshot.
             self.executor_discovery_catalog_snapshot(providers, query)
-                .await;
-            ExecutorCatalogSelection::Discovery
+                .await
         } else {
             // High-level discovery is not enabled: retain the legacy per-root cache path.
             let roots = std::mem::take(&mut query.executor_roots);
-            for root in &roots {
+            let mut catalog = SkillCatalog::default();
+            for root in roots {
                 query.executor_roots = vec![root.clone()];
-                self.executor_root_catalog(providers, root.clone(), query.clone())
-                    .await;
+                catalog.extend(
+                    self.executor_root_catalog(providers, root, query.clone())
+                        .await,
+                );
             }
-            ExecutorCatalogSelection::Roots(roots)
-        };
-        self.skills_extension_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .executor_catalog_selection = selection;
-    }
-
-    /// Reads the most recently refreshed selection without invoking providers.
-    pub fn executor_catalog_snapshot(&self) -> SkillCatalog {
-        let state = self
-            .skills_extension_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match &state.executor_catalog_selection {
-            ExecutorCatalogSelection::Discovery => state
-                .executor_discovery_cache
-                .as_ref()
-                .map(|cached| cached.catalog.clone())
-                .unwrap_or_default(),
-            ExecutorCatalogSelection::Roots(roots) => {
-                let mut catalog = SkillCatalog::default();
-                for root in roots {
-                    if let Some(cached) = state
-                        .executor_cache
-                        .iter()
-                        .find(|cached| &cached.root == root)
-                    {
-                        catalog.extend(cached.catalog.clone());
-                    }
-                }
-                catalog
-            }
+            catalog
         }
     }
 
-    /// Reuses matching successful discovery or retains a fresh result for snapshot reads.
+    /// Reuses matching successful discovery; otherwise returns the result of this request.
     async fn executor_discovery_catalog_snapshot(
         &self,
         providers: &SkillProviders,
@@ -219,7 +187,7 @@ impl SkillsThreadState {
             .skills_extension_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Retain failures for read-only snapshots; discovery_failed above prevents reuse.
+        // Failed discovery is returned to this caller but is never reused by another request.
         state.executor_discovery_cache =
             discovery.map(|discovery| CachedExecutorDiscoveryCatalog {
                 roots,
@@ -267,21 +235,29 @@ impl SkillsThreadState {
     /// Reads the last authorized turn-start catalog without discovery or retries.
     /// Same-auth failures may retain it; disabled or invalidated catalogs are empty.
     pub fn cloud_catalog_snapshot(&self) -> SkillCatalog {
+        self.with_cloud_catalog(|catalog| catalog.cloned().unwrap_or_default())
+    }
+
+    /// Borrows the authorized catalog under the cache lock. The reader must not re-enter this state.
+    pub(crate) fn with_cloud_catalog<T>(&self, read: impl FnOnce(Option<&SkillCatalog>) -> T) -> T {
         let config = self
             .config
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !config.cloud_skill_enabled || !self.cloud_skills_available {
-            return SkillCatalog::default();
+            return read(None);
         }
-        self.skills_extension_state
+        let state = self
+            .skills_extension_state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cloud_cache
-            .as_ref()
-            .filter(|cache| cache.is_current())
-            .and_then(|cache| cache.catalog.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        read(
+            state
+                .cloud_cache
+                .as_ref()
+                .filter(|cache| cache.is_current())
+                .and_then(|cache| cache.catalog.as_ref()),
+        )
     }
 
     fn cloud_cache(&self, mcp_resources: Option<&McpResourceClient>) -> Arc<CloudSkillGeneration> {
@@ -370,7 +346,12 @@ impl SkillsThreadState {
             return providers.read(request).await;
         }
 
-        let cache = self.cloud_cache(request.mcp_resources.as_deref());
+        let SkillReadContext::Cloud { mcp_resources } = &request.context else {
+            return Err(SkillProviderError::new(
+                "cloud skill reads require a cloud context",
+            ));
+        };
+        let cache = self.cloud_cache(mcp_resources.as_deref());
         let cache_key = SkillReadCacheKey::from(&request);
         {
             let config = self
@@ -435,9 +416,8 @@ impl SkillsThreadState {
 pub(crate) struct ExecutorReadSnapshot {
     pub(crate) authority: SkillAuthority,
     pub(crate) package: SkillPackageId,
-    // Named environments can be replaced; do not reuse their old resource or keep them alive.
-    pub(crate) environment: Weak<Environment>,
-    pub(crate) sandbox: Option<FileSystemSandboxContext>,
+    // The key binds cached contents to their source filesystem and callback permissions.
+    pub(crate) access: EnvironmentAccessKey,
     pub(crate) result: Arc<SkillReadResult>,
 }
 

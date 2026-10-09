@@ -347,7 +347,7 @@ async fn schedule_startup_prewarm_inner(
     ) {
         crate::session::get_service_tier(
             session.services.agent_control.service_tier(),
-            session.features().enabled(Feature::FastMode),
+            &session.features(),
             &preconnect_model_info,
         )
     } else {
@@ -418,6 +418,9 @@ async fn schedule_startup_prewarm_inner(
             text: base_instructions,
             provenance: None,
         },
+        session
+            .current_window_uses_incremental_tools(&step_context)
+            .await,
     );
     startup_turn_context.session_telemetry.record_startup_phase(
         "startup_prewarm_build_prompt",

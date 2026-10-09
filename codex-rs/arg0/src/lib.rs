@@ -95,6 +95,9 @@ impl Arg0PathEntryGuard {
     }
 }
 
+#[cfg(any(target_os = "android", test))]
+mod se_process_context;
+
 pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
     #[cfg(target_os = "linux")]
     codex_utils_pty::init_spawn_helper(std::env::args_os());
@@ -172,13 +175,8 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
                     Err(_) => std::process::exit(1),
                 };
                 let cwd = cwd.into();
-                let update_file_mode = codex_apply_patch::apply_patch_file_update_mode_from_env();
-                match runtime.block_on(codex_apply_patch::apply_patch_with_options(
+                match runtime.block_on(codex_apply_patch::apply_patch(
                     &patch_arg,
-                    codex_apply_patch::ApplyPatchOptions {
-                        update_file_mode,
-                        ..Default::default()
-                    },
                     &cwd,
                     &mut stdout,
                     &mut stderr,
@@ -200,6 +198,11 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
     // This modifies the environment, which is not thread-safe, so do this
     // before creating any threads/the Tokio runtime.
     load_dotenv();
+
+    // Same constraint: termux-exec's execve() hook can deadlock a forked child when this
+    // variable is missing (https://github.com/termux/termux-exec-package/issues/41).
+    #[cfg(target_os = "android")]
+    se_process_context::export_se_process_context();
 
     let (path_entry_guard, updated_path_env_var) = prepare_path_env_var_with_aliases(
         InstallContext::current(),
@@ -695,7 +698,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("missing Windows system root"))?;
         let command_shell = PathBuf::from(system_root).join("System32").join("cmd.exe");
         let executable = executable_directory.join("cmd.exe");
-        fs::copy(&command_shell, &executable)?;
+        codex_utils_cargo_bin::copy_executable(&command_shell, &executable)?;
 
         let batch_path = alias_directory.join("apply_patch.bat");
         let executable_path = super::windows_batch_executable_path(&executable, &alias_directory);

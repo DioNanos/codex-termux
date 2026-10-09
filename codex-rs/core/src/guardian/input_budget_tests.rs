@@ -28,7 +28,7 @@ fn required_context(text: String) -> ComposedContext {
     )
     .expect("collect required context");
     let transcript = ContextProfile::synchronous()
-        .render_transcript(context.transcript_entries(), /*entry_number_offset*/ 0);
+        .prepare_transcript(context.transcript_entries(), /*entry_number_offset*/ 0);
     context
         .compose(
             ContextPresentation::SyncFull {
@@ -190,7 +190,12 @@ async fn compacted_review_restores_originals_once_and_persists_the_request_prefi
     session
         .replace_history(vec![], /*reference_context_item*/ None)
         .await;
-    let mut prompt = build_prompt(vec![], &step, session.get_prompt_base_instructions().await);
+    let mut prompt = build_prompt(
+        vec![],
+        &step,
+        session.get_prompt_base_instructions().await,
+        /*incremental_tools*/ false,
+    );
     let metadata = session
         .responses_metadata(&step, CodexResponsesRequestKind::Turn)
         .await;

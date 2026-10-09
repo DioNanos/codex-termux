@@ -5,7 +5,6 @@ use super::prepare_from_package;
 use super::validate_package;
 use crate::settings::DaemonSettings;
 use pretty_assertions::assert_eq;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -76,28 +75,17 @@ fn package(root: &Path, version: &str) -> PathBuf {
         std::fs::create_dir_all(root.join(dir)).expect("package directory");
     }
     let bin = root.join("bin/codex");
-    std::fs::write(&bin, format!("#!/bin/sh\necho 'codex {version}'\n")).expect("codex executable");
-    for file in [
-        "bin/codex-code-mode-host",
-        "codex-path/rg",
-        "codex-resources/nested/runtime",
-    ] {
-        std::fs::write(root.join(file), b"runtime").expect("package file");
-        if file != "codex-resources/nested/runtime" {
-            std::fs::set_permissions(root.join(file), std::fs::Permissions::from_mode(0o755))
-                .expect("executable helper");
-        }
+    codex_utils_cargo_bin::write_executable(&bin, &format!("#!/bin/sh\necho 'codex {version}'\n"))
+        .expect("codex executable");
+    for file in ["bin/codex-code-mode-host", "codex-path/rg"] {
+        codex_utils_cargo_bin::write_executable(&root.join(file), "runtime")
+            .expect("executable helper");
     }
+    std::fs::write(root.join("codex-resources/nested/runtime"), b"runtime").expect("package file");
     if cfg!(target_os = "linux") {
-        std::fs::write(root.join("codex-resources/bwrap"), b"runtime").expect("bwrap");
-        std::fs::set_permissions(
-            root.join("codex-resources/bwrap"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .expect("executable bwrap");
+        codex_utils_cargo_bin::write_executable(&root.join("codex-resources/bwrap"), "runtime")
+            .expect("executable bwrap");
     }
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
-        .expect("executable permission");
     std::fs::write(
         root.join("codex-package.json"),
         serde_json::json!({
@@ -168,7 +156,8 @@ async fn provisioned_macos_bundle_seeds_from_its_running_executable() {
     let temp = tempfile::TempDir::new().expect("temp");
     let source = temp.path().join("package");
     let launcher = package(&source, "0.1.0-internal-test.202609091200.1");
-    std::fs::write(&launcher, b"#!/bin/sh\necho codex 0.0.0\n").expect("launcher");
+    codex_utils_cargo_bin::write_executable(&launcher, "#!/bin/sh\necho codex 0.0.0\n")
+        .expect("launcher");
     let bundle = source.join("CodexCLI.app/Contents/MacOS/codex");
     std::fs::create_dir_all(bundle.parent().expect("bundle parent")).expect("bundle dir");
     std::fs::write(&bundle, b"provisioned executable").expect("bundle executable");
@@ -431,4 +420,25 @@ async fn broken_selection_is_not_a_missing_installation() {
         std::fs::read_link(current).unwrap(),
         PathBuf::from("missing-release")
     );
+}
+
+/// The Android package does not bundle ripgrep (Termux resolves `rg` from
+/// PATH via `pkg install ripgrep`), so it must validate without
+/// `codex-path/rg` while every other platform still requires it.
+#[test]
+fn android_package_without_bundled_ripgrep_is_valid() {
+    let temp = tempfile::TempDir::new().expect("temp");
+    let source = temp.path().join("package");
+    package(&source, "0.152.0");
+    std::fs::remove_file(source.join("codex-path/rg")).expect("remove bundled rg");
+
+    let error = super::validate_package_for_platform(&source, /*android*/ false)
+        .expect_err("non-Android platforms still require the bundled rg");
+    assert!(
+        error.to_string().contains("codex-path/rg"),
+        "the error must name the missing file: {error}"
+    );
+
+    super::validate_package_for_platform(&source, /*android*/ true)
+        .expect("the Android package ships without bundled ripgrep");
 }

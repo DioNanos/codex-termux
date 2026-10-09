@@ -12,6 +12,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageReference as CoreImageReference;
 use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
+use codex_protocol::protocol::TurnEnvironmentRequests;
 use codex_protocol::protocol::TurnSettingsUpdate;
 use codex_protocol::protocol::TurnSettingsUpdateOutcome;
 use codex_skills::system_cache_root_dir;
@@ -136,7 +137,7 @@ fn map_additional_context(
 
 #[derive(Default)]
 struct ThreadEnvironmentOverride {
-    environments: Option<TurnEnvironmentSelections>,
+    environment_requests: Option<TurnEnvironmentRequests>,
     // Only default-environment updates replace the task's separately persisted root selection.
     runtime_workspace_roots: Option<Vec<AbsolutePathBuf>>,
 }
@@ -607,8 +608,8 @@ impl TurnRequestProcessor {
         let runtime_workspace_roots = params
             .runtime_workspace_roots
             .map(resolve_runtime_workspace_roots);
-        let environment_selections =
-            resolve_turn_environment_selections(self.thread_manager.as_ref(), params.environments)?;
+        let environment_requests =
+            resolve_turn_environment_requests(self.thread_manager.as_ref(), params.environments)?;
 
         let additional_context = map_additional_context(params.additional_context);
         let turn_has_input = !params.input.is_empty();
@@ -643,7 +644,7 @@ impl TurnRequestProcessor {
                 thread.as_ref(),
                 cwd,
                 runtime_workspace_roots,
-                environment_selections,
+                environment_requests,
             )
             .await;
         let thread_settings = self
@@ -673,10 +674,12 @@ impl TurnRequestProcessor {
                     .with_thread_settings(thread_settings)
                     .on_start(TurnStartOptions {
                         turn_trigger: params.turn_trigger,
+                        parent_turn_id: params.parent_turn_id,
+                        initiating_agent_path: None,
+                        root_turn_id: params.root_turn_id,
                         final_output_json_schema: params.output_schema,
                         service_tier: params.service_tier_for_turn,
                         cyber_access_program: params.cyber_access_program.map(Into::into),
-                        ..Default::default()
                     })
                     .with_additional_context(additional_context)
                     .with_responses_metadata(params.responsesapi_client_metadata)
@@ -688,9 +691,15 @@ impl TurnRequestProcessor {
                 self.track_error_response(&request_id, &error, /*error_type*/ None);
                 error
             })?;
-        let (turn_id, started) = match submission {
-            TurnInputSubmission::Started { turn_id } => (turn_id, true),
-            TurnInputSubmission::Steered { turn_id } => (turn_id, false),
+        let (turn_id, root_turn_id, started) = match submission {
+            TurnInputSubmission::Started {
+                turn_id,
+                root_turn_id,
+            } => (turn_id, root_turn_id, true),
+            TurnInputSubmission::Steered {
+                turn_id,
+                root_turn_id,
+            } => (turn_id, root_turn_id, false),
             TurnInputSubmission::NotSubmitted { reason } => {
                 let error = if reason == NotSubmittedReason::ServerDraining {
                     crate::error_code::server_draining_error()
@@ -722,6 +731,7 @@ impl TurnRequestProcessor {
             .await;
         let turn = Turn {
             id: turn_id,
+            root_turn_id: Some(root_turn_id),
             items: vec![],
             items_view: TurnItemsView::NotLoaded,
             error: None,
@@ -739,30 +749,30 @@ impl TurnRequestProcessor {
         thread: &CodexThread,
         cwd: Option<AbsolutePathBuf>,
         workspace_roots: Option<Vec<AbsolutePathBuf>>,
-        environment_selections: Option<Vec<TurnEnvironmentSelection>>,
+        environment_requests: Option<Vec<TurnEnvironmentRequest>>,
     ) -> ThreadEnvironmentOverride {
-        if cwd.is_none() && workspace_roots.is_none() && environment_selections.is_none() {
+        if cwd.is_none() && workspace_roots.is_none() && environment_requests.is_none() {
             return ThreadEnvironmentOverride::default();
         }
 
-        // Explicit environment selections own their roots and pass through unchanged. Top-level
+        // Explicit environment requests own their workspace roots and pass through unchanged. Top-level
         // `runtimeWorkspaceRoots` is only a compatibility input for default environments.
-        if let Some(environment_selections) = environment_selections {
+        if let Some(environment_requests) = environment_requests {
             let legacy_fallback_cwd = match cwd {
                 Some(cwd) => cwd,
-                None => match environment_selections
+                None => match environment_requests
                     .iter()
-                    .find(|selection| selection.environment_id == LOCAL_ENVIRONMENT_ID)
-                    .and_then(|selection| selection.cwd.to_abs_path().ok())
+                    .find(|request| request.environment_id == LOCAL_ENVIRONMENT_ID)
+                    .and_then(|request| request.cwd.to_abs_path().ok())
                 {
                     Some(cwd) => cwd,
                     None => thread.config_snapshot().await.cwd().clone(),
                 },
             };
             return ThreadEnvironmentOverride {
-                environments: Some(TurnEnvironmentSelections::new(
+                environment_requests: Some(TurnEnvironmentRequests::new(
                     legacy_fallback_cwd,
-                    environment_selections,
+                    environment_requests,
                 )),
                 ..Default::default()
             };
@@ -780,13 +790,13 @@ impl TurnRequestProcessor {
                 legacy_fallback_cwd.clone(),
             ),
         };
-        let environment_selections = self
+        let environment_requests = self
             .thread_manager
-            .default_environment_selections(&legacy_fallback_cwd, &workspace_roots);
+            .default_environment_requests(&legacy_fallback_cwd, &workspace_roots);
         ThreadEnvironmentOverride {
-            environments: Some(TurnEnvironmentSelections::new(
+            environment_requests: Some(TurnEnvironmentRequests::new(
                 legacy_fallback_cwd,
-                environment_selections,
+                environment_requests,
             )),
             runtime_workspace_roots: Some(workspace_roots),
         }
@@ -802,7 +812,7 @@ impl TurnRequestProcessor {
             disabled_plugin_ids,
             environment_override:
                 ThreadEnvironmentOverride {
-                    environments,
+                    environment_requests,
                     runtime_workspace_roots,
                 },
             approval_policy,
@@ -825,7 +835,7 @@ impl TurnRequestProcessor {
 
         let collaboration_mode =
             collaboration_mode.map(|mode| self.normalize_collaboration_mode(mode));
-        let has_environment_override = environments.is_some();
+        let has_environment_override = environment_requests.is_some();
         // `thread/settings/update` only acknowledges that the update was queued.
         // Clients that send dependent partial updates should wait for
         // `thread/settings/updated` or combine the fields in one request.
@@ -861,9 +871,9 @@ impl TurnRequestProcessor {
                     )));
                 };
                 let thread_config = thread.config().await;
-                let cwd = environments.as_ref().map_or_else(
+                let cwd = environment_requests.as_ref().map_or_else(
                     || snapshot.cwd().clone(),
-                    |environments| environments.legacy_fallback_cwd.clone(),
+                    |environment_requests| environment_requests.legacy_fallback_cwd.clone(),
                 );
                 let config = self
                     .config_manager
@@ -893,8 +903,9 @@ impl TurnRequestProcessor {
         if has_any_overrides {
             thread
                 .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
+                    turn_extension_init: None,
                     disabled_plugin_ids: disabled_plugin_ids.clone(),
-                    environments: environments.clone(),
+                    environments: environment_requests.clone(),
                     runtime_workspace_roots: runtime_workspace_roots.clone(),
                     approval_policy,
                     approvals_reviewer,
@@ -918,7 +929,7 @@ impl TurnRequestProcessor {
 
         Ok(codex_protocol::protocol::ThreadSettingsOverrides {
             disabled_plugin_ids,
-            environments,
+            environments: environment_requests,
             runtime_workspace_roots,
             profile_workspace_roots,
             approval_policy,
@@ -950,7 +961,7 @@ impl TurnRequestProcessor {
                 thread.as_ref(),
                 cwd,
                 /*workspace_roots*/ None,
-                /*environment_selections*/ None,
+                /*environment_requests*/ None,
             )
             .await;
         let thread_settings = self
@@ -1422,6 +1433,7 @@ impl TurnRequestProcessor {
 
         Turn {
             id: turn_id,
+            root_turn_id: None,
             items,
             items_view: TurnItemsView::NotLoaded,
             error: None,

@@ -147,6 +147,11 @@ impl App {
         {
             session.approval_policy = policy;
         }
+        if let Some(reviewer) = self.runtime_approvals_reviewer_override
+            && reviewer == cached.approvals_reviewer
+        {
+            session.approvals_reviewer = reviewer;
+        }
         if let Some(profile) = &self.runtime_permission_profile_override
             && profile.permission_profile == cached.permission_profile
             && profile.active_permission_profile == cached.active_permission_profile
@@ -190,6 +195,7 @@ impl App {
             }
             self.retire_background_voice();
             self.reconnect.offline = true;
+            self.account_email_request_id = None;
             // Cached blank sessions are usable only while this connection owns a subscription.
             self.agents_overview.blank_sessions.clear();
             self.reconnect.failed = false;
@@ -208,8 +214,11 @@ impl App {
                 task.abort();
             }
             self.agents_overview.request_id = None;
+            self.agents_overview.refresh_show_more = false;
+            self.agents_overview.active_refresh_thread_ids.clear();
             self.agents_overview.refresh_pending = false;
             self.agents_overview.refresh_notifications.clear();
+            self.agents_overview.pending_pin_change = None;
             self.agents_overview.pending_usage = None;
             self.agents_overview.usage_disabled = false;
             self.agents_overview.usage.clear();
@@ -285,6 +294,7 @@ impl App {
         self.agent_navigation.picker_refresh = None;
         self.last_subagent_backfill_attempt = None;
         self.rate_limit_refresh_state.invalidate_recovery();
+        session.worktree_source_config_builder = app_server.worktree_source_config_builder.clone();
         session.inherit_task_tool_capabilities(app_server);
         *app_server = session;
         #[cfg(any(target_os = "windows", test))]
@@ -308,7 +318,6 @@ impl App {
             !self.app_server_target.uses_remote_workspace()
                 && app_server.app_server_platform_os() == Some("windows");
         self.chat_widget.windows_sandbox_host = WindowsSandboxHost::Unknown;
-        self.chat_widget.cyber_policy_notice = Default::default();
         self.chat_widget.requires_openai_auth = bootstrap.requires_openai_auth;
         self.chat_widget.remote_connection =
             crate::status::remote_connection::remote_connection_status_value(
@@ -327,8 +336,13 @@ impl App {
         self.pending_app_server_requests.clear();
         // The displayed task was resumed above. Keep offscreen selections pending until those
         // tasks can be resumed from the server too; their old confirmations cannot arrive.
-        let pending_displayed_profile =
-            displayed.and_then(|id| self.pending_server_profiles.remove(&id));
+        let pending_displayed_profile = displayed.and_then(|id| {
+            self.pending_server_profiles.remove(&id).or_else(|| {
+                self.agents_overview
+                    .requested_permission_profiles
+                    .remove(&id)
+            })
+        });
         if let Some(selection) = &pending_displayed_profile {
             self.runtime_approval_policy_override = None;
             if selection.approvals_reviewer.is_some() {
@@ -346,6 +360,8 @@ impl App {
         self.sync_thread_title_progress();
         self.agents_overview.dispatched_requests.clear();
         self.agents_overview.request_id = None;
+        self.agents_overview.refresh_show_more = false;
+        self.agents_overview.active_refresh_thread_ids.clear();
         self.agents_overview.refresh_pending = false;
         for input in self.agents_overview.input_states.values_mut() {
             input.reconnect_pending = true;
@@ -484,11 +500,6 @@ impl App {
                 app_server,
                 self.app_event_tx.clone(),
                 self.chat_widget.security_setup_request_id,
-            );
-            crate::daybreak::prefetch_notice(
-                &self.config,
-                app_server,
-                self.chat_widget.cyber_policy_notice.clone(),
             );
         }
         self.feedback_audience = bootstrap.feedback_audience;

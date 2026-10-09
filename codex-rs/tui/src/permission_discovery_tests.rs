@@ -76,15 +76,8 @@ async fn discovery_preserves_config_scope_and_bounds_server_requests() {
                 json!({"result": {"data": [data[1]], "nextCursor": null}}),
             ],
         });
-        if mode == ThreadParamsMode::Remote {
-            replies.insert(
-                /*index*/ 0,
-                json!({"result": {"config": {
-                "default_permissions": (case != "legacy").then_some(":workspace")
-            }, "origins": {}}}),
-            );
-        } else if case == "timeout" {
-            replies = vec![Value::Null];
+        if case == "timeout" {
+            replies = vec![Value::Null; 4];
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
@@ -127,7 +120,7 @@ async fn discovery_preserves_config_scope_and_bounds_server_requests() {
         if case == "timeout" {
             tokio::time::pause();
         } // Keep real time for the socket handshake.
-        for attempt in 0..if case == "timeout" { 4 } else { 1 } {
+        for _ in 0..if case == "timeout" { 4 } else { 1 } {
             fetch(
                 &session,
                 Uuid::new_v4(),
@@ -142,8 +135,7 @@ async fn discovery_preserves_config_scope_and_bounds_server_requests() {
                 "unsupported" => Some("Upgrade"),
                 "config-error" => Some("Invalid project config"),
                 "cycle" | "limit" => Some("pagination limit"),
-                "timeout" if attempt == 0 => Some("timed out"),
-                "timeout" => Some("duplicate"),
+                "timeout" => Some("timed out"),
                 _ => None,
             };
             if let Some(error) = error {
@@ -151,15 +143,7 @@ async fn discovery_preserves_config_scope_and_bounds_server_requests() {
                 continue;
             }
             let discovery = result.unwrap();
-            assert_eq!(discovery.explicit_profile_mode, case != "legacy");
-            if case == "session-only" {
-                assert!(
-                    discovery
-                        .profiles
-                        .iter()
-                        .any(|profile| profile.id == "session-only" && profile.allowed)
-                );
-            } else if matches!(case, "empty" | "legacy") {
+            if case == "empty" {
                 assert!(discovery.profiles.is_empty());
             } else {
                 assert_eq!(serde_json::to_value(&discovery.profiles).unwrap(), data);
@@ -172,9 +156,12 @@ async fn discovery_preserves_config_scope_and_bounds_server_requests() {
         session.shutdown().await.unwrap();
         let requests = server.await.unwrap();
         match case {
-            "session-only" => assert!(requests.is_empty()),
-            "timeout" | "legacy" => assert_eq!(requests.len(), 1),
-            "local" | "remote" | "remote-default" | "thread" => {
+            "timeout" => {
+                assert_eq!(requests.len(), 4);
+                let ids: HashSet<_> = requests.iter().map(|request| &request["id"]).collect();
+                assert_eq!(ids.len(), requests.len());
+            }
+            "local" | "session-only" | "remote" | "remote-default" | "thread" | "legacy" => {
                 let pages: Vec<_> = requests
                     .iter()
                     .filter(|request| request["method"] == "permissionProfile/list")
@@ -187,9 +174,6 @@ async fn discovery_preserves_config_scope_and_bounds_server_requests() {
                         json!({"cwd": cwd, "limit": 100, "cursor": "second"})
                     ]
                 );
-                if mode == ThreadParamsMode::Remote {
-                    assert_eq!(requests[0]["params"]["cwd"], json!(cwd));
-                }
             }
             _ => {}
         }

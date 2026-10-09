@@ -11,6 +11,8 @@ use crate::context::ContextualUserFragment;
 use crate::tools::MULTI_AGENT_V2_NAMESPACE_DESCRIPTION;
 use chrono::DateTime;
 use chrono::Utc;
+use codex_agent_message_board_client::AccessToken;
+use codex_agent_message_board_client::RemoteAgentMessageBoard;
 use codex_agent_message_board_extension::AgentMessageBoard;
 use codex_agent_message_board_extension::InMemoryMessageBoards;
 use codex_agent_message_board_extension::LocalAgentMessageBoard;
@@ -18,7 +20,9 @@ use codex_agent_message_board_extension::MessageBoardHost;
 use codex_agent_message_board_extension::NotificationDelivery;
 use codex_agent_message_board_extension::PostPreview;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::ThreadStartInput;
 use codex_features::Feature;
+use codex_http_client::ClientRouteClass;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
@@ -36,29 +40,68 @@ pub fn install_agent_message_board(
     registry: &mut ExtensionRegistryBuilder<Config>,
     manager: Weak<ThreadManager>,
 ) {
+    codex_agent_message_board_client::install_notifications(registry, |input| {
+        let board = input.thread_store.get::<RemoteAgentMessageBoard>()?;
+        let host = input.thread_store.get::<LocalBoardHost>()?;
+        Some((
+            board,
+            Arc::new(LocalBoardHost {
+                expected_turn_id: Some(input.turn_id.into()),
+                ..host.as_ref().clone()
+            }),
+        ))
+    });
     let in_memory_boards = Arc::new(InMemoryMessageBoards::default());
     codex_agent_message_board_extension::install(
         registry,
         MULTI_AGENT_V2_NAMESPACE_DESCRIPTION,
         |config: &Config| config.multi_agent_v2.tool_namespace.clone(),
-        move |config: &Config, tree, caller| {
+        move |input: &ThreadStartInput<'_, Config>, tree, caller| {
+            let config = input.config;
             let in_memory = config.multi_agent_v2.message_board_in_memory;
-            // MAv2 supplies tree paths; ephemeral runtimes must not open durable storage.
+            // MAv2 supplies tree paths; ephemeral runtimes must not open local SQLite.
             if !config.features.enabled(Feature::AgentMessageBoard)
                 || !config.features.enabled(Feature::MultiAgentV2)
-                || (config.ephemeral && !in_memory)
+                || (config.ephemeral
+                    && !in_memory
+                    && config.multi_agent_v2.message_board_remote.is_none())
             {
                 return Box::pin(async { Ok(None) });
             }
             let sqlite = config.sqlite_config().clone();
+            let remote = config.multi_agent_v2.message_board_remote.clone();
+            let http_factory = config.http_client_factory();
             let in_memory_boards = Arc::clone(&in_memory_boards);
             let host = Arc::new(LocalBoardHost {
                 manager: manager.clone(),
                 tree,
                 caller,
+                expected_turn_id: None,
             });
             Box::pin(async move {
-                let board: Arc<dyn AgentMessageBoard> = if in_memory {
+                let board: Arc<dyn AgentMessageBoard> = if let Some(remote) = remote {
+                    let token = match remote.bearer_token_env_var {
+                        Some(name) => std::env::var(name).map_err(|_| CodexErr::InvalidRequest(
+                            "message-board credential environment variable is missing or invalid".into(),
+                        ))?,
+                        None => remote.bearer_token.ok_or_else(|| CodexErr::InvalidRequest(
+                            "remote message board requires a credential".into(),
+                        ))?.into_inner(),
+                    };
+                    let token = AccessToken::new(token)
+                        .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+                    let http = http_factory
+                        .build_client(&remote.url, ClientRouteClass::Api)
+                        .map_err(|err| CodexErr::Io(std::io::Error::other(err)))?;
+                    input.thread_store.insert(host.as_ref().clone());
+                    let board = RemoteAgentMessageBoard::new(http, &remote.url, tree, token)
+                        .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?
+                        .with_clock(move |caller| {
+                            let host = host.clone();
+                            Box::pin(async move { host.current_time(caller).await })
+                        });
+                    input.thread_store.get_or_init(|| board)
+                } else if in_memory {
                     Arc::new(in_memory_boards.open(tree, host).await)
                 } else {
                     Arc::new(LocalAgentMessageBoard::open(&sqlite, tree, host).await?)
@@ -69,10 +112,12 @@ pub fn install_agent_message_board(
     );
 }
 
+#[derive(Clone)]
 struct LocalBoardHost {
     manager: Weak<ThreadManager>,
     tree: SessionId,
     caller: ThreadId,
+    expected_turn_id: Option<String>,
 }
 
 impl LocalBoardHost {
@@ -186,6 +231,18 @@ impl MessageBoardHost for LocalBoardHost {
                 notice.render(),
                 /*trigger_turn*/ false,
             );
+            // Remote metadata is untrusted. Skip an oversized notice without closing
+            // the receiver; the post remains available through the board tools.
+            if self.expected_turn_id.is_some()
+                && communication.content.len()
+                    + communication.author.as_str().len()
+                    + communication.recipient.as_str().len()
+                    > 1024
+            {
+                return Err(CodexErr::InvalidRequest(
+                    "remote board notice exceeds the context budget".into(),
+                ));
+            }
             Ok(
                 if recipient
                     .session
@@ -193,6 +250,7 @@ impl MessageBoardHost for LocalBoardHost {
                     .deliver_mailbox_communication_to_current_turn(
                         &recipient.session.active_turn,
                         communication,
+                        self.expected_turn_id.as_deref(),
                     )
                     .await
                 {

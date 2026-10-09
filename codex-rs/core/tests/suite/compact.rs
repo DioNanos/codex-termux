@@ -23,6 +23,7 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookRunStatus;
@@ -43,7 +44,7 @@ use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::mount_models_once;
 use core_test_support::responses::strip_response_item_ids_from_json;
 use core_test_support::skip_if_no_network;
-use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::local_requests;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::test_path_buf;
@@ -129,7 +130,7 @@ fn disabled_permission_user_turn(
         text_elements: Vec::new(),
     }])
     .with_thread_settings(ThreadSettingsOverrides {
-        environments: Some(local_selections(cwd.abs())),
+        environments: Some(local_requests(cwd.abs())),
         approval_policy: Some(AskForApproval::Never),
         sandbox_policy: Some(sandbox_policy),
         permission_profile,
@@ -734,7 +735,7 @@ async fn summarize_context_three_requests_and_instructions(
     // Verify rollout contains user-turn TurnContext entries and a Compacted entry.
     println!("rollout path: {}", rollout_path.display());
     let text = std::fs::read_to_string(&rollout_path).expect("failed to read rollout file");
-    let mut regular_turn_context_count = 0usize;
+    let mut turn_context_count = 0usize;
     let mut saw_compacted_summary = false;
     for line in text.lines() {
         let trimmed = line.trim();
@@ -746,7 +747,7 @@ async fn summarize_context_three_requests_and_instructions(
         };
         match entry.item {
             RolloutItem::TurnContext(_) => {
-                regular_turn_context_count += 1;
+                turn_context_count += 1;
             }
             RolloutItem::Compacted(ci) if ci.message == expected_summary_message => {
                 let summary_item = ci
@@ -779,8 +780,8 @@ async fn summarize_context_three_requests_and_instructions(
     }
 
     assert_eq!(
-        regular_turn_context_count, 2,
-        "rollout should contain one TurnContext entry per real user turn"
+        turn_context_count, 3,
+        "rollout should contain two user-turn contexts and the compaction baseline"
     );
     assert!(
         saw_compacted_summary,
@@ -1475,21 +1476,10 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                     return None;
                 }
 
-                let texts = value
-                    .get("content")
-                    .and_then(|content| content.as_array())
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|item| item.get("text").and_then(|text| text.as_str()));
-
-                // Ignore cached prefix messages (project docs + permissions) since they are not
-                // relevant to compaction behavior and can change as bundled prompts evolve.
+                // Ignore instruction prefixes since they are not relevant to the history
+                // being compacted and can change as bundled prompts evolve.
                 let role = value.get("role").and_then(|role| role.as_str());
-                if role == Some("developer")
-                    && texts
-                        .into_iter()
-                        .any(|text| text.contains("`sandbox_mode`"))
-                {
+                if role == Some("developer") {
                     return None;
                 }
                 if role == Some("user") {
@@ -1963,18 +1953,10 @@ async fn auto_compact_runs_after_token_limit_hit() {
         .expect("follow-up request missing");
     assert_eq!(follow_up_index, 3, "follow-up request should be last");
 
-    let body_first = requests[0].body_json();
     let body_auto = requests[auto_compact_index].body_json();
     let body_follow_up = requests[follow_up_index].body_json();
-    let instructions = body_auto
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let baseline_instructions = body_first
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let instructions = requests[auto_compact_index].instructions_text();
+    let baseline_instructions = requests[0].instructions_text();
     assert_eq!(
         instructions, baseline_instructions,
         "auto compact should keep the standard developer instructions",
@@ -2852,8 +2834,12 @@ async fn pre_sampling_compact_falls_back_when_previous_model_is_not_found() {
     );
 }
 
+#[test_case::test_case("openai"; "built in provider")]
+#[test_case::test_case("local"; "cloud agent provider alias")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on_downshift() {
+async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on_downshift(
+    provider_id: &'static str,
+) {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
@@ -2908,11 +2894,15 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(retired_model)
         .with_config(move |config| {
+            config.model_provider_id = provider_id.to_owned();
             config.model_provider = model_provider;
             config.tool_registry.turn_metadata_includes_tool_info = true;
             set_test_compact_prompt(config);
         });
-    let test = builder.build(&server).await.expect("build test codex");
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build test codex");
 
     test.codex
         .start_or_steer_turn(disabled_permission_user_turn(
@@ -3072,6 +3062,193 @@ async fn pre_sampling_compact_falls_back_after_previous_model_stream_retries_are
             selected_model, // Turn sampling.
         ]
     );
+}
+
+/// Both compaction models keep the configured retry budget when the server supplies advice,
+/// including the selected model's final attempt.
+#[test_case::test_case(2; "selected_model_recovers")]
+#[test_case::test_case(3; "selected_model_exhausts_retries")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_sampling_compact_advised_errors_fall_back_then_retry_on_selected_model(
+    selected_model_failures: usize,
+) {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let previous_model = "gpt-5.4";
+    let selected_model = "gpt-5.2";
+    let _models_mock = mount_models_once(
+        &server,
+        ModelsResponse {
+            models: vec![
+                model_info_with_context_window(previous_model, /*context_window*/ 273_000),
+                model_info_with_context_window(selected_model, /*context_window*/ 125_000),
+            ],
+        },
+    )
+    .await;
+    let overload = wiremock::ResponseTemplate::new(/*s*/ 503)
+        .insert_header("Retry-After", "0")
+        .set_body_json(json!({ "error": { "code": "server_is_overloaded" } }));
+    let mut responses = vec![
+        sse_response(sse(vec![
+            ev_assistant_message("m1", "before switch"),
+            ev_completed_with_tokens("r1", /*total_tokens*/ 120_000),
+        ])),
+        overload.clone(), // Old model: initial attempt and two retries.
+        overload.clone(),
+        overload.clone(),
+    ];
+    responses.extend(vec![overload; selected_model_failures]);
+    if selected_model_failures < 3 {
+        responses.extend([
+            sse_response(remote_v2_compaction_response()),
+            sse_response(sse(vec![
+                ev_assistant_message("m3", "after switch"),
+                ev_completed_with_tokens("r3", /*total_tokens*/ 100),
+            ])),
+        ]);
+    }
+    let request_log = mount_response_sequence(&server, responses).await;
+    let mut model_provider = openai_model_provider(&server);
+    model_provider.request_max_retries = Some(0);
+    model_provider.stream_max_retries = Some(2);
+    let test = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model(previous_model)
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        })
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+    test.codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            "before switch",
+            test.cwd.path().to_path_buf(),
+            previous_model.to_string(),
+        ))
+        .await
+        .expect("submit first turn");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    test.codex
+        .start_or_steer_turn(disabled_permission_user_turn(
+            "after switch",
+            test.cwd.path().to_path_buf(),
+            selected_model.to_string(),
+        ))
+        .await
+        .expect("submit selected-model turn");
+    if selected_model_failures < 3 {
+        assert_compaction_uses_turn_lifecycle_id(&test.codex).await;
+    } else {
+        let mut errors = Vec::new();
+        loop {
+            match wait_for_event(&test.codex, |_| true).await {
+                EventMsg::Error(error) => errors.push(error.codex_error_info),
+                EventMsg::TurnComplete(event) => {
+                    assert_eq!(
+                        event.error.and_then(|error| error.codex_error_info),
+                        Some(CodexErrorInfo::ServerOverloaded)
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(errors, vec![Some(CodexErrorInfo::ServerOverloaded)]);
+    }
+    let actual_models = request_log
+        .requests()
+        .iter()
+        .map(|request| {
+            request.body_json()["model"]
+                .as_str()
+                .expect("request model")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    let mut expected_models = vec![
+        previous_model, // First turn.
+        previous_model, // Old-model compaction attempt and retries.
+        previous_model,
+        previous_model,
+        selected_model, // Selected-model compaction attempt and retries.
+        selected_model,
+        selected_model,
+    ];
+    if selected_model_failures < 3 {
+        expected_models.push(selected_model); // Sampling after compaction succeeds.
+    }
+    assert_eq!(actual_models, expected_models);
+}
+
+/// Manual compaction keeps the configured retry limit even when the server supplies advice.
+#[test_case::test_case(0; "no_retries")]
+#[test_case::test_case(2; "two_retries")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_remote_compact_advice_respects_retry_limit(max_retries: u64) {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let overload = wiremock::ResponseTemplate::new(/*s*/ 503)
+        .insert_header("Retry-After", "0")
+        .set_body_json(json!({ "error": { "code": "server_is_overloaded" } }));
+    let request_log =
+        mount_response_sequence(&server, vec![overload; (max_retries + 1) as usize]).await;
+    let mut model_provider = openai_model_provider(&server);
+    model_provider.request_max_retries = Some(0);
+    model_provider.stream_max_retries = Some(max_retries);
+    let test = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model("gpt-5.4")
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        })
+        .build_with_auto_env(&server)
+        .await
+        .expect("build codex");
+
+    test.codex.submit(Op::Compact).await.expect("run /compact");
+    let mut errors = Vec::new();
+    let mut reconnect_messages = Vec::new();
+    loop {
+        match wait_for_event(&test.codex, |_| true).await {
+            EventMsg::Error(error) => errors.push(error.codex_error_info),
+            EventMsg::StreamError(error) => reconnect_messages.push(error.message),
+            EventMsg::TurnComplete(event) => {
+                assert_eq!(
+                    event.error.and_then(|error| error.codex_error_info),
+                    Some(CodexErrorInfo::ServerOverloaded)
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(errors, vec![Some(CodexErrorInfo::ServerOverloaded)]);
+    assert_eq!(
+        reconnect_messages,
+        (1..=max_retries)
+            .map(|retry| format!("Reconnecting... {retry}/{max_retries}"))
+            .collect::<Vec<_>>()
+    );
+    let models = request_log
+        .requests()
+        .iter()
+        .map(|request| {
+            request.body_json()["model"]
+                .as_str()
+                .expect("request model")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(models, vec!["gpt-5.4"; (max_retries + 1) as usize]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3964,7 +4141,8 @@ async fn manual_compact_retries_after_context_window_error() {
         compact_input.len(),
         retry_input.len()
     );
-    if let (Some(first_before), Some(first_after)) = (compact_input.first(), retry_input.first()) {
+    assert_eq!(compact_input.first(), retry_input.first());
+    if let (Some(first_before), Some(first_after)) = (compact_input.get(1), retry_input.get(1)) {
         assert_ne!(
             first_before, first_after,
             "retry should drop the oldest conversation item"
@@ -4267,15 +4445,10 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         final_request_last_user_text, final_user_message,
         "final turn request should end with the submitted user message"
     );
-    let history_before_seeded_prefix = final_request_before_last_user
-        .strip_suffix(initial_seeded_user_prefix)
-        .expect("final request should end with the seeded user prefix from the first request");
-    let expected_history = vec![
-        first_user_message.to_string(),
-        second_user_message.to_string(),
-        expected_second_summary,
-    ];
-    assert_eq!(history_before_seeded_prefix, expected_history.as_slice());
+    let mut expected_history = vec![first_user_message.to_string()];
+    expected_history.extend_from_slice(initial_seeded_user_prefix);
+    expected_history.extend([second_user_message.to_string(), expected_second_summary]);
+    assert_eq!(final_request_before_last_user, expected_history.as_slice());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4449,7 +4622,7 @@ async fn paginated_compaction_cold_resume_from_bounded_suffix() -> Result<()> {
         },
     )
     .await?;
-    let codex_core::TurnInputSubmission::Started { turn_id } = test
+    let codex_core::TurnInputSubmission::Started { turn_id, .. } = test
         .codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
             text: FUNCTION_CALL_LIMIT_MSG.into(),
@@ -4502,6 +4675,7 @@ async fn paginated_compaction_cold_resume_from_bounded_suffix() -> Result<()> {
         .resume_thread_with_history(
             test.config.clone(),
             codex_history::InitialHistory::Resumed(codex_history::ResumedHistory {
+                history_revision: None,
                 conversation_id: context.thread_id,
                 history: Arc::new(context.items),
                 rollout_path: Some(path),
@@ -4591,17 +4765,38 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
         config.model_context_window = Some(context_window);
         config.model_auto_compact_token_limit = Some(limit);
     });
-    let codex = builder.build(&server).await.unwrap().codex;
+    let codex = builder.build_with_auto_env(&server).await.unwrap().codex;
+    let continuation = r#"{"review_target":"RB._~:-opaque"}"#;
 
     codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: FUNCTION_CALL_LIMIT_MSG.into(),
-            text_elements: Vec::new(),
-        }]))
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: FUNCTION_CALL_LIMIT_MSG.into(),
+                text_elements: Vec::new(),
+            }])
+            .with_responses_metadata(Some(std::collections::HashMap::from([(
+                "misalignment_override".to_string(),
+                continuation.to_string(),
+            )]))),
+        )
         .await
         .unwrap();
 
     wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+
+    for (request, expected) in [
+        (first_turn_mock.single_request(), Some(continuation)),
+        (auto_compact_mock.single_request(), None),
+        (post_auto_compact_mock.single_request(), Some(continuation)),
+    ] {
+        let metadata: Value = serde_json::from_str(
+            request.body_json()["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .expect("turn metadata"),
+        )
+        .expect("valid turn metadata");
+        assert_eq!(metadata["misalignment_override"].as_str(), expected);
+    }
 
     // Assert first request captured expected user message that triggers function call.
     let first_request = first_turn_mock.single_request().input();
@@ -5096,7 +5291,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
     core_test_support::submit_thread_settings(
         &codex,
         ThreadSettingsOverrides {
-            environments: Some(local_selections(
+            environments: Some(local_requests(
                 test_path_buf(PRETURN_CONTEXT_DIFF_CWD).abs(),
             )),
             ..Default::default()
@@ -5628,8 +5823,8 @@ async fn remote_v2_compaction_refreshes_instructions_and_preserves_them_on_cold_
     let replacement_history = replacement_history_from_rollout(&rollout_path)?;
     assert_eq!(
         instruction_fragments_in_items(&replacement_history),
-        Vec::<String>::new(),
-        "remote-v2 replacement history currently omits the global-instruction fragment"
+        vec![new_fragment.clone()],
+        "remote-v2 replacement history includes refreshed global instructions"
     );
     assert_eq!(
         test.codex.instruction_sources().await,
@@ -5666,7 +5861,7 @@ async fn remote_v2_compaction_refreshes_instructions_and_preserves_them_on_cold_
     assert_single_instruction_fragment(&requests[3], &new_fragment);
     let resumed_input = requests[3].input();
     assert_eq!(
-        resumed_input.get(..replacement_history.len()),
+        resumed_input.get(1..=replacement_history.len()),
         Some(replacement_history.as_slice()),
         "remote-v2 cold resume should replay persisted replacement history verbatim"
     );

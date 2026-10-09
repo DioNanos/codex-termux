@@ -1,17 +1,80 @@
 //! Live terminal turns recover open and collapsed question drafts into the composer.
 
 use super::*;
+use crate::bottom_pane::QueuedInputAction;
 use codex_protocol::items::AsyncUserInputQuestion;
 use pretty_assertions::assert_eq;
 
-fn questions(chat: &mut ChatWidget, message_id: &str) {
+fn questions(chat: &mut ChatWidget, message_id: &str, title: &str) {
     chat.add_async_questions(
         message_id,
         &[AsyncUserInputQuestion {
-            title: "Which way?".into(),
+            title: title.into(),
             options: None,
         }],
     );
+}
+
+#[tokio::test]
+async fn question_turn_end_escapes_command_drafts_before_submission() {
+    for (draft, escaped, queued_action) in [
+        ("!echo partial", "\\!echo partial", QueuedInputAction::Plain),
+        (
+            "  !echo partial",
+            "  \\!echo partial",
+            QueuedInputAction::Plain,
+        ),
+        ("/", "\\/", QueuedInputAction::Plain),
+        ("/diff", "\\/diff", QueuedInputAction::Plain),
+        ("\t/diff", "\t\\/diff", QueuedInputAction::Plain),
+        (" /diff", " /diff", QueuedInputAction::Plain),
+        ("/tmp/file", "/tmp/file", QueuedInputAction::ParseSlash),
+        ("\\/diff", "\\/diff", QueuedInputAction::Plain),
+    ] {
+        for queued in [false, true] {
+            let (mut chat, _rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
+            chat.thread_id = Some(ThreadId::new());
+            chat.show_welcome_banner = false;
+            handle_turn_started(&mut chat, "turn");
+            questions(&mut chat, "question", "Which way?");
+            chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+            chat.bottom_pane.handle_paste("answer".into());
+            chat.bottom_pane
+                .set_composer_text(draft.into(), Vec::new(), Vec::new());
+
+            handle_turn_completed(&mut chat, "turn", /*duration_ms*/ None);
+            let expected = format!("{escaped}\n\n> Which way?\n\nanswer");
+            let submitted_text = expected.trim().to_string();
+            assert_eq!(chat.bottom_pane.composer_text(), expected);
+            if draft == "!echo partial" && !queued {
+                insta::assert_snapshot!(
+                    "question_turn_end_escaped_shell_command",
+                    normalize_snapshot_paths(render_bottom_popup(&chat, /*width*/ 80))
+                );
+            }
+
+            if queued {
+                chat.on_task_started();
+                chat.handle_key_event(KeyEvent::from(KeyCode::Tab));
+                let queued_message = chat.input_queue.queued_user_messages.front().unwrap();
+                assert_eq!(queued_message.text, submitted_text);
+                assert_eq!(queued_message.action, queued_action);
+                assert!(ops.try_recv().is_err());
+            } else {
+                chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+                let Op::UserTurn { items, .. } = ops.try_recv().unwrap() else {
+                    panic!("expected user turn");
+                };
+                assert_eq!(
+                    items,
+                    vec![UserInput::Text {
+                        text: submitted_text,
+                        text_elements: Vec::new(),
+                    }]
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -31,8 +94,8 @@ async fn question_turn_end_appends_open_drafts_in_order_once() {
         Vec::new(),
     );
     chat.bottom_pane.set_composer_cursor(/*cursor*/ 0);
-    questions(&mut chat, "first");
-    questions(&mut chat, "second");
+    questions(&mut chat, "first", "Which style?");
+    questions(&mut chat, "second", "What budget?");
     chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
     chat.bottom_pane.handle_paste("  Over-ear  ".into());
     chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
@@ -40,6 +103,8 @@ async fn question_turn_end_appends_open_drafts_in_order_once() {
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
     chat.handle_key_event(KeyEvent::from(KeyCode::Char('e')));
 
+    let recovered =
+        "$tool existing draft\n\n> Which style?\n\nOver-ear\n\n> What budget?\n\nUnder 250";
     handle_turn_completed(&mut chat, "ended-turn", /*duration_ms*/ None);
     assert_eq!(
         (
@@ -47,11 +112,7 @@ async fn question_turn_end_appends_open_drafts_in_order_once() {
             chat.bottom_pane.composer_text_elements(),
             chat.bottom_pane.question_editor().unanswered_count()
         ),
-        (
-            "$tool existing draft\nOver-ear\nUnder 250".into(),
-            vec![element],
-            0
-        )
+        (recovered.into(), vec![element], 0)
     );
     assert!(ops.try_recv().is_err());
     insta::assert_snapshot!(
@@ -60,19 +121,16 @@ async fn question_turn_end_appends_open_drafts_in_order_once() {
     );
 
     handle_turn_completed(&mut chat, "ended-turn", /*duration_ms*/ None);
-    assert_recovered_draft(&mut chat, "$tool existing draft\nOver-ear\nUnder 250");
+    assert_recovered_draft(&mut chat, recovered);
 
-    questions(&mut chat, "large");
+    questions(&mut chat, "large", "Which way?");
     chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
     let large_answer = "long answer ".repeat(/*n*/ 200);
     chat.bottom_pane.handle_paste(large_answer.clone());
     handle_turn_completed(&mut chat, "ended-turn", /*duration_ms*/ None);
     assert_eq!(
         chat.bottom_pane.composer_text_with_pending(),
-        format!(
-            "$tool existing draft\nOver-ear\nUnder 250\n{}",
-            large_answer.trim()
-        )
+        format!("{recovered}\n\n> Which way?\n\n{}", large_answer.trim())
     );
     assert_eq!(chat.bottom_pane.composer_pending_pastes().len(), 1);
     insta::assert_snapshot!(
@@ -88,7 +146,7 @@ async fn question_turn_end_recovers_collapsed_drafts_on_completion_and_failure()
         chat.thread_id = Some(ThreadId::new());
         chat.bottom_pane.set_disable_paste_burst(/*disabled*/ false);
         handle_turn_started(&mut chat, "turn");
-        questions(&mut chat, "question");
+        questions(&mut chat, "question", "Which way?");
         chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
         // Leave typing buffered, then collapse before completion.
         for ch in "answer".chars() {
@@ -119,7 +177,7 @@ async fn question_turn_end_recovers_collapsed_drafts_on_completion_and_failure()
                     .composer
                     .unwrap()
                     .text,
-                "main\nanswer"
+                "main\n\n> Which way?\n\nanswer"
             );
         }
         chat.handle_server_notification(
@@ -142,7 +200,7 @@ async fn question_turn_end_recovers_collapsed_drafts_on_completion_and_failure()
         assert_eq!(chat.bottom_pane.composer_text(), "earlier prompt");
         assert!(!chat.bottom_pane.no_modal_or_popup_active());
         chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
-        assert_recovered_draft(&mut chat, "main\nanswer");
+        assert_recovered_draft(&mut chat, "main\n\n> Which way?\n\nanswer");
         assert!(ops.try_recv().is_err());
     }
 }
@@ -164,7 +222,7 @@ async fn question_turn_end_recovers_after_interruption_restores_queued_input() {
         chat.bottom_pane.set_disable_paste_burst(/*disabled*/ false);
         chat.bottom_pane
             .set_composer_text("main draft".into(), Vec::new(), Vec::new());
-        questions(&mut chat, "question");
+        questions(&mut chat, "question", "Which way?");
         chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
         chat.bottom_pane.handle_paste("answer".into());
         chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
@@ -203,7 +261,7 @@ async fn question_turn_end_recovers_after_interruption_restores_queued_input() {
                     .composer
                     .unwrap()
                     .text,
-                "pending steer\nqueued prompt\nmain draft\nanswer"
+                "pending steer\nqueued prompt\nmain draft\n\n> Which way?\n\nanswer"
             );
             // A query miss and unsuccessful Enter must retain both the search and the answers.
             chat.handle_key_event(KeyEvent::from(KeyCode::Char('z')));
@@ -227,12 +285,51 @@ async fn question_turn_end_recovers_after_interruption_restores_queued_input() {
         } else {
             assert_recovered_draft(
                 &mut chat,
-                &format!("pending steer\nqueued prompt\n{main_draft}\nanswer"),
+                &format!("pending steer\nqueued prompt\n{main_draft}\n\n> Which way?\n\nanswer"),
             );
         }
         assert!(!chat.has_queued_follow_up_messages());
         assert!(ops.try_recv().is_err());
     }
+}
+
+#[tokio::test]
+async fn question_turn_end_keeps_multiline_question_and_answer_as_text() {
+    let (mut chat, _rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    handle_turn_started(&mut chat, "turn");
+    questions(
+        &mut chat,
+        "question",
+        "First line\r\n\r\n\x1b[31mLast\r line?\x1b[0m\x07",
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    chat.bottom_pane
+        .handle_paste("  First answer line\n\nLast answer line  ".into());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+
+    handle_turn_completed(&mut chat, "turn", /*duration_ms*/ None);
+    let recovered = "> First line\n>\n> Last line?\n\nFirst answer line\n\nLast answer line";
+    assert_eq!(
+        (
+            chat.bottom_pane.composer_text_with_pending(),
+            chat.bottom_pane.question_editor().unanswered_count(),
+        ),
+        (recovered.to_string(), 0),
+    );
+    assert!(ops.try_recv().is_err());
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    let Op::UserTurn { items, .. } = ops.try_recv().unwrap() else {
+        panic!("user turn")
+    };
+    assert_eq!(
+        items,
+        vec![UserInput::Text {
+            text: recovered.into(),
+            text_elements: Vec::new(),
+        }]
+    );
 }
 
 fn assert_recovered_draft(chat: &mut ChatWidget, text: &str) {

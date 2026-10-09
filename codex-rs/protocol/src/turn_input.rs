@@ -1,5 +1,6 @@
 //! Turn-input request and result types shared by Core's submission APIs.
 
+use crate::AgentPath;
 use crate::models::ResponseItem;
 use crate::protocol::AdditionalContextEntry;
 use crate::protocol::InterAgentCommunication;
@@ -50,6 +51,29 @@ pub struct TurnInputRequest {
     pub additional_context: BTreeMap<String, AdditionalContextEntry>,
     pub responsesapi_client_metadata: Option<HashMap<String, String>>,
     pub trace: Option<W3cTraceContext>,
+}
+
+/// Attribution retained across recovery, sleep, and model-context compaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct TurnAttribution {
+    pub turn_id: String,
+    pub turn_trigger: Option<String>,
+    pub parent_turn_id: Option<String>,
+    pub initiating_agent_path: Option<AgentPath>,
+    pub root_turn_id: Option<String>,
+}
+
+impl TurnAttribution {
+    /// Restores provenance without changing the thread's execution settings.
+    pub fn start_options(&self) -> TurnStartOptions {
+        TurnStartOptions {
+            turn_trigger: self.turn_trigger.clone(),
+            parent_turn_id: self.parent_turn_id.clone(),
+            initiating_agent_path: self.initiating_agent_path.clone(),
+            root_turn_id: self.root_turn_id.clone(),
+            ..Default::default()
+        }
+    }
 }
 
 /// Request to resume sampling for an interrupted regular turn.
@@ -142,7 +166,7 @@ pub enum TurnInputMode {
     Steer { expected_turn_id: String },
 }
 
-/// Requested cyber treatment for a ChatGPT-authenticated Codex turn.
+/// Requested cyber treatment for an OpenAI model turn.
 /// Authorization and model-tier restrictions remain server-owned.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
@@ -171,6 +195,8 @@ pub struct TurnStartOptions {
     pub service_tier: Option<String>,
     /// Parent turn lineage recorded if this request starts a new turn.
     pub parent_turn_id: Option<String>,
+    /// Agent owning the parent turn, retained when recovering delegated work.
+    pub initiating_agent_path: Option<AgentPath>,
     /// Causal root turn lineage recorded if this request starts a new turn.
     pub root_turn_id: Option<String>,
     /// Explicit cyber treatment for this turn. Omission preserves the backend's
@@ -182,16 +208,23 @@ pub struct TurnStartOptions {
 ///
 /// Started and Steered only mean Core accepted the input for turn processing. They
 /// do not wait for user-prompt hooks, updating the in-memory model context,
-/// rollout persistence, or sampling.
+/// rollout persistence, or sampling. The returned root is the accepted turn's
+/// resolved causal root, including when steering preserves an existing turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TurnInputSubmission {
     /// Core started a turn. Persistent thread settings and start options were applied.
-    Started { turn_id: String },
+    Started {
+        turn_id: String,
+        root_turn_id: String,
+    },
     /// Core steered an active turn. Persistent thread settings were applied for
     /// subsequent turns. No new turn was created, so lineage metadata was not
     /// recorded. If the request included `final_output_json_schema`, the active
     /// turn already used the same schema.
-    Steered { turn_id: String },
+    Steered {
+        turn_id: String,
+        root_turn_id: String,
+    },
     /// Core rejected the input without applying settings or start options.
     NotSubmitted { reason: NotSubmittedReason },
 }
@@ -200,7 +233,10 @@ pub enum TurnInputSubmission {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StartIfIdleSubmission {
     /// Core started a turn. Persistent thread settings and start options were applied.
-    Started { turn_id: String },
+    Started {
+        turn_id: String,
+        root_turn_id: String,
+    },
     /// Core rejected the input without applying settings or start options.
     NotSubmitted { reason: NotSubmittedReason },
 }

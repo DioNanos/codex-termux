@@ -88,6 +88,7 @@ use tracing::warn;
 mod bem;
 mod existing_call;
 mod sideband;
+mod transcript_tail;
 
 use self::bem::ChannelParser as BemChannelParser;
 use self::bem::message_phase as bem_message_phase;
@@ -171,6 +172,8 @@ pub(crate) struct RealtimeConversationManager {
 struct RealtimeConversationManagerState {
     conversation: Option<ConversationState>,
     mode_instructions: Option<RealtimeModeInstructions>,
+    // Keep context active until the terminal transcript is recorded.
+    context_active: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -240,7 +243,7 @@ impl RealtimeStreamedItem {
     fn output_prefix(&self) -> &'static str {
         if self.prefix_final_message
             && self.sent_bytes == 0
-            && !matches!(self.phase, Some(MessagePhase::Commentary))
+            && matches!(self.phase, Some(MessagePhase::FinalAnswer) | None)
         {
             AGENT_FINAL_MESSAGE_PREFIX
         } else {
@@ -556,6 +559,7 @@ impl RealtimeConversationManager {
             state: Mutex::new(RealtimeConversationManagerState {
                 conversation: None,
                 mode_instructions: None,
+                context_active: false,
             }),
         }
     }
@@ -563,10 +567,7 @@ impl RealtimeConversationManager {
     pub(crate) async fn snapshot(&self) -> RealtimeConversationSnapshot {
         let state = self.state.lock().await;
         RealtimeConversationSnapshot {
-            active: state
-                .conversation
-                .as_ref()
-                .is_some_and(|conversation| conversation.realtime_active.load(Ordering::Relaxed)),
+            active: state.context_active,
             mode_instructions: state.mode_instructions.clone(),
         }
     }
@@ -780,6 +781,7 @@ impl RealtimeConversationManager {
             stop_token,
         });
         state.mode_instructions = Some(mode_instructions);
+        state.context_active = true;
         Ok(RealtimeStartOutput {
             realtime_active,
             route_handoffs,
@@ -926,7 +928,9 @@ impl RealtimeConversationManager {
         if handoff.client_managed_handoffs {
             return Ok(());
         }
-        let phase = if handoff.routes_handoff_by_bem() {
+        let phase = if handoff.routes_handoff_by_bem()
+            && !matches!(phase, Some(MessagePhase::PartialAnswer))
+        {
             match bem_message_phase(
                 &output_text,
                 &handoff.codex_response_handoff_channel_prefixes,
@@ -940,7 +944,10 @@ impl RealtimeConversationManager {
         } else {
             phase
         };
-        let is_commentary = matches!(phase, Some(MessagePhase::Commentary));
+        let is_nonterminal = matches!(
+            phase,
+            Some(MessagePhase::Commentary | MessagePhase::PartialAnswer)
+        );
         let active_handoff = handoff.stream.lock().await.active_handoff.clone();
         let output = match active_handoff {
             Some(handoff_id) => {
@@ -957,7 +964,7 @@ impl RealtimeConversationManager {
                         ),
                         phase,
                     }
-                } else if handoff.event_parser == RealtimeEventParser::V1 && is_commentary {
+                } else if handoff.event_parser == RealtimeEventParser::V1 && is_nonterminal {
                     RealtimeOutbound::HandoffAppend {
                         handoff_id,
                         text: output_text,
@@ -984,7 +991,8 @@ impl RealtimeConversationManager {
                     }
                 } else {
                     RealtimeOutbound::StandaloneHandoff {
-                        text: if handoff.event_parser == RealtimeEventParser::V1 && !is_commentary {
+                        text: if handoff.event_parser == RealtimeEventParser::V1 && !is_nonterminal
+                        {
                             format!("{AGENT_FINAL_MESSAGE_PREFIX}{output_text}")
                         } else {
                             output_text
@@ -1026,14 +1034,14 @@ impl RealtimeConversationManager {
             let Some(handoff_id) = stream.active_handoff.clone() else {
                 return;
             };
+            // An explicit stable fragment is answer text, even when it starts
+            // with characters that legacy BEM treats as a private channel tag.
+            let parse_bem = handoff.routes_handoff_by_bem()
+                && !matches!(phase, Some(MessagePhase::PartialAnswer));
             let mut streamed_item = RealtimeStreamedItem {
                 handoff_id,
-                phase: if handoff.routes_handoff_by_bem() {
-                    None
-                } else {
-                    phase
-                },
-                bem_channel_parser: handoff.routes_handoff_by_bem().then(|| {
+                phase: if parse_bem { None } else { phase },
+                bem_channel_parser: parse_bem.then(|| {
                     BemChannelParser::new(Arc::clone(
                         &handoff.codex_response_handoff_channel_prefixes,
                     ))
@@ -1785,8 +1793,16 @@ async fn handle_start_inner(
         if handoff_error.is_none()
             && let Ok(text) = transcript_tail_rx.recv().await
         {
-            handoff_error = route_handoffs.route(&sess_clone, text).await.err();
+            let _permit = route_handoffs.gate.acquire().await;
+            if !route_handoffs.retired.load(Ordering::Acquire)
+                && let Err(err) = transcript_tail::record(&sess_clone, text).await
+            {
+                warn!("failed to flush realtime transcript before closure: {err}");
+                handoff_error = Some("failed to save the realtime transcript before closure");
+            }
         }
+        // Make realtime_end eligible only after the tail has reached history.
+        sess_clone.conversation.state.lock().await.context_active = false;
         if let Some(error) = handoff_error {
             end = RealtimeConversationEnd::Error;
             sess_clone
@@ -2262,7 +2278,9 @@ fn v3_output_writer(
         CodexResponseHandoffMode::Thinking => None,
         CodexResponseHandoffMode::Commentary => Some(RealtimeContextAppendChannel::Commentary),
         CodexResponseHandoffMode::BemTags => match phase {
-            Some(MessagePhase::FinalAnswer) => Some(RealtimeContextAppendChannel::Speakable),
+            Some(MessagePhase::PartialAnswer | MessagePhase::FinalAnswer) => {
+                Some(RealtimeContextAppendChannel::Speakable)
+            }
             Some(MessagePhase::Commentary) => Some(RealtimeContextAppendChannel::Commentary),
             None => Some(RealtimeContextAppendChannel::Speakable),
         },

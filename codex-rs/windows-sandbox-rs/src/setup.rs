@@ -360,6 +360,9 @@ fn run_setup_refresh_inner(
         allow_local_binding: offline_proxy_settings.allow_local_binding,
         otel: None,
         real_user: crate::runtime_ownership::current_setup_user()?,
+        user_profile: std::env::var_os("USERPROFILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
         mode: SetupMode::Full,
         runtime,
         refresh_only: true,
@@ -501,7 +504,7 @@ impl SandboxUsersFile {
     }
 }
 
-fn is_elevated() -> Result<bool> {
+pub(crate) fn is_elevated() -> Result<bool> {
     unsafe {
         let mut administrators_group: *mut c_void = std::ptr::null_mut();
         let ok = AllocateAndInitializeSid(
@@ -524,7 +527,11 @@ fn is_elevated() -> Result<bool> {
             ));
         }
         let mut is_member = 0i32;
-        let check = CheckTokenMembership(0, administrators_group, &mut is_member as *mut _);
+        let check = CheckTokenMembership(
+            std::ptr::null_mut(),
+            administrators_group,
+            &mut is_member as *mut _,
+        );
         FreeSid(administrators_group as *mut _);
         if check == 0 {
             return Err(anyhow!("CheckTokenMembership failed: {}", GetLastError()));
@@ -715,6 +722,8 @@ struct ElevationPayload {
     allow_local_binding: bool,
     otel: Option<codex_otel::StatsigMetricsSettings>,
     real_user: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_profile: Option<PathBuf>,
     mode: SetupMode,
     #[serde(default, skip_serializing_if = "SetupRuntime::is_legacy")]
     runtime: SetupRuntime,
@@ -1034,7 +1043,7 @@ fn run_setup_exe_payload(
     // Hide the window for the elevated helper.
     sei.nShow = 0; // SW_HIDE
     let ok = unsafe { ShellExecuteExW(&mut sei) };
-    if ok == 0 || sei.hProcess == 0 {
+    if ok == 0 || sei.hProcess.is_null() {
         let last_error = unsafe { GetLastError() };
         let code = if last_error == ERROR_CANCELLED {
             SetupErrorCode::OrchestratorHelperLaunchCanceled
@@ -1163,6 +1172,7 @@ fn elevated_provisioning_payload(
         allow_local_binding: offline_proxy_settings.allow_local_binding,
         real_user,
         otel: codex_otel::global_statsig_metrics_settings(),
+        user_profile: None,
         mode: SetupMode::InteractiveProvision,
         runtime: SetupRuntime::Legacy,
         refresh_only: false,
@@ -1243,6 +1253,9 @@ pub fn run_elevated_provisioning_setup_with_retained_handles(
         allow_local_binding: settings.allow_local_binding,
         otel: codex_otel::global_statsig_metrics_settings(),
         real_user: real_user.to_string(),
+        user_profile: std::env::var_os("USERPROFILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
         mode: SetupMode::ProvisionOnly,
         runtime,
         refresh_only: false,

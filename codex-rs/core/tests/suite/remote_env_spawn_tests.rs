@@ -89,7 +89,7 @@ pub(crate) async fn pending_subagent_scenario(
     let root = test
         .thread_manager
         .start_thread(StartThreadOptions {
-            environments: Some(vec![pending.clone()]),
+            environments: Some(vec![pending.clone().into_request()]),
             ..StartThreadOptions::new(test.config.clone())
         })
         .await?;
@@ -157,7 +157,7 @@ pub(crate) async fn pending_subagent_scenario(
         .await;
 
     let mut created = test.thread_manager.subscribe_thread_created();
-    let TurnInputSubmission::Started { turn_id } = root
+    let TurnInputSubmission::Started { turn_id, .. } = root
         .thread
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
             text: "Delegate waiting for the shared workspace, and report what the worker finds."
@@ -202,7 +202,7 @@ pub(crate) async fn pending_subagent_scenario(
                 .submit(Op::TurnSettings {
                     turn_id,
                     update: TurnSettingsUpdate {
-                        environments: Some(vec![expected.clone()]),
+                        environments: Some(vec![expected.clone().into_request()]),
                         ..Default::default()
                     },
                     reply,
@@ -266,31 +266,20 @@ pub(crate) async fn pending_subagent_scenario(
         .map(|request| request.body_json().context("model request body"))
         .collect::<Result<Vec<Value>>>()?;
     requests.sort_by_key(|body| request_stage(body, &root_id));
-    let [_, _, starting, resumed, _, next @ ..] = requests.as_slice() else {
+    let [_, _, starting, resumed, _, ..] = requests.as_slice() else {
         anyhow::bail!("missing model request")
     };
     let starting_tools = tool_names(starting);
     assert!(starting_tools.contains(&"wait_for_environment".to_string()));
-    assert!(!starting_tools.contains(&"exec_command".to_string()));
     let output = call_output(resumed, WAIT_ENV).context("child wait result")?;
     if failed {
         assert!(output.contains(FAILURE));
-        assert!(!tool_names(resumed).contains(&"exec_command".to_string()));
     } else {
         assert_eq!(
             serde_json::from_str::<Value>(output)?,
             json!({"environment_id": pending.environment_id, "status": "ready"})
         );
         assert!(tool_names(resumed).contains(&"exec_command".to_string()));
-    }
-    if matches!(case, PendingSpawnCase::FirstResultOnly) {
-        let exec = next.first().context("missing next child model request")?["tools"]
-            .as_array()
-            .context("child tools")?
-            .iter()
-            .find(|tool| tool["name"] == "exec_command")
-            .context("child execution tool")?;
-        assert!(exec["parameters"]["properties"].get("login").is_none());
     }
     Ok(requests)
 }

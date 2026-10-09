@@ -77,8 +77,11 @@ pub fn package(test: &str) -> Result<Option<PathBuf>> {
     fs::create_dir_all(root.join("bin"))?;
     fs::create_dir_all(root.join("codex-resources/voice/bin"))?;
     fs::write(root.join("codex-package.json"), "{}")?;
-    fs::copy(&source, root.join("bin").join(APP))?;
-    fs::copy(&source, root.join("codex-resources/voice/bin").join(HELPER))?;
+    codex_utils_cargo_bin::copy_executable(&source, &root.join("bin").join(APP))?;
+    codex_utils_cargo_bin::copy_executable(
+        &source,
+        &root.join("codex-resources/voice/bin").join(HELPER),
+    )?;
     let mut child = Command::new(root.join("bin").join(APP))
         .args(["--exact", test, "--nocapture"])
         .current_dir(root)
@@ -148,6 +151,17 @@ fn helper() -> Result<()> {
                 stage = Stage::Initialize;
                 Message::Ready {}
             }
+            Message::ListDevices { kind } if stage == Stage::Initialize => Message::DeviceList {
+                devices: vec![codex_realtime_webrtc::AudioDevice {
+                    name: match kind {
+                        codex_realtime_webrtc::AudioDeviceKind::Input => "Interface",
+                        codex_realtime_webrtc::AudioDeviceKind::Output => "Headphones",
+                    }
+                    .into(),
+                    channels: 16,
+                    is_default: true,
+                }],
+            },
             Message::InitializeRuntime {} if stage == Stage::Initialize => {
                 fs::write(root.join("initializing"), [])?;
                 if root.join("hold-initialization").exists() {
@@ -178,7 +192,11 @@ fn helper() -> Result<()> {
                 stage = Stage::Devices;
                 Message::TransportReady {}
             }
-            Message::OpenDevices {} if stage == Stage::Devices => {
+            Message::OpenDevices { selection } if stage == Stage::Devices => {
+                fs::write(
+                    root.join("input-selection"),
+                    serde_json::to_vec(&selection)?,
+                )?;
                 if root.join("fail-devices").exists() {
                     anyhow::bail!("synthetic private device diagnostic");
                 }

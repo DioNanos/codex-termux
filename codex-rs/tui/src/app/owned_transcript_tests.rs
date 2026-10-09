@@ -35,6 +35,7 @@ pub(in crate::app) fn user_cell(message: &str) -> Arc<dyn HistoryCell> {
 
 pub(in crate::app) fn attach_thread(app: &mut App, thread_id: ThreadId) {
     app.chat_widget.handle_thread_session(ThreadSessionState {
+        daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
@@ -52,7 +53,6 @@ pub(in crate::app) fn attach_thread(app: &mut App, thread_id: ThreadId) {
         instruction_source_paths: Vec::new(),
         reasoning_effort: None,
         collaboration_mode: None,
-        personality: None,
         message_history: None,
         network_proxy: None,
         rollout_path: None,
@@ -178,9 +178,10 @@ async fn list_spacing_completion_preserves_the_scrolled_reader() -> Result<()> {
     assert!(buffer_text(&before).contains("• c"));
     app.handle_consolidate_agent_message(
         &mut tui,
-        "- First item wraps onto a second row\n- b\n- c".into(),
-        app.config.cwd.to_path_buf(),
-        /*inline_visualization_context*/ None,
+        crate::history_cell::AgentMarkdownCell::new(
+            "- First item wraps onto a second row\n- b\n- c".into(),
+            &app.config.cwd,
+        ),
         ConsolidationScrollbackReflow::Required,
         /*deferred_history_cell*/ None,
     )?;
@@ -511,12 +512,11 @@ async fn owned_details_keep_the_composer_cursor_and_screen() -> Result<()> {
         app.render_owned_transcript(&mut tui, Size::new(/*width*/ 80, /*height*/ 24))?;
     let expected_cursor = app
         .chat_widget
-        .bottom_pane_renderable(
-            /*footer*/ None,
-            crate::bottom_pane::CommandPopupPlacement::Overlay,
-            Some(&crate::bottom_pane::ComposerGap::default()),
-            /*working_tip*/ None,
-        )
+        .bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions {
+            command_popup_placement: crate::bottom_pane::CommandPopupPlacement::Overlay,
+            composer_gap: Some(&crate::bottom_pane::ComposerGap::default()),
+            ..Default::default()
+        })
         .cursor_pos(bottom_area)
         .expect("composer cursor");
     assert_eq!(
@@ -598,6 +598,7 @@ async fn owned_details_escape_interrupts_work_without_starting_backtrack() -> Re
             thread_id: thread_id.to_string(),
             turn: codex_app_server_protocol::Turn {
                 id: "active-turn".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: codex_app_server_protocol::TurnStatus::InProgress,
@@ -787,9 +788,50 @@ async fn owned_search_and_selection_consume_input_before_composer_and_backtrack(
             .to_string()
             .starts_with("Find: needle")
     );
-    let escape = TuiEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    assert!(app.handle_owned_transcript_event(&mut tui, &mut app_server, &escape)?);
+    let accept = TuiEvent::Key(KeyCode::Enter.into());
+    let escape = TuiEvent::Key(KeyCode::Esc.into());
+    assert!(app.handle_owned_transcript_event(&mut tui, &mut app_server, &accept)?);
+    assert!(!app.transcript_view.is_search_editing());
+    assert!(app.transcript_view.has_active_interaction());
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "composer draft"
+    );
     assert!(!app.backtrack.overlay_preview_active);
+    // Ghostty, iTerm2 and some tmux paths report held keys as Press, not Repeat.
+    for kind in [
+        crossterm::event::KeyEventKind::Press,
+        crossterm::event::KeyEventKind::Repeat,
+    ] {
+        let repeat = KeyEvent {
+            kind,
+            ..KeyCode::Enter.into()
+        };
+        assert!(app.transcript_view.owns_interaction_key(repeat));
+        assert!(app.handle_owned_transcript_event(
+            &mut tui,
+            &mut app_server,
+            &TuiEvent::Key(repeat)
+        )?);
+    }
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "composer draft"
+    );
+    // Once Find is accepted, modified Enter can still reach configured composer bindings.
+    for modifiers in [
+        KeyModifiers::SHIFT,
+        KeyModifiers::ALT,
+        KeyModifiers::CONTROL,
+    ] {
+        let key = KeyEvent::new(KeyCode::Enter, modifiers);
+        assert!(!app.transcript_view.owns_interaction_key(key));
+        assert!(!app.handle_owned_transcript_event(
+            &mut tui,
+            &mut app_server,
+            &TuiEvent::Key(key)
+        )?);
+    }
     // Start and extend a selection through the app, then inspect its copy action without touching
     // the host clipboard. The app's existing clipboard handler is tested with an injected writer.
     for key in [
@@ -802,10 +844,11 @@ async fn owned_search_and_selection_consume_input_before_composer_and_backtrack(
             &TuiEvent::Key(key)
         )?);
     }
-    let copy = app.transcript_view.handle_key(
-        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-        &app.transcript_cells,
-    );
+    let copy_key = KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL);
+    assert!(app.transcript_view.owns_interaction_key(copy_key));
+    let copy = app
+        .transcript_view
+        .handle_key(copy_key, &app.transcript_cells);
     assert!(matches!(copy, Some(ViewAction::Copy(text)) if !text.is_empty()));
     assert!(app.handle_owned_transcript_event(&mut tui, &mut app_server, &escape)?);
     assert!(!app.backtrack.overlay_preview_active);
@@ -843,18 +886,25 @@ async fn inline_transcript_search_draws_and_escape_precedes_backtrack() -> Resul
         &tui.terminal,
     ));
     assert!(
-        rendered.contains("enter next"),
+        rendered.contains("enter accept"),
         "search advances on the inline overlay draw path"
     );
+    app.handle_backtrack_overlay_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Key(KeyCode::Enter.into()),
+    )
+    .await?;
+    assert!(
+        matches!(&app.overlay, Some(Overlay::Transcript(overlay)) if overlay.has_active_interaction() && !overlay.is_search_editing())
+    );
+    assert!(!app.backtrack.overlay_preview_active);
     app.handle_backtrack_overlay_event(
         &mut tui,
         &mut app_server,
         TuiEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
     )
     .await?;
-    assert!(
-        matches!(&app.overlay, Some(Overlay::Transcript(overlay)) if !overlay.has_active_interaction())
-    );
     assert!(!app.backtrack.overlay_preview_active);
     app.handle_backtrack_overlay_event(
         &mut tui,
@@ -912,7 +962,7 @@ async fn find_owns_editor_chords_without_changing_the_composer_draft() -> Result
                     crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal),
                 );
                 assert!(
-                    rendered.contains("enter next"),
+                    rendered.contains("enter accept"),
                     "Find must resume after pasting over selection"
                 );
             }
@@ -962,8 +1012,8 @@ async fn find_owns_editor_chords_without_changing_the_composer_draft() -> Result
         )
         .await?;
         assert!(!match &app.overlay {
-            Some(Overlay::Transcript(overlay)) => overlay.is_search_active(),
-            _ => app.transcript_view.is_search_active(),
+            Some(Overlay::Transcript(overlay)) => overlay.is_search_editing(),
+            _ => app.transcript_view.is_search_editing(),
         });
         assert_eq!(
             app.chat_widget.composer_text_with_pending(),
@@ -998,14 +1048,14 @@ async fn offline_find_closes_before_the_next_ctrl_c_quits() -> Result<()> {
         rendered.lines().nth(usize::from(cursor.y)).map(str::trim),
         Some("Find: needle")
     );
-    assert!(!rendered.contains("ctrl+c quit"));
+    assert!(!rendered.contains("⌃c quit"));
     let close = TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(matches!(
         app.handle_tui_event(&mut tui, &mut app_server, close)
             .await?,
         AppRunControl::Continue
     ));
-    assert!(!app.transcript_view.is_search_active());
+    assert!(!app.transcript_view.is_search_editing());
     assert_eq!(
         app.chat_widget.composer_text_with_pending(),
         "offline draft"
@@ -1089,9 +1139,9 @@ async fn offline_backtrack_keeps_the_preview_and_draft_without_reverting() -> Re
         )
         .await?;
         assert!(if owned {
-            app.transcript_view.is_search_active()
+            app.transcript_view.is_search_editing()
         } else {
-            matches!(&app.overlay, Some(Overlay::Transcript(overlay)) if overlay.is_search_active())
+            matches!(&app.overlay, Some(Overlay::Transcript(overlay)) if overlay.is_search_editing())
         });
         for (key, preview_active, draft) in [
             (KeyCode::Esc, true, "offline draft"),
@@ -1136,10 +1186,30 @@ async fn slash_picker_overlays_history_without_moving_the_transcript_or_composer
     ))];
     let mut tui = crate::tui::test_support::make_test_tui()?;
     tui.set_owned_screen(/*owned*/ true)?;
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
     for (width, height) in [(80, 14), (32, 14), (80, 7), (80, 5)] {
         let size = Size::new(width, height);
         tui.terminal.resize(size)?;
-        app.chat_widget.apply_external_edit("/m".to_string());
+        app.chat_widget.apply_external_edit(String::new());
+        app.chat_widget.toggle_vim_mode_and_notify();
+        app.chat_widget.handle_key_event(KeyCode::Esc.into());
+        let slash = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE);
+        assert!(!app.handle_owned_transcript_event(
+            &mut tui,
+            &mut app_server,
+            &TuiEvent::Key(slash),
+        )?);
+        tokio::time::pause();
+        for key in [slash, KeyCode::Char('m').into()] {
+            app.chat_widget.handle_key_event(key);
+            tokio::time::advance(crate::bottom_pane::ChatComposer::recommended_paste_flush_delay())
+                .await;
+            app.chat_widget
+                .handle_paste_burst_tick(tui.frame_requester());
+        }
+        tokio::time::resume();
+        assert_eq!(app.chat_widget.composer_text_with_pending(), "/m");
+        app.chat_widget.toggle_vim_mode_and_notify();
         app.chat_widget
             .handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.render_owned_transcript(&mut tui, size)?;
@@ -1211,6 +1281,7 @@ async fn slash_picker_overlays_history_without_moving_the_transcript_or_composer
         );
     }
     tui.set_owned_screen(/*owned*/ false)?;
+    app_server.shutdown().await?;
     Ok(())
 }
 
@@ -1320,8 +1391,26 @@ async fn find_refreshes_live_details_before_searching_the_first_query() -> Resul
     let rendered = buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
         &tui.terminal,
     ));
-    assert!(rendered.contains("enter next"), "{rendered}");
+    assert!(rendered.contains("enter accept"), "{rendered}");
     tui.set_owned_screen(/*owned*/ false)?;
+    app.open_transcript_overlay(&mut tui);
+    let Some(Overlay::Transcript(overlay)) = &mut app.overlay else {
+        panic!("expected transcript overlay");
+    };
+    overlay.set_presentation(/*detailed*/ false, HistoryRenderMode::Rich);
+    for event in [
+        TuiEvent::Key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)),
+        TuiEvent::Paste("needle".into()),
+        TuiEvent::Draw,
+    ] {
+        app.handle_tui_event(&mut tui, &mut app_server, event)
+            .await?;
+    }
+    let rendered = buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
+        &tui.terminal,
+    ));
+    assert!(rendered.contains("printf needle"), "{rendered}");
+    insta::assert_snapshot!("compact_overlay_finds_hidden_live_text", rendered);
     app_server.shutdown().await?;
     Ok(())
 }
@@ -1390,6 +1479,7 @@ async fn fullscreen_composer_mouse_copy_and_input_ownership() -> Result<()> {
     let copy_events = [
         TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER)),
         TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        TuiEvent::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL)),
         mouse(Down(Right), x + 2, y),
     ];
     let mut selection_frames = Vec::new();
@@ -1449,6 +1539,7 @@ async fn fullscreen_composer_mouse_copy_and_input_ownership() -> Result<()> {
             );
             let gesture = match event {
                 TuiEvent::Mouse(_) => "right-click",
+                TuiEvent::Key(key) if key.code == KeyCode::Insert => "ctrl-insert",
                 TuiEvent::Key(key) if key.modifiers == KeyModifiers::SUPER => "cmd-c",
                 _ => "ctrl-c",
             };
@@ -1509,6 +1600,186 @@ async fn fullscreen_composer_mouse_copy_and_input_ownership() -> Result<()> {
     }
     assert!(!app.handle_owned_transcript_event(&mut tui, &mut server, &mouse(Down(Left), x, y))?);
     server.shutdown().await?;
+    tui.set_owned_screen(/*owned*/ false)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn inline_confirmation_preserves_compact_viewport_without_replaying_history() -> Result<()> {
+    let mut app = crate::app::test_support::make_test_app().await;
+    attach_thread(&mut app, ThreadId::new());
+    app.local_settings.tui.animations = false;
+    app.chat_widget
+        .apply_external_edit("preserved draft".to_string());
+    app.transcript_cells = vec![user_cell("Completed conversation behind the confirmation")];
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ false)?;
+    let size = Size::new(/*width*/ 80, /*height*/ 24);
+    app.show_replace_thread_goal_confirmation(
+        ThreadId::new(),
+        crate::goal_files::GoalDraft {
+            objective: "A replacement goal".to_string(),
+            ..Default::default()
+        },
+    );
+    app.render_chat_widget_frame(&mut tui, size)?;
+    assert!(tui.terminal.viewport_area.height < size.height);
+    app.chat_widget.handle_key_event(KeyCode::Esc.into());
+    app.render_chat_widget_frame(&mut tui, size)?;
+    assert!(tui.terminal.viewport_area.height < size.height);
+    assert!(app.last_rendered_history_tail.is_none());
+    assert!(
+        buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
+            &tui.terminal
+        ))
+        .contains("preserved draft")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fullscreen_composer_scrolls_without_moving_caret_or_transcript() -> Result<()> {
+    let mut app = crate::app::test_support::make_test_app().await;
+    let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    let size = Size::new(/*width*/ 60, /*height*/ 24);
+    tui.terminal.resize(size)?;
+    app.transcript_cells = vec![Arc::new(crate::history_cell::PlainHistoryCell::new(
+        (1..=40).map(|n| format!("History {n:02}").into()).collect(),
+    ))];
+    let draft = (1..=35)
+        .map(|n| format!("Prompt {n:02} 界"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.chat_widget.apply_external_edit(draft.clone());
+    let bottom = app.render_owned_transcript(&mut tui, size)?;
+    assert!(bottom.y > 0);
+    let caret = tui.terminal.last_known_cursor_pos;
+    let original = app.chat_widget.capture_thread_input_state();
+    let mut frames = Vec::new();
+    let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
+    frames.push(format!("Following caret\n{}", buffer_text(buffer)));
+    let wheel = mouse(MouseEventKind::ScrollUp, caret.x, caret.y);
+    for _ in 0..3 {
+        assert!(app.handle_owned_transcript_event(&mut tui, &mut server, &wheel)?);
+    }
+    assert_eq!(app.chat_widget.capture_thread_input_state(), original);
+    assert_eq!(app.render_owned_transcript(&mut tui, size)?, bottom);
+    let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
+    let rendered = buffer_text(buffer);
+    assert!(!rendered.contains("Prompt 35"), "{rendered}");
+    assert!(rendered.contains("History 40"), "{rendered}");
+    frames.push(format!("Wheel up\n{rendered}"));
+
+    // The new draft key is applied at the real caret even while that caret is offscreen.
+    app.chat_widget.handle_key_event(KeyCode::Left.into());
+    app.render_owned_transcript(&mut tui, size)?;
+    let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
+    assert!(buffer_text(buffer).contains("Prompt 35"));
+    frames.push(format!("Edit at caret\n{}", buffer_text(buffer)));
+    // Returning from an external editor restores the caret even for a same-length edit.
+    app.chat_widget.handle_key_event(KeyCode::Right.into());
+    app.render_owned_transcript(&mut tui, size)?;
+    let caret = tui.terminal.last_known_cursor_pos;
+    for _ in 0..3 {
+        assert!(app.handle_owned_transcript_event(
+            &mut tui,
+            &mut server,
+            &mouse(MouseEventKind::ScrollUp, caret.x, caret.y),
+        )?);
+    }
+    app.chat_widget
+        .apply_external_edit(draft.replace("Prompt", "Edited"));
+    app.render_owned_transcript(&mut tui, size)?;
+    let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
+    assert!(buffer_text(buffer).contains("Edited 35"));
+
+    // Pasting while browsing also resumes following, without inserting into a visible earlier row.
+    let caret = tui.terminal.last_known_cursor_pos;
+    for _ in 0..3 {
+        assert!(app.handle_owned_transcript_event(
+            &mut tui,
+            &mut server,
+            &mouse(MouseEventKind::ScrollUp, caret.x, caret.y),
+        )?);
+    }
+    app.chat_widget.handle_paste(" pasted here".to_string());
+    app.render_owned_transcript(&mut tui, size)?;
+    let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
+    let rendered = buffer_text(buffer);
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line.contains("Edited 35") && line.contains("pasted here")),
+        "{rendered}"
+    );
+    frames.push(format!("Paste at caret\n{rendered}"));
+
+    // A shorter screen still leaves a usable composer.
+    let small = Size::new(/*width*/ 40, /*height*/ 10);
+    tui.terminal.resize(small)?;
+    app.render_owned_transcript(&mut tui, small)?;
+    let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
+    frames.push(format!("Short screen\n{}", buffer_text(buffer)));
+    insta::assert_snapshot!(
+        "fullscreen_prompt_wheel",
+        normalize_snapshot_paths(frames.join("\n\n"))
+    );
+    server.shutdown().await?;
+    tui.set_owned_screen(/*owned*/ false)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn fullscreen_composer_remote_images_leave_an_editable_prompt_row() -> Result<()> {
+    let mut app = crate::app::test_support::make_test_app().await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    let size = Size::new(/*width*/ 60, /*height*/ 12);
+    tui.terminal.resize(size)?;
+    app.transcript_cells = vec![Arc::new(crate::history_cell::PlainHistoryCell::new(vec![
+        "History stays visible".into(),
+    ]))];
+    app.chat_widget
+        .apply_external_edit("Edit this prompt".to_string());
+    app.chat_widget.set_remote_image_urls(
+        (1..=12)
+            .map(|n| format!("https://example.com/image-{n}.png"))
+            .collect(),
+    );
+    let bottom = app.render_owned_transcript(&mut tui, size)?;
+    let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
+    let rendered = buffer_text(buffer);
+    assert!(bottom.y > 0);
+    assert!(rendered.contains("Edit this prompt"), "{rendered}");
+    let mut frames = vec![format!("Draft\n{rendered}")];
+    app.chat_widget.handle_key_event(KeyCode::Home.into());
+    for (key, label) in [
+        (KeyCode::Up, "[Image #12]"),
+        (KeyCode::Up, "[Image #11]"),
+        (KeyCode::Delete, "[Image #11]"),
+        (KeyCode::Down, "Edit this prompt"),
+    ] {
+        app.chat_widget.handle_key_event(key.into());
+        app.render_owned_transcript(&mut tui, size)?;
+        let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
+        let rendered = buffer_text(buffer);
+        assert!(rendered.contains(label), "{key:?}: {rendered}");
+        assert!(rendered.contains("Edit this prompt"), "{key:?}: {rendered}");
+        frames.push(format!("{key:?}\n{rendered}"));
+    }
+    assert_eq!(
+        app.chat_widget.remote_image_urls(),
+        (1..=12)
+            .filter(|n| *n != 11)
+            .map(|n| format!("https://example.com/image-{n}.png"))
+            .collect::<Vec<_>>()
+    );
+    insta::assert_snapshot!(
+        "fullscreen_prompt_remote_images",
+        normalize_snapshot_paths(frames.join("\n\n"))
+    );
     tui.set_owned_screen(/*owned*/ false)?;
     Ok(())
 }

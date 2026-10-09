@@ -47,25 +47,30 @@ fn experimental_features_keep_following_choice_at_wrap_boundary() {
     insta::assert_snapshot!(snapshots.join("\n\n"));
 }
 
+/// Experimental settings show each feature's label, description, and default state.
 #[test]
-fn experimental_features_analytics_plan_history() {
-    let feature = Feature::AnalyticsPlanHistory;
-    let stage = feature.stage();
-    let (app_tx, _app_rx) = tokio::sync::mpsc::unbounded_channel();
-    let view = ExperimentalFeaturesView::new(
-        vec![ExperimentalFeatureItem {
-            key: feature.key().to_string(),
-            name: stage.experimental_menu_name().unwrap().to_string(),
-            description: stage.experimental_menu_description().unwrap().to_string(),
-            enabled: feature.default_enabled(),
-            writable: true,
-        }],
-        ThreadId::new(),
-        /*catalog_rx*/ None,
-        AppEventSender::new(app_tx),
-        crate::keymap::RuntimeKeymap::defaults().list,
-    );
-    snapshot_view("experimental_features_analytics_plan_history", &view);
+fn experimental_features_display_metadata() {
+    for feature in [
+        Feature::AnalyticsPlanHistory,
+        Feature::LoginShellPackagePath,
+    ] {
+        let stage = feature.stage();
+        let (app_tx, _app_rx) = tokio::sync::mpsc::unbounded_channel();
+        let view = ExperimentalFeaturesView::new(
+            vec![ExperimentalFeatureItem {
+                key: feature.key().to_string(),
+                name: stage.experimental_menu_name().unwrap().to_string(),
+                description: stage.experimental_menu_description().unwrap().to_string(),
+                enabled: feature.default_enabled(),
+                writable: true,
+            }],
+            ThreadId::new(),
+            /*catalog_rx*/ None,
+            AppEventSender::new(app_tx),
+            crate::keymap::RuntimeKeymap::defaults().list,
+        );
+        snapshot_view(&format!("experimental_features_{}", feature.key()), &view);
+    }
 }
 
 fn server_feature(name: &str) -> ExperimentalFeature {
@@ -293,13 +298,8 @@ fn voice_discovery_requires_the_client_runtime() {
             .unwrap();
         assert!(view.pre_draw_tick(Instant::now()));
         assert_eq!(view.features.len(), usize::from(supported));
-        snapshot_view(
-            if supported {
-                "voice_runtime_available"
-            } else {
-                "voice_runtime_unavailable"
-            },
-            &view,
-        );
+        if supported {
+            snapshot_view("voice_runtime_available", &view);
+        }
     }
 }

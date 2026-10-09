@@ -63,13 +63,30 @@ impl TextArea {
         (!range.is_empty()).then_some(range)
     }
 
-    pub(super) fn delete_mouse_selection(&mut self) -> bool {
-        let Some(range) = self.mouse_selection_range() else {
-            return false;
+    /// Consume events at the edges too, but only detach from the caret if the viewport moves.
+    pub(crate) fn scroll_mouse(&self, event: MouseEvent, state: &mut TextAreaState) -> bool {
+        let rows = match event.kind {
+            MouseEventKind::ScrollUp => -3,
+            MouseEventKind::ScrollDown => 3,
+            _ => return false,
         };
-        // A pointer-selected edit cannot be replayed as a keyboard-relative Vim command.
-        self.vim_commands = VimCommandState::default();
-        self.replace_range(range, "");
+        if !event.modifiers.is_empty() || !self.contains_mouse(event) {
+            return false;
+        }
+        let area = self.rendered_area.get();
+        let lines = self.wrapped_lines(area.width);
+        let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        if total <= area.height {
+            return false;
+        }
+        let scroll = state
+            .scroll
+            .saturating_add_signed(rows)
+            .min(total - area.height);
+        if scroll != state.scroll {
+            state.scroll = scroll;
+            state.manual_cursor = Some(self.cursor_pos);
+        }
         true
     }
 

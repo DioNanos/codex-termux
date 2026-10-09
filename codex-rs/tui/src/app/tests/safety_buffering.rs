@@ -5,14 +5,17 @@ use crate::chatwidget::UserMessage;
 use crate::chatwidget::tests::helpers::normalize_completion_timestamps;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::ModelSafetyBufferingUpdatedNotification;
+use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::models::ManagedFileSystemPermissions;
+use codex_protocol::openai_models::ModelAccessPrograms;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::turn_input::CyberAccessProgram;
 use codex_utils_absolute_path::test_support::PathExt;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
@@ -40,6 +43,7 @@ const SAFETY_RETRY_THREAD_NAME: &str = "Safety retry source";
 enum SafetyRetryScenario {
     Once,
     RetryTwice,
+    PendingPermissions,
     InterruptedPrevious,
     UnsupportedPermissions,
 }
@@ -527,10 +531,21 @@ async fn run_safety_retry(
         .filter(|model| matches!(model.slug.as_str(), CURRENT_MODEL | FASTER_MODEL))
     {
         model.tool_mode = Some(ToolMode::Direct);
+        if scenario == SafetyRetryScenario::UnsupportedPermissions && model.slug == FASTER_MODEL {
+            model.available_access_programs = Some(ModelAccessPrograms {
+                cyber: vec![CyberAccessProgram::Standard],
+            });
+        }
     }
     let model_catalog_path = codex_home.path().join("models.json");
     std::fs::write(&model_catalog_path, serde_json::to_vec(&model_catalog)?)?;
     let model_catalog_path = toml::Value::String(model_catalog_path.display().to_string());
+    // The committed-steer case counts usage from the response that finishes before steering.
+    let instant_interrupt_config = if committed_steer.is_some() {
+        "instant_interrupt = false"
+    } else {
+        ""
+    };
     std::fs::write(
         codex_home.path().join("config.toml"),
         format!(
@@ -548,6 +563,7 @@ stream_max_retries = 0
 
 [features]
 goals = true
+{instant_interrupt_config}
 "#,
             server.uri()
         ),
@@ -555,6 +571,16 @@ goals = true
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
     app.config.model = Some(CURRENT_MODEL.to_string());
+    if scenario == SafetyRetryScenario::UnsupportedPermissions {
+        app.model_catalog = Arc::new(ModelCatalog::new(
+            model_catalog
+                .models
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect(),
+        ));
+    }
     app.config.model_catalog = Some(model_catalog);
     app.config.model_provider_id = MODEL_PROVIDER_ID.to_string();
     app.config.model_provider = ModelProviderInfo {
@@ -569,6 +595,16 @@ goals = true
         .enable(Feature::Goals)
         .expect("test config should allow goals");
 
+    if scenario == SafetyRetryScenario::PendingPermissions {
+        app.config
+            .permissions
+            .set_permission_profile_from_session_snapshot(
+                PermissionProfileSnapshot::from_session_snapshot(
+                    PermissionProfile::Disabled,
+                    Some(ActivePermissionProfile::new(":danger-full-access")),
+                ),
+            )?;
+    }
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
     let mut started = app_server.start_thread(&app.config).await?;
@@ -741,6 +777,55 @@ goals = true
     while app_event_rx.try_recv().is_ok() {}
 
     if scenario == SafetyRetryScenario::UnsupportedPermissions {
+        app_server
+            .thread_settings_update(ThreadSettingsUpdateParams {
+                thread_id: source_thread_id.to_string(),
+                effort: Some(ReasoningEffortConfig::Low),
+                ..Default::default()
+            })
+            .await?;
+        let mut settings = next_thread_settings_updated(&mut app_server, source_thread_id).await;
+        settings.thread_settings.model_provider = "openai".to_string();
+        app.chat_widget.on_thread_settings_updated(settings);
+        app.chat_widget.update_account_state(
+            /*status_account_display*/ None, /*plan_type*/ None,
+            /*has_chatgpt_account*/ true, /*has_codex_backend_auth*/ false,
+        );
+        app.chat_widget
+            .set_feature_enabled(Feature::CliDaybreak, /*enabled*/ true);
+        app.chat_widget.set_daybreak_enabled(/*enabled*/ true);
+        Box::pin(app.retry_safety_buffered_turn(
+            &mut tui,
+            &mut app_server,
+            SafetyBufferedRetry {
+                thread_id: source_thread_id,
+                turn_id: active_turn_id.clone(),
+                model: FASTER_MODEL.to_string(),
+                turn: active_turn.clone(),
+                prompt: UserMessage::from(RETRY_PROMPT),
+            },
+        ))
+        .await;
+        assert_eq!(app.chat_widget.thread_id(), Some(source_thread_id));
+        let source = app_server
+            .thread_read(source_thread_id, /*include_turns*/ true)
+            .await?;
+        assert_eq!(
+            source.turns.last().map(|turn| &turn.status),
+            Some(&TurnStatus::InProgress)
+        );
+        let error_cell = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+            .find_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(cell),
+                _ => None,
+            })
+            .expect("unsupported Daybreak model should be added to history");
+        insta::assert_snapshot!(
+            lines_to_single_string(&error_cell.display_lines(/*width*/ 200)),
+            @"■ Daybreak support for model gpt-5.6-luna could not be confirmed by the connected server. Use /daybreak to turn it off, or choose a compatible model and server."
+        );
+        app.chat_widget.set_daybreak_enabled(/*enabled*/ false);
+
         let extra_root =
             AbsolutePathBuf::resolve_path_against_base("extra", app.config.cwd.as_path());
         let permission_profile = PermissionProfile::Managed {
@@ -781,6 +866,22 @@ goals = true
         {
             *active_permission_profile = None;
         }
+    }
+
+    if scenario == SafetyRetryScenario::PendingPermissions {
+        app.runtime_permission_profile_override = Some(
+            RuntimePermissionProfileOverride::from_config(app.chat_widget.config_ref()),
+        );
+        app.select_permission_profile(
+            &mut app_server,
+            PermissionProfileSelection {
+                profile_id: ":read-only".into(),
+                approval_policy: Some(AskForApproval::OnRequest),
+                approvals_reviewer: Some(ApprovalsReviewer::User),
+                display_label: "Read Only".into(),
+            },
+        )
+        .await;
     }
 
     Box::pin(app.retry_safety_buffered_turn(
@@ -923,6 +1024,15 @@ goals = true
     let retry_thread_id = app.chat_widget.thread_id().expect("retry thread id");
     // Capture the completed retry before processing its automatic goal continuation.
     wait_for_turn_completed(&mut app, &mut app_server, retry_thread_id).await;
+    if scenario == SafetyRetryScenario::PendingPermissions {
+        assert_eq!(
+            app.chat_widget
+                .config_ref()
+                .permissions
+                .permission_profile(),
+            &PermissionProfile::read_only()
+        );
+    }
     let mut replayed_history = String::new();
     while let Ok(event) = app_event_rx.try_recv() {
         if let AppEvent::InsertHistoryCell(cell) = event {
@@ -1162,6 +1272,17 @@ async fn safety_retry_rejects_unsupported_permissions_before_interrupting() -> R
         /*failing_draft*/ None,
         /*committed_steer*/ None,
         SafetyRetryScenario::UnsupportedPermissions,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn safety_retry_preserves_unconfirmed_permissions_on_its_first_turn() -> Result<()> {
+    run_safety_retry(
+        /*previous_prompt*/ None,
+        /*failing_draft*/ None,
+        /*committed_steer*/ None,
+        SafetyRetryScenario::PendingPermissions,
     )
     .await
 }

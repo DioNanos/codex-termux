@@ -1,12 +1,9 @@
-use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::HostSkillsSnapshot;
 use crate::InjectedHostSkillPrompts;
 use codex_analytics::InvocationType;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
-use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_extension_api::ConfigContributor;
@@ -46,6 +43,7 @@ use crate::fragments::SkillInstructions;
 use crate::fragments::SkillResourceAccess;
 use crate::provider::HostSkillProvider;
 use crate::provider::SkillListQuery;
+use crate::provider::SkillReadContext;
 use crate::provider::SkillReadRequest;
 use crate::render::AvailableSkillsRender;
 use crate::render::MAX_SKILL_NAME_BYTES;
@@ -73,7 +71,6 @@ use crate::tools::SkillAnalytics;
 use crate::tools::SkillToolAuthority;
 use crate::tools::skill_tools;
 use crate::warnings::bounded_warnings;
-use crate::world_state::CLOUD_SKILLS_WORLD_STATE_ID;
 use crate::world_state_catalogs::CatalogContext;
 use crate::world_state_catalogs::CatalogStatus;
 
@@ -267,25 +264,6 @@ where
                 .collect()
         })
     }
-
-    fn retain_world_state_after_compaction(
-        &self,
-        previous_world_state: &serde_json::Map<String, serde_json::Value>,
-    ) -> serde_json::Map<String, serde_json::Value> {
-        let mut retained = serde_json::Map::new();
-        if let Some(allocation) = previous_world_state
-            .get(CLOUD_SKILLS_WORLD_STATE_ID)
-            .and_then(|section| section.get("allocation"))
-        {
-            // Allocation survives lost history; the catalog fingerprint and budget still
-            // determine whether it can be reused after fresh discovery and policy resolution.
-            retained.insert(
-                CLOUD_SKILLS_WORLD_STATE_ID.to_string(),
-                serde_json::json!({ "allocation": allocation }),
-            );
-        }
-        retained
-    }
 }
 
 impl<C> ToolContributor for SkillsExtension<C>
@@ -302,7 +280,6 @@ where
             thread_store,
             /*executor_query*/ None,
             /*selected_plugins*/ None,
-            /*sandbox_contexts*/ None,
         )
     }
 
@@ -337,7 +314,6 @@ where
             thread_store,
             executor_query,
             step_store.get::<SelectedPluginSnapshot>(),
-            step_store.get::<HashMap<String, FileSystemSandboxContext>>(),
         )
     }
 }
@@ -362,8 +338,7 @@ where
                         .get::<SkillsThreadState>()
                         .and_then(|state| state.shadow_selection_turn(input.turn_id))
                     {
-                        self.shadow_selection
-                            .record_invocation(&state, input.skill_resource);
+                        state.record_invocation(input.skill_resource);
                     }
                 }
                 SkillInvocationKind::Explicit => {}
@@ -425,11 +400,11 @@ where
                 }
                 let shadow_selected_entries =
                     collect_explicit_skill_mentions(&input.user_input, &shadow_catalog);
-                Some(self.shadow_selection.run(
+                Some(self.shadow_selection.start(
                     &input,
-                    &shadow_catalog,
+                    shadow_catalog,
                     &shadow_selected_entries,
-                    host_snapshot.as_deref(),
+                    host_snapshot.clone(),
                     Arc::clone(&thread_state.recent_skill_invocations),
                     Arc::clone(&thread_state.shadow_task_context),
                 ))
@@ -481,6 +456,7 @@ where
                         host_snapshot.clone(),
                         mcp_resources.clone(),
                         &thread_state,
+                        &input,
                     )
                     .await
                 {
@@ -554,8 +530,9 @@ where
                         .iter()
                         .filter(|host_skill| host_skill.name == entry.name)
                     {
-                        injected_host_skill_prompts
-                            .insert_superseded_path(host_skill.path_to_skills_md.to_string_lossy());
+                        injected_host_skill_prompts.insert_superseded_path(
+                            host_skill.path_to_skills_md.inferred_native_path_string(),
+                        );
                     }
                 }
             }
@@ -582,7 +559,6 @@ impl<C> SkillsExtension<C> {
         thread_store: &ExtensionData,
         executor_query: Option<SkillListQuery>,
         selected_plugins: Option<Arc<SelectedPluginSnapshot>>,
-        sandbox_contexts: Option<Arc<HashMap<String, FileSystemSandboxContext>>>,
     ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
         skill_tools(
             self.providers.clone(),
@@ -590,8 +566,6 @@ impl<C> SkillsExtension<C> {
             thread_store,
             executor_query,
             selected_plugins,
-            sandbox_contexts,
-            Arc::clone(&self.shadow_selection),
         )
     }
 
@@ -619,19 +593,37 @@ impl<C> SkillsExtension<C> {
         host_snapshot: Option<Arc<HostSkillsSnapshot>>,
         mcp_resources: Option<Arc<McpResourceClient>>,
         thread_state: &SkillsThreadState,
+        input: &TurnInputContext<'_>,
     ) -> Result<SkillReadResult, String> {
+        let context = match entry.authority.kind {
+            SkillSourceKind::Cloud => SkillReadContext::Cloud { mcp_resources },
+            SkillSourceKind::Custom(_) => SkillReadContext::Custom { mcp_resources },
+            SkillSourceKind::Host => SkillReadContext::Host { host_snapshot },
+            SkillSourceKind::Executor => {
+                let fs = entry
+                    .main_prompt
+                    .environment_path()
+                    .and_then(|(id, _)| {
+                        input
+                            .environments
+                            .iter()
+                            .find(|env| env.environment_id == id)
+                            .map(|env| env.fs)
+                    })
+                    .ok_or_else(|| {
+                        "skill environment is not available for this callback".to_string()
+                    })?;
+                SkillReadContext::Executor { fs }
+            }
+        };
         thread_state
             .read_skill(
                 &self.providers,
                 SkillReadRequest {
-                    _lifetime: PhantomData,
                     authority: entry.authority.clone(),
                     package: entry.id.clone(),
                     resource: entry.main_prompt.clone(),
-                    resolved_executor_roots: Vec::new(),
-                    sandbox: None,
-                    host_snapshot,
-                    mcp_resources,
+                    context,
                 },
             )
             .await

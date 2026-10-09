@@ -188,7 +188,7 @@ fn rollout_response_item(item: ResponseItem) -> RolloutItem {
     RolloutItem::ResponseItem(item.into())
 }
 
-fn exec_completion(turn_id: &str, call_id: &str) -> RolloutItem {
+fn exec_completion(turn_id: &str, call_id: &str, output: &str) -> RolloutItem {
     serde_json::from_value(json!({
         "type": "event_msg",
         "payload": {
@@ -199,12 +199,12 @@ fn exec_completion(turn_id: &str, call_id: &str) -> RolloutItem {
             "cwd": "file:///tmp",
             "parsed_cmd": [],
             "source": "agent",
-            "stdout": "ok",
+            "stdout": output,
             "stderr": "",
-            "aggregated_output": "ok",
+            "aggregated_output": output,
             "exit_code": 0,
             "duration": {"secs": 0, "nanos": 0},
-            "formatted_output": "ok",
+            "formatted_output": output,
             "status": "completed"
         }
     }))
@@ -227,6 +227,7 @@ fn item_completed(turn_id: &str, item_id: &str) -> RolloutItem {
 
 fn started(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+        turn_attribution: None,
         turn_id: turn_id.to_string(),
         root_turn_id: None,
         trace_id: None,
@@ -255,6 +256,7 @@ fn compacted(replacement_history: Vec<ResponseItem>) -> RolloutItem {
 
 fn completed(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        root_turn_id: None,
         turn_id: turn_id.to_string(),
         last_agent_message: None,
         error: None,
@@ -417,7 +419,8 @@ async fn migration_publishes_canonical_projected_history_and_is_idempotent() {
 async fn migration_projects_explicit_and_implicit_legacy_completed_items() {
     let home = TempDir::new().expect("create Codex home");
     let thread_id = ThreadId::new();
-    let exec = exec_completion("explicit", "call-1");
+    let output = format!("head\n{}\ntail", "x".repeat(128 * 1024));
+    let exec = exec_completion("explicit", "call-1", &output);
     let reasoning = serde_json::from_value(json!({
         "type": "event_msg",
         "payload": {"type": "agent_reasoning", "text": "summary"}
@@ -428,6 +431,22 @@ async fn migration_projects_explicit_and_implicit_legacy_completed_items() {
         "payload": {"type": "agent_reasoning_raw_content", "text": "raw"}
     }))
     .expect("build legacy reasoning content");
+    let child_id = ThreadId::new();
+    let [old_activity, activity] = [None, Some("gpt-5")].map(|model| {
+        let mut payload = json!({
+            "type": "sub_agent_activity",
+            "event_id": if model.is_some() { "spawn" } else { "old-spawn" },
+            "kind": "started",
+            "agent_thread_id": child_id,
+            "agent_path": "/root/worker",
+        });
+        if let Some(model) = model {
+            payload["model"] = json!(model);
+            payload["reasoning_effort"] = json!("high");
+        }
+        serde_json::from_value(json!({"type": "event_msg", "payload": payload}))
+            .expect("build legacy activity")
+    });
     write_rollout(
         home.path(),
         thread_id,
@@ -435,6 +454,8 @@ async fn migration_projects_explicit_and_implicit_legacy_completed_items() {
         vec![
             started("explicit"),
             exec,
+            old_activity,
+            activity,
             completed("explicit"),
             reasoning,
             raw_reasoning,
@@ -463,17 +484,39 @@ async fn migration_projects_explicit_and_implicit_legacy_completed_items() {
         })
         .await
         .expect("read projected items");
-    assert_eq!(items.items.len(), 2);
+    assert_eq!(items.items.len(), 4);
     assert_eq!(items.items[0].turn_id, "explicit");
-    assert_eq!(items.items[1].turn_id, turns.turns[1].turn_id);
+    assert_eq!(items.items[3].turn_id, turns.turns[1].turn_id);
     let command: serde_json::Value =
         serde_json::from_slice(&items.items[0].item_json).expect("parse projected command");
     let reasoning: serde_json::Value =
-        serde_json::from_slice(&items.items[1].item_json).expect("parse projected reasoning");
+        serde_json::from_slice(&items.items[3].item_json).expect("parse projected reasoning");
     assert_eq!(command["type"], "commandExecution");
+    let aggregated_output = command["aggregatedOutput"]
+        .as_str()
+        .expect("migrated command output");
+    assert_eq!(aggregated_output.len(), 64 * 1024);
+    assert!(aggregated_output.starts_with("head\n"));
+    assert!(aggregated_output.ends_with("\ntail"));
+    assert!(aggregated_output.contains("command output truncated for persistence"));
     assert_eq!(reasoning["type"], "reasoning");
     assert_eq!(reasoning["summary"], json!(["summary"]));
     assert_eq!(reasoning["content"], json!(["raw"]));
+    for (item, model) in items.items[1..3].iter().zip([None, Some("gpt-5")]) {
+        assert_eq!(item.turn_id, "explicit");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&item.item_json).unwrap(),
+            json!({
+                "type": "subAgentActivity",
+                "id": if model.is_some() { "spawn" } else { "old-spawn" },
+                "kind": "started",
+                "agentThreadId": child_id,
+                "agentPath": "/root/worker",
+                "model": model,
+                "reasoningEffort": model.map(|_| "high"),
+            })
+        );
+    }
 }
 
 #[tokio::test]
@@ -547,7 +590,7 @@ async fn migration_keeps_late_completions_in_their_original_turn() {
             user_message("old question"),
             started("current"),
             user_message("current question"),
-            exec_completion("old", "call-old"),
+            exec_completion("old", "call-old", "ok"),
             serde_json::from_value(json!({
                 "type": "event_msg",
                 "payload": {
@@ -988,9 +1031,9 @@ async fn migration_keeps_late_completions_for_surviving_turns_across_rollback() 
             started("remove"),
             user_message("remove question"),
             completed("old"),
-            exec_completion("old", "call-old"),
+            exec_completion("old", "call-old", "ok"),
             item_completed("old", "reason-old"),
-            exec_completion("remove", "call-remove"),
+            exec_completion("remove", "call-remove", "ok"),
             completed("remove"),
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
                 num_turns: 1,
@@ -2059,26 +2102,20 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                 root_turn_id: None,
                 disabled_plugin_ids: None,
                 cwd: serde_json::from_value(json!(home.path())).expect("absolute cwd"),
-                workspace_roots: None,
-                current_date: None,
-                timezone: None,
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 permission_profile: None,
                 active_permission_profile: None,
-                network: None,
                 file_system_sandbox_policy: None,
                 model: "test-model".to_string(),
                 comp_hash: None,
-                personality: None,
                 collaboration_mode: None,
                 multi_agent_version: None,
-                multi_agent_mode: None,
                 realtime_active: None,
                 cyber_access_program: None,
                 effort: None,
-                summary: ReasoningSummary::Auto,
+                summary: Some(ReasoningSummary::Auto),
             }),
             user_message("child question"),
             agent_message("child answer"),

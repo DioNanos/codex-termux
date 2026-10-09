@@ -21,12 +21,14 @@ async fn fork_current_session_preserves_conversation_ultra() -> Result<()> {
         .expect("create source rollout"),
     )?;
     app.chat_widget.handle_thread_session(ThreadSessionState {
+        daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         model: "gpt-5.4".to_string(),
         model_provider_id: app.config.model_provider_id.clone(),
         reasoning_effort: Some(ReasoningEffortConfig::Ultra),
         ..test_thread_session(source_thread_id, test_path_buf("/tmp/project"))
     });
+    app.ensure_thread_channel(source_thread_id);
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
 
@@ -39,6 +41,12 @@ async fn fork_current_session_preserves_conversation_ultra() -> Result<()> {
 
     assert!(matches!(control, AppRunControl::Continue));
     assert_ne!(app.chat_widget.thread_id(), Some(source_thread_id));
+    assert!(
+        !app.agents_overview
+            .dispatched_requests
+            .contains_key(&source_thread_id)
+    );
+    assert!(!app.thread_event_channels.contains_key(&source_thread_id));
     assert_eq!(app.chat_widget.current_model(), "gpt-5.4");
     assert_eq!(
         app.chat_widget.current_reasoning_effort(),
@@ -55,12 +63,14 @@ async fn switching_from_ultra_thread_restores_configured_plan_effort() {
     app.chat_widget
         .set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
     let ultra_session = ThreadSessionState {
+        daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         model: "gpt-5.4".to_string(),
         reasoning_effort: Some(ReasoningEffortConfig::Ultra),
         ..test_thread_session(ThreadId::new(), test_path_buf("/tmp/ultra"))
     };
     let normal_session = ThreadSessionState {
+        daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         model: "gpt-5.4".to_string(),
         reasoning_effort: Some(ReasoningEffortConfig::Medium),

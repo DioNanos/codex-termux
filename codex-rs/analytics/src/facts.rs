@@ -33,6 +33,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
+use codex_utils_path_uri::PathUri;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -207,6 +208,7 @@ pub struct TurnResolvedConfigFact {
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
     pub guardian_v2_enabled: bool,
+    pub multi_agent_version: codex_protocol::protocol::MultiAgentVersion,
     pub sandbox_network_access: bool,
     pub collaboration_mode: ModeKind,
     pub personality: Option<Personality>,
@@ -252,6 +254,7 @@ pub struct TurnProfile {
     pub after_last_sampling_ms: u64,
     pub sampling_request_count: u32,
     pub sampling_retry_count: u32,
+    pub tools_change_count: u32,
 }
 
 #[derive(Clone)]
@@ -385,7 +388,7 @@ pub struct SkillInvocation {
 #[derive(Clone, Debug)]
 pub enum SkillInvocationLocation {
     Host {
-        path: PathBuf,
+        path: PathUri,
         scope: SkillScope,
     },
     Resource {
@@ -442,6 +445,7 @@ pub struct SubAgentThreadStartedInput {
     pub ephemeral: bool,
     pub thread_source: Option<ThreadSource>,
     pub subagent_source: SubAgentSource,
+    pub initialization_mode: ThreadInitializationMode,
     pub created_at: u64,
 }
 

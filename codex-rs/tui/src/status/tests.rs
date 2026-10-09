@@ -828,26 +828,33 @@ async fn status_uses_server_provider_id_and_auth_requirement() {
         sanitize_directory(render_lines(&composite.display_lines(/*width*/ 120))).join("\n");
     assert_snapshot!("status_server_auth_required", rendered);
 
-    for width in [42, 120] {
-        let destinations: Vec<String> = composite
-            .display_hyperlink_lines(width)
-            .into_iter()
-            .flat_map(|line| line.hyperlinks.into_iter())
-            .map(|link| link.destination)
-            .collect();
+    for width in [24, 42, 120] {
+        let lines = composite.display_hyperlink_lines(width);
+        let mut fragments = String::new();
+        let mut destinations = Vec::new();
+        for line in lines {
+            let visible = line.line.to_string();
+            for link in line.hyperlinks {
+                fragments.extend(
+                    visible
+                        .chars()
+                        .skip(link.columns.start)
+                        .take(link.columns.len()),
+                );
+                destinations.push(link.destination);
+            }
+        }
         assert_eq!(
-            destinations,
-            vec!["https://chatgpt.com/codex/settings/usage"]
+            fragments, "https://chatgpt.com/settings/usage",
+            "width {width}"
+        );
+        assert!(!destinations.is_empty());
+        assert!(
+            destinations
+                .iter()
+                .all(|destination| destination == "https://chatgpt.com/settings/usage")
         );
     }
-
-    let narrow_destinations: Vec<String> = composite
-        .display_hyperlink_lines(/*width*/ 24)
-        .into_iter()
-        .flat_map(|line| line.hyperlinks.into_iter())
-        .map(|link| link.destination)
-        .collect();
-    assert_eq!(narrow_destinations, Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -1916,7 +1923,10 @@ async fn status_snapshot_includes_credits_and_limits() {
     config.model = Some("gpt-5.1-codex".to_string());
     set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
 
-    let account_display = test_status_account_display();
+    let account_display = Some(StatusAccountDisplay::ChatGpt {
+        email: Some("user@example.com".into()),
+        plan: Some("Pro 200".into()),
+    });
     let usage = TokenUsage {
         input_tokens: 1_500,
         cached_input_tokens: 100,
@@ -2101,7 +2111,7 @@ async fn status_snapshot_treats_refreshing_empty_limits_as_unavailable() {
         }
     }
     let sanitized = sanitize_directory(rendered_lines).join("\n");
-    assert_snapshot!(sanitized);
+    assert!(sanitized.contains("Limits:          not available for this account"));
 }
 
 #[tokio::test]

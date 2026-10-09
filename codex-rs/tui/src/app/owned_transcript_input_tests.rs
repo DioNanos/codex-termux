@@ -1,7 +1,9 @@
 //! Composer input resumes after transcript selection without changing search or keymap ownership.
 
+use super::tests::attach_thread;
 use super::*;
 use crate::app::tests::make_test_app_with_channels;
+use crate::app_command::AppCommand as Op;
 use crate::chatwidget::tests::helpers::normalize_snapshot_paths;
 use crate::chatwidget::tests::helpers::render_bottom_popup;
 use crate::history_cell::HistoryRenderMode;
@@ -11,6 +13,7 @@ use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::TurnStartedNotification;
+use codex_app_server_protocol::UserInput;
 use codex_protocol::config_types::ModeKind;
 use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
@@ -64,6 +67,99 @@ async fn select_transcript(
     Ok(())
 }
 
+#[tokio::test]
+async fn configured_ctrl_space_submit_wins_over_transcript_selection() -> Result<()> {
+    for running in [false, true] {
+        let (mut app, mut events, mut operations) = make_test_app_with_channels().await;
+        let thread_id = ThreadId::new();
+        attach_thread(&mut app, thread_id);
+        if running {
+            app.chat_widget.handle_server_notification(
+                ServerNotification::TurnStarted(TurnStartedNotification {
+                    thread_id: thread_id.to_string(),
+                    turn: Turn {
+                        id: "turn".into(),
+                        root_turn_id: None,
+                        items_view: TurnItemsView::Full,
+                        items: Vec::new(),
+                        status: TurnStatus::InProgress,
+                        error: None,
+                        started_at: None,
+                        completed_at: None,
+                        duration_ms: None,
+                    },
+                }),
+                /*replay_kind*/ None,
+            );
+        }
+        let config = serde_json::from_value(serde_json::json!({
+            "composer": {"submit": ["ctrl-space", "f9"]}
+        }))?;
+        app.keymap = RuntimeKeymap::from_config(&config).expect("valid composer bindings");
+        app.local_settings.tui.keymap = config.clone();
+        app.chat_widget.apply_keymap_update(config, &app.keymap);
+        let mut app_server =
+            Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        tui.set_owned_screen(/*owned*/ true)?;
+        app.transcript_cells = vec![Arc::new(PlainHistoryCell::new(vec!["transcript".into()]))];
+        app.render_owned_transcript(&mut tui, Size::new(/*width*/ 80, /*height*/ 12))?;
+        let text = if running { "steer once" } else { "send once" };
+        app.chat_widget.apply_external_edit(text.to_string());
+        while events.try_recv().is_ok() {}
+
+        app.handle_tui_event(
+            &mut tui,
+            &mut app_server,
+            TuiEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)),
+        )
+        .await?;
+
+        assert!(!app.transcript_view.has_active_interaction());
+        assert_eq!(app.chat_widget.composer_text_with_pending(), "");
+        let items = std::iter::from_fn(|| operations.try_recv().ok())
+            .find_map(|op| match op {
+                Op::UserTurn { items, .. } => Some(items),
+                _ => None,
+            })
+            .expect("expected submitted user turn");
+        assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: text.into(),
+                text_elements: Vec::new(),
+            }]
+        );
+        app_server.shutdown().await?;
+        tui.set_owned_screen(/*owned*/ false)?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_page_up_still_scrolls_the_transcript() -> Result<()> {
+    let mut app = crate::app::test_support::make_test_app().await;
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    app.transcript_cells = vec![Arc::new(PlainHistoryCell::new(
+        (0..30).map(|row| format!("row {row}").into()).collect(),
+    ))];
+    app.render_owned_transcript(&mut tui, Size::new(/*width*/ 80, /*height*/ 12))?;
+
+    app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Key(KeyCode::PageUp.into()),
+    )
+    .await?;
+
+    assert!(!app.transcript_view.is_following());
+    app_server.shutdown().await?;
+    tui.set_owned_screen(/*owned*/ false)?;
+    Ok(())
+}
+
 fn screen(tui: &tui::Tui) -> String {
     let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
     let rendered = buffer
@@ -90,6 +186,7 @@ fn complete_plan_turn(app: &mut App) {
     let thread_id = ThreadId::new().to_string();
     let turn = Turn {
         id: "plan-turn".into(),
+        root_turn_id: None,
         items_view: TurnItemsView::Full,
         items: Vec::new(),
         status: TurnStatus::InProgress,
@@ -230,8 +327,9 @@ async fn plan_menu_allows_transcript_wheel_scrolling_and_keeps_keyboard_ownershi
 }
 
 #[tokio::test]
-async fn plan_menu_wheel_scrolling_respects_modal_and_completion_popup_bounds() -> Result<()> {
+async fn plan_menu_allows_transcript_selection_and_copy_but_respects_popup_bounds() -> Result<()> {
     let (mut app, mut events, _operations) = make_test_app_with_channels().await;
+    app.local_settings.tui.copy_on_select = codex_config::types::CopyOnSelect::Never;
     let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
     tui.set_owned_screen(/*owned*/ true)?;
@@ -248,9 +346,6 @@ async fn plan_menu_wheel_scrolling_respects_modal_and_completion_popup_bounds() 
         (MouseEventKind::ScrollUp, 1, bottom.y),
         (MouseEventKind::ScrollDown, 1, bottom.y),
         (MouseEventKind::ScrollUp, size.width, 1),
-        (MouseEventKind::Down(MouseButton::Left), 1, 1),
-        (MouseEventKind::Drag(MouseButton::Left), 6, 1),
-        (MouseEventKind::Up(MouseButton::Left), 6, 1),
     ] {
         app.handle_tui_event(&mut tui, &mut server, pointer_event(kind, column, row))
             .await?;
@@ -258,8 +353,73 @@ async fn plan_menu_wheel_scrolling_respects_modal_and_completion_popup_bounds() 
         assert_eq!(screen(&tui), before);
         assert!(!app.transcript_view.has_active_interaction());
     }
+    let (plan_row, plan_column) = before
+        .lines()
+        .enumerate()
+        .find_map(|(row, line)| {
+            line.find("Plan step")
+                .map(|column| (row as u16, column as u16))
+        })
+        .expect("visible plan step");
+    for event in [
+        pointer_event(
+            MouseEventKind::Down(MouseButton::Left),
+            plan_column,
+            plan_row,
+        ),
+        TuiEvent::Draw,
+        pointer_event(
+            MouseEventKind::Drag(MouseButton::Left),
+            plan_column + 4,
+            plan_row,
+        ),
+        TuiEvent::Draw,
+        pointer_event(
+            MouseEventKind::Up(MouseButton::Left),
+            plan_column + 4,
+            plan_row,
+        ),
+    ] {
+        app.handle_tui_event(&mut tui, &mut server, event).await?;
+    }
+    let selected = app
+        .transcript_view
+        .selected_text(&app.transcript_cells)
+        .expect("selected plan text");
+    assert!("Plan step".contains(&selected), "selected {selected:?}");
+    app.handle_tui_event(
+        &mut tui,
+        &mut server,
+        TuiEvent::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL)),
+    )
+    .await?;
+    assert!(tui.clipboard.is_busy());
+    assert!(app.chat_widget.has_active_modal());
+    app.render_owned_transcript(&mut tui, size)?;
+    let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
+    let selection = (0..size.width)
+        .map(|column| {
+            if buffer[(column, plan_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+            {
+                '^'
+            } else {
+                '·'
+            }
+        })
+        .collect::<String>();
+    insta::assert_snapshot!(
+        "plan_prompt_selection",
+        format!(
+            "{selection}\n\n{}",
+            render_bottom_popup(&app.chat_widget, /*width*/ 80),
+        )
+    );
     app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Esc.into()))
         .await?;
+    app.transcript_view.end_selection(&app.transcript_cells);
+    app.transcript_view.jump_to_latest();
     app.chat_widget.apply_external_edit("/m".to_string());
     app.render_owned_transcript(&mut tui, size)?;
     let popup = screen(&tui);
@@ -292,6 +452,10 @@ async fn empty_enter_returns_to_latest_with_contextual_hints() -> Result<()> {
     let mut tui = crate::tui::test_support::make_test_tui()?;
     tui.set_owned_screen(/*owned*/ true)?;
     for (width, detailed) in [(80, false), (40, true)] {
+        let config = serde_json::from_value(serde_json::json!({}))?;
+        app.keymap = RuntimeKeymap::from_config(&config).expect("valid default bindings");
+        app.local_settings.tui.keymap = config.clone();
+        app.chat_widget.apply_keymap_update(config, &app.keymap);
         let size = Size::new(width, /*height*/ 12);
         tui.terminal.resize(size)?;
         app.transcript_view = Default::default();
@@ -344,6 +508,33 @@ async fn empty_enter_returns_to_latest_with_contextual_hints() -> Result<()> {
         assert!(!screen(&tui).contains("latest"));
         assert!(events.try_recv().is_err());
         assert!(operations.try_recv().is_err());
+
+        for config in [
+            serde_json::json!({"composer": {"submit": ["enter", "ctrl-space"]}}),
+            serde_json::json!({"global": {"submit": ["enter", "ctrl-space"]}}),
+        ] {
+            let config = serde_json::from_value(config)?;
+            app.keymap = RuntimeKeymap::from_config(&config).expect("valid submit bindings");
+            app.local_settings.tui.keymap = config.clone();
+            app.chat_widget.apply_keymap_update(config, &app.keymap);
+            app.transcript_view
+                .scroll(&app.transcript_cells, /*rows*/ -10);
+            app.render_owned_transcript(&mut tui, size)?;
+            assert!(screen(&tui).contains("enter/esc latest"));
+            while events.try_recv().is_ok() {}
+            app.handle_tui_event(
+                &mut tui,
+                &mut server,
+                TuiEvent::Key(KeyEvent::from(KeyCode::Enter)),
+            )
+            .await?;
+            app.render_owned_transcript(&mut tui, size)?;
+            assert!(app.transcript_view.is_following());
+            assert_eq!(app.chat_widget.composer_text_with_pending(), "");
+            assert!(!screen(&tui).contains("latest"));
+            assert!(events.try_recv().is_err());
+            assert!(operations.try_recv().is_err());
+        }
 
         assert!(!app.handle_owned_transcript_event(
             &mut tui,
@@ -415,7 +606,7 @@ async fn enter_preserves_search_backtrack_and_modal_ownership_while_scrolled() -
     let enter = TuiEvent::Key(KeyEvent::from(KeyCode::Enter));
     app.transcript_view.begin_search();
     assert!(app.handle_owned_transcript_event(&mut tui, &mut server, &enter)?);
-    assert!(app.transcript_view.is_search_active());
+    assert!(app.transcript_view.is_search_editing());
     assert!(!app.transcript_view.is_following());
     app.handle_owned_transcript_event(
         &mut tui,

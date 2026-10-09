@@ -16,6 +16,7 @@ use codex_exec_server::ExecServerError;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::SelectedCapabilityRootsStatus;
 use codex_protocol::capabilities::CapabilityRootLocation;
+use codex_protocol::capabilities::EnvironmentCapabilityRoots;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -26,7 +27,9 @@ use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EnvironmentConnectionEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::TurnEnvironmentRequest;
 use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_skills_extension::EnvironmentSkillRequirements;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use futures::FutureExt;
@@ -121,15 +124,15 @@ pub(crate) fn combine_selected_capability_roots(
     combined_roots
 }
 
-pub(crate) fn default_thread_environment_selections(
+pub(crate) fn default_thread_environment_requests(
     environment_manager: &EnvironmentManager,
     cwd: &AbsolutePathBuf,
     workspace_roots: &[AbsolutePathBuf],
-) -> Vec<TurnEnvironmentSelection> {
+) -> Vec<TurnEnvironmentRequest> {
     environment_manager
         .default_environment_ids()
         .into_iter()
-        .map(|environment_id| TurnEnvironmentSelection {
+        .map(|environment_id| TurnEnvironmentRequest {
             environment_id,
             cwd: PathUri::from_abs_path(cwd),
             workspace_roots: workspace_roots.iter().map(PathUri::from_abs_path).collect(),
@@ -139,30 +142,26 @@ pub(crate) fn default_thread_environment_selections(
 }
 
 /// Checks that environment IDs are registered and unique and that working directories are not too long.
-pub fn validate_environment_ids_and_cwds(
+pub fn validate_environment_ids_and_cwds<'a>(
     environment_manager: &EnvironmentManager,
-    environments: &[TurnEnvironmentSelection],
+    environments: impl IntoIterator<Item = (&'a str, &'a PathUri)>,
 ) -> CodexResult<()> {
-    let mut environment_ids = HashSet::with_capacity(environments.len());
-    for environment in environments {
-        if environment.cwd.inferred_native_path_string().len() > MAX_TURN_ENVIRONMENT_CWD_BYTES {
+    let mut environment_ids = HashSet::new();
+    for (environment_id, cwd) in environments {
+        if cwd.inferred_native_path_string().len() > MAX_TURN_ENVIRONMENT_CWD_BYTES {
             return Err(CodexErr::InvalidRequest(
                 "turn environment working directory exceeds the maximum size".to_string(),
             ));
         }
-        if !environment_ids.insert(environment.environment_id.as_str()) {
+        if !environment_ids.insert(environment_id) {
             return Err(CodexErr::InvalidRequest(format!(
-                "duplicate turn environment id `{}`",
-                environment.environment_id
+                "duplicate turn environment id `{environment_id}`"
             )));
         }
         environment_manager
-            .get_environment(&environment.environment_id)
+            .get_environment(environment_id)
             .ok_or_else(|| {
-                CodexErr::InvalidRequest(format!(
-                    "unknown turn environment id `{}`",
-                    environment.environment_id
-                ))
+                CodexErr::InvalidRequest(format!("unknown turn environment id `{environment_id}`"))
             })?;
     }
     Ok(())
@@ -420,9 +419,7 @@ impl ThreadEnvironments {
             }
             let previous = current.iter().find(|environment| {
                 let previous = &environment.selection;
-                previous.environment_id == selected_environment.environment_id
-                    && previous.cwd == selected_environment.cwd
-                    && previous.workspace_roots == selected_environment.workspace_roots
+                previous.has_same_workspace(selected_environment)
             });
             let (selected_environment, config_origin) =
                 resolve_selection_config(selected_environment.clone(), thread_defaults);
@@ -982,6 +979,7 @@ pub(crate) enum TurnEnvironmentState {
     Failed {
         // Keep the input form so connection failure doesn't hide whether config comes from the thread.
         selection: TurnEnvironmentSelection,
+        required_skills: Vec<String>,
         error: String,
     },
 }
@@ -991,9 +989,11 @@ impl TurnEnvironmentState {
         starting: StartingTurnEnvironment,
         resolved: Option<TurnEnvironmentResult>,
     ) -> Self {
+        let required_skills = starting.environment.required_skills().to_vec();
         if let EnvironmentConfigState::Failed(error) = &starting.selection.config {
             let error = error.clone();
             return Self::Failed {
+                required_skills,
                 selection: starting
                     .config_origin
                     .into_input_selection(starting.selection),
@@ -1006,6 +1006,7 @@ impl TurnEnvironmentState {
                 if matches!(selection.config, EnvironmentConfigState::Pending) {
                     let Some(config) = environment.installed_config else {
                         return Self::Failed {
+                            required_skills,
                             selection: starting.config_origin.into_input_selection(selection),
                             error: "Environment configuration was not supplied.".to_string(),
                         };
@@ -1035,6 +1036,7 @@ impl TurnEnvironmentState {
                     "skipping failed turn environment: {err}"
                 );
                 Self::Failed {
+                    required_skills,
                     selection: starting
                         .config_origin
                         .into_input_selection(starting.selection),
@@ -1055,6 +1057,18 @@ pub struct TurnEnvironmentSnapshot {
 }
 
 impl TurnEnvironmentSnapshot {
+    /// Keeps the original root order for child threads and saved history.
+    pub(crate) fn selected_capability_roots(&self) -> Vec<SelectedCapabilityRoot> {
+        EnvironmentCapabilityRoots::collect(self.environments.iter().map(|environment| {
+            let selection = match environment {
+                TurnEnvironmentState::Ready(environment) => &environment.selection,
+                TurnEnvironmentState::Starting(environment) => &environment.selection,
+                TurnEnvironmentState::Failed { selection, .. } => selection,
+            };
+            &selection.selected_capability_roots
+        }))
+    }
+
     pub(crate) fn has_full_access(
         &self,
         approval_policy: AskForApproval,
@@ -1211,6 +1225,35 @@ impl TurnEnvironmentSnapshot {
             .collect()
     }
 
+    /// Captures requirements from the selected registration even when connection setup fails.
+    pub(crate) fn required_skills(&self) -> impl Iterator<Item = EnvironmentSkillRequirements<'_>> {
+        self.environments.iter().filter_map(|environment| {
+            let (selection, required) = match environment {
+                TurnEnvironmentState::Ready(environment) => (
+                    &environment.selection,
+                    environment.environment.required_skills(),
+                ),
+                TurnEnvironmentState::Starting(environment) => (
+                    &environment.selection,
+                    environment.environment.required_skills(),
+                ),
+                TurnEnvironmentState::Failed {
+                    selection,
+                    required_skills,
+                    ..
+                } => (selection, required_skills.as_slice()),
+            };
+            if required.is_empty() {
+                None
+            } else {
+                Some(EnvironmentSkillRequirements {
+                    environment_id: &selection.environment_id,
+                    skill_names: required,
+                })
+            }
+        })
+    }
+
     /// Native children retain ready and starting attachments captured by their spawning step.
     pub(crate) fn inheritable_selections(&self) -> Vec<TurnEnvironmentSelection> {
         self.environments
@@ -1286,6 +1329,7 @@ mod tests {
     use codex_protocol::models::ActivePermissionProfile;
     use codex_protocol::models::PermissionProfile;
     use codex_protocol::permissions::FileSystemSandboxPolicyContext;
+    use codex_protocol::protocol::TurnEnvironmentRequest;
     use codex_protocol::protocol::TurnEnvironmentSelection;
     use codex_protocol::sandbox::SandboxType;
     use codex_utils_absolute_path::AbsolutePathBuf;
@@ -1409,7 +1453,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_thread_environment_selections_use_manager_default_id() {
+    async fn default_thread_environment_requests_use_manager_default_id() {
         let cwd = AbsolutePathBuf::current_dir().expect("cwd");
         let cwd_uri = PathUri::from_abs_path(&cwd);
         let manager = EnvironmentManager::create_for_tests(
@@ -1419,8 +1463,8 @@ mod tests {
         .await;
 
         assert_eq!(
-            default_thread_environment_selections(&manager, &cwd, std::slice::from_ref(&cwd)),
-            vec![TurnEnvironmentSelection {
+            default_thread_environment_requests(&manager, &cwd, std::slice::from_ref(&cwd)),
+            vec![TurnEnvironmentRequest {
                 environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
                 cwd: cwd_uri.clone(),
                 workspace_roots: vec![cwd_uri],
@@ -1430,7 +1474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn toml_default_thread_environment_selections_include_local_and_remote() {
+    async fn toml_default_thread_environment_requests_include_local_and_remote() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             temp_dir.path().join("environments.toml"),
@@ -1452,15 +1496,15 @@ url = "ws://127.0.0.1:8765"
         .expect("environment manager");
 
         assert_eq!(
-            default_thread_environment_selections(&manager, &cwd, std::slice::from_ref(&cwd)),
+            default_thread_environment_requests(&manager, &cwd, std::slice::from_ref(&cwd)),
             vec![
-                TurnEnvironmentSelection {
+                TurnEnvironmentRequest {
                     environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                     cwd: cwd_uri.clone(),
                     workspace_roots: vec![cwd_uri.clone()],
                     config: EnvironmentConfigState::FromThread,
                 },
-                TurnEnvironmentSelection {
+                TurnEnvironmentRequest {
                     environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
                     cwd: cwd_uri.clone(),
                     workspace_roots: vec![cwd_uri],
@@ -1471,13 +1515,13 @@ url = "ws://127.0.0.1:8765"
     }
 
     #[tokio::test]
-    async fn default_thread_environment_selections_empty_when_default_disabled() {
+    async fn default_thread_environment_requests_empty_when_default_disabled() {
         let cwd = AbsolutePathBuf::current_dir().expect("cwd");
         let manager = environment_manager_without_environments();
 
         assert_eq!(
-            default_thread_environment_selections(&manager, &cwd, std::slice::from_ref(&cwd)),
-            Vec::<TurnEnvironmentSelection>::new()
+            default_thread_environment_requests(&manager, &cwd, std::slice::from_ref(&cwd)),
+            Vec::<TurnEnvironmentRequest>::new()
         );
     }
 
@@ -1517,6 +1561,7 @@ url = "ws://127.0.0.1:8765"
             /*non_blocking_snapshots*/ false,
         );
         turn_environments.update_selections(&[TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
             environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
             cwd: PathUri::from_abs_path(&cwd),
             workspace_roots: Vec::new(),
@@ -1549,6 +1594,7 @@ url = "ws://127.0.0.1:8765"
         let cwd_uri = PathUri::from_abs_path(&cwd);
         let manager = Arc::new(EnvironmentManager::default_for_tests());
         let first = TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
             environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
             cwd: cwd_uri.clone(),
             workspace_roots: Vec::new(),
@@ -1560,6 +1606,7 @@ url = "ws://127.0.0.1:8765"
             &[
                 first.clone(),
                 TurnEnvironmentSelection {
+                    selected_capability_roots: Default::default(),
                     environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                     cwd: cwd_uri.join("other").expect("other cwd URI"),
                     workspace_roots: Vec::new(),
@@ -1582,6 +1629,7 @@ url = "ws://127.0.0.1:8765"
         let resolved = resolve_turn_environments(
             Arc::clone(&manager),
             &[TurnEnvironmentSelection {
+                selected_capability_roots: Default::default(),
                 environment_id: "local".to_string(),
                 cwd: selected_cwd_uri,
                 workspace_roots: Vec::new(),
@@ -1622,6 +1670,7 @@ url = "ws://127.0.0.1:8765"
         let cwd_uri = PathUri::from_abs_path(&cwd);
         let manager = Arc::new(EnvironmentManager::default_for_tests());
         let local = TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
             environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
             cwd: cwd_uri.clone(),
             workspace_roots: Vec::new(),
@@ -1632,6 +1681,7 @@ url = "ws://127.0.0.1:8765"
             manager,
             &[
                 TurnEnvironmentSelection {
+                    selected_capability_roots: Default::default(),
                     environment_id: "missing".to_string(),
                     cwd: cwd_uri,
                     workspace_roots: Vec::new(),
@@ -1675,6 +1725,7 @@ url = "ws://127.0.0.1:8765"
             .await,
         );
         let selection = TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
             environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
             cwd: PathUri::from_abs_path(&AbsolutePathBuf::current_dir().expect("cwd")),
             workspace_roots: Vec::new(),
@@ -1781,12 +1832,14 @@ url = "ws://127.0.0.1:8765"
         };
         let cwd = PathUri::from_abs_path(&cwd);
         let remote = TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
             environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
             cwd: cwd.clone(),
             workspace_roots: Vec::new(),
             config: EnvironmentConfigState::FromThread,
         };
         let local = TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
             environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
             cwd,
             workspace_roots: Vec::new(),
@@ -1966,6 +2019,7 @@ url = "ws://127.0.0.1:8765"
             .await,
         );
         let selection = TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
             environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
             cwd: PathUri::from_abs_path(&AbsolutePathBuf::current_dir().expect("cwd")),
             workspace_roots: Vec::new(),
@@ -2068,6 +2122,7 @@ url = "ws://127.0.0.1:8765"
             .await,
         );
         let selection = TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
             environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
             cwd: PathUri::from_abs_path(&cwd),
             workspace_roots: Vec::new(),
@@ -2153,6 +2208,7 @@ url = "ws://127.0.0.1:8765"
     async fn inherited_environment_reuses_parent_handle_and_uses_child_config() {
         let cwd = AbsolutePathBuf::current_dir().expect("cwd");
         let selection = TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
             environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
             cwd: PathUri::from_abs_path(&cwd),
             workspace_roots: Vec::new(),
@@ -2239,6 +2295,7 @@ url = "ws://127.0.0.1:8765"
     async fn owner_environment_config_is_inherited_and_reset_for_new_cwd() {
         let cwd = AbsolutePathBuf::current_dir().expect("cwd");
         let selection = TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
             environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
             cwd: PathUri::from_abs_path(&cwd),
             workspace_roots: Vec::new(),
@@ -2342,6 +2399,7 @@ url = "ws://127.0.0.1:8765"
         let local = resolve_turn_environments(
             Arc::clone(&local_manager),
             &[TurnEnvironmentSelection {
+                selected_capability_roots: Default::default(),
                 environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                 cwd: cwd_uri.clone(),
                 workspace_roots: Vec::new(),
@@ -2357,6 +2415,7 @@ url = "ws://127.0.0.1:8765"
         let remote = TurnEnvironmentSnapshot {
             environments: vec![TurnEnvironmentState::Ready(TurnEnvironment::new(
                 TurnEnvironmentSelection {
+                    selected_capability_roots: Default::default(),
                     environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
                     cwd: remote_cwd_uri.clone(),
                     workspace_roots: Vec::new(),
@@ -2371,6 +2430,7 @@ url = "ws://127.0.0.1:8765"
             environments: vec![
                 TurnEnvironmentState::Ready(TurnEnvironment::new(
                     TurnEnvironmentSelection {
+                        selected_capability_roots: Default::default(),
                         environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
                         cwd: remote_cwd_uri,
                         workspace_roots: Vec::new(),
@@ -2398,6 +2458,7 @@ url = "ws://127.0.0.1:8765"
         let snapshot = TurnEnvironmentSnapshot {
             environments: vec![TurnEnvironmentState::Starting(StartingTurnEnvironment {
                 selection: TurnEnvironmentSelection {
+                    selected_capability_roots: Default::default(),
                     environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                     cwd: PathUri::from_abs_path(&cwd),
                     workspace_roots: Vec::new(),

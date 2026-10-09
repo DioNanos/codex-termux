@@ -47,6 +47,7 @@ mod guardian_v2;
 mod reasoning_effort;
 
 pub use access_programs::ModelAccessPrograms;
+pub use guardian_v2::AsyncClassifierMode;
 pub use guardian_v2::GuardianV2ModelConfig;
 pub use guardian_v2::GuardianV2TranscriptModelConfig;
 
@@ -277,7 +278,8 @@ pub struct ModelPreset {
     pub default_reasoning_effort: ReasoningEffort,
     /// Supported reasoning effort options.
     pub supported_reasoning_efforts: Vec<ReasoningEffortPreset>,
-    /// Deprecated catalog field, always false for new model presets.
+    /// Compatibility field retained for consumers of model presets; personality selection is no
+    /// longer supported.
     #[serde(default)]
     pub supports_personality: bool,
     /// Deprecated: use `service_tiers` instead.
@@ -612,8 +614,8 @@ impl ModelInfo {
 
 /// A strongly-typed template for assembling model instructions and developer messages.
 ///
-/// `instructions_template` is literal text. The deprecated `instructions_variables` field is
-/// retained to decode catalogs produced before personality selection was removed.
+/// `instructions_template`: Formerly a personality template, now literal text. The name is
+/// retained for model catalog compatibility.
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelMessages {
     /// Developer guidance after a content-filter block. Missing, null, blank, or values over
@@ -627,7 +629,6 @@ pub struct ModelMessages {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolMessages>,
     pub instructions_template: Option<String>,
-    pub instructions_variables: Option<ModelInstructionsVariables>,
     pub approvals: Option<ApprovalMessages>,
     pub collaboration_modes: Option<CollaborationModeMessages>,
     pub auto_review: Option<AutoReviewMessages>,
@@ -863,13 +864,6 @@ pub struct MultiAgentModeMessages {
     /// an empty string suppresses the mode message. `hint_text` takes precedence.
     pub proactive: Option<String>,
     pub hint_text: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
-pub struct ModelInstructionsVariables {
-    pub personality_default: Option<String>,
-    pub personality_friendly: Option<String>,
-    pub personality_pragmatic: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
@@ -1184,10 +1178,9 @@ mod tests {
     }
     #[test]
     fn model_messages_deserialize_without_optional_sections() {
-        let messages: ModelMessages = from_str(
-            r#"{"instructions_template":null,"instructions_variables":null,"persistent_instructions":null}"#,
-        )
-        .expect("model messages should deserialize");
+        let messages: ModelMessages =
+            from_str(r#"{"instructions_template":null,"persistent_instructions":null}"#)
+                .expect("model messages should deserialize");
 
         assert_eq!(messages, ModelMessages::default());
     }
@@ -1199,7 +1192,6 @@ mod tests {
             persistent_instructions: Some(String::new()),
             tools: None,
             instructions_template: Some("template".to_string()),
-            instructions_variables: None,
             approvals: None,
             collaboration_modes: None,
             auto_review: Some(AutoReviewMessages {
@@ -1221,7 +1213,6 @@ mod tests {
             persistent_instructions: Some("x".repeat(MODEL_MESSAGE_TEXT_MAX_BYTES)),
             tools: None,
             instructions_template: Some("template".to_string()),
-            instructions_variables: None,
             approvals: None,
             collaboration_modes: None,
             auto_review: None,
@@ -1364,7 +1355,6 @@ mod tests {
         let messages: ModelMessages = from_str(
             r#"{
                 "instructions_template": null,
-                "instructions_variables": null,
                 "approvals": {
                     "on_request": "",
                     "never": ""
@@ -1389,7 +1379,6 @@ mod tests {
         let missing_template: ModelMessages = from_str(
             r#"{
                 "instructions_template": null,
-                "instructions_variables": null,
                 "auto_review": {
                     "policy": "policy"
                 }
@@ -1399,7 +1388,6 @@ mod tests {
         let empty_template: ModelMessages = from_str(
             r#"{
                 "instructions_template": null,
-                "instructions_variables": null,
                 "auto_review": {
                     "policy": "policy",
                     "policy_template": "",
@@ -1438,7 +1426,6 @@ mod tests {
         let messages: ModelMessages = from_str(
             r#"{
                 "instructions_template": null,
-                "instructions_variables": null,
                 "permissions": {
                     "workspace_write": ""
                 }
@@ -1459,7 +1446,7 @@ mod tests {
     #[test]
     fn multi_agent_messages_preserve_missing_and_empty_values() {
         let messages: ModelMessages = from_str(
-            r#"{"instructions_template":null,"instructions_variables":null,"multi_agent":{"role":{"root":"","subagent":"subagent base"},"mode":{"explicit":"explicit mode","proactive":"","hint_text":""}}}"#,
+            r#"{"instructions_template":null,"multi_agent":{"role":{"root":"","subagent":"subagent base"},"mode":{"explicit":"explicit mode","proactive":"","hint_text":""}}}"#,
         )
         .expect("multi-agent messages should deserialize");
 
@@ -1483,8 +1470,12 @@ mod tests {
     fn collaboration_mode_messages_preserve_missing_and_empty_values() {
         let messages: ModelMessages = from_str(
             r#"{
-                "instructions_template": null,
-                "instructions_variables": null,
+                "instructions_template": "legacy catalog instructions",
+                "instructions_variables": {
+                    "personality_default": "default",
+                    "personality_friendly": "friendly",
+                    "personality_pragmatic": "pragmatic"
+                },
                 "collaboration_modes": {
                     "default": ""
                 }
@@ -1495,6 +1486,7 @@ mod tests {
         assert_eq!(
             messages,
             ModelMessages {
+                instructions_template: Some("legacy catalog instructions".to_string()),
                 collaboration_modes: Some(CollaborationModeMessages {
                     default: Some(String::new()),
                     plan: None,
@@ -1502,6 +1494,11 @@ mod tests {
                 ..Default::default()
             }
         );
+        let roundtripped: ModelMessages = serde_json::from_value(
+            serde_json::to_value(&messages).expect("serialize model messages"),
+        )
+        .expect("deserialize model messages");
+        assert_eq!(roundtripped, messages);
     }
 
     #[test]
@@ -1637,11 +1634,6 @@ mod tests {
             let response = ModelsResponse {
                 models: vec![test_model(Some(ModelMessages {
                     instructions_template: template.map(str::to_owned),
-                    instructions_variables: Some(ModelInstructionsVariables {
-                        personality_default: Some("default".to_string()),
-                        personality_friendly: Some("friendly".to_string()),
-                        personality_pragmatic: Some("pragmatic".to_string()),
-                    }),
                     ..Default::default()
                 }))],
             };
@@ -1670,7 +1662,6 @@ mod tests {
                 ..Default::default()
             }),
             instructions_template: None,
-            instructions_variables: None,
             approvals: Some(ApprovalMessages {
                 on_request: Some("approval".to_string()),
                 on_request_auto_review: None,

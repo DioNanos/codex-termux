@@ -82,7 +82,7 @@ use core_test_support::responses::strip_response_item_ids_from_json;
 use core_test_support::responses_metadata as test_responses_metadata;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
-use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::local_requests;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use futures::StreamExt;
@@ -106,6 +106,63 @@ use wiremock::matchers::query_param;
 const INSTALLATION_ID_FILENAME: &str = "installation_id";
 const TEST_WINDOW_ID: &str = "test-thread:0";
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+#[test_case::test_case(false, false)]
+#[test_case::test_case(false, true)]
+#[test_case::test_case(true, false)]
+#[test_case::test_case(true, true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_request_enforces_independent_speed_requirements(
+    fast_enabled: bool,
+    ultrafast_enabled: bool,
+) -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    for (tier, enabled) in [("priority", fast_enabled), ("ultrafast", ultrafast_enabled)] {
+        for configure_at_start in [false, true] {
+            let server = start_mock_server().await;
+            let response_mock = mount_sse_once(&server, sse(vec![ev_completed("done")])).await;
+            let test = test_codex()
+                .with_model("gpt-5.4")
+                .with_model_info_override("gpt-5.4", move |model| {
+                    model.service_tiers = vec![codex_protocol::openai_models::ModelServiceTier {
+                        id: tier.to_string(),
+                        name: tier.to_string(),
+                        description: String::new(),
+                    }];
+                })
+                .with_config(move |config| {
+                    config
+                        .features
+                        .set_enabled(Feature::FastMode, fast_enabled)
+                        .expect("configure Fast mode");
+                    config
+                        .features
+                        .set_enabled(Feature::UltrafastMode, ultrafast_enabled)
+                        .expect("configure Ultra Fast mode");
+                    config.service_tier = configure_at_start.then(|| tier.to_string());
+                })
+                .build_with_auto_env(&server)
+                .await?;
+            if !configure_at_start {
+                core_test_support::submit_thread_settings(
+                    &test.codex,
+                    ThreadSettingsOverrides {
+                        service_tier: Some(Some(tier.to_string())),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
+            test.submit_turn("hello").await?;
+            assert_eq!(
+                response_mock.single_request().body_json()["service_tier"].as_str(),
+                enabled.then_some(tier),
+                "tier={tier}, configure_at_start={configure_at_start}",
+            );
+        }
+    }
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_request_preserves_flex_without_catalog_support_or_fast_mode()
@@ -330,7 +387,7 @@ async fn openai_stateless_responses_requests_preserve_item_turn_metadata_across_
     let first_input = first["input"].as_array().expect("first input");
     let second_input = second["input"].as_array().expect("second input");
     assert_eq!(&second_input[..first_input.len()], first_input.as_slice());
-    for item in first_input {
+    for item in &first_input[1..] {
         assert_eq!(
             item["internal_chat_message_metadata_passthrough"]["turn_id"].as_str(),
             Some(first_turn_id)
@@ -832,7 +889,7 @@ impl ProviderAuthCommandFixture {
         #[cfg(unix)]
         let (command, args) = {
             let script_path = tempdir.path().join("print-token.sh");
-            std::fs::write(
+            codex_utils_cargo_bin::write_executable(
                 &script_path,
                 r#"#!/bin/sh
 if [ -f fail-until-401 ]; then
@@ -844,12 +901,6 @@ tail -n +2 tokens.txt > tokens.next
 mv tokens.next tokens.txt
 "#,
             )?;
-            let mut permissions = std::fs::metadata(&script_path)?.permissions();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                permissions.set_mode(0o755);
-            }
-            std::fs::set_permissions(&script_path, permissions)?;
             ("./print-token.sh".to_string(), Vec::new())
         };
 
@@ -907,7 +958,7 @@ fn non_zero_u64(value: u64) -> NonZeroU64 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_includes_initial_messages_and_sends_prior_items() {
+async fn resume_sends_prior_items() {
     skip_if_no_network!();
 
     // Create a fake rollout session file with prior user + system + assistant messages.
@@ -1022,18 +1073,8 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         .await
         .expect("resume conversation");
     let codex = test.codex.clone();
-    let session_configured = test.session_configured;
 
-    // 1) Assert initial_messages only includes existing EventMsg entries; response items are not converted
-    let initial_msgs = session_configured
-        .initial_messages
-        .clone()
-        .expect("expected initial messages option for resumed session");
-    let initial_json = serde_json::to_value(&initial_msgs).unwrap();
-    let expected_initial_json = json!([]);
-    assert_eq!(initial_json, expected_initial_json);
-
-    // 2) Submit new input; the request body must include the prior items, then initial context, then new user input.
+    // Submit new input; the request body must include the prior items, then initial context, then new user input.
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
             text: "hello".into(),
@@ -1658,6 +1699,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        capabilities: None,
         include_internal_metadata: false,
     };
 
@@ -1793,14 +1835,7 @@ async fn includes_base_instructions_override_in_request() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let request = resp_mock.single_request();
-    let request_body = request.body_json();
-
-    assert!(
-        request_body["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("test instructions")
-    );
+    assert_eq!(request.instructions_text(), "test instructions");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2013,12 +2048,7 @@ async fn includes_user_instructions_message_in_request() {
     let request = resp_mock.single_request();
     let request_body = request.body_json();
 
-    assert!(
-        !request_body["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("be nice")
-    );
+    assert!(!request.instructions_text().contains("be nice"));
     assert_message_role(&request_body["input"][0], "developer");
     let developer_texts = request_body["input"]
         .as_array()
@@ -2034,8 +2064,8 @@ async fn includes_user_instructions_message_in_request() {
         "expected permissions message to mention sandbox_mode, got {developer_texts:?}"
     );
 
-    assert_message_role(&request_body["input"][1], "user");
-    let user_context_texts = message_input_texts(&request_body["input"][1]);
+    assert_message_role(&request_body["input"][2], "user");
+    let user_context_texts = message_input_texts(&request_body["input"][2]);
     assert!(
         user_context_texts
             .iter()
@@ -2516,7 +2546,7 @@ async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Re
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(config.cwd.clone())),
+                environments: Some(local_requests(config.cwd.clone())),
                 approval_policy: Some(config.permissions.approval_policy.value()),
                 sandbox_policy: Some(config.legacy_sandbox_policy()),
                 summary: Some(
@@ -2774,7 +2804,7 @@ async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() 
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(config.cwd.clone())),
+                environments: Some(local_requests(config.cwd.clone())),
                 approval_policy: Some(config.permissions.approval_policy.value()),
                 sandbox_policy: Some(config.legacy_sandbox_policy()),
                 summary: Some(ReasoningSummary::Concise),
@@ -3053,12 +3083,7 @@ async fn includes_developer_instructions_message_in_request() {
     let request = resp_mock.single_request();
     let request_body = request.body_json();
 
-    assert!(
-        !request_body["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("be nice")
-    );
+    assert!(!request.instructions_text().contains("be nice"));
     assert_message_role(&request_body["input"][0], "developer");
     let developer_texts = request_body["input"]
         .as_array()
@@ -3078,8 +3103,8 @@ async fn includes_developer_instructions_message_in_request() {
         "expected developer instructions in a developer message, got {developer_texts:?}"
     );
 
-    assert_message_role(&request_body["input"][1], "user");
-    let user_context_texts = message_input_texts(&request_body["input"][1]);
+    assert_message_role(&request_body["input"][2], "user");
+    let user_context_texts = message_input_texts(&request_body["input"][2]);
     assert!(
         user_context_texts
             .iter()
@@ -3177,6 +3202,7 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        capabilities: None,
         include_internal_metadata: false,
     };
 
@@ -3350,23 +3376,20 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
 
     assert_eq!(body["store"], serde_json::Value::Bool(false));
     assert_eq!(body["stream"], serde_json::Value::Bool(true));
-    assert_eq!(body["input"].as_array().map(Vec::len), Some(10));
-    assert_eq!(body["input"][0]["id"].as_str(), Some("rs_reasoning-id"));
-    assert_eq!(body["input"][1]["id"].as_str(), Some("msg_message-id"));
-    assert_eq!(body["input"][2]["id"].as_str(), Some("ws_web-search-id"));
-    assert_eq!(body["input"][3]["id"].as_str(), Some("fc_function-id"));
-    assert_eq!(
-        body["input"][4]["call_id"].as_str(),
-        Some("function-call-id")
-    );
-    assert_eq!(body["input"][5]["id"].as_str(), Some("lsh_local-shell-id"));
-    assert_eq!(body["input"][6]["id"].as_str(), Some("ctc_custom-tool-id"));
-    assert_eq!(
-        body["input"][7]["call_id"].as_str(),
-        Some("custom-tool-call-id")
-    );
-    assert_eq!(body["input"][8].get("id"), None);
-    assert_eq!(body["input"][9].get("id"), None);
+    let input = body["input"].as_array().expect("request input");
+    assert_eq!(input[0]["role"], "developer");
+    let input = &input[1..];
+    assert_eq!(input.len(), 10);
+    assert_eq!(input[0]["id"].as_str(), Some("rs_reasoning-id"));
+    assert_eq!(input[1]["id"].as_str(), Some("msg_message-id"));
+    assert_eq!(input[2]["id"].as_str(), Some("ws_web-search-id"));
+    assert_eq!(input[3]["id"].as_str(), Some("fc_function-id"));
+    assert_eq!(input[4]["call_id"].as_str(), Some("function-call-id"));
+    assert_eq!(input[5]["id"].as_str(), Some("lsh_local-shell-id"));
+    assert_eq!(input[6]["id"].as_str(), Some("ctc_custom-tool-id"));
+    assert_eq!(input[7]["call_id"].as_str(), Some("custom-tool-call-id"));
+    assert_eq!(input[8].get("id"), None);
+    assert_eq!(input[9].get("id"), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3815,6 +3838,7 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        capabilities: None,
         include_internal_metadata: false,
     };
 
@@ -3902,6 +3926,7 @@ async fn env_var_overrides_loaded_auth() {
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        capabilities: None,
         include_internal_metadata: false,
     };
 

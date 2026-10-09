@@ -268,10 +268,15 @@ impl FeedbackRequestProcessor {
 
         let session_source = self.thread_manager.session_source();
         let runtime_handle = tokio::runtime::Handle::current();
+        let codex_home = self.config.codex_home.clone();
 
         let upload_result = tokio::task::spawn_blocking(move || {
             // Cancelling the RPC waiter must not release a still-running upload's slot.
             let _permit = permit;
+            if include_logs {
+                extra_attachments
+                    .extend(codex_feedback::daemon_log_attachments(codex_home.as_path()));
+            }
             let tags = (!upload_tags.is_empty()).then_some(&upload_tags);
             runtime_handle.block_on(snapshot.upload_feedback(
                 FeedbackUploadOptions {
@@ -279,7 +284,7 @@ impl FeedbackRequestProcessor {
                     reason: reason.as_deref(),
                     tags,
                     include_logs,
-                    extra_attachments: &extra_attachments,
+                    extra_attachments,
                     extra_attachment_paths: &attachment_paths,
                     session_source: Some(session_source),
                     logs_override: sqlite_feedback_logs,
@@ -758,26 +763,20 @@ mod tests {
                     disabled_plugin_ids: None,
                     cwd: AbsolutePathBuf::from_absolute_path(tempdir.path())
                         .expect("absolute feedback rollout directory"),
-                    workspace_roots: None,
-                    current_date: None,
-                    timezone: None,
                     approval_policy: codex_protocol::protocol::AskForApproval::Never,
                     approvals_reviewer: None,
                     sandbox_policy: codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
                     permission_profile: None,
                     active_permission_profile: None,
-                    network: None,
                     file_system_sandbox_policy: None,
                     model: (*model).to_string(),
                     comp_hash: None,
-                    personality: None,
                     collaboration_mode: None,
                     multi_agent_version: None,
-                    multi_agent_mode: None,
                     realtime_active: None,
                     cyber_access_program: None,
                     effort: effort.clone(),
-                    summary: ReasoningSummary::Auto,
+                    summary: Some(ReasoningSummary::Auto),
                 }),
             }
         }));

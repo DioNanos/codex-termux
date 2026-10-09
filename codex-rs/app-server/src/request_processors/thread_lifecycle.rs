@@ -154,21 +154,32 @@ pub(super) async fn ensure_conversation_listener(
             )));
         }
     };
-    let thread_state = {
+    let (thread_state, result) = {
         let pending_thread_unloads = listener_task_context.pending_thread_unloads.lock().await;
         if pending_thread_unloads.contains(&conversation_id) {
             return Err(invalid_request(format!(
                 "thread {conversation_id} is closing; retry after the thread is closed"
             )));
         }
-        let Some(thread_state) = listener_task_context
+        match listener_task_context
             .thread_state_manager
             .try_ensure_connection_subscribed(conversation_id, connection_id, raw_events_enabled)
             .await
-        else {
-            return Ok(EnsureConversationListenerResult::ConnectionClosed);
-        };
-        thread_state
+        {
+            Some(thread_state) => (thread_state, EnsureConversationListenerResult::Attached),
+            None => {
+                // Startup can outlast connection cleanup; the thread still needs a
+                // listener to unload once it is idle and has no subscribers.
+                let thread_state = listener_task_context
+                    .thread_state_manager
+                    .thread_state(conversation_id)
+                    .await;
+                (
+                    thread_state,
+                    EnsureConversationListenerResult::ConnectionClosed,
+                )
+            }
+        }
     };
     if let Err(error) = ensure_listener_task_running(
         listener_task_context.clone(),
@@ -184,7 +195,7 @@ pub(super) async fn ensure_conversation_listener(
             .await;
         return Err(error);
     }
-    Ok(EnsureConversationListenerResult::Attached)
+    Ok(result)
 }
 
 pub(super) fn log_listener_attach_result(
@@ -432,8 +443,24 @@ pub(super) async fn unload_thread_without_subscribers(
     thread_state_manager.remove_thread_state(thread_id).await;
 
     tokio::spawn(async move {
-        match wait_for_thread_shutdown(&thread).await {
-            ThreadShutdownResult::Complete => {
+        // The deadline bounds our warning, not background cleanup. Keep polling the
+        // same future so even delayed shutdown submission can eventually finish.
+        let shutdown = thread.shutdown_and_wait();
+        tokio::pin!(shutdown);
+        let result = match tokio::time::timeout(Duration::from_secs(/*secs*/ 10), &mut shutdown)
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    event.name = "codex.app_server.thread_shutdown_slow",
+                    "thread {thread_id} shutdown is taking longer than expected; continuing to wait"
+                );
+                shutdown.await
+            }
+        };
+        match result {
+            Ok(()) => {
                 // A delayed unload can finish after thread/revert replaces this runtime under
                 // the same thread ID. Only the runtime that scheduled this unload may remove it.
                 if thread_manager
@@ -456,13 +483,9 @@ pub(super) async fn unload_thread_without_subscribers(
                     .await;
                 pending_thread_unloads.lock().await.remove(&thread_id);
             }
-            ThreadShutdownResult::SubmitFailed => {
+            Err(_) => {
                 pending_thread_unloads.lock().await.remove(&thread_id);
                 warn!("failed to submit Shutdown to thread {thread_id}");
-            }
-            ThreadShutdownResult::TimedOut => {
-                pending_thread_unloads.lock().await.remove(&thread_id);
-                warn!("thread {thread_id} shutdown timed out; leaving thread loaded");
             }
         }
     });

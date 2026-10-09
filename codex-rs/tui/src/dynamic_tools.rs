@@ -4,6 +4,7 @@ use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
+use codex_app_server_protocol::Account;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::DynamicToolCallOutputContentItem;
 use codex_app_server_protocol::DynamicToolCallParams;
@@ -12,7 +13,11 @@ use codex_app_server_protocol::DynamicToolFunctionSpec;
 use codex_app_server_protocol::DynamicToolNamespaceSpec;
 use codex_app_server_protocol::DynamicToolNamespaceTool;
 use codex_app_server_protocol::DynamicToolSpec;
+use codex_app_server_protocol::GetAccountParams;
+use codex_app_server_protocol::GetAccountResponse;
 use codex_app_server_protocol::ImageReference;
+use codex_app_server_protocol::ModelListParams;
+use codex_app_server_protocol::ModelListResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxMode;
 use codex_app_server_protocol::SandboxPolicy;
@@ -49,6 +54,8 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnToolOutput;
 use codex_app_server_protocol::UserInput;
+use codex_features::Feature;
+use codex_features::Features;
 use codex_protocol::ThreadId;
 use codex_protocol::models::FunctionCallOutputBody;
 use serde::Deserialize;
@@ -285,6 +292,7 @@ pub(crate) async fn execute(
     request_handle: AppServerRequestHandle,
     params: DynamicToolCallParams,
     thread_start_params: ThreadStartParams,
+    features: Features,
     status_updates: broadcast::Receiver<ThreadStatusChangedNotification>,
     app_event_tx: Option<&AppEventSender>,
 ) -> DynamicToolCallResponse {
@@ -292,6 +300,7 @@ pub(crate) async fn execute(
         request_handle,
         params,
         thread_start_params,
+        features,
         status_updates,
         app_event_tx,
     )
@@ -315,6 +324,7 @@ async fn execute_inner(
     handle: AppServerRequestHandle,
     params: DynamicToolCallParams,
     mut thread_start_params: ThreadStartParams,
+    features: Features,
     mut status_updates: broadcast::Receiver<ThreadStatusChangedNotification>,
     app_event_tx: Option<&AppEventSender>,
 ) -> Result<Value, String> {
@@ -480,6 +490,21 @@ async fn execute_inner(
             thread_start_params.cwd = Some(source_thread.cwd.to_string_lossy().into_owned());
             thread_start_params.project_id = source_thread.project_id.clone();
             thread_start_params.ephemeral = Some(source_thread.ephemeral);
+            if features.enabled(Feature::CliDaybreak)
+                && thread_start_params.daybreak_enabled.is_none()
+            {
+                let defaults = crate::config_update::read_effective_config(
+                    handle.clone(),
+                    source_thread.cwd.to_string_lossy().into_owned(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                thread_start_params.daybreak_enabled = defaults
+                    .config
+                    .additional
+                    .get("daybreak")
+                    .and_then(Value::as_bool);
+            }
             thread_start_params.history_mode = (source_thread.history_mode
                 == ThreadHistoryMode::Paginated)
                 .then_some(ThreadHistoryMode::Paginated);
@@ -533,7 +558,16 @@ async fn execute_inner(
                 .await
                 .map_err(|error| error.to_string())?;
             let thread_id = started.thread.id.clone();
+            let daybreak_enabled = started.thread.daybreak_enabled.unwrap_or(false);
             register_background_thread(app_event_tx, started.thread, task_tools_available).await?;
+            let cyber_access_program = background_turn_program(
+                &features,
+                &handle,
+                &started.model,
+                &started.model_provider,
+                daybreak_enabled,
+            )
+            .await?;
             if let Some(title) = arguments.title
                 && let Err(error) = request::<ThreadSetNameResponse>(&handle, |request_id| {
                     ClientRequest::ThreadSetName {
@@ -555,6 +589,7 @@ async fn execute_inner(
                 prompt,
                 /*model*/ None,
                 sandbox_policy,
+                cyber_access_program,
             )
             .await?;
             Ok(json!({"threadId": thread_id}))
@@ -565,6 +600,13 @@ async fn execute_inner(
                 .thread_id
                 .unwrap_or_else(|| params.thread_id.clone());
             let thread = read_thread(&handle, &thread_id).await?;
+            // Keep source requests routable while the fork is being created.
+            register_background_thread(
+                app_event_tx,
+                thread.clone(),
+                /*task_tools_available*/ false,
+            )
+            .await?;
             let before_turn_id = if same_thread_id(&thread_id, &params.thread_id) {
                 Some(params.turn_id)
             } else if matches!(thread.status, ThreadStatus::Active { .. }) {
@@ -662,10 +704,19 @@ async fn execute_inner(
                 },
             )
             .await?;
+            let daybreak_enabled = thread.daybreak_enabled.unwrap_or(false);
             register_background_thread(
                 app_event_tx,
                 resumed.thread,
                 /*task_tools_available*/ false,
+            )
+            .await?;
+            let cyber_access_program = background_turn_program(
+                &features,
+                &handle,
+                arguments.model.as_deref().unwrap_or(&resumed.model),
+                &resumed.model_provider,
+                daybreak_enabled,
             )
             .await?;
             start_turn(
@@ -675,6 +726,7 @@ async fn execute_inner(
                 prompt,
                 arguments.model,
                 /*sandbox_policy*/ None,
+                cyber_access_program,
             )
             .await?;
             Ok(json!({"threadId": arguments.thread_id}))
@@ -1180,6 +1232,7 @@ async fn start_turn(
     prompt: String,
     model: Option<String>,
     sandbox_policy: Option<SandboxPolicy>,
+    cyber_access_program: Option<codex_app_server_protocol::CyberAccessProgram>,
 ) -> Result<TurnStartResponse, String> {
     request(handle, |request_id| ClientRequest::TurnStart {
         request_id,
@@ -1195,10 +1248,55 @@ async fn start_turn(
             })),
             model,
             sandbox_policy,
+            cyber_access_program,
             ..TurnStartParams::default()
         },
     })
     .await
+}
+
+async fn background_turn_program(
+    features: &Features,
+    handle: &AppServerRequestHandle,
+    model: &str,
+    provider: &str,
+    enabled: bool,
+) -> Result<Option<codex_app_server_protocol::CyberAccessProgram>, String> {
+    if !features.enabled(Feature::CliDaybreak) {
+        return Ok(None);
+    }
+    let (account, models) = tokio::join!(
+        request::<GetAccountResponse>(handle, |request_id| ClientRequest::GetAccount {
+            request_id,
+            params: GetAccountParams {
+                refresh_token: false
+            },
+        }),
+        request::<ModelListResponse>(handle, |request_id| ClientRequest::ModelList {
+            request_id,
+            params: ModelListParams {
+                cursor: None,
+                limit: None,
+                include_hidden: Some(true)
+            },
+        }),
+    );
+    let eligible = provider == "openai"
+        && matches!(
+            account.ok().and_then(|response| response.account),
+            Some(Account::Chatgpt { .. })
+        );
+    let models = models
+        .map(|response| {
+            response
+                .data
+                .into_iter()
+                .map(crate::app_server_session::model_preset_from_api_model)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    crate::daybreak::program_for_turn(&models, model, eligible, enabled)
+        .map(|program| program.map(Into::into))
 }
 
 fn thread_summary(thread: &Thread) -> Value {
@@ -1393,6 +1491,7 @@ fn turn_summary(turn: &Turn, include_outputs: bool, output_chars: usize) -> Valu
                 kind,
                 agent_thread_id,
                 agent_path,
+                ..
             } => json!({
                 "type": "subAgentActivity", "id": id, "kind": kind,
                 "agentThreadId": agent_thread_id, "agentPath": agent_path

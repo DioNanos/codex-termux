@@ -1,11 +1,15 @@
 //! Managed app-server lifecycle, serialized across CLI invocations and the updater.
 
 mod backend;
+mod background_command;
 #[cfg(windows)]
 pub use backend::windows::DetachedLaunchRestricted;
 #[cfg(windows)]
+pub use backend::windows::is_elevated;
+#[cfg(windows)]
 use backend::windows::try_lock_file;
 mod client;
+mod diagnostics;
 mod install_lock;
 mod launch;
 pub use launch::restart_with_features;
@@ -569,7 +573,10 @@ impl Daemon {
                 mode
             };
             match restart_decision(mode, info.as_ref(), managed_version.as_deref()) {
-                RestartDecision::NotReady => return Ok(RestartIfRunningOutcome::NotReady),
+                RestartDecision::NotReady => {
+                    diagnostics::event("daemon_not_ready", ());
+                    return Ok(RestartIfRunningOutcome::NotReady);
+                }
                 RestartDecision::AlreadyCurrent => RestartIfRunningOutcome::AlreadyCurrent,
                 RestartDecision::Restart => {
                     #[cfg(windows)]
@@ -579,13 +586,29 @@ impl Daemon {
                             "warning: failed to clear stale daemon recovery before update: {err}"
                         );
                     }
-                    backend
-                        .stop_with_grace(settings.shutdown_grace_seconds)
-                        .await?;
-                    let _ = self
-                        .start_managed_backend_with_bin(&settings, managed_codex_bin)
-                        .await?;
-                    self.wait_until_ready().await?;
+                    diagnostics::event(
+                        "restart_requested",
+                        serde_json::json!({
+                                "shutdownGraceSeconds": settings.shutdown_grace_seconds,
+                        }),
+                    );
+                    let started = std::time::Instant::now();
+                    diagnostics::result(
+                        "shutdown",
+                        started,
+                        backend
+                            .stop_with_grace(settings.shutdown_grace_seconds)
+                            .await,
+                    )?;
+                    let started = std::time::Instant::now();
+                    diagnostics::result(
+                        "replacement_launch",
+                        started,
+                        self.start_managed_backend_with_bin(&settings, managed_codex_bin)
+                            .await,
+                    )?;
+                    let started = std::time::Instant::now();
+                    diagnostics::result("readiness", started, self.wait_until_ready().await)?;
                     RestartIfRunningOutcome::Restarted
                 }
             }
@@ -594,6 +617,7 @@ impl Daemon {
                 "app server is running but is not managed by codex app-server daemon"
             ));
         } else {
+            diagnostics::event("daemon_not_running", ());
             RestartIfRunningOutcome::NotRunning
         };
 
@@ -611,6 +635,12 @@ impl Daemon {
 
     async fn stop(&self) -> Result<LifecycleOutput> {
         let settings = DaemonSettings::load_for_stop(&self.settings_file).await;
+        // The fork has no standalone channel to keep installing from while
+        // the daemon is stopped, and its updater can never install anything:
+        // stopping the daemon must also stop the update loop.
+        backend::pid_update_loop_backend(self.backend_paths(&settings))
+            .stop()
+            .await?;
         if let Some(backend) = self.running_backend_instance(&settings).await? {
             backend
                 .stop_with_grace(settings.shutdown_grace_seconds)
@@ -1406,19 +1436,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn managed_local_backend_counts_as_bootstrapped_without_updater() {
-        use std::os::unix::fs::PermissionsExt;
-
         let home = TempDir::new().expect("home");
         let standalone = home.path().join("packages/standalone");
         let local_bin = standalone.join("local-main/bin/codex");
         tokio::fs::create_dir_all(local_bin.parent().expect("bin parent"))
             .await
             .expect("local bin directory");
-        tokio::fs::write(&local_bin, b"#!/bin/sh\nexec sleep 30\n")
-            .await
+        codex_utils_cargo_bin::write_executable(&local_bin, "#!/bin/sh\nexec sleep 30\n")
             .expect("local bin");
-        std::fs::set_permissions(&local_bin, std::fs::Permissions::from_mode(0o755))
-            .expect("executable local bin");
         std::os::unix::fs::symlink("local-main", standalone.join("current"))
             .expect("current local build");
         let state = home.path().join("app-server-daemon");

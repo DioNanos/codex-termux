@@ -172,6 +172,7 @@ use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::request_permissions::PermissionGrantScope as CorePermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionsResponse as CoreRequestPermissionsResponse;
+use codex_utils_path_uri::PathUri;
 use sha1::Digest;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1201,15 +1202,17 @@ impl AnalyticsReducer {
         thread_state
             .originator
             .get_or_insert_with(|| input.product_client_id.clone());
-        thread_state
-            .metadata
-            .get_or_insert_with(|| ThreadMetadataState {
+        if thread_state.metadata.is_none()
+            || matches!(input.initialization_mode, ThreadInitializationMode::Resumed)
+        {
+            thread_state.metadata = Some(ThreadMetadataState {
                 session_id: input.session_id.clone(),
                 thread_source: input.thread_source.clone(),
-                initialization_mode: ThreadInitializationMode::New,
+                initialization_mode: input.initialization_mode,
                 subagent_source: Some(subagent_source_name(&input.subagent_source)),
                 parent_thread_id,
             });
+        }
         if thread_state.connection_id.is_none() {
             thread_state.connection_id = parent_connection_id;
         }
@@ -1354,7 +1357,10 @@ impl AnalyticsReducer {
                         SkillScope::System => "system",
                         SkillScope::Admin => "admin",
                     };
-                    let repo_root = get_git_repo_root(path.as_path());
+                    let repo_root = path
+                        .to_abs_path()
+                        .ok()
+                        .and_then(|path| get_git_repo_root(path.as_path()));
                     let repo_url = if let Some(root) = repo_root.as_ref() {
                         get_git_origin_url(root).await
                     } else {
@@ -1363,7 +1369,7 @@ impl AnalyticsReducer {
                     let skill_id = skill_id_for_local_skill(
                         repo_url.as_ref().map(SanitizedGitUrl::as_str),
                         repo_root.as_deref(),
-                        path.as_path(),
+                        &path,
                         invocation.skill_name.as_str(),
                     );
                     (skill_id, Some(skill_scope.to_string()))
@@ -3652,6 +3658,7 @@ fn codex_turn_event_params(
         approval_policy,
         approvals_reviewer,
         guardian_v2_enabled,
+        multi_agent_version,
         sandbox_network_access,
         collaboration_mode,
         personality,
@@ -3667,6 +3674,7 @@ fn codex_turn_event_params(
         after_last_sampling_ms,
         sampling_request_count,
         sampling_retry_count,
+        tools_change_count,
     } = profile;
     let token_usage = turn_state.token_usage.clone();
     let codex_error = turn_state.codex_error.as_ref();
@@ -3701,6 +3709,7 @@ fn codex_turn_event_params(
         approval_policy: approval_policy.to_string(),
         approvals_reviewer: approvals_reviewer.to_string(),
         guardian_v2_enabled,
+        multi_agent_version,
         sandbox_network_access,
         collaboration_mode: Some(collaboration_mode_mode(collaboration_mode)),
         personality: personality_mode(personality),
@@ -3750,6 +3759,7 @@ fn codex_turn_event_params(
         after_last_sampling_ms,
         sampling_request_count,
         sampling_retry_count,
+        tools_change_count,
         duration_ms: completed.duration_ms,
         started_at,
         completed_at: Some(completed.completed_at),
@@ -3829,7 +3839,7 @@ fn rejection_reason_from_error_type(
 pub(crate) fn skill_id_for_local_skill(
     repo_url: Option<&str>,
     repo_root: Option<&Path>,
-    skill_path: &Path,
+    skill_path: &PathUri,
     skill_name: &str,
 ) -> String {
     let path = normalize_path_for_skill_id(repo_url, repo_root, skill_path);
@@ -3851,10 +3861,14 @@ pub(crate) fn skill_id_for_local_skill(
 pub(crate) fn normalize_path_for_skill_id(
     repo_url: Option<&str>,
     repo_root: Option<&Path>,
-    skill_path: &Path,
+    skill_path: &PathUri,
 ) -> String {
+    // Foreign paths have no host repository to inspect; retain their native spelling for telemetry.
+    let Ok(skill_path) = skill_path.to_abs_path() else {
+        return skill_path.inferred_native_path_string().replace('\\', "/");
+    };
     let resolved_path =
-        std::fs::canonicalize(skill_path).unwrap_or_else(|_| skill_path.to_path_buf());
+        std::fs::canonicalize(skill_path.as_path()).unwrap_or_else(|_| skill_path.to_path_buf());
     match (repo_url, repo_root) {
         (Some(_), Some(root)) => {
             let resolved_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());

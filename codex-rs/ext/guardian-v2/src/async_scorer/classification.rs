@@ -39,6 +39,8 @@ use codex_protocol::security_risk::SecurityRiskScore;
 
 use super::authorization::ScoreAuthorization;
 use super::config::GuardianV2Config;
+use super::conversation::ConversationRequest;
+use super::conversation::Reservation;
 use super::metrics::record_classification;
 use super::metrics::record_classification_risk;
 use super::metrics::sampler_failure_reason;
@@ -46,14 +48,18 @@ use super::sampler::LunaSampler;
 use super::sampler::LunaSamplerError;
 use super::sampler::LunaSamplingRequest;
 use super::score::GuardianV2ScoreProgress;
+use super::transcript::CollectedTranscript;
 use super::transcript::ContextInput;
 use super::truncation::ClassificationTruncations;
 use super::trusted_skills::TrustedSkillInvocations;
 use super::trusted_tools::trusted_tool_context;
+use codex_guardian_context::ComposedContext;
 
 pub(super) struct Classification {
+    pub(super) reservation: Option<Reservation>,
     pub(super) classification_started_at: Instant,
     pub(super) sampler: Arc<LunaSampler>,
+    pub(super) decisions_sampler: Option<Arc<super::decisions::DecisionsSampler>>,
     pub(super) guardian_config: GuardianV2Config,
     pub(super) score_progress: Arc<GuardianV2ScoreProgress>,
     pub(super) parent_model: Option<Arc<ModelInfo>>,
@@ -86,6 +92,14 @@ pub(super) struct Classification {
     pub(super) score_authorization: ScoreAuthorization,
 }
 
+enum ClassificationContext {
+    Snapshot(ComposedContext),
+    Conversation {
+        evidence: CollectedTranscript,
+        reservation: Reservation,
+    },
+}
+
 enum ClassificationOutcome {
     Scored,
     Superseded,
@@ -94,8 +108,10 @@ enum ClassificationOutcome {
 impl Classification {
     pub(super) async fn run(self) {
         let Self {
+            reservation,
             classification_started_at,
             sampler,
+            decisions_sampler,
             guardian_config,
             score_progress,
             parent_model,
@@ -127,6 +143,9 @@ impl Classification {
             root_snapshot,
             score_authorization,
         } = self;
+        let generation = reservation
+            .as_ref()
+            .map(|reservation| reservation.generation.clone());
         let mut truncations = ClassificationTruncations::default();
         let trusted_tool_context = match mcp_tool.as_ref() {
             Some(tool) => {
@@ -180,19 +199,22 @@ impl Classification {
                     && review.root_review_context_revision == root_review_context_revision
             })
             .map(|review| {
-                let review = render_review_evidence(ReviewEvidence {
+                let rendered = render_review_evidence(ReviewEvidence {
                     correlation: &review.correlation,
                     decision: &review.decision,
                     action: &review.action,
                     rationale: review.rationale.as_deref(),
                 });
-                truncations.extend(review.truncations);
-                GuardianReviewEvidenceFragment::new(review.body).render()
+                truncations.extend(rendered.truncations);
+                codex_guardian_context::PreviousReview {
+                    id: review.delivery_id.clone(),
+                    fragment: GuardianReviewEvidenceFragment::new(rendered.body).render(),
+                }
             })
             .collect::<Vec<_>>();
         let transcript =
             PreviousReviews::try_from_fragments(review_fragments).and_then(|reviews| {
-                guardian_config.transcript.build_context(ContextInput {
+                let context_input = ContextInput {
                     target: ContextTarget::Async,
                     history: history.as_ref(),
                     root_conversation: root_conversation.as_deref().unwrap_or_default(),
@@ -203,7 +225,20 @@ impl Classification {
                     trusted_tool: trusted_tool_context.as_ref(),
                     trusted_skill_paths: &trusted_skill_paths,
                     node_repl_images: Some(&node_repl_images),
-                })
+                };
+                match reservation {
+                    Some(reservation) => guardian_config
+                        .transcript
+                        .collect_context(context_input)
+                        .map(|evidence| ClassificationContext::Conversation {
+                            evidence,
+                            reservation,
+                        }),
+                    None => guardian_config
+                        .transcript
+                        .build_context(context_input)
+                        .map(ClassificationContext::Snapshot),
+                }
             });
         let mut transcript = match transcript {
             Ok(transcript) => transcript,
@@ -211,6 +246,7 @@ impl Classification {
                 score_progress.fail_closed(sampled_at);
                 record_classification(
                     metrics.as_deref(),
+                    context_mode,
                     classification_started_at.elapsed(),
                     "failure",
                     Some("context_build_error"),
@@ -225,24 +261,12 @@ impl Classification {
         };
         drop(history);
         drop(node_repl_images);
-        truncations.extend(std::mem::take(&mut transcript.truncations));
-        if let Some(metrics) = metrics.as_deref() {
-            for (section, cost) in transcript.section_costs() {
-                for (measurement, value) in cost.measurements() {
-                    metrics.histogram_with_boundaries(
-                        codex_guardian_context::SECTION_COST_METRIC,
-                        i64::try_from(value).unwrap_or(i64::MAX),
-                        codex_guardian_context::SECTION_COST_BOUNDARIES,
-                        &[
-                            ("target", "async"),
-                            ("section", section),
-                            ("measurement", measurement),
-                        ],
-                    );
-                }
-            }
+        if let ClassificationContext::Snapshot(context) = &mut transcript {
+            truncations.extend(std::mem::take(&mut context.truncations));
+            super::metrics::record_section_costs(metrics.as_deref(), context.section_costs());
         }
-        let classification_input = transcript.into_messages();
+        let mut decisions_task = None;
+        let mut responses_duration = None;
         let mut failure_reason = "invalid_output";
         let mut classification_risk = None;
         let mut classification_finished_at = None;
@@ -274,19 +298,68 @@ impl Classification {
             let policy = config.resolve_guardian_policy(model_messages);
             let extra_policy = config.guardian_extra_policy.as_deref().unwrap_or_default();
             let instructions = guardian_config.render_classifier_instructions(policy, extra_policy);
-            let output = match sampler
-                .sample(LunaSamplingRequest {
-                    parent_response_id,
-                    instructions,
-                    input: classification_input,
-                    parent_compaction,
-                    parent_compaction_hash,
-                    reasoning_effort: guardian_config.reasoning_effort.clone(),
-                    parent_turn_id: turn_id.clone(),
-                    root_turn_id,
-                })
-                .await
-            {
+            let mut sampling = LunaSamplingRequest {
+                parent_response_id,
+                instructions,
+                input: Vec::new(),
+                parent_compaction,
+                parent_compaction_hash,
+                reasoning_effort: guardian_config.reasoning_effort.clone(),
+                parent_turn_id: turn_id.clone(),
+                root_turn_id,
+            };
+            let result = match transcript {
+                ClassificationContext::Snapshot(context) => {
+                    sampling.input = context.into_messages();
+                    if let Some(decisions_sampler) = decisions_sampler.as_ref() {
+                        decisions_task =
+                            Some(decisions_sampler.spawn(&sampling, sampler.max_input_tokens()));
+                    } else if config
+                        .features
+                        .enabled(codex_features::Feature::GuardianV2DecisionsComparison)
+                    {
+                        super::metrics::record_decisions_comparison_outcome(
+                            metrics.as_deref(),
+                            "skipped",
+                            "not_initialized",
+                        );
+                    }
+                    let sampling_started = Instant::now();
+                    let result = sampler.sample(sampling).await;
+                    responses_duration = Some(sampling_started.elapsed());
+                    result
+                }
+
+                ClassificationContext::Conversation {
+                    evidence,
+                    reservation,
+                } => {
+                    // The retained prefix is owned by the conversation backend, not this snapshot.
+                    if config
+                        .features
+                        .enabled(codex_features::Feature::GuardianV2DecisionsComparison)
+                    {
+                        super::metrics::record_decisions_comparison_outcome(
+                            metrics.as_deref(),
+                            "skipped",
+                            "unsupported_evidence",
+                        );
+                    }
+                    let (ready, score) = tokio::sync::oneshot::channel();
+                    reservation.submit(ConversationRequest {
+                        evidence,
+                        sampling,
+                        reset_token_limit: guardian_config
+                            .async_classifier_conversation_token_limit,
+                        ready,
+                        authorization: score_authorization.clone(),
+                        thread: Arc::clone(&thread),
+                        metrics: metrics.clone(),
+                    });
+                    score.await.unwrap_or(Err(LunaSamplerError::Superseded))
+                }
+            };
+            let output = match result {
                 Ok(output) => output,
                 Err(LunaSamplerError::Superseded) => {
                     return Ok(ClassificationOutcome::Superseded);
@@ -311,8 +384,10 @@ impl Classification {
                 ),
                 sampled_at: Some(sampled_at.into()),
             };
-            if score_authorization
-                != ScoreAuthorization::current(&thread, &score_authorization.permissions).await
+            if !score_authorization.is_current(&thread).await
+                || generation
+                    .as_ref()
+                    .is_some_and(|generation| generation.strong_count() == 0)
             {
                 return Ok(ClassificationOutcome::Superseded);
             }
@@ -364,6 +439,7 @@ impl Classification {
         };
         record_classification(
             metrics.as_deref(),
+            context_mode,
             duration,
             outcome,
             result.is_err().then_some(failure_reason),
@@ -376,6 +452,7 @@ impl Classification {
                 model: parent_model.as_ref().map(|model| model.slug.clone()),
                 occurred_at_ms: codex_analytics::now_unix_millis(),
                 kind: GuardianV2EventKind::Classification {
+                    guardian_context_mode: context_mode.as_str(),
                     outcome,
                     risk_level: classification_risk,
                     duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
@@ -385,12 +462,50 @@ impl Classification {
         if matches!(result, Ok(ClassificationOutcome::Scored)) {
             truncations.emit(metrics.as_deref());
         }
+        if matches!(result, Ok(ClassificationOutcome::Superseded))
+            && let Some(task) = decisions_task.take()
+        {
+            drop(task);
+            super::metrics::record_decisions_comparison_outcome(
+                metrics.as_deref(),
+                "skipped",
+                "superseded",
+            );
+        }
+        // Only compare against a score accepted by the authoritative publication path.
+        let baseline_risk = if matches!(result, Ok(ClassificationOutcome::Scored)) {
+            classification_risk
+        } else {
+            None
+        };
         if let Err(error) = result {
             event_sink.emit_warning(ExtensionWarning {
                 thread_id,
                 turn_id: Some(turn_id),
                 message: format!("Guardian V2 risk scoring failed: {error}"),
             });
+        }
+        if let Some(decisions_task) = decisions_task {
+            super::metrics::record_decisions_comparison(
+                decisions_task.finish().await,
+                baseline_risk.zip(responses_duration),
+                metrics.as_deref(),
+            );
+        } else if config
+            .features
+            .enabled(codex_features::Feature::GuardianV2DecisionsComparison)
+            && let Some(risk) = baseline_risk
+            && let Some(metrics) = metrics.as_deref()
+        {
+            metrics.counter(
+                "codex.guardian_v2.decisions_comparison.comparison",
+                /*inc*/ 1,
+                &[
+                    ("comparison", "unavailable"),
+                    ("responses", risk),
+                    ("decisions", "unavailable"),
+                ],
+            );
         }
     }
 }

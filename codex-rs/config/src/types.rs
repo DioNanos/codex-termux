@@ -3,6 +3,7 @@
 // Note this file should generally be restricted to simple struct/enum
 // definitions that do not contain business logic.
 
+pub use crate::mcp_ema::McpEmaAuthScope;
 pub use crate::mcp_ema::McpEnterpriseManagedAuthConfig;
 pub use crate::mcp_ema::McpServerIdpOAuthConfig;
 pub use crate::mcp_types::AppToolApproval;
@@ -64,6 +65,26 @@ const MAX_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize = 128;
 
 const fn default_enabled() -> bool {
     true
+}
+
+/// Last selected grouping in Agent Command Center.
+#[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentsOverviewGrouping {
+    #[default]
+    Project,
+    Status,
+    Model,
+}
+
+impl AgentsOverviewGrouping {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Status => "status",
+            Self::Model => "model",
+        }
+    }
 }
 
 /// Preferred layout for the resume/fork session picker.
@@ -860,6 +881,12 @@ pub struct Tui {
     #[serde(default = "default_true")]
     pub fullscreen_transcript: bool,
 
+    /// Mouse wheel speed multiplier for transcript scrolling, based on one row per event.
+    /// Defaults to `1.0`. Positive fractional values slow scrolling; values above `1.0` speed it up.
+    #[serde(default, deserialize_with = "crate::tui_mouse_scroll::deserialize")]
+    #[schemars(schema_with = "crate::tui_mouse_scroll::schema")]
+    pub mouse_scroll_speed: Option<f64>,
+
     /// Copy selected transcript text when the mouse button is released.
     /// Defaults to `auto`: enabled except in direct terminals known to forward their native
     /// copy shortcut (Ghostty 1.2+, Kitty on macOS, Windows Terminal, and VS Code on Windows).
@@ -924,6 +951,10 @@ pub struct Tui {
     /// Preferred layout for resume/fork session picker results.
     #[serde(default)]
     pub session_picker_view: Option<SessionPickerViewMode>,
+
+    /// Last selected grouping in Agent Command Center.
+    #[serde(default)]
+    pub agents_overview_grouping: AgentsOverviewGrouping,
 
     /// Working directory to use when resuming or forking a session.
     /// When unset, prompt if the current and session directories differ.
@@ -1021,9 +1052,15 @@ pub struct PluginMcpServerConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
-    /// Host-configured EMA registration; the plugin still owns its endpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ema_auth: Option<PluginMcpServerEmaAuthConfig>,
+    /// Retired EMA overlays must disable the server instead of losing their auth policy.
+    #[serde(
+        default,
+        rename = "ema_auth",
+        deserialize_with = "unsupported_plugin_ema_auth",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    #[schemars(skip)]
+    pub has_unsupported_ema_auth: bool,
 
     /// Approval mode for tools in this server unless a tool override exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1046,7 +1083,7 @@ impl Default for PluginMcpServerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            ema_auth: None,
+            has_unsupported_ema_auth: false,
             default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
@@ -1055,46 +1092,11 @@ impl Default for PluginMcpServerConfig {
     }
 }
 
-/// Resource registration applied through an existing per-plugin policy overlay.
-/// The enterprise IdP is selected separately by trusted host configuration.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct PluginMcpServerEmaAuthConfig {
-    /// Exact plugin endpoint approved by the host; never overrides the declaration.
-    pub url: String,
-    pub client_id: String,
-    pub authorization_server_issuer: String,
-    #[serde(default)]
-    pub scopes: Vec<String>,
-    pub resource: String,
-}
-
-impl PluginMcpServerEmaAuthConfig {
-    pub fn apply(&self, server: &mut McpServerConfig) {
-        let registration_error = if self.resource.trim().is_empty() {
-            Some("plugin EMA registration requires a resource")
-        } else if !server.matches_requirement(&crate::McpServerRequirement::Identity {
-            identity: crate::McpServerIdentity::Url {
-                url: self.url.clone(),
-            },
-        }) {
-            Some("plugin endpoint does not match its EMA registration")
-        } else {
-            None
-        };
-        if registration_error.is_some() && server.enabled {
-            server.enabled = false;
-            server.disabled_reason = Some(crate::McpServerDisabledReason::EmaRegistration);
-        }
-        server.auth = McpServerAuth::EmaAuth;
-        let oauth = server.oauth.get_or_insert_default();
-        oauth.client_id = Some(self.client_id.clone());
-        oauth.authorization_server_issuer = Some(self.authorization_server_issuer.clone());
-        server.scopes = Some(self.scopes.clone());
-        oauth.ema_registration = None;
-        oauth.ema_registration_error = registration_error;
-        server.oauth_resource = Some(self.resource.clone());
-    }
+fn unsupported_plugin_ema_auth<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]

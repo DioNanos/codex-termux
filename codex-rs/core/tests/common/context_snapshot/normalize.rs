@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::sync::OnceLock;
 
 const GUARDIAN_INSTRUCTIONS_PREFIX: &str = "You are judging one planned coding-agent action.";
+const GUARDIAN_PROVENANCE_PREFIX: &str = "# Transcript provenance\n";
 
 #[derive(Clone, Copy)]
 pub(super) enum TextSource<'a> {
@@ -297,11 +298,13 @@ fn known_segment_name(text: &str, source: TextSource<'_>) -> Option<String> {
     let prefixes: &[(&str, &str)] = match source {
         TextSource::ModelInstructions => &[
             (GUARDIAN_INSTRUCTIONS_PREFIX, "GUARDIAN_INSTRUCTIONS"),
+            (GUARDIAN_PROVENANCE_PREFIX, "GUARDIAN_INSTRUCTIONS"),
             ("", "MODEL_INSTRUCTIONS"),
         ],
-        TextSource::Message("developer") => {
-            &[(GUARDIAN_INSTRUCTIONS_PREFIX, "GUARDIAN_INSTRUCTIONS")]
-        }
+        TextSource::Message("developer") => &[
+            (GUARDIAN_INSTRUCTIONS_PREFIX, "GUARDIAN_INSTRUCTIONS"),
+            (GUARDIAN_PROVENANCE_PREFIX, "GUARDIAN_INSTRUCTIONS"),
+        ],
         TextSource::Message("user") => &[
             ("# AGENTS.md instructions", "AGENTS_MD"),
             (
@@ -330,6 +333,7 @@ fn known_segment_name(text: &str, source: TextSource<'_>) -> Option<String> {
                 | "collaboration_mode"
                 | "multi_agent_role"
                 | "multi_agent_mode"
+                | "model_catalog"
                 | "apps_instructions"
                 | "skills_instructions"
                 | "plugins_instructions"
@@ -496,13 +500,21 @@ pub(super) fn portable_tool_schema(tool: &Value) -> Value {
     if definition.get("name").and_then(Value::as_str) != Some("exec_command") {
         return stable;
     }
-    if let Some(Value::String(description)) = definition.get_mut("description")
-        && description.strip_prefix(BASE).is_some_and(|rest| {
-            rest.starts_with("\n\nWindows safety rules:")
-                && fnv1a(normalize_line_endings(rest).as_bytes()) == WINDOWS_SAFETY_SUFFIX_HASH
-        })
-    {
-        *description = BASE.to_string();
+    if let Some(Value::String(description)) = definition.get_mut("description") {
+        if let Some(rest) = description.strip_prefix(BASE) {
+            let suffix = rest
+                .split_once("\n\nexec tool declaration:")
+                .map_or(rest, |(suffix, _)| suffix);
+            if suffix.starts_with("\n\nWindows safety rules:")
+                && fnv1a(normalize_line_endings(suffix).as_bytes()) == WINDOWS_SAFETY_SUFFIX_HASH
+            {
+                *description = format!("{BASE}{}", &rest[suffix.len()..]);
+            }
+        }
+        *description = description.replace(
+            &format!("  // {WINDOWS_WAIT}"),
+            &format!("  // {UNIX_WAIT}"),
+        );
     }
     if let Some(Value::String(wait)) =
         definition.pointer_mut("/parameters/properties/yield_time_ms/description")

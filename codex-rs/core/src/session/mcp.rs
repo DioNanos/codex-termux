@@ -2,6 +2,7 @@ use super::mcp_refresh::McpRefreshInvalidationGuard;
 use super::*;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::environment_selection::combine_selected_capability_roots;
+use crate::mcp_tool_call::McpToolApprovalContext;
 use codex_exec_server::ExecutorCapabilityDiscoveryCache;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
 use codex_exec_server::MAX_SELECTED_CAPABILITY_ROOTS;
@@ -11,6 +12,7 @@ use codex_mcp::ElicitationReviewRequest;
 use codex_mcp::ElicitationReviewer;
 use codex_mcp::ElicitationReviewerHandle;
 use codex_mcp::MCP_TOOL_CODEX_APPS_META_KEY;
+use codex_otel::auth_storage::AuthStorageOriginator;
 use codex_prompts::ResolvedModelMessages;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -343,7 +345,9 @@ impl Session {
             input.mcp_servers.contains_key(CODEX_APPS_MCP_SERVER_NAME),
             "unknown MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"
         );
-        let refreshed = self.services.mcp_runtime.replace_fresh(input).await;
+        let refreshed = AuthStorageOriginator::from_client_name(&desired.originator)
+            .scope(self.services.mcp_runtime.replace_fresh(input))
+            .await;
         self.services.thread_extension_data.insert(selected_plugins);
         refreshed
     }
@@ -375,11 +379,14 @@ impl Session {
             self.mark_mcp_runtime_dirty();
         }
 
-        let recovered_oauth_servers = self
-            .services
-            .mcp_runtime
-            .updated_oauth_credentials_after_auth_failure()
-            .await;
+        let recovered_oauth_servers =
+            AuthStorageOriginator::from_client_name(&turn_context.originator)
+                .scope(
+                    self.services
+                        .mcp_runtime
+                        .updated_oauth_credentials_after_auth_failure(),
+                )
+                .await;
         if !recovered_oauth_servers.is_empty()
             && let Ok(_refresh) = self.mcp_refresh.acquire().await
             && self
@@ -419,12 +426,6 @@ impl Session {
         ready_selected_capability_roots: &[SelectedCapabilityRoot],
         environments: &TurnEnvironmentSnapshot,
     ) -> Option<Arc<ExecutorCapabilityDiscoverySnapshot>> {
-        // Capability roots can currently be selected independently of turn environments, so a
-        // root may be ready when there is no primary `TurnEnvironment`. Keep using the thread
-        // policy in that case so restricted discovery fails closed below. Once every selected
-        // root belongs to a thread/environment attachment whose `EnvironmentConfig` is installed
-        // before the root becomes ready, discovery can use the root owner's policy and this
-        // fallback can be removed.
         let restricted_file_system = environments.primary().map_or_else(
             || {
                 !config
@@ -499,12 +500,14 @@ impl Session {
         &self,
         environments: &TurnEnvironmentSnapshot,
     ) -> Vec<ResolvedSelectedCapabilityRoot> {
-        let thread_root_count = self.services.selected_capability_roots.len();
+        let captured_environments = environments.captured_environments();
+        let thread_roots = environments.selected_capability_roots();
+        let thread_root_count = thread_roots.len();
         let mut root_locations_by_id = HashMap::new();
         let mut selected_capability_roots = Vec::new();
         let mut ready_environment_root_count = 0;
         let combined_roots = combine_selected_capability_roots(
-            &self.services.selected_capability_roots,
+            &thread_roots,
             environments.turn_environments().map(|environment| {
                 (
                     environment.config_origin,
@@ -515,6 +518,16 @@ impl Session {
             }),
         );
         for (index, root) in combined_roots.into_iter().enumerate() {
+            let CapabilityRootLocation::Environment { environment_id, .. } = &root.location;
+            // Filter before readiness resolution, which can reconnect a historical executor.
+            if !captured_environments.contains_key(environment_id) {
+                tracing::warn!(
+                    root_id = root.id,
+                    environment_id,
+                    "ignoring capability root without a captured turn environment"
+                );
+                continue;
+            }
             if let Some(kept_location) = root_locations_by_id.get(&root.id) {
                 if kept_location != &root.location {
                     tracing::warn!(
@@ -542,10 +555,7 @@ impl Session {
         self.services
             .turn_environments
             .environment_manager()
-            .resolve_selected_capability_roots(
-                &selected_capability_roots,
-                &environments.captured_environments(),
-            )
+            .resolve_selected_capability_roots(&selected_capability_roots, &captured_environments)
             .await
     }
 
@@ -816,9 +826,14 @@ async fn review_guardian_mcp_elicitation(
             _ => meta.get("callId"),
         })
         .and_then(Value::as_str);
+    let approval_context = call_id
+        .and_then(|call_id| session.mcp_tool_approval_metadata(&request.server_name, call_id));
     let (originating_call_id, guardian_scope) = if let Some(call_id) = call_id
-        && let Some((Some(invocation), metadata)) =
-            session.mcp_tool_approval_metadata(&request.server_name, call_id)
+        && let Some(McpToolApprovalContext {
+            invocation: Some(invocation),
+            metadata,
+            ..
+        }) = approval_context.as_ref()
         && invocation.server == request.server_name
         && is_node_repl_backed_connector(&invocation.server, metadata.connector_id.as_deref())
     {
@@ -835,7 +850,12 @@ async fn review_guardian_mcp_elicitation(
         Some(Value::Bool(true))
     );
 
-    let mut review_context = crate::guardian::GuardianReviewContext::from(&turn_context);
+    // Bind the review to the issuing step, which may include environments that
+    // became ready after the turn started. Do not refresh an in-flight action.
+    let mut review_context = approval_context
+        .as_ref()
+        .map(|context| context.review_context.clone())
+        .unwrap_or_else(|| crate::guardian::GuardianReviewContext::from(&turn_context));
     let strict_auto_review = matches!(
         request
             .elicitation
@@ -850,18 +870,14 @@ async fn review_guardian_mcp_elicitation(
         let review_outer_invocation =
             request.server_name == CODEX_APPS_MCP_SERVER_NAME && originating_call_id.is_none();
         let trusted_guardian_request = if review_outer_invocation {
-            let Some(call_id) = request
-                .elicitation
-                .meta()
-                .and_then(|meta| meta.get(MCP_TOOL_CODEX_APPS_META_KEY))
-                .and_then(Value::as_object)
-                .and_then(|meta| meta.get("call_id"))
-                .and_then(Value::as_str)
-            else {
+            let Some(call_id) = call_id else {
                 return Ok(None);
             };
-            let Some((Some(invocation), metadata)) =
-                session.mcp_tool_approval_metadata(&request.server_name, call_id)
+            let Some(McpToolApprovalContext {
+                invocation: Some(invocation),
+                metadata,
+                ..
+            }) = approval_context.as_ref()
             else {
                 return Ok(None);
             };
@@ -878,8 +894,8 @@ async fn review_guardian_mcp_elicitation(
             Some(
                 crate::mcp_tool_call::build_guardian_mcp_tool_review_request(
                     call_id,
-                    &invocation,
-                    Some(&metadata),
+                    invocation,
+                    Some(metadata),
                 ),
             )
         } else {

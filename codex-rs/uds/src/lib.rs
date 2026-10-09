@@ -6,6 +6,8 @@ mod daemon_directory;
 pub use daemon_directory::prepare_shared_daemon_socket_directory;
 #[cfg(unix)]
 pub use daemon_directory::shared_daemon_socket_directory;
+#[cfg(unix)]
+pub use platform::unix_socket_path_limit;
 
 use std::io::Result as IoResult;
 use std::path::Path;
@@ -153,8 +155,42 @@ mod platform {
         Ok(())
     }
 
+    /// Maximum path length a Unix domain socket can use on this platform:
+    /// `sockaddr_un::sun_path` minus the terminating NUL byte.
+    pub fn unix_socket_path_limit() -> usize {
+        // SAFETY: `sockaddr_un` is a plain old data struct, so an all-zero
+        // instance is a valid value used only to read the array capacity.
+        let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_path.len() - 1
+    }
+
     pub(super) async fn bind_listener(socket_path: &Path) -> IoResult<Listener> {
+        validate_socket_path(socket_path)?;
         UnixListener::bind(socket_path).map(Listener)
+    }
+
+    /// Reject paths that cannot fit `sockaddr_un.sun_path` with an error that
+    /// names both the path and the platform limit, instead of surfacing the
+    /// bare "path must be shorter than SUN_LEN" from the standard library.
+    /// A long home directory (which lengthens CODEX_HOME-derived sockets)
+    /// otherwise produces an unexplained startup failure.
+    fn validate_socket_path(socket_path: &Path) -> IoResult<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let limit = unix_socket_path_limit();
+        let length = socket_path.as_os_str().as_bytes().len();
+        if length > limit {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "unix socket path {} is {} bytes long, but sockaddr_un.sun_path \
+                     on this platform holds at most {limit} bytes",
+                    socket_path.display(),
+                    length
+                ),
+            ));
+        }
+        Ok(())
     }
 
     impl Listener {

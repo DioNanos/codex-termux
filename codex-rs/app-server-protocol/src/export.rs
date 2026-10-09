@@ -1366,6 +1366,11 @@ where
             strip_v1_server_notification_variants_from_json_schema(&mut schema_value);
             add_server_notification_emitted_at_to_json_schema(&mut schema_value)?;
         }
+        if let Some(Value::Object(error_schema)) =
+            schema_value.pointer_mut("/definitions/CodexErrorInfo")
+        {
+            keep_enum_open_ended(error_schema);
+        }
         enforce_numbered_definition_collision_overrides(file_stem, &mut schema_value);
         annotate_schema(&mut schema_value, Some(file_stem));
     }
@@ -1395,6 +1400,13 @@ where
         logical_name: logical_name.to_string(),
         value: schema_value,
     })
+}
+
+fn keep_enum_open_ended(schema: &mut Map<String, Value>) {
+    if let Some(Value::Array(mut variants)) = schema.remove("oneOf") {
+        variants.push(serde_json::json!({ "type": ["string", "object"] }));
+        schema.insert("anyOf".to_string(), Value::Array(variants));
+    }
 }
 
 fn add_server_notification_emitted_at_to_json_schema(schema: &mut Value) -> Result<()> {
@@ -2193,6 +2205,12 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("missing account usage response fixture"))?,
         )?;
         assert!(account_usage_response_ts.contains("threadUsage?: ThreadUsage | null"));
+        let mcp_login_completion_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("v2/McpServerOauthLoginCompletedNotification.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing MCP login completion fixture"))?,
+        )?;
+        assert!(mcp_login_completion_ts.contains("loginId?: string | null"));
         let server_request_ts = std::str::from_utf8(
             fixture_tree
                 .get(Path::new("ServerRequest.ts"))
@@ -2386,14 +2404,18 @@ mod tests {
 
                 // If the last non-whitespace before ':' is '?', then this is an
                 // optional field with a nullable type (i.e., "?: T | null").
-                // These are only allowed in *Params types, except the additive stable usage
-                // response field, which older servers omit and newer servers return as null.
-                let legacy_account_usage_response = path
+                // These are only allowed in *Params types, except additive stable fields
+                // that older servers omit and newer servers may return as null.
+                let legacy_optional_nullable_field = (path
                     == Path::new("v2/GetAccountTokenUsageResponse.ts")
-                    && field_prefix.trim() == "threadUsage?";
+                    && field_prefix.trim() == "threadUsage?")
+                    || (path == Path::new("v2/McpServerOauthLoginCompletedNotification.ts")
+                        && field_prefix.trim() == "loginId?")
+                    || (path == Path::new("v2/MisalignmentErrorDetails.ts")
+                        && field_prefix.trim() == "reviewTarget?");
                 if field_prefix.chars().rev().find(|c| !c.is_whitespace()) == Some('?')
                     && !allow_optional_nullable
-                    && !legacy_account_usage_response
+                    && !legacy_optional_nullable_field
                 {
                     let line_number =
                         contents[..abs_idx].chars().filter(|c| *c == '\n').count() + 1;

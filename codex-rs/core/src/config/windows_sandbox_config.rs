@@ -58,6 +58,9 @@ pub fn prepare_windows_sandbox_config(
     constraint: &mut ConstrainedWithSource<Option<WindowsSandboxModeToml>>,
     warnings: &mut Vec<String>,
 ) -> std::io::Result<PreparedWindowsSandboxConfig> {
+    if configured_mode == Some(WindowsSandboxModeToml::Mxc) {
+        constraint.can_set(&configured_mode)?;
+    }
     let selected_mode = configured_mode.or(match feature_level {
         WindowsSandboxLevel::Elevated => Some(WindowsSandboxModeToml::Elevated),
         WindowsSandboxLevel::RestrictedToken => Some(WindowsSandboxModeToml::Unelevated),
@@ -93,7 +96,8 @@ pub fn prepare_windows_sandbox_config(
 
 /// Managed requirements take precedence; otherwise preserve explicit
 /// feature-level or active-profile binding denials during automatic selection.
-pub(super) fn network_config_allows_mxc(
+pub(super) fn config_allows_mxc(
+    windows_sandbox_mode: &ConstrainedWithSource<Option<WindowsSandboxModeToml>>,
     permission_selection: &EffectivePermissionSelection<'_>,
     profiles_are_active: bool,
     permission_profile: Option<&PermissionProfile>,
@@ -101,6 +105,12 @@ pub(super) fn network_config_allows_mxc(
     features: Option<&FeaturesToml>,
     enable_network_proxy: bool,
 ) -> std::io::Result<bool> {
+    if windows_sandbox_mode
+        .can_set(&Some(WindowsSandboxModeToml::Mxc))
+        .is_err()
+    {
+        return Ok(false);
+    }
     let profile_local_binding = if profiles_are_active
         && permission_profile.is_none_or(profile_allows_configured_network_proxy)
         && let Some(profile) = permission_selection.selected_profile_id
@@ -110,6 +120,30 @@ pub(super) fn network_config_allows_mxc(
     } else {
         None
     };
+    Ok(windows_mxc_allowed_by_config(
+        windows_sandbox_mode,
+        network_requirements,
+        features,
+        enable_network_proxy,
+        profile_local_binding,
+    ))
+}
+
+/// Eligibility shared with remote selection after the caller resolves its active profile.
+/// Managed network requirements outrank feature and profile binding restrictions.
+pub fn windows_mxc_allowed_by_config(
+    windows_sandbox_mode: &ConstrainedWithSource<Option<WindowsSandboxModeToml>>,
+    network_requirements: Option<&Sourced<NetworkConstraints>>,
+    features: Option<&FeaturesToml>,
+    enable_network_proxy: bool,
+    profile_local_binding: Option<bool>,
+) -> bool {
+    if windows_sandbox_mode
+        .can_set(&Some(WindowsSandboxModeToml::Mxc))
+        .is_err()
+    {
+        return false;
+    }
     let allow_local_binding = network_requirements
         .and_then(|requirements| requirements.value.allow_local_binding)
         .or_else(|| {
@@ -118,7 +152,7 @@ pub(super) fn network_config_allows_mxc(
                 .and_then(|config| config.allow_local_binding)
         })
         .or(profile_local_binding);
-    Ok(allow_local_binding != Some(false))
+    allow_local_binding != Some(false)
 }
 
 #[cfg(test)]

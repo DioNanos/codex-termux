@@ -5,9 +5,12 @@ use pretty_assertions::assert_eq;
 
 #[test]
 fn delivery_preserves_arbitrary_message_boundaries_and_rejects_them_for_sync() {
-    let message = crate::PreviousReviews::try_from_fragments(vec!["host-attested review".into()])
-        .unwrap()
-        .into_message();
+    let message = crate::PreviousReviews::try_from_fragments(vec![crate::PreviousReview {
+        id: codex_protocol::ResponseItemId::new("review"),
+        fragment: "host-attested review".into(),
+    }])
+    .unwrap()
+    .into_annotated_message();
     let sections = || {
         vec![
             SectionOutput {
@@ -41,7 +44,7 @@ fn delivery_preserves_arbitrary_message_boundaries_and_rejects_them_for_sync() {
                     text: "second".into()
                 }
             ]),
-            message.clone(),
+            message.item.clone(),
             user_message(vec![ContentItem::InputText {
                 text: "third".into()
             }]),
@@ -68,7 +71,7 @@ fn long_text_and_file_image_delivery_is_lossless_bounded_and_fully_budgeted() {
     let context = ComposedContext {
         sections: vec![SectionOutput {
             id: "planned_action",
-            delivery: SectionDelivery::UserContent(vec![
+            delivery: SectionDelivery::user_content(vec![
                 Budgeted::required(ContentItem::InputText { text: text.clone() }),
                 Budgeted::required(ContentItem::InputImage {
                     image: file_image.clone(),
@@ -141,7 +144,7 @@ fn sender_restrictions_survive_budget_trimming_for_both_reviewers() {
         }
         .compose(
             presentation,
-            RenderedTranscript {
+            PreparedTranscript {
                 items: vec![Budgeted::optional(
                     crate::TranscriptContent::Text("old tool output ".repeat(/*n*/ 2_000)),
                     BudgetPriority::Tool,
@@ -174,9 +177,11 @@ fn sender_restrictions_survive_budget_trimming_for_both_reviewers() {
         };
         assert_eq!(
             items,
-            vec![Budgeted::required(ContentItem::InputText {
-                text: sender[0].clone()
-            })]
+            vec![Budgeted::required(SectionContent::Other(
+                ContentItem::InputText {
+                    text: sender[0].clone()
+                }
+            ))]
         );
         assert!(matches!(
             context.enforce_budget(

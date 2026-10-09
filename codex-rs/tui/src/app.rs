@@ -194,6 +194,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use toml::Value as TomlValue;
 use uuid::Uuid;
+mod account_status;
 mod agent_message_consolidation;
 mod agent_navigation;
 mod agent_picker;
@@ -211,12 +212,14 @@ mod activity_groups;
 mod app_server_event_targets;
 mod app_server_events;
 pub(crate) mod app_server_requests;
+mod app_server_thread_ownership;
 mod backend_banner_fallback;
 mod background_requests;
 mod composer_hints;
 mod config_persistence;
 mod connector_mentions;
 mod daemon_menu;
+mod daybreak;
 mod empty_state_policy;
 mod event_dispatch;
 mod exit_summary;
@@ -258,6 +261,7 @@ mod session_lifecycle;
 mod session_picker;
 mod side;
 mod startup;
+pub(crate) mod startup_bootstrap;
 mod startup_prompts;
 mod startup_warnings;
 mod thread_event_buffer;
@@ -653,8 +657,12 @@ pub(crate) struct App {
     /// Keeps that boundary armed while a startup approval waits for the typing-idle timer.
     startup_pending_protected_request: bool,
     /// Invalidates in-flight full rate-limit reads when a newer rolling hard stop arrives.
+    account_email_request_id: Option<uuid::Uuid>,
     rate_limit_hard_stop_generation: u64,
     rate_limit_refresh_state: rate_limit_refresh::RateLimitRefreshState,
+    pending_mcp_login_start: Option<PendingMcpLoginStart>,
+    // Latest accepted attempt per server; stale retry completions must not update the UI.
+    active_mcp_login_ids: HashMap<String, String>,
     // Serialize plugin enablement writes per plugin so stale completions cannot
     // overwrite a newer toggle, even if the plugin is toggled from different
     // cwd contexts.
@@ -666,6 +674,13 @@ pub(crate) struct App {
     // App fixtures keep their home alive across widget replacement; drop it last.
     #[cfg(test)]
     _test_codex_home: Option<tempfile::TempDir>,
+}
+
+struct PendingMcpLoginStart {
+    request_id: String,
+    name: String,
+    thread_id: ThreadId,
+    completions: Vec<codex_app_server_protocol::McpServerOauthLoginCompletedNotification>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

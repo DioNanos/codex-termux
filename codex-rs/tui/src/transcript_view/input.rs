@@ -3,6 +3,7 @@
 //! Shift-click extends the existing selection from its original text unit.
 //! Optional automatic copying happens only when a nonempty mouse selection is released.
 //! Automatic copies retain the selection; explicit copies clear it after confirmed delivery.
+//! Wheel input accumulates fractional rows and discards the remainder when direction reverses.
 
 use crate::key_hint::KeyBindingListExt;
 use crossterm::event::KeyCode;
@@ -23,6 +24,12 @@ pub(crate) enum ViewAction {
     PrimarySelection(String),
     CopyAndFollow(String),
     OpenLink(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MouseMode {
+    Interactive,
+    Selection,
 }
 
 /// Transcript jumps shared with input routing so legacy terminals preserve their Alt modifier.
@@ -134,11 +141,11 @@ impl TranscriptView {
         {
             return true;
         }
+        if self.copy_mode.is_some() {
+            return true;
+        }
         if self.selection.is_some() {
-            return (code == KeyCode::Char('c')
-                && matches!(modifiers, KeyModifiers::CONTROL | KeyModifiers::SUPER))
-                || (code == KeyCode::Char('c')
-                    && modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT))
+            return crate::text_selection::is_copy_key(key)
                 || code == KeyCode::Esc
                 || (code == KeyCode::Enter && modifiers == KeyModifiers::NONE)
                 || (matches!(modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
@@ -149,8 +156,12 @@ impl TranscriptView {
                 || (modifiers == KeyModifiers::NONE
                     && matches!(code, KeyCode::PageUp | KeyCode::PageDown));
         }
-        self.is_search_active()
-            && (matches!(code, KeyCode::Esc | KeyCode::Enter)
+        self.search.is_active()
+            && (code == KeyCode::Esc
+                || (code == KeyCode::Enter
+                    && (self.is_search_editing() || modifiers == KeyModifiers::NONE))
+                || (modifiers == KeyModifiers::NONE
+                    && matches!(code, KeyCode::PageUp | KeyCode::PageDown))
                 || (modifiers == KeyModifiers::CONTROL
                     && matches!(code, KeyCode::Char('c' | 'n' | 'p'))))
     }
@@ -162,6 +173,9 @@ impl TranscriptView {
     ) -> Option<ViewAction> {
         if key.kind == KeyEventKind::Release {
             return None;
+        }
+        if let Some(action) = self.handle_copy_mode_key(key, cells) {
+            return Some(action);
         }
         if let Some(action) = self.handle_disclosure_key(key, cells) {
             return Some(action);
@@ -192,10 +206,31 @@ impl TranscriptView {
         event: MouseEvent,
         cells: &[Arc<dyn HistoryCell>],
     ) -> Option<ViewAction> {
-        if let Some(action) = self.handle_follow_control_mouse(event) {
+        self.handle_mouse_with_mode(event, cells, MouseMode::Interactive)
+    }
+
+    /// Handles selection and scrolling without activating transcript content.
+    pub(crate) fn handle_selection_mouse(
+        &mut self,
+        event: MouseEvent,
+        cells: &[Arc<dyn HistoryCell>],
+    ) -> Option<ViewAction> {
+        self.handle_mouse_with_mode(event, cells, MouseMode::Selection)
+    }
+
+    fn handle_mouse_with_mode(
+        &mut self,
+        event: MouseEvent,
+        cells: &[Arc<dyn HistoryCell>],
+        mode: MouseMode,
+    ) -> Option<ViewAction> {
+        if mode == MouseMode::Interactive
+            && let Some(action) = self.handle_follow_control_mouse(event)
+        {
             return Some(action);
         }
-        if event.kind == MouseEventKind::Down(MouseButton::Left)
+        if mode == MouseMode::Interactive
+            && event.kind == MouseEventKind::Down(MouseButton::Left)
             && event
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
@@ -229,29 +264,55 @@ impl TranscriptView {
             selection.pointer = None;
         }
         match event.kind {
-            MouseEventKind::ScrollUp => self.scroll(cells, /*rows*/ -3),
-            MouseEventKind::ScrollDown => self.scroll(cells, /*rows*/ 3),
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let direction = if event.kind == MouseEventKind::ScrollUp {
+                    -1.0
+                } else {
+                    1.0
+                };
+                if self.pending_mouse_scroll.signum() != direction {
+                    self.pending_mouse_scroll = 0.0;
+                }
+                self.pending_mouse_scroll += direction * self.mouse_scroll_speed;
+                // Decimal speeds can land just short of a whole row after repeated addition.
+                let rounded = self.pending_mouse_scroll.round();
+                if rounded != 0.0 && (self.pending_mouse_scroll - rounded).abs() < 1e-9 {
+                    self.pending_mouse_scroll = rounded;
+                }
+                let rows = self.pending_mouse_scroll as isize;
+                self.pending_mouse_scroll = self.pending_mouse_scroll.fract();
+                if rows != 0 {
+                    self.scroll(cells, rows);
+                }
+            }
             MouseEventKind::Down(MouseButton::Right) if inside => {
                 return self
                     .selected_text(cells)
                     .filter(|text| !text.is_empty())
                     .map(ViewAction::Copy);
             }
-            MouseEventKind::Down(MouseButton::Left) => return self.pointer_down(event, cells),
+            MouseEventKind::Down(MouseButton::Left) => {
+                return self.pointer_down(event, cells, mode);
+            }
             MouseEventKind::Drag(MouseButton::Left) if dragging => {
                 self.extend_selection(event.column, event.row);
             }
             MouseEventKind::Up(MouseButton::Left) if dragging => {
                 // Open only a stationary click. Dragging back to the origin is still selection,
                 // and wheel scrolling clears the pointer even when it cannot move the viewport.
-                let link = self.selection.as_mut().and_then(|selection| {
-                    (inside
-                        && !selection.moved
-                        && selection.pointer == Some(ScreenPosition::new(event.column, event.row))
-                        && event.modifiers.is_empty())
-                    .then(|| selection.pressed_link.take())
-                    .flatten()
-                });
+                let link = if mode == MouseMode::Interactive {
+                    self.selection.as_mut().and_then(|selection| {
+                        (inside
+                            && !selection.moved
+                            && selection.pointer
+                                == Some(ScreenPosition::new(event.column, event.row))
+                            && event.modifiers.is_empty())
+                        .then(|| selection.pressed_link.take())
+                        .flatten()
+                    })
+                } else {
+                    None
+                };
                 let link = link.filter(|destination| {
                     self.link_at(event.column, event.row).as_ref() == Some(destination)
                 });
@@ -316,24 +377,31 @@ impl TranscriptView {
         self.handle_scroll_key(key, cells)
     }
 
-    fn handle_scroll_key(
+    pub(super) fn handle_scroll_key(
         &mut self,
         key: KeyEvent,
         cells: &[Arc<dyn HistoryCell>],
     ) -> Option<ViewAction> {
         let jump = JumpTarget::from_key(key);
         match (key.code, key.modifiers) {
-            (KeyCode::PageUp, KeyModifiers::NONE) => {
-                self.scroll(
-                    cells,
-                    -(self.area.height.saturating_sub(/*rhs*/ 1).max(/*other*/ 1) as isize),
-                );
-            }
-            (KeyCode::PageDown, KeyModifiers::NONE) => {
-                self.scroll(
-                    cells,
-                    self.area.height.saturating_sub(/*rhs*/ 1).max(/*other*/ 1) as isize,
-                );
+            (KeyCode::PageUp | KeyCode::PageDown, KeyModifiers::NONE) => {
+                // Share page-key configuration without taking the pager's typing shortcuts.
+                // Full pages retain the main view's existing one-row overlap.
+                let keymap = &self.disclosure.keymap.pager;
+                let height = self.area.height.max(/*other*/ 1) as isize;
+                let page = (height - 1).max(/*other*/ 1);
+                let half = (height + 1) / 2;
+                let delta = [
+                    (&keymap.scroll_up, -1),
+                    (&keymap.scroll_down, 1),
+                    (&keymap.page_up, -page),
+                    (&keymap.page_down, page),
+                    (&keymap.half_page_up, -half),
+                    (&keymap.half_page_down, half),
+                ]
+                .into_iter()
+                .find_map(|(bindings, delta)| bindings.is_pressed(key).then_some(delta))?;
+                self.scroll(cells, delta);
             }
             (KeyCode::Esc, KeyModifiers::NONE) if self.can_return_to_latest() => {
                 self.jump_to_latest();
@@ -351,17 +419,22 @@ impl TranscriptView {
         &mut self,
         event: MouseEvent,
         cells: &[Arc<dyn HistoryCell>],
+        mode: MouseMode,
     ) -> Option<ViewAction> {
-        if event.modifiers.is_empty() && self.toggle_disclosure_at(cells, event.column, event.row) {
+        if mode == MouseMode::Interactive
+            && event.modifiers.is_empty()
+            && self.toggle_disclosure_at(cells, event.column, event.row)
+        {
             return Some(ViewAction::Changed);
         }
         self.disclosure.focused = None;
         let visible = self
             .visible
             .get(usize::from(event.row.checked_sub(self.area.y)?))?;
-        if event
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        if mode == MouseMode::Interactive
+            && event
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
         {
             return self
                 .link_at(event.column, event.row)
@@ -386,7 +459,7 @@ impl TranscriptView {
         {
             return None;
         }
-        let link = (clicks == 1 && event.modifiers.is_empty())
+        let link = (mode == MouseMode::Interactive && clicks == 1 && event.modifiers.is_empty())
             .then(|| self.link_at(event.column, event.row))
             .flatten();
         self.begin_selection(cells, event.column, event.row, clicks);

@@ -74,7 +74,9 @@ pub(in crate::local) async fn search_thread_occurrences(
         &params.search_term,
     )?;
     let matcher = LiteralMatcher::new(params.search_term.as_str());
-    let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
+    let lineage = store
+        .resolve_rollout_lineage(params.thread_id, /*initial_path*/ None)
+        .await?;
     let cursor_segment = cursor
         .as_ref()
         .map(|cursor| {
@@ -123,7 +125,13 @@ FROM (
       ON turns.thread_id = items.thread_id
      AND turns.turn_id = items.turn_id
     WHERE items.thread_id = ?
-      AND items.item_type = 'userMessage'
+      AND (
+          items.item_type = 'userMessage'
+          OR (
+              items.item_type = 'agentMessage'
+              AND json_extract(items.item_json, '$.phase') = 'partial_answer'
+          )
+      )
       AND items.rollout_ordinal >= ?
       AND items.rollout_ordinal < ?
       AND turns.rollout_ordinal >= ?

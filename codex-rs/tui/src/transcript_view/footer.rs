@@ -20,6 +20,17 @@ impl TranscriptView {
         motion: MotionMode,
         latest_navigation: &str,
     ) -> Option<TranscriptFooter> {
+        if let Some(mode) = &self.copy_mode {
+            return Some(TranscriptFooter {
+                text: vec![
+                    Line::from(format!("Copy {}", mode.label.to_lowercase())).bold(),
+                    navigation_line("↑/↓/j/k select · g/G ends · enter copy · esc close"),
+                ]
+                .into(),
+                cursor_column: None,
+                is_interactive: true,
+            });
+        }
         // A mouse-down anchor owns the gesture, but has no text to copy yet. Compare
         // source positions so movement across wrapping or padding is not a selection.
         let has_selected_text = self.selection.as_ref().is_some_and(|selection| {
@@ -50,7 +61,10 @@ impl TranscriptView {
                     first_fitting_line(
                         [
                             self.status_line_with_navigation(
-                                "ctrl+c copy · enter copy & follow · esc clear",
+                                &format!(
+                                    "{} copy · enter copy & follow · esc clear",
+                                    crate::key_hint::ctrl(KeyCode::Char('c')).display_label()
+                                ),
                                 motion,
                             ),
                             selection_hint(width),
@@ -63,7 +77,14 @@ impl TranscriptView {
                 is_interactive: true,
             });
         }
-        if self.is_activity_focused() {
+        if self.search.is_reading() && !pending && !self.is_activity_focused() {
+            return Some(TranscriptFooter {
+                text: self.search.status_line(width, self.history).into(),
+                cursor_column: None,
+                is_interactive: false,
+            });
+        }
+        if self.is_activity_focused() && !pending {
             return self.disclosure_footer(width);
         }
         // Selection can pause following without hiding the current final row.
@@ -192,7 +213,10 @@ impl TranscriptView {
 fn selection_hint(width: u16) -> Line<'static> {
     first_fitting_line(
         [
-            "ctrl+c copy · enter copy & follow · esc clear",
+            &format!(
+                "{} copy · enter copy & follow · esc clear",
+                crate::key_hint::ctrl(KeyCode::Char('c')).display_label()
+            ),
             "enter copy & follow · esc clear",
             "enter copy+↓ · esc",
             "esc clear",
@@ -217,6 +241,10 @@ pub(super) fn navigation_line(navigation: &str) -> Line<'static> {
             " clear selection",
             " copy+↓",
             " previous",
+            " accept",
+            " cancel",
+            " older",
+            " newer",
             " latest",
             " retry",
             " select",

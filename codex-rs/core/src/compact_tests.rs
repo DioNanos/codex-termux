@@ -143,9 +143,10 @@ async fn local_compaction_respects_tool_metadata_state(
     assert!(metadata_bytes > 2 * 1024 * 1024);
 
     if !metadata_enabled {
-        let mut config = (*session.get_config().await).clone();
+        let current_config = session.get_config().await;
+        let mut config = current_config.as_ref().clone();
         config.features.disable(Feature::ExecutedToolCallMetadata)?;
-        session.refresh_runtime_config(config).await;
+        let _ = session.refresh_runtime_config(current_config, config).await;
     }
 
     let mock = responses::mount_sse_once(
@@ -156,10 +157,19 @@ async fn local_compaction_respects_tool_metadata_state(
         ]),
     )
     .await;
+    let step = session
+        .capture_step_context(turn, &tokio_util::sync::CancellationToken::new())
+        .await?;
+    let world_state = Arc::new(
+        session
+            .build_world_state_for_step(&step, /*new_window*/ true)
+            .await?,
+    );
     // OpenAI identity keeps the client from removing passthrough for compatibility.
     run_compact_task(
         Arc::clone(&session),
-        turn,
+        step,
+        world_state,
         vec![UserInput::Text {
             text: "Summarize the conversation.".to_string(),
             text_elements: Vec::new(),
@@ -554,7 +564,10 @@ fn build_compacted_history_preserves_user_message_passthrough_metadata() {
 }
 
 #[test]
-fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() {
+fn assemble_compaction_history_keeps_prefix_first_and_summary_last() {
+    let prefix = ContextualUserFragment::into(crate::context::BaseInstructionsFragment(
+        "base instructions".to_string(),
+    ));
     let agent_completion = ResponseItem::AgentMessage {
         id: None,
         author: "child".to_string(),
@@ -604,11 +617,13 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
         internal_chat_message_metadata_passthrough: None,
     }];
 
-    let refreshed = raw(insert_initial_context_before_last_real_user_or_summary(
+    let refreshed = raw(assemble_compaction_history(
         annotated(compacted_history),
-        annotated(initial_context),
+        vec![prefix.clone()],
+        initial_context,
     ));
     let expected = vec![
+        prefix,
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -651,7 +666,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
 }
 
 #[test]
-fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last() {
+fn assemble_compaction_history_keeps_compaction_last() {
     let agent_task = ResponseItem::AgentMessage {
         id: None,
         author: "parent".to_string(),
@@ -677,9 +692,10 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
         internal_chat_message_metadata_passthrough: None,
     }];
 
-    let refreshed = raw(insert_initial_context_before_last_real_user_or_summary(
+    let refreshed = raw(assemble_compaction_history(
         annotated(compacted_history),
-        annotated(initial_context),
+        Vec::new(),
+        initial_context,
     ));
     let expected = vec![
         ResponseItem::Message {

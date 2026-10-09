@@ -153,7 +153,7 @@ async fn fork_context_excludes_items_after_frozen_cutoff() {
     append_items(path.as_path(), [user_message("later message")]);
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
     let lineage = store
-        .resolve_rollout_lineage(thread_id)
+        .resolve_rollout_lineage(thread_id, /*initial_path*/ None)
         .await
         .expect("resolve source lineage");
     let session_meta = codex_rollout::read_session_meta_line(path.as_path())
@@ -219,6 +219,7 @@ async fn fork_version_stops_before_older_segments_once_resolved() {
         compacted.resume_metadata = Some(codex_rollout::CompactionResumeMetadata {
             multi_agent_version: Some(MultiAgentVersion::V2),
             last_started_turn_id: None,
+            turn_attribution: None,
             previous_turn_settings: None,
         });
         append_items(
@@ -230,7 +231,7 @@ async fn fork_version_stops_before_older_segments_once_resolved() {
         );
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         let lineage = store
-            .resolve_rollout_lineage(child_id)
+            .resolve_rollout_lineage(child_id, /*initial_path*/ None)
             .await
             .expect("resolve source lineage");
         // The usable compaction should stop the scan before it reaches this missing segment.
@@ -282,7 +283,7 @@ async fn fork_version_respects_inherited_segment_cutoffs() {
     );
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
     let lineage = store
-        .resolve_rollout_lineage(child_id)
+        .resolve_rollout_lineage(child_id, /*initial_path*/ None)
         .await
         .expect("resolve source lineage");
     let mut source_meta = codex_rollout::read_session_meta_line(&child_path)
@@ -616,6 +617,7 @@ fn append_items(path: &Path, items: impl IntoIterator<Item = RolloutItem>) {
 
 fn turn_started(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+        turn_attribution: None,
         turn_id: turn_id.to_string(),
         root_turn_id: None,
         trace_id: None,
@@ -627,6 +629,7 @@ fn turn_started(turn_id: &str) -> RolloutItem {
 
 fn turn_complete(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        root_turn_id: None,
         turn_id: turn_id.to_string(),
         last_agent_message: None,
         error: None,
@@ -680,26 +683,20 @@ fn turn_context(root: &Path, turn_id: &str) -> RolloutItem {
         root_turn_id: None,
         disabled_plugin_ids: None,
         cwd: serde_json::from_value(serde_json::json!(root)).expect("absolute cwd"),
-        workspace_roots: None,
-        current_date: None,
-        timezone: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: None,
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         permission_profile: None,
         active_permission_profile: None,
-        network: None,
         file_system_sandbox_policy: None,
         model: "test-model".to_string(),
         comp_hash: None,
-        personality: None,
         collaboration_mode: None,
         multi_agent_version: None,
-        multi_agent_mode: None,
         realtime_active: None,
         cyber_access_program: None,
         effort: None,
-        summary: ReasoningSummary::Auto,
+        summary: Some(ReasoningSummary::Auto),
     })
 }
 

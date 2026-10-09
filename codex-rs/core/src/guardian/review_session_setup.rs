@@ -1,10 +1,23 @@
-//! Captures the context used by Guardian before and after it starts a reviewer agent.
-//! Context selection and assembly stay on the existing path pending its replacement.
+//! Captures action-time parent context and starts or recovers its Guardian reviewer.
+//! Checkpoint recovery allows one fresh attempt under the original review deadline.
+//! Both attempts share captured context and use separate recovery flags.
+
+use std::sync::atomic::AtomicBool;
 
 use super::*;
+use crate::guardian::input_budget::CheckpointRecovery;
 use codex_guardian_reviewer::ReviewerPool;
 use codex_guardian_reviewer::ReviewerRequest;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 
+/// Controls whether selection may reuse a session or must start from the parent checkpoint.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReviewerSelection {
+    ReuseIfAvailable,
+    FreshParentCheckpoint,
+}
+
+#[derive(Clone)]
 pub struct PreparedGuardianContext {
     parent: Arc<Session>,
     context: GuardianReviewContext,
@@ -12,6 +25,7 @@ pub struct PreparedGuardianContext {
     context_policy: ReviewContextPolicy,
     key: GuardianReviewSessionReuseKey,
     parent_compaction: Option<ResponseItem>,
+    reviewer_selection: ReviewerSelection,
     pub history_reset: CancellationToken,
 }
 
@@ -51,6 +65,7 @@ impl PreparedGuardianContext {
             context_policy,
             key,
             parent_compaction,
+            reviewer_selection: ReviewerSelection::ReuseIfAvailable,
             history_reset,
         })
     }
@@ -79,9 +94,26 @@ impl PreparedGuardianContext {
         &self,
         snapshot: Option<GuardianReviewForkSnapshot>,
     ) -> (crate::StartThreadOptions, GuardianReviewState) {
-        let (conversation, history) = snapshot.map(ConversationState::fork).unzip();
+        let snapshot =
+            snapshot.filter(|_| self.reviewer_selection == ReviewerSelection::ReuseIfAvailable);
+        let (mut conversation, mut history) = snapshot.map(ConversationState::fork).unzip();
+        if self.parent_compaction.is_some()
+            && conversation
+                .as_ref()
+                .is_some_and(|state| state.cursor().is_none())
+        {
+            // A compacted fork has no valid transcript progress. Prefer the
+            // captured parent checkpoint to its lossy reviewer summary.
+            conversation = None;
+            history = None;
+        }
         let state = GuardianReviewState {
             conversation: conversation.unwrap_or_default(),
+            fresh_parent_checkpoint: history.is_none() && self.parent_compaction.is_some(),
+            transcript_history_version: 0,
+            transcript_source: history
+                .as_ref()
+                .and_then(|history| history.transcript_source),
             last_admitted_node_repl_response_sequence: history.as_ref().map_or(0, |history| {
                 history.last_admitted_node_repl_response_sequence
             }),
@@ -117,7 +149,14 @@ impl PreparedGuardianContext {
                 }),
             }),
             initial_history: initial_history.unwrap_or(InitialHistory::New),
-            environments: Some(self.context.environments().to_selections()),
+            environments: Some(
+                self.context
+                    .environments()
+                    .to_selections()
+                    .into_iter()
+                    .map(TurnEnvironmentSelection::into_request)
+                    .collect(),
+            ),
             inherited_environments: Some(self.context.environments().clone()),
             client_mcp_extensions: self.parent.services.client_mcp_extensions.clone(),
             ..crate::StartThreadOptions::new(config)
@@ -130,7 +169,7 @@ impl PreparedGuardianContext {
         &self,
         thread: &crate::CodexThread,
         context: GuardianReviewSessionReuseKey,
-        state: GuardianReviewState,
+        mut state: GuardianReviewState,
         cancellation: CancellationToken,
     ) -> GuardianReviewSession {
         let session = Arc::clone(&thread.session);
@@ -141,6 +180,17 @@ impl PreparedGuardianContext {
             session_loop_termination: thread.io.session_loop_termination.clone(),
         };
         let inherited = session.inherited_instructions().await;
+        {
+            let history = session.clone_history().await;
+            state.transcript_history_version = history.history_version();
+            state.fresh_parent_checkpoint &= self
+                .parent_compaction
+                .as_ref()
+                .zip(codex_history::CompactionCheckpoint::latest(
+                    history.annotated_items(),
+                ))
+                .is_some_and(|(parent, loaded)| parent == loaded.item);
+        }
         let context = GuardianReviewSessionReuseKey {
             user_instructions: inherited.user,
             thread_instructions: inherited.thread,
@@ -154,6 +204,7 @@ impl PreparedGuardianContext {
             Some(self.parent.thread_id()),
             session.thread_config_snapshot().await,
             SubAgentSource::Other(GUARDIAN_REVIEWER_NAME.to_owned()),
+            /*resumed_created_at*/ None,
         );
         GuardianReviewSession {
             session,
@@ -165,9 +216,11 @@ impl PreparedGuardianContext {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct PreparedReview {
     context: Arc<PreparedGuardianContext>,
-    params: GuardianReviewSessionParams,
+    params: Arc<GuardianReviewSessionParams>,
+    recovery_requested: Arc<AtomicBool>,
 }
 
 impl ReviewerRequest for PreparedReview {
@@ -178,6 +231,9 @@ impl ReviewerRequest for PreparedReview {
     }
     fn context(&self, previous: Option<&GuardianReviewSession>) -> GuardianReviewSessionReuseKey {
         self.context.reuse_key(previous)
+    }
+    fn requires_fresh_session(&self) -> bool {
+        self.context.reviewer_selection == ReviewerSelection::FreshParentCheckpoint
     }
     fn deadline(&self) -> tokio::time::Instant {
         self.params.deadline
@@ -191,14 +247,43 @@ impl ReviewerRequest for PreparedReview {
         session: &GuardianReviewSession,
         kind: GuardianReviewSessionKind,
     ) -> ReviewSessionResult {
-        let result = Box::pin(run_review_on_session(
+        // A prewarmed session can already be fresh on the initial attempt. Consume
+        // this before running: even a failed review can leave new input in history.
+        let fresh_parent_checkpoint =
+            std::mem::take(&mut session.state.lock().await.fresh_parent_checkpoint);
+        if self.context.parent_compaction.is_some() {
+            session
+                .session
+                .services
+                .thread_extension_data
+                .insert(CheckpointRecovery {
+                    requested: Arc::clone(&self.recovery_requested),
+                    history_version: session.session.clone_history().await.history_version(),
+                    fresh_parent_checkpoint,
+                });
+        } else {
+            session
+                .session
+                .services
+                .thread_extension_data
+                .remove::<CheckpointRecovery>();
+        }
+        let mut result = Box::pin(run_review_on_session(
             session,
             &self.params,
             kind,
             self.params.deadline,
         ))
         .await;
-        record_failed_review(&session.session, &self.params, &result.outcome).await;
+        let recovery_requested = self.recovery_requested.load(Ordering::Acquire);
+        if recovery_requested {
+            result.disposition = SessionDisposition::Discard;
+        }
+        if self.context.reviewer_selection == ReviewerSelection::FreshParentCheckpoint
+            || !recovery_requested
+        {
+            record_failed_review(&session.session, &self.params, &result.outcome).await;
+        }
         result
     }
 }
@@ -207,13 +292,34 @@ pub(crate) async fn run_guardian_review_session(
     pool: Arc<ReviewerPool<GuardianReviewSession>>,
     params: GuardianReviewSessionParams,
 ) -> (GuardianReviewSessionOutcome, GuardianReviewAnalyticsResult) {
-    match prepare_review(params).await {
-        Ok(prepared) => pool.review(prepared).await,
+    let context_mode = GuardianContextMode::from_history(
+        params
+            .parent_history
+            .conversation_history_snapshot()
+            .as_ref(),
+    );
+    let (outcome, mut analytics) = match prepare_review(params).await {
+        Ok(mut prepared) => {
+            let result = pool.review(prepared.clone()).await;
+            if prepared.recovery_requested.load(Ordering::Acquire) {
+                // One restart only, under the original deadline. An oversized parent
+                // checkpoint must fail rather than repeatedly compact and recreate.
+                Arc::make_mut(&mut prepared.context).reviewer_selection =
+                    ReviewerSelection::FreshParentCheckpoint;
+                prepared.recovery_requested = Arc::default();
+                pool.review(prepared).await
+            } else {
+                result
+            }
+        }
         Err(error) => (
             GuardianReviewSessionOutcome::PromptBuildFailed(error),
             GuardianReviewAnalyticsResult::without_session(),
         ),
-    }
+    };
+    // Keep the captured mode even when preparation or reviewer startup fails.
+    analytics.guardian_context_mode = Some(context_mode.as_str());
+    (outcome, analytics)
 }
 
 pub(super) async fn prepare_review(
@@ -229,7 +335,8 @@ pub(super) async fn prepare_review(
     .await?;
     Ok(PreparedReview {
         context: Arc::new(context),
-        params,
+        params: Arc::new(params),
+        recovery_requested: Arc::default(),
     })
 }
 

@@ -27,11 +27,15 @@ use std::time::Duration;
 
 const WS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 
-#[test_case::test_case(true; "fast mode enabled")]
-#[test_case::test_case(false; "fast mode disabled")]
+#[test_case::test_case("priority", true, false; "fast mode enabled")]
+#[test_case::test_case("priority", false, true; "fast mode disabled")]
+#[test_case::test_case("ultrafast", false, true; "ultrafast mode enabled")]
+#[test_case::test_case("ultrafast", true, false; "ultrafast mode disabled")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_agent_prewarm_handshake_inherits_effective_root_service_tier(
+    tier: &'static str,
     fast_mode_enabled: bool,
+    ultrafast_mode_enabled: bool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -63,7 +67,11 @@ async fn spawned_agent_prewarm_handshake_inherits_effective_root_service_tier(
         ],
     ])
     .await;
-    let tier = ServiceTier::Fast.request_value();
+    let tier_enabled = if tier == "ultrafast" {
+        ultrafast_mode_enabled
+    } else {
+        fast_mode_enabled
+    };
     let test = test_codex()
         .with_model("gpt-5.4")
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -89,7 +97,11 @@ async fn spawned_agent_prewarm_handshake_inherits_effective_root_service_tier(
                     .disable(Feature::FastMode)
                     .expect("fast mode");
             }
-            config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+            config
+                .features
+                .set_enabled(Feature::UltrafastMode, ultrafast_mode_enabled)
+                .expect("configure Ultra Fast mode");
+            config.service_tier = Some(tier.to_string());
         })
         .build_with_websocket_server(&server)
         .await?;
@@ -122,7 +134,7 @@ async fn spawned_agent_prewarm_handshake_inherits_effective_root_service_tier(
         "child startup should connect before its first turn"
     );
     let handshakes = server.handshakes();
-    let expected_hint = if fast_mode_enabled {
+    let expected_hint = if tier_enabled {
         format!("model=gpt-5.4;tier={tier}")
     } else {
         "model=gpt-5.4".to_string()
@@ -140,7 +152,7 @@ async fn spawned_agent_prewarm_handshake_inherits_effective_root_service_tier(
     assert_eq!(child_warmup["generate"], false);
     assert_eq!(
         child_warmup["service_tier"].as_str(),
-        fast_mode_enabled.then_some(tier)
+        tier_enabled.then_some(tier)
     );
     assert_eq!(server.handshakes().len(), 2);
     child.shutdown_and_wait().await?;
@@ -292,11 +304,13 @@ async fn websocket_test_codex_shell_chain() -> Result<()> {
     Ok(())
 }
 
-#[test_case::test_case(false; "update_plan disabled")]
-#[test_case::test_case(true; "update_plan enabled")]
+#[test_case::test_case(false, false; "update_plan disabled")]
+#[test_case::test_case(true, false; "update_plan enabled")]
+#[test_case::test_case(true, true; "incremental tools")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_first_turn_uses_startup_prewarm_and_create(
     update_plan_enabled: bool,
+    incremental_tools: bool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -315,7 +329,18 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create(
         .with_config(move |config| {
             config.update_plan_enabled = update_plan_enabled;
             config.analytics_enabled = Some(false);
+            if incremental_tools {
+                config
+                    .features
+                    .enable(Feature::IncrementalTools)
+                    .expect("enable incremental tools");
+            }
         });
+    if incremental_tools {
+        builder = builder.with_model_info_override("gpt-5.2", |model| {
+            model.use_responses_lite = true;
+        });
+    }
     let test = builder.build_with_websocket_server(&server).await?;
     test.submit_turn_with_policy("hello", test.config.legacy_sandbox_policy())
         .await?;
@@ -328,14 +353,25 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create(
         .expect("missing warmup request")
         .body_json();
     let turn = connection.get(1).expect("missing turn request").body_json();
-    assert_eq!(warmup["instructions"], turn["instructions"]);
-    assert_eq!(
-        warmup["instructions"]
-            .as_str()
-            .expect("warmup base instructions")
-            .contains("update_plan"),
-        update_plan_enabled
-    );
+    assert_eq!(turn["previous_response_id"], "warm-1");
+    if incremental_tools {
+        assert_eq!(warmup["input"], json!([]));
+        assert!(
+            turn["input"]
+                .as_array()
+                .expect("turn input array")
+                .iter()
+                .any(|item| item["type"] == "additional_tools")
+        );
+    } else {
+        assert_eq!(
+            warmup["input"][0]["content"][0]["text"]
+                .as_str()
+                .expect("warmup base instructions")
+                .contains("update_plan"),
+            update_plan_enabled
+        );
+    }
     assert_eq!(warmup["type"].as_str(), Some("response.create"));
     assert_eq!(warmup["generate"].as_bool(), Some(false));
     let warmup_metadata: Value = serde_json::from_str(
@@ -349,11 +385,11 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create(
         warmup_metadata["window_id"].as_str(),
         warmup["client_metadata"]["x-codex-window-id"].as_str()
     );
-    assert!(
+    assert_eq!(
         turn["tools"]
             .as_array()
             .is_some_and(|tools| !tools.is_empty()),
-        "expected request tools to be populated"
+        !incremental_tools
     );
     assert_eq!(turn["type"].as_str(), Some("response.create"));
     assert_eq!(turn.get("generate"), None);

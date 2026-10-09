@@ -87,6 +87,7 @@ use codex_rollout::state_db;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::truncate_mcp_tool_result;
 use codex_utils_output_truncation::truncate_text;
 use codex_utils_path_uri::PathUri;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
@@ -254,8 +255,12 @@ pub(crate) async fn handle_mcp_tool_call(
                 .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
         };
     }
-    let _approval_metadata =
-        sess.register_mcp_tool_approval_metadata(&call_id, &invocation, metadata.clone());
+    let _approval_metadata = sess.register_mcp_tool_approval_metadata(
+        &call_id,
+        &invocation,
+        metadata.clone(),
+        GuardianReviewContext::from(step_context),
+    );
     notify_mcp_tool_call_started(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -518,6 +523,7 @@ async fn handle_approved_mcp_tool_call(
                         &server,
                         call_id,
                         Some(&metadata),
+                        prepared_call.is_host_owned_apps(),
                     );
                     let request_meta = with_mcp_tool_call_ids_meta(
                         request_meta,
@@ -874,6 +880,12 @@ async fn augment_mcp_tool_request_meta_with_sandbox_state(
         codex_linux_sandbox_exe: prepared_call.config().codex_linux_sandbox_exe.clone(),
         sandbox_cwd,
         use_legacy_landlock: prepared_call.config().use_legacy_landlock,
+        use_mxc: prepared_call
+            .config()
+            .environment_use_mxc
+            .get(server_environment_id)
+            .copied()
+            .unwrap_or(false),
     })?;
 
     match meta.as_mut() {
@@ -976,39 +988,11 @@ fn truncate_mcp_tool_result_for_event(
     result: &Result<CallToolResult, String>,
 ) -> Result<CallToolResult, String> {
     match result {
-        Ok(call_tool_result) => {
-            // The app-server rebuilds `ThreadItem::McpToolCall` from this item,
-            // so avoid persisting multi-megabyte results in rollout storage.
-            let Ok(serialized) = serde_json::to_string(call_tool_result) else {
-                return Ok(call_tool_result.clone());
-            };
-            if serialized.len() <= MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES {
-                return Ok(call_tool_result.clone());
-            }
-
-            // A huge MCP result can put bytes in `content`, `structuredContent`,
-            // or `_meta`. Collapse the event copy to a text preview of the whole
-            // serialized result so the UI still has useful context without
-            // preserving a multi-megabyte structured payload.
-            //
-            // This budget applies to the preview text, not the final event JSON.
-            // The preview is itself serialized into a JSON string, so quotes and
-            // backslashes can be escaped again and the stored event may end up
-            // somewhat larger than this byte budget.
-            let truncated = truncate_text(
-                &serialized,
-                TruncationPolicy::Bytes(MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES),
-            );
-            Ok(CallToolResult {
-                content: vec![serde_json::json!({
-                    "type": "text",
-                    "text": truncated,
-                })],
-                structured_content: None,
-                is_error: call_tool_result.is_error,
-                meta: None,
-            })
-        }
+        Ok(call_tool_result) => Ok(truncate_mcp_tool_result(
+            call_tool_result,
+            MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES,
+        )
+        .into_owned()),
         Err(message) => Err(truncate_text(
             message,
             TruncationPolicy::Bytes(MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES),
@@ -1210,20 +1194,29 @@ pub(crate) struct McpToolApprovalMetadata {
     openai_file_input_optional_fields: Option<HashMap<String, Vec<String>>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct McpToolApprovalContext {
+    pub(crate) invocation: Option<McpInvocation>,
+    pub(crate) metadata: McpToolApprovalMetadata,
+    pub(crate) review_context: GuardianReviewContext,
+}
+
 impl Session {
     fn register_mcp_tool_approval_metadata(
         &self,
         call_id: &str,
         invocation: &McpInvocation,
         metadata: McpToolApprovalMetadata,
-    ) -> Arc<(Option<McpInvocation>, McpToolApprovalMetadata)> {
+        review_context: GuardianReviewContext,
+    ) -> Arc<McpToolApprovalContext> {
         let key = (invocation.server.clone(), call_id.to_string());
-        let metadata = Arc::new((
-            (invocation.server == CODEX_APPS_MCP_SERVER_NAME
+        let metadata = Arc::new(McpToolApprovalContext {
+            invocation: (invocation.server == CODEX_APPS_MCP_SERVER_NAME
                 || is_node_repl_backed_server(&invocation.server))
             .then(|| invocation.clone()),
             metadata,
-        ));
+            review_context,
+        });
         let mut registry = self
             .mcp_tool_approval_metadata
             .lock()
@@ -1239,7 +1232,7 @@ impl Session {
         &self,
         server: &str,
         call_id: &str,
-    ) -> Option<(Option<McpInvocation>, McpToolApprovalMetadata)> {
+    ) -> Option<McpToolApprovalContext> {
         self.mcp_tool_approval_metadata
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1316,6 +1309,7 @@ fn build_mcp_tool_call_request_meta(
     server: &str,
     call_id: &str,
     metadata: Option<&McpToolApprovalMetadata>,
+    is_host_owned_apps: bool,
 ) -> Option<serde_json::Value> {
     let mut request_meta = serde_json::Map::new();
     request_meta.insert(
@@ -1344,6 +1338,16 @@ fn build_mcp_tool_call_request_meta(
             "call_id".to_string(),
             serde_json::Value::String(call_id.to_string()),
         );
+        // Only the captured host-owned Apps registration receives Core lineage.
+        codex_apps_meta.remove("root_turn_id");
+        if is_host_owned_apps
+            && let Some(root_turn_id) = step_context.turn.turn_metadata_state.root_turn_id()
+        {
+            codex_apps_meta.insert(
+                "root_turn_id".to_string(),
+                serde_json::Value::String(root_turn_id),
+            );
+        }
         request_meta.insert(
             MCP_TOOL_CODEX_APPS_META_KEY.to_string(),
             serde_json::Value::Object(codex_apps_meta),
@@ -1491,16 +1495,7 @@ async fn maybe_request_mcp_tool_approval(
     policy: McpToolApprovalPolicy,
 ) -> Option<ReviewDecision> {
     let turn_context = &step_context.turn;
-    let turn_state = sess
-        .active_turn
-        .lock()
-        .await
-        .as_ref()
-        .map(|active| Arc::clone(&active.turn_state));
-    let strict_auto_review = match turn_state {
-        Some(turn_state) => turn_state.lock().await.strict_auto_review_enabled(),
-        None => false,
-    };
+    let strict_auto_review = turn_context.strict_auto_review_enabled();
     let approvals_reviewer = connectors::mcp_approvals_reviewer_from_layers(
         &config.config_layer_stack,
         step_context
@@ -1657,7 +1652,7 @@ pub(crate) async fn request_mcp_tool_user_approval(
     let (request_dispatched, decision) = if tool_call_mcp_elicitation_enabled {
         let link_id = sess
             .mcp_tool_approval_metadata(server, id)
-            .and_then(|(_, metadata)| metadata.link_id);
+            .and_then(|context| context.metadata.link_id);
         let metadata = McpToolApprovalMetadata {
             annotations: None,
             connector_id: connector_id.clone(),

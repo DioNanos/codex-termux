@@ -31,8 +31,9 @@ fn persistent_instructions_follow_mode_and_catalog_updates_without_duplicates() 
             )
             .expect("test instructions should be valid"),
         );
-        let updates = world_state
-            .render_history_diff(previous.as_ref(), &history)
+        let (snapshot, fragments) =
+            world_state.render_history_fragment_diff(previous.as_ref(), &history);
+        let updates = fragments
             .into_iter()
             .map(ContextualUserFragment::into_boxed_response_item)
             .collect::<Vec<_>>();
@@ -48,7 +49,7 @@ fn persistent_instructions_follow_mode_and_catalog_updates_without_duplicates() 
                 .collect::<Vec<_>>()
         );
         history.extend(updates);
-        previous = Some(world_state.snapshot());
+        previous = Some(snapshot);
     }
 }
 
@@ -76,7 +77,11 @@ fn retained_persistent_instructions_are_replaced_or_retired_without_a_snapshot()
         );
         assert_eq!(
             world_state
-                .render_history_diff(/*previous*/ None, std::slice::from_ref(&retained))
+                .render_history_fragment_diff(
+                    /*previous*/ None,
+                    std::slice::from_ref(&retained)
+                )
+                .1
                 .into_iter()
                 .map(ContextualUserFragment::into_boxed_response_item)
                 .collect::<Vec<_>>(),

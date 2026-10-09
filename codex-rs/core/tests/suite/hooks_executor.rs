@@ -20,8 +20,9 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TurnEnvironmentRequest;
+use codex_protocol::protocol::TurnEnvironmentRequests;
 use codex_protocol::protocol::TurnEnvironmentSelection;
-use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::user_input::UserInput;
 use codex_utils_path_uri::PathUri;
 use core_test_support::apps_test_server::AppsTestServer;
@@ -362,14 +363,14 @@ async fn executor_stop_hook_rejects_mismatched_environment() -> Result<()> {
     submit_thread_settings(
         &fixture.test.codex,
         ThreadSettingsOverrides {
-            environments: Some(TurnEnvironmentSelections::new(
+            environments: Some(TurnEnvironmentRequests::new(
                 fixture.test.config.cwd.clone(),
                 vec![
-                    attached_selection,
-                    TurnEnvironmentSelection {
+                    attached_selection.into_request(),
+                    TurnEnvironmentRequest {
                         environment_id: mismatched_environment_id.to_string(),
                         config: EnvironmentConfigState::FromThread,
-                        ..selection.clone()
+                        ..selection.clone().into_request()
                     },
                 ],
             )),
@@ -383,6 +384,7 @@ async fn executor_stop_hook_rejects_mismatched_environment() -> Result<()> {
         .await?;
     fixture.wait_for_hook_call().await?;
 
+    let current_config = fixture.test.codex.config().await;
     let mut mismatched_config = fixture.test.config.clone();
     let mut node_repl = mismatched_config
         .mcp_servers
@@ -396,10 +398,10 @@ async fn executor_stop_hook_rejects_mismatched_environment() -> Result<()> {
             .into_iter()
             .collect(),
     )?;
-    fixture
+    let _ = fixture
         .test
         .codex
-        .refresh_mcp_config(mismatched_config)
+        .refresh_mcp_config(current_config, mismatched_config)
         .await;
     fixture
         .test
@@ -557,8 +559,7 @@ async fn executor_browser_and_computer_use_cleanup_hooks_use_separate_mcp_routes
                     agent_role: None,
                 })),
                 thread_source: Some(ThreadSource::Subagent),
-                environments: Some(fixture.test.codex.environment_selections().await),
-                ..StartThreadOptions::new(fixture.test.config.clone())
+                ..fixture.test.start_thread_options().await
             })
             .await?;
         fixture.test.codex = child.thread;

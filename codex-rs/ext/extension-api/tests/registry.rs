@@ -33,11 +33,14 @@ use codex_extension_api::TurnItemContributor;
 use codex_extension_api::TurnLifecycleContributor;
 use codex_protocol::items::HookPromptItem;
 use codex_protocol::items::TurnItem;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::WarningEvent;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 
 struct AllContributors;
@@ -63,6 +66,41 @@ fn mcp_contribution_context_identifies_the_running_thread() {
     assert_eq!(
         McpServerContributionContext::global(&config).session_source(),
         None
+    );
+}
+
+#[test]
+fn mcp_context_preserves_selected_executor_order_and_unavailability() {
+    let config = ();
+    let environments = vec![
+        TurnEnvironmentSelection {
+            environment_id: "starting-primary".to_owned(),
+            cwd: PathUri::parse("file:///workspace").expect("workspace URI"),
+            workspace_roots: Vec::new(),
+            config: EnvironmentConfigState::Pending,
+            selected_capability_roots: Default::default(),
+        },
+        TurnEnvironmentSelection {
+            environment_id: "ready-secondary".to_owned(),
+            cwd: PathUri::parse("file:///other").expect("workspace URI"),
+            workspace_roots: Vec::new(),
+            config: EnvironmentConfigState::FromThread,
+            selected_capability_roots: Default::default(),
+        },
+    ];
+    let context = McpServerContributionContext::global(&config);
+    assert_eq!(context.selected_environments(), None);
+    assert_eq!(
+        context
+            .with_selected_environments(&[])
+            .selected_environments(),
+        Some([].as_slice())
+    );
+    assert_eq!(
+        context
+            .with_selected_environments(&environments)
+            .selected_environments(),
+        Some(environments.as_slice())
     );
 }
 
@@ -165,10 +203,11 @@ impl ApprovalReviewContributor for AllContributors {
 }
 
 impl codex_extension_api::SynchronousApprovalReviewer for AllContributors {
-    fn review(
-        &self,
+    fn review<'a>(
+        &'a self,
         _reason: codex_protocol::approvals::GuardianReviewReason,
-    ) -> ExtensionFuture<'_, Option<codex_protocol::protocol::ReviewDecision>> {
+        _async_approval: Option<codex_extension_api::ExtensionFuture<'a, ()>>,
+    ) -> ExtensionFuture<'a, Option<codex_protocol::protocol::ReviewDecision>> {
         Box::pin(std::future::ready(Some(
             codex_protocol::protocol::ReviewDecision::Approved,
         )))

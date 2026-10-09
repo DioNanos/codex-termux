@@ -8,6 +8,17 @@ use crate::text_formatting::truncate_text;
 
 impl ChatWidget {
     pub(super) fn show_copy_picker(&mut self) {
+        if self.local_settings.transcript_mode.is_owned()
+            && self.transcript.last_status_copy_targets.is_none()
+        {
+            let guard = Arc::new(crate::copy_input_guard::CopyInputGuard(
+                self.app_event_tx.clone(),
+            ));
+            self.input_queue.transcript_copy = Arc::downgrade(&guard);
+            self.app_event_tx
+                .send(AppEvent::SelectTranscriptCopy { guard });
+            return;
+        }
         let mut choices = Vec::new();
         if let Some(status_targets) = &self.transcript.last_status_copy_targets {
             choices.push((
@@ -87,7 +98,7 @@ impl ChatWidget {
                         tx.send(AppEvent::CopySelection {
                             text: Arc::clone(&text),
                             label: label.clone(),
-                            format,
+                            format: format.clone(),
                         });
                     })],
                     dismiss_on_select: true,

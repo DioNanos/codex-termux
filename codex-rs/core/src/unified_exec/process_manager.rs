@@ -899,7 +899,7 @@ impl UnifiedExecProcessManager {
         };
         let _interaction_guard = locked_process.interaction_lock().lock_owned().await;
         // A queued write must observe strict review enabled while it was waiting.
-        let strict_auto_review = context.session.strict_auto_review_enabled().await;
+        let strict_auto_review = context.step_context.turn.strict_auto_review_enabled();
         let approval = {
             let store = self.process_store.lock().await;
             let entry = store
@@ -1440,7 +1440,6 @@ impl UnifiedExecProcessManager {
         cwd: PathUri,
         context: &UnifiedExecContext,
     ) -> Result<(UnifiedExecAttempt, Option<DeferredNetworkApproval>), UnifiedExecError> {
-        let turn = &context.step_context.turn;
         let shell_environment_policy = request.turn_environment.shell_environment_policy();
         let local_policy_env = create_env(shell_environment_policy, /*thread_id*/ None);
         let mut env = local_policy_env.clone();
@@ -1449,7 +1448,7 @@ impl UnifiedExecProcessManager {
             context.session.thread_id.to_string(),
         );
         inject_session_env(&mut env, context.session.session_id());
-        inject_apply_patch_env(&mut env, &turn.config.features);
+        inject_apply_patch_env(&mut env);
         let active_permission_profile = request.turn_environment.active_permission_profile();
         inject_permission_profile_env(&mut env, active_permission_profile.as_ref());
         let mut env = apply_unified_exec_env(env);
@@ -1505,7 +1504,7 @@ impl UnifiedExecProcessManager {
             .await;
         let req = UnifiedExecToolRequest {
             command: request.command.clone(),
-            shell_type: request.shell_type,
+            shell: request.shell.clone(),
             hook_command: request.hook_command.clone(),
             process_id: request.process_id,
             cwd,

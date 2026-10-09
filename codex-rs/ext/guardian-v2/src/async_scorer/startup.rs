@@ -15,6 +15,56 @@ use codex_model_provider::create_model_provider;
 use super::sampler::LunaSamplerConfig;
 use super::sampler::MODEL;
 
+// Decisions setup failures are telemetry only; they never affect the baseline sampler.
+pub(super) fn decisions_sampler(
+    input: &ThreadStartInput<'_, Config>,
+) -> Option<super::decisions::DecisionsSampler> {
+    use super::decisions::DecisionsError;
+    use super::decisions::DecisionsSampler;
+    use super::decisions::URL;
+    use codex_http_client::ClientRouteClass;
+    let result = decisions_api_key(
+        &input.config.model_provider_id,
+        input.config.model_provider.base_url.as_deref(),
+        |name| std::env::var(name),
+    )
+    .map_err(|_| DecisionsError::Credentials)
+    .and_then(|key| {
+        let client = input
+            .config
+            .http_client_factory()
+            .build_client_without_request_logging(URL, ClientRouteClass::Api)
+            .map_err(|_| DecisionsError::ClientSetup)?;
+        DecisionsSampler::new(client, key, URL.to_owned())
+    });
+    match result {
+        Ok(sampler) => Some(sampler),
+        Err(error) => {
+            if let Some(metrics) = input.extension_metrics.as_deref() {
+                metrics.counter(
+                    "codex.guardian_v2.decisions_comparison.setup_failure",
+                    /*inc*/ 1,
+                    &[("reason", super::metrics::decisions_failure_reason(error))],
+                );
+            }
+            None
+        }
+    }
+}
+
+fn decisions_api_key(
+    provider_id: &str,
+    base_url: Option<&str>,
+    read_env: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<String, std::env::VarError> {
+    read_env("CODEX_GUARDIAN_DECISIONS_API_KEY").or_else(|error| match error {
+        std::env::VarError::NotPresent if provider_id == "openai" && base_url.is_none() => {
+            read_env("OPENAI_API_KEY")
+        }
+        std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_) => Err(error),
+    })
+}
+
 pub(super) async fn sampler_config(
     input: &ThreadStartInput<'_, Config>,
     auth_manager: Arc<AuthManager>,
@@ -67,3 +117,7 @@ pub(super) async fn sampler_config(
         metrics: input.extension_metrics.clone(),
     }
 }
+
+#[cfg(test)]
+#[path = "startup_tests.rs"]
+mod tests;

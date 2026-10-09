@@ -39,13 +39,13 @@ use axum::http::HeaderValue;
 use base64::Engine;
 use codex_app_server_protocol::RemoteControlConnectionStatus;
 use codex_app_server_protocol::RemoteControlStatusChangedNotification;
-use codex_core::util::backoff;
 use codex_state::StateRuntime;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use futures::SinkExt;
 use futures::StreamExt;
 use futures::stream::SplitSink;
 use futures::stream::SplitStream;
+use rand::Rng;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io;
@@ -75,6 +75,10 @@ const REMOTE_CONTROL_WEBSOCKET_PONG_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(60);
 const REMOTE_CONTROL_ACCOUNT_ID_RETRY_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(1);
+const REMOTE_CONTROL_RECONNECT_BACKOFF_INITIAL: std::time::Duration =
+    std::time::Duration::from_secs(5);
+const REMOTE_CONTROL_RECONNECT_BACKOFF_RESET_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(60);
 const REMOTE_CONTROL_RECONNECT_BACKOFF_CAP: std::time::Duration =
     std::time::Duration::from_secs(30);
 const REMOTE_CONTROL_WEBSOCKET_CONNECT_TIMEOUT: std::time::Duration =
@@ -535,6 +539,31 @@ impl RemoteControlWebsocket {
                 desired_state = ?*self.desired_state_rx.borrow(),
                 "app-server remote control websocket connection cycle ended"
             );
+            if matches!(
+                connection_end_reason,
+                ConnectionEndReason::ConnectionWorkerStopped
+            ) {
+                self.status_publisher
+                    .publish_status(RemoteControlConnectionStatus::Connecting);
+                // Spread automatic reconnects before token refresh or enrollment, too.
+                let reconnect_delay = next_reconnect_delay(&mut self.reconnect_attempt);
+                tokio::select! {
+                    biased;
+                    _ = self.shutdown_token.cancelled() => break,
+                    _ = auth_owner.invalidated() => break,
+                    // A disable/enable pair must interrupt the delay even if the latest state is enabled.
+                    changed = self.desired_state_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        if !self.desired_state_rx.borrow().is_enabled() {
+                            self.status_publisher
+                                .publish_status(RemoteControlConnectionStatus::Disabled);
+                        }
+                    }
+                    _ = tokio::time::sleep(reconnect_delay) => {}
+                }
+            }
         }
 
         self.client_tracker.lock().await.shutdown().await;
@@ -751,7 +780,6 @@ impl RemoteControlWebsocket {
                     if !self.desired_state_rx.borrow().is_enabled() {
                         return ConnectOutcome::Disabled;
                     }
-                    self.reconnect_attempt = 0;
                     self.auth_recovery = self.auth_manager.unauthorized_recovery();
                     self.status_publisher
                         .publish_status(RemoteControlConnectionStatus::Connected);
@@ -793,8 +821,7 @@ impl RemoteControlWebsocket {
                         self.status_publisher
                             .publish_status(RemoteControlConnectionStatus::Errored);
                         let reconnect_attempt = self.reconnect_attempt.saturating_add(1);
-                        let (reconnect_delay, reconnect_backoff_reset) =
-                            next_reconnect_delay(&mut self.reconnect_attempt);
+                        let reconnect_delay = next_reconnect_delay(&mut self.reconnect_attempt);
                         let reconnect_delay = server_retry_delay
                             .map_or(reconnect_delay, |delay| reconnect_delay.max(delay));
                         let enrollment = self.current_enrollment.snapshot();
@@ -806,19 +833,12 @@ impl RemoteControlWebsocket {
                             error_kind = ?err.kind(),
                             reconnect_attempt,
                             reconnect_delay = ?reconnect_delay,
-                            reconnect_backoff_reset,
                             has_enrollment = enrollment.is_some(),
                             server_id = ?enrollment.as_ref().map(|enrollment| enrollment.server_id.as_str()),
                             environment_id = ?enrollment.as_ref().map(|enrollment| enrollment.environment_id.as_str()),
                             subscribe_cursor_present = subscribe_cursor.is_some(),
                             "failed to connect to app-server remote control websocket"
                         );
-                        if reconnect_backoff_reset {
-                            info!(
-                                reconnect_backoff_cap = ?REMOTE_CONTROL_RECONNECT_BACKOFF_CAP,
-                                "reset app-server remote control websocket reconnect backoff after cap"
-                            );
-                        }
                         reconnect_delay
                     };
                     tokio::select! {
@@ -846,13 +866,14 @@ impl RemoteControlWebsocket {
     }
 
     async fn run_connection(
-        &self,
+        &mut self,
         websocket_connection: codex_websocket_client::WebSocketConnection,
         shutdown_token: CancellationToken,
     ) -> ConnectionEndReason {
         if !self.auth_manager.owner.is_current() {
             return ConnectionEndReason::AuthOwnerChanged;
         }
+        let connected_at = tokio::time::Instant::now();
         self.client_tracker.lock().await.auth = Some(self.auth_manager.owner.clone());
         let (websocket_writer, websocket_reader) = websocket_connection.split();
         let mut join_set = tokio::task::JoinSet::new();
@@ -889,6 +910,9 @@ impl RemoteControlWebsocket {
             }
             _ = join_set.join_next() => ConnectionEndReason::ConnectionWorkerStopped,
         };
+        if connected_at.elapsed() >= REMOTE_CONTROL_RECONNECT_BACKOFF_RESET_AFTER {
+            self.reconnect_attempt = 0;
+        }
         shutdown_token.cancel();
 
         Self::join_connection_workers(&mut join_set, REMOTE_CONTROL_CONNECTION_SHUTDOWN_TIMEOUT)
@@ -1339,15 +1363,14 @@ async fn wait_for_auth_change(
     auth_change_rx.changed().await
 }
 
-fn next_reconnect_delay(reconnect_attempt: &mut u64) -> (std::time::Duration, bool) {
-    let reconnect_delay = backoff(*reconnect_attempt).min(REMOTE_CONTROL_RECONNECT_BACKOFF_CAP);
-    let reconnect_backoff_reset = reconnect_delay == REMOTE_CONTROL_RECONNECT_BACKOFF_CAP;
-    *reconnect_attempt = if reconnect_backoff_reset {
-        0
-    } else {
-        (*reconnect_attempt).saturating_add(1)
-    };
-    (reconnect_delay, reconnect_backoff_reset)
+fn next_reconnect_delay(reconnect_attempt: &mut u64) -> std::time::Duration {
+    let exponent = u32::try_from(*reconnect_attempt).unwrap_or(u32::MAX);
+    let backoff = REMOTE_CONTROL_RECONNECT_BACKOFF_INITIAL
+        .saturating_mul(2_u32.saturating_pow(exponent))
+        .min(REMOTE_CONTROL_RECONNECT_BACKOFF_CAP);
+    *reconnect_attempt = reconnect_attempt.saturating_add(1);
+    // Keep jitter at the cap, with a lower bound to avoid immediate retries.
+    backoff.mul_f64(rand::rng().random_range(0.5..=1.0))
 }
 
 pub(super) async fn connect_remote_control_websocket(
@@ -1811,6 +1834,10 @@ fn format_remote_control_websocket_connect_error(
 }
 
 #[cfg(test)]
+#[path = "websocket_retry_tests.rs"]
+mod retry_tests;
+
+#[cfg(test)]
 #[path = "websocket_refresh_tests.rs"]
 mod refresh_tests;
 
@@ -1901,26 +1928,6 @@ mod tests {
             .expect("queued credentials should be usable as soon as the server delay expires")
             .expect("auth watch should remain open");
         assert_eq!(started.elapsed(), Duration::from_secs(5));
-    }
-
-    #[test]
-    fn next_reconnect_delay_resets_after_cap() {
-        let mut reconnect_attempt = 9;
-
-        let (reconnect_delay, reconnect_backoff_reset) =
-            next_reconnect_delay(&mut reconnect_attempt);
-
-        assert_eq!(reconnect_delay, REMOTE_CONTROL_RECONNECT_BACKOFF_CAP);
-        assert!(reconnect_backoff_reset);
-        assert_eq!(reconnect_attempt, 0);
-
-        let (reconnect_delay, reconnect_backoff_reset) =
-            next_reconnect_delay(&mut reconnect_attempt);
-
-        assert!(reconnect_delay >= Duration::from_millis(180));
-        assert!(reconnect_delay <= Duration::from_millis(220));
-        assert!(!reconnect_backoff_reset);
-        assert_eq!(reconnect_attempt, 1);
     }
 
     #[test]

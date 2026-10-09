@@ -3,12 +3,18 @@ source: tui/src/app/agents_overview_tests.rs
 expression: "render_bottom_popup(&app.chat_widget,\n96).replace(&format!(\"{project}  2\"),\n&normalized_group).replace(&project, \"/tmp/project\")"
 ---
   Agent command center  Group: Project  g
-   All 2   Needs you 1   Working 0   Ready 0   Inactive 1                 tab/shift+tab filter
+   All 2   Needs you 1   Working 0   Ready 0   Inactive 1                      tab/⇧tab filter
   ────────────────────────────────────────────────────────────────────────────────────────────
       Tasks                                           │ Task details
   /tmp/project  2                                     │
   › ● Repair authentication                           │ Repair authentication
     ○ Investigate parser                              │ ● Needs input
+                                                      │
+                                                      │ Model: Unknown
+                                                      │ Reasoning: Unknown
+                                                      │
+                                                      │ Project
+                                                      │ /tmp/project
                                                       │
                                                       │ Agent: Check dependencies
                                                       │ Which dependency version should I use?
@@ -16,13 +22,7 @@ expression: "render_bottom_popup(&app.chat_widget,\n96).replace(&format!(\"{proj
                                                       │ Waiting for approval.
                                                       │ Waiting for your response.
                                                       │
-                                                      │ Project
-                                                      │ /tmp/project
-                                                      │ Model: Unknown
-                                                      │
                                                       │ Prompt
                                                       │ Repair authentication
-                                                      │
-                                                      │
                                                       │
   ? help  esc back  ↑/↓ move  enter open  n new

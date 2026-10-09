@@ -19,8 +19,10 @@ env:
   CODEX_ZSH_RELEASE_TAG: codex-zsh-v0.1.0
   CODEX_ZSH_MANIFEST_SHA256: c534eab89dcea7e3d8a5e5b3f49c025c7c64cd4e4d9814ee24871de58a9359a1
 
+# The launcher uses this per-tag group as the migration boundary. Keep shared
+# publication jobs on the original queued group below when changing this.
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -1531,6 +1533,12 @@ jobs:
           if-no-files-found: error
 
   release:
+    # Each job checks its channel under this lock; out-of-order builds cannot
+    # roll back GitHub, npm, R2, or the canary branch.
+    concurrency: &release-publication
+      group: rust-release
+      queue: max
+      cancel-in-progress: false
     needs:
       - tag-check
       - build
@@ -1650,7 +1658,10 @@ jobs:
 
       - name: Define release name
         id: release_name
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           # Extract the version from the tag name, which is in the format
           # "rust-v0.1.0".
           version="${GITHUB_REF_NAME#rust-v}"
@@ -1659,7 +1670,9 @@ jobs:
             echo "make_latest=false" >> $GITHUB_OUTPUT
             echo "prerelease=true" >> $GITHUB_OUTPUT
           else
-            echo "make_latest=true" >> $GITHUB_OUTPUT
+            make_latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" \
+              | python3 .github/scripts/releases.py "$version" --check-github latest)"
+            echo "make_latest=${make_latest}" >> $GITHUB_OUTPUT
             echo "prerelease=false" >> $GITHUB_OUTPUT
           fi
 
@@ -1685,7 +1698,7 @@ jobs:
       - name: Stage installer scripts
         run: |
           cp scripts/install/install.sh dist/install.sh
-          cp scripts/install/install.ps1 dist/install.ps1
+          mv dist/x86_64-pc-windows-msvc/install.ps1 dist/install.ps1
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
@@ -1720,6 +1733,7 @@ jobs:
       stage: assets
 
   publish-r2:
+    concurrency: *release-publication
     name: publish-r2
     needs: [release, publish-dotslash, publish-r2-assets]
     if: >-
@@ -1783,6 +1797,7 @@ jobs:
   # July 31, 2025: https://github.blog/changelog/2025-07-31-npm-trusted-publishing-with-oidc-is-generally-available/
   # npm docs: https://docs.npmjs.com/trusted-publishers
   publish-npm:
+    concurrency: *release-publication
     # Publish to npm for stable releases, numbered alphas, and alpha hotfixes.
     if: >-
       ${{
@@ -1798,6 +1813,11 @@ jobs:
       contents: read
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
       - name: Setup Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
@@ -1918,6 +1938,10 @@ jobs:
                 ;;
             esac
 
+            # The publication workflow holds the lock from this lookup through
+            # publish, including concurrent releases from other version lines.
+            tag="$(python3 .github/scripts/npm_alpha_tag.py "${tarball}" "${VERSION}" "${tag:-latest}")"
+
             publish_cmd=(npm publish "${GITHUB_WORKSPACE}/${tarball}")
             if [[ -n "${tag}" ]]; then
               publish_cmd+=(--tag "${tag}")
@@ -1972,6 +1996,7 @@ jobs:
           fi
 
   winget:
+    concurrency: *release-publication
     name: winget
     needs: release
     # Only publish stable/mainline releases to WinGet; pre-releases include a
@@ -2033,6 +2058,7 @@ jobs:
           komac cleanup --only-merged
 
   update-branch:
+    concurrency: *release-publication
     name: Update latest-alpha-cli branch
     if: >-
       ${{
@@ -2068,7 +2094,7 @@ jobs:
           # is JSON metadata with the file contents encoded as base64.
           update="$(gh api "repos/$GITHUB_REPOSITORY/contents/codex-rs/Cargo.toml?ref=latest-alpha-cli" \
             -H 'Accept: application/vnd.github.raw+json' \
-            | python3 .github/scripts/check_github_canary.py "$RELEASE_VERSION")"
+            | python3 .github/scripts/releases.py "$RELEASE_VERSION" --check-github canary)"
           echo "update=$update" >> "$GITHUB_OUTPUT"
       - name: Update latest-alpha-cli branch
         if: success() && steps.github_canary.outputs.update == 'true'

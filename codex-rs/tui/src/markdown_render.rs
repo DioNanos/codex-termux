@@ -81,6 +81,7 @@ mod mermaid;
 pub(crate) mod preferences;
 mod source_tables;
 mod streaming;
+pub(crate) use streaming::render_with_copy_sources;
 mod table_key_value;
 mod task_lists;
 mod web_links;
@@ -91,7 +92,6 @@ pub(crate) use list_spacing::ListSpacing;
 use list_spacing::UniformList;
 use local_links::is_local_path_like_link;
 use local_links::render_local_link_target;
-use local_links::should_render_local_link_label;
 pub(crate) use streaming::StreamingMarkdownRender;
 pub(crate) use streaming::render_streaming_markdown_lines_with_width_and_cwd;
 #[cfg(test)]
@@ -447,6 +447,9 @@ struct Writer<'a, 'policy> {
     inline_styles: Vec<Style>,
     copy_inline: Vec<crate::markdown_copy::Inline>,
     copy_line: crate::markdown_copy::CopyLine,
+    quote_sources: Vec<std::sync::Arc<str>>,
+    code_sources: Vec<crate::markdown_copy::SourceBlock>,
+    transformed_code_source: Option<std::sync::Arc<str>>,
     indent_stack: Vec<IndentContext>,
     list_indices: Vec<Option<u64>>,
     list_needs_blank_before_next_item: Vec<bool>,
@@ -489,6 +492,9 @@ impl<'a, 'policy> Writer<'a, 'policy> {
             inline_styles: Vec::new(),
             copy_inline: Vec::new(),
             copy_line: Default::default(),
+            quote_sources: Vec::new(),
+            code_sources: Vec::new(),
+            transformed_code_source: None,
             indent_stack: Vec::new(),
             list_indices: Vec::new(),
             list_needs_blank_before_next_item: Vec::new(),
@@ -532,6 +538,20 @@ impl<'a, 'policy> Writer<'a, 'policy> {
     where
         I: Iterator<Item = (Event<'a>, Range<usize>)>,
     {
+        let source = self
+            .code_sources
+            .iter()
+            .find(|source| source.range.contains(&range.start))
+            .map(|source| std::sync::Arc::clone(&source.content));
+        let same_source = match (&source, &self.transformed_code_source) {
+            (Some(source), Some(current)) => std::sync::Arc::ptr_eq(source, current),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_source {
+            self.flush_current_line();
+            self.transformed_code_source = source;
+        }
         self.prepare_for_event(&event);
         let copy_inline = crate::markdown_copy::Inline::from_event(&event);
         if let Some(inline) = &copy_inline {
@@ -608,7 +628,13 @@ impl<'a, 'policy> Writer<'a, 'policy> {
         match tag {
             Tag::Paragraph => self.start_paragraph(),
             Tag::Heading { level, .. } => self.start_heading(level),
-            Tag::BlockQuote => self.start_blockquote(),
+            Tag::BlockQuote => {
+                self.start_blockquote();
+                let source = self.quote_sources.first().cloned().unwrap_or_else(|| {
+                    crate::markdown_copy::quote_content(&self.input[range]).into()
+                });
+                self.quote_sources.push(source);
+            }
             Tag::CodeBlock(kind) => {
                 self.code_block_content_end = range.end;
                 let indent = match kind {
@@ -692,7 +718,11 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                 self.end_paragraph();
             }
             TagEnd::Heading(_) => self.end_heading(),
-            TagEnd::BlockQuote => self.end_blockquote(),
+            TagEnd::BlockQuote => {
+                self.flush_current_line();
+                self.end_blockquote();
+                self.quote_sources.pop();
+            }
             TagEnd::CodeBlock => self.end_codeblock(range),
             TagEnd::List(_) => self.end_list(),
             TagEnd::Item => {
@@ -1116,8 +1146,10 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                     Some(diagram) => diagram,
                     None => highlight_code_to_lines(&code, &lang),
                 };
+                let source: std::sync::Arc<str> = code.into();
                 for hl_line in highlighted {
                     self.push_line(Line::default());
+                    self.copy_line.code_source = Some(std::sync::Arc::clone(&source));
                     for span in hl_line.spans {
                         self.push_span(span);
                     }
@@ -2139,7 +2171,10 @@ impl<'a, 'policy> Writer<'a, 'policy> {
             style_label,
             has_visible_label: false,
             local_target_display: if is_local_path_like_link(&dest_url) {
-                render_local_link_target(&dest_url, self.cwd.as_deref())
+                Some(
+                    render_local_link_target(&dest_url, self.cwd.as_deref())
+                        .unwrap_or_else(|| dest_url.clone()),
+                )
             } else {
                 None
             },
@@ -2184,13 +2219,10 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                     self.push_span(")".into());
                 }
             } else if let Some(local_target_display) = link.local_target_display {
-                let local_label_text = link
+                let show_label = link
                     .local_label_spans
                     .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>();
-                let show_label =
-                    should_render_local_link_label(&local_label_text, &link.destination);
+                    .any(|span| !span.content.trim().is_empty());
                 let style = self
                     .inline_styles
                     .last()
@@ -2211,7 +2243,9 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                         }
                         self.push_span_to_table_cell(" (".into());
                     }
+                    self.copy_inline.push(crate::markdown_copy::Inline::Literal);
                     self.push_span_to_table_cell(span);
+                    self.copy_inline.pop();
                     if show_label {
                         self.push_span_to_table_cell(")".into());
                     }
@@ -2231,7 +2265,9 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                         }
                         self.push_span(" (".into());
                     }
+                    self.copy_inline.push(crate::markdown_copy::Inline::Literal);
                     self.push_span(span);
+                    self.copy_inline.pop();
                     if show_label {
                         self.push_span(")".into());
                     }
@@ -2343,6 +2379,8 @@ impl<'a, 'policy> Writer<'a, 'policy> {
             .and_then(|source| source.copy.as_deref())
             .cloned()
             .unwrap_or_default();
+        copy.code_source = self.transformed_code_source.clone();
+        copy.quote_source = self.quote_sources.first().cloned();
         copy.prefix = self.copy_prefix(pending_marker_line);
         copy.continuation = self.copy_prefix(/*pending_marker_line*/ false);
         copy.item_prefix = self.copy_prefix(/*pending_marker_line*/ true);
@@ -2377,6 +2415,8 @@ impl<'a, 'policy> Writer<'a, 'policy> {
         self.copy_line.continuation = self.copy_prefix(/*pending_marker_line*/ false);
         self.copy_line.item_prefix = self.copy_prefix(/*pending_marker_line*/ true);
         self.copy_line.code = self.in_code_block;
+        self.copy_line.code_source = self.transformed_code_source.clone();
+        self.copy_line.quote_source = self.quote_sources.first().cloned();
         // Heading markers are already visible; retain them as Markdown syntax.
         self.copy_line
             .push(line.spans.iter().map(|span| span.content.len()).sum(), &[]);

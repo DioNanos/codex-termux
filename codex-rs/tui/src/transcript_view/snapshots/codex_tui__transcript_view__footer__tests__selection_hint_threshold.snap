@@ -6,7 +6,7 @@ searching=false · mouse down
 <composer hints>
 
 searching=false · one character
-ctrl+c copy · enter copy & follow · esc clear
+⌃c copy · enter copy & follow · esc clear
 
 searching=false · back to anchor
 <composer hints>
@@ -16,16 +16,16 @@ searching=false · released empty
 
 searching=true · mouse down
 Find:
-Searching… · full transcript · esc close
+Searching… · full transcript · esc cancel
 
 searching=true · one character
 Find:
-ctrl+c copy · enter copy & follow · esc clear
+⌃c copy · enter copy & follow · esc clear
 
 searching=true · back to anchor
 Find:
-Searching… · full transcript · esc close
+Searching… · full transcript · esc cancel
 
 searching=true · released empty
 Find:
-Searching… · full transcript · esc close
+Searching… · full transcript · esc cancel

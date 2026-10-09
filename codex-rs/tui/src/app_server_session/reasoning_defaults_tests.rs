@@ -3,8 +3,6 @@
 use super::*;
 use crate::legacy_core::config::ConfigBuilder;
 use codex_app_server_protocol::ServerNotification;
-use codex_protocol::config_types::ReasoningSummary;
-use codex_protocol::config_types::Verbosity;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -12,17 +10,22 @@ use serde_json::json;
 #[tokio::test]
 async fn reasoning_defaults_reach_responses() -> Result<()> {
     for (settings, summary, stream_options, mode) in [
-        ("", json!(null), json!(null), ThreadParamsMode::Embedded),
+        (
+            "",
+            json!("concise"),
+            json!(null),
+            ThreadParamsMode::Embedded,
+        ),
         (
             "[features]\nconcurrent_reasoning_summaries = false",
-            json!(null),
+            json!("concise"),
             json!(null),
             ThreadParamsMode::Embedded,
         ),
         (
             "[features]\nconcurrent_reasoning_summaries = true",
-            json!(null),
-            json!(null),
+            json!("concise"),
+            json!({"reasoning_summary_delivery": "sequential_cutoff"}),
             ThreadParamsMode::Embedded,
         ),
         (
@@ -44,7 +47,7 @@ async fn reasoning_defaults_reach_responses() -> Result<()> {
             ThreadParamsMode::Embedded,
         ),
         (
-            "model_reasoning_summary = 'detailed'\nmodel_verbosity = 'high'",
+            "model_reasoning_summary = 'detailed'\nmodel_verbosity = 'high'\nweb_search = 'live'",
             json!("detailed"),
             json!(null),
             ThreadParamsMode::Remote,
@@ -75,16 +78,33 @@ stream_max_retries = 0
             codex_protocol::config_types::TrustLevel::Trusted,
         )
         .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
-        let mut config = ConfigBuilder::default()
+        let mut server_config = ConfigBuilder::default()
             .codex_home(home.path().to_path_buf())
             .build()
             .await?;
-        let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let mut catalog = codex_models_manager::bundled_models_response()?;
+        catalog
+            .models
+            .iter_mut()
+            .find(|model| model.slug == "gpt-5.5")
+            .expect("bundled model")
+            .default_reasoning_summary = codex_protocol::config_types::ReasoningSummary::Concise;
+        server_config.model_catalog = Some(catalog);
+        let client_home = tempfile::tempdir()?;
+        let config = if mode == ThreadParamsMode::Remote {
+            std::fs::write(
+                client_home.path().join("config.toml"),
+                "model_reasoning_summary = 'concise'\nmodel_verbosity = 'low'\nweb_search = 'disabled'",
+            )?;
+            ConfigBuilder::default()
+                .codex_home(client_home.path().to_path_buf())
+                .build()
+                .await?
+        } else {
+            server_config.clone()
+        };
+        let mut app_server = crate::start_embedded_app_server_for_picker(&server_config).await?;
         app_server.thread_params_mode = mode;
-        if mode == ThreadParamsMode::Remote {
-            config.model_reasoning_summary = Some(ReasoningSummary::Concise);
-            config.model_verbosity = Some(Verbosity::Low);
-        }
         let started = app_server.start_thread(&config).await?;
         for resume in [false, true] {
             if resume {
@@ -92,7 +112,7 @@ stream_max_retries = 0
                     break;
                 }
                 app_server.shutdown().await?;
-                app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+                app_server = crate::start_embedded_app_server_for_picker(&server_config).await?;
                 app_server.thread_params_mode = mode;
                 app_server
                     .resume_thread(
@@ -129,8 +149,8 @@ stream_max_retries = 0
                     /*summary*/ None,
                     /*service_tier*/ None,
                     /*collaboration_mode*/ None,
-                    /*personality*/ None,
                     /*output_schema*/ None,
+                    /*cyber_access_program*/ None,
                 )
                 .await?;
             tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 30), async {
@@ -156,6 +176,13 @@ stream_max_retries = 0
             );
             if mode == ThreadParamsMode::Remote {
                 assert_eq!(body["text"]["verbosity"], json!("high"));
+                let web_search = body["tools"]
+                    .as_array()
+                    .expect("tools")
+                    .iter()
+                    .find(|tool| tool["type"] == "web_search")
+                    .expect("server's web search tool");
+                assert_eq!(web_search["external_web_access"], json!(true));
             }
             let metadata: serde_json::Value = serde_json::from_str(
                 body["client_metadata"]["x-codex-turn-metadata"]
@@ -178,83 +205,4 @@ stream_max_retries = 0
         app_server.shutdown().await?;
     }
     Ok(())
-}
-
-#[tokio::test]
-async fn new_tui_threads_disable_summaries_unless_explicitly_enabled() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    for (config_text, expected_summary, expected_concurrent) in [
-        ("", "none", false),
-        (
-            "[features]\nconcurrent_reasoning_summaries = true",
-            "none",
-            false,
-        ),
-        ("model_reasoning_summary = 'auto'", "auto", false),
-        ("model_reasoning_summary = 'detailed'", "detailed", false),
-        (
-            "model_reasoning_summary = 'detailed'\n[features]\nconcurrent_reasoning_summaries = true",
-            "detailed",
-            true,
-        ),
-        ("model_reasoning_summary = 'none'", "none", false),
-        (
-            "model_reasoning_summary = 'none'\n[features]\nconcurrent_reasoning_summaries = true",
-            "none",
-            false,
-        ),
-        (
-            "model_reasoning_summary = 'concise'\n[features]\nconcurrent_reasoning_summaries = false",
-            "concise",
-            false,
-        ),
-    ] {
-        std::fs::write(temp_dir.path().join("config.toml"), config_text).expect("config");
-        let config = ConfigBuilder::default()
-            .codex_home(temp_dir.path().to_path_buf())
-            .build()
-            .await
-            .expect("config should build");
-        let start = thread_start_params_from_config(
-            &config,
-            ThreadParamsMode::Embedded,
-            /*remote_cwd_override*/ None,
-            /*session_start_source*/ None,
-        );
-        let overrides = start.config.expect("thread config");
-        assert_eq!(
-            overrides.get("model_reasoning_summary"),
-            Some(&serde_json::json!(expected_summary)),
-        );
-        assert_eq!(
-            overrides["features"]["concurrent_reasoning_summaries"],
-            expected_concurrent,
-        );
-    }
-    std::fs::write(
-        temp_dir.path().join("config.toml"),
-        "model_reasoning_summary = 'detailed'",
-    )
-    .expect("config");
-    let config = ConfigBuilder::default()
-        .codex_home(temp_dir.path().to_path_buf())
-        .cli_overrides(vec![(
-            "model_reasoning_summary".to_string(),
-            toml::Value::String("none".to_string()),
-        )])
-        .build()
-        .await
-        .expect("override config");
-    let start = thread_start_params_from_config(
-        &config,
-        ThreadParamsMode::Embedded,
-        /*remote_cwd_override*/ None,
-        /*session_start_source*/ None,
-    );
-    let overrides = start.config.expect("thread config");
-    assert_eq!(overrides["model_reasoning_summary"], "none");
-    assert_eq!(
-        overrides["features"]["concurrent_reasoning_summaries"],
-        false
-    );
 }

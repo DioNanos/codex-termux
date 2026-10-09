@@ -245,7 +245,9 @@ async fn prepare_from_package(
     anyhow::ensure!(
         package_tree(source, /*destination*/ None)? == digest
             && std::fs::read(stage.path().join("codex-package.json"))? == manifest_bytes
-            && managed_install::executable_identity(&staged_exe).await? == running_identity,
+            && managed_install::executable_identity(&staged_exe)
+                .await?
+                .same_contents(&running_identity),
         "the CLI package changed while preparing the daemon or differs from the running executable"
     );
     let binary_version =
@@ -271,6 +273,9 @@ async fn prepare_from_package(
         if !stage.path().join("codex").exists() {
             std::os::unix::fs::symlink("bin/codex", stage.path().join("codex"))?;
         }
+        #[cfg(windows)]
+        windows::publish_release(stage.path(), &release).await?;
+        #[cfg(not(windows))]
         std::fs::rename(stage.path(), &release)?;
     }
     let standalone = home.join("packages/standalone");
@@ -434,6 +439,12 @@ fn stable_version(value: &str) -> Option<semver::Version> {
 }
 
 fn validate_package(root: &Path) -> Result<()> {
+    validate_package_for_platform(root, cfg!(target_os = "android"))
+}
+
+/// Android is split out of `validate_package` so the Termux policy stays
+/// testable on every host.
+fn validate_package_for_platform(root: &Path, android: bool) -> Result<()> {
     let mut names = vec![
         "codex-package.json",
         if cfg!(windows) {
@@ -446,12 +457,17 @@ fn validate_package(root: &Path) -> Result<()> {
         } else {
             "bin/codex-code-mode-host"
         },
-        if cfg!(windows) {
+    ];
+    // The Android package does not bundle ripgrep: Termux resolves `rg` from
+    // PATH (`pkg install ripgrep`), the same way bwrap is only required where
+    // the package actually ships it.
+    if !android {
+        names.push(if cfg!(windows) {
             "codex-path/rg.exe"
         } else {
             "codex-path/rg"
-        },
-    ];
+        });
+    }
     if cfg!(windows) {
         names.extend([
             "codex-resources/codex-command-runner.exe",

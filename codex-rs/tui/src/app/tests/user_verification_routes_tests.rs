@@ -137,9 +137,9 @@ async fn side_toggle_surfaces_pending_verification_from_an_inactive_thread() -> 
         app.toggle_side_conversation(&mut tui, &mut app_server)
             .await?;
         assert_eq!(app.active_thread_id, Some(primary_thread_id));
-        insta::assert_snapshot!(
-            "side_toggle_surfaces_pending_user_verification",
-            render_bottom_popup(&app.chat_widget, /*width*/ 80)
+        assert!(app.chat_widget.has_active_view());
+        assert!(
+            render_bottom_popup(&app.chat_widget, /*width*/ 80).contains("Approve deployment?")
         );
         app_server.shutdown().await?;
         Ok(())
@@ -268,6 +268,7 @@ async fn inactive_thread_user_verification_preserves_foreground_stream() -> Resu
             AppEvent::InsertHistoryCell(cell) => app.insert_history_cell(&mut tui, cell),
             AppEvent::ConsolidateAgentMessage {
                 source,
+                copy_source,
                 cwd,
                 inline_visualization_context,
                 scrollback_reflow,
@@ -276,9 +277,12 @@ async fn inactive_thread_user_verification_preserves_foreground_stream() -> Resu
                 completed_messages.push(source.clone());
                 app.handle_consolidate_agent_message(
                     &mut tui,
-                    source,
-                    cwd,
-                    inline_visualization_context,
+                    history_cell::AgentMarkdownCell::new_with_inline_visualizations(
+                        source,
+                        &cwd,
+                        inline_visualization_context,
+                    )
+                    .with_copy_source(copy_source),
                     scrollback_reflow,
                     deferred_history_cell,
                 )?;

@@ -59,7 +59,10 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
             | EventMsg::ThreadSettingsApplied(_),
         ) => true,
         RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
-            if matches!(event.item, TurnItem::UserMessage(_)) =>
+            if matches!(
+                event.item,
+                TurnItem::UserMessage(_) | TurnItem::FunctionCallOutput(_)
+            ) =>
         {
             true
         }
@@ -142,6 +145,12 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
                 && !metadata_is_guardian_review(metadata)
             {
                 apply_user_message(metadata, &user.as_legacy_user_message_event());
+            } else if let TurnItem::FunctionCallOutput(output) = &event.item
+                && !metadata_is_guardian_review(metadata)
+            {
+                // Delegated turns have no user message, but must still be discoverable.
+                let preview = crate::delegated_output_preview(output);
+                set_preview_if_empty(metadata, preview);
             }
         }
         EventMsg::ThreadGoalUpdated(event) if !metadata_is_guardian_review(metadata) => {
@@ -287,6 +296,40 @@ mod tests {
         );
         assert_eq!(metadata.preview.as_deref(), Some("actual user request"));
         assert_eq!(metadata.title, "actual user request");
+    }
+
+    #[test]
+    fn delegated_turn_preview_preserves_user_message_metadata() {
+        let mut metadata = metadata_for_test();
+        let mut expected = metadata.clone();
+        for text in ["  ", "delegated task", "later output"] {
+            let item = RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: metadata.id,
+                turn_id: "turn-1".to_string(),
+                item: TurnItem::FunctionCallOutput(codex_protocol::items::FunctionCallOutputItem {
+                    id: "output-1".to_string(),
+                    name: "create_thread".to_string(),
+                    namespace: Some("codex_app".to_string()),
+                    output: codex_protocol::models::FunctionCallOutputBody::Text(text.to_string()),
+                }),
+                started_at_ms: Some(0),
+                completed_at_ms: 0,
+            }));
+            assert!(rollout_item_affects_thread_metadata(&item));
+            apply_rollout_item(&mut metadata, &item, "test-provider");
+            if text == "delegated task" {
+                expected.preview = Some(text.to_string());
+            }
+            assert_eq!(metadata, expected);
+        }
+        let user_item = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "actual user follow-up".to_string(),
+            ..Default::default()
+        }));
+        apply_rollout_item(&mut metadata, &user_item, "test-provider");
+        expected.first_user_message = Some("actual user follow-up".to_string());
+        expected.title = "actual user follow-up".to_string();
+        assert_eq!(metadata, expected);
     }
 
     #[test]
@@ -528,26 +571,20 @@ mod tests {
                         .join("parent/workspace")
                 ))
                 .expect("absolute parent cwd"),
-                workspace_roots: None,
-                current_date: None,
-                timezone: None,
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
                 permission_profile: None,
                 active_permission_profile: None,
-                network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
                 comp_hash: None,
-                personality: None,
                 collaboration_mode: None,
                 multi_agent_version: None,
-                multi_agent_mode: None,
                 realtime_active: None,
                 cyber_access_program: None,
                 effort: None,
-                summary: codex_protocol::config_types::ReasoningSummary::Auto,
+                summary: Some(codex_protocol::config_types::ReasoningSummary::Auto),
             }),
             "test-provider",
         );
@@ -578,26 +615,20 @@ mod tests {
                         .join("workspace")
                 ))
                 .expect("absolute workspace cwd"),
-                workspace_roots: None,
-                current_date: None,
-                timezone: None,
                 approval_policy: AskForApproval::OnRequest,
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
                 permission_profile: Some(permission_profile.clone()),
                 active_permission_profile: None,
-                network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
                 comp_hash: None,
-                personality: None,
                 collaboration_mode: None,
                 multi_agent_version: None,
-                multi_agent_mode: None,
                 realtime_active: None,
                 cyber_access_program: None,
                 effort: None,
-                summary: codex_protocol::config_types::ReasoningSummary::Auto,
+                summary: Some(codex_protocol::config_types::ReasoningSummary::Auto),
             }),
             "test-provider",
         );
@@ -624,26 +655,20 @@ mod tests {
                 disabled_plugin_ids: None,
                 cwd: serde_json::from_value(serde_json::json!(&fallback_cwd))
                     .expect("absolute fallback cwd"),
-                workspace_roots: None,
-                current_date: None,
-                timezone: None,
                 approval_policy: AskForApproval::OnRequest,
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 permission_profile: None,
                 active_permission_profile: None,
-                network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
                 comp_hash: None,
-                personality: None,
                 collaboration_mode: None,
                 multi_agent_version: None,
-                multi_agent_mode: None,
                 realtime_active: None,
                 cyber_access_program: None,
                 effort: Some(ReasoningEffort::High),
-                summary: codex_protocol::config_types::ReasoningSummary::Auto,
+                summary: Some(codex_protocol::config_types::ReasoningSummary::Auto),
             }),
             "test-provider",
         );
@@ -667,26 +692,20 @@ mod tests {
                         .join("fallback/workspace")
                 ))
                 .expect("absolute fallback cwd"),
-                workspace_roots: None,
-                current_date: None,
-                timezone: None,
                 approval_policy: AskForApproval::OnRequest,
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 permission_profile: None,
                 active_permission_profile: None,
-                network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
                 comp_hash: None,
-                personality: None,
                 collaboration_mode: None,
                 multi_agent_version: None,
-                multi_agent_mode: None,
                 realtime_active: None,
                 cyber_access_program: None,
                 effort: Some(ReasoningEffort::High),
-                summary: codex_protocol::config_types::ReasoningSummary::Auto,
+                summary: Some(codex_protocol::config_types::ReasoningSummary::Auto),
             }),
             "test-provider",
         );

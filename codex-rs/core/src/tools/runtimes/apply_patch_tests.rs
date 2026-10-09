@@ -34,6 +34,7 @@ use std::collections::HashMap;
 fn test_turn_environment(environment_id: &str) -> crate::session::turn_context::TurnEnvironment {
     crate::session::turn_context::TurnEnvironment::new(
         TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
             environment_id: environment_id.to_string(),
             cwd: PathUri::from_abs_path(&std::env::temp_dir().abs()),
             workspace_roots: Vec::new(),
@@ -600,14 +601,8 @@ async fn delete_preverification_reads_host_files_when_no_sandbox_can_exist() {
     );
     let backend = codex_exec_server::LocalFileSystem::unsandboxed();
 
-    let verified = codex_apply_patch::verify_apply_patch_args_with_mode(
-        args,
-        &cwd,
-        codex_apply_patch::ApplyPatchFileUpdateMode::NormalizeToLf,
-        &backend,
-        Some(&context),
-    )
-    .await;
+    let verified =
+        codex_apply_patch::verify_apply_patch_args(args, &cwd, &backend, Some(&context)).await;
 
     let action = match verified {
         codex_apply_patch::MaybeApplyPatchVerified::Body(action) => action,
@@ -640,14 +635,8 @@ async fn update_preverification_reads_host_files_when_no_sandbox_can_exist() {
     );
     let backend = codex_exec_server::LocalFileSystem::unsandboxed();
 
-    let verified = codex_apply_patch::verify_apply_patch_args_with_mode(
-        args,
-        &cwd,
-        codex_apply_patch::ApplyPatchFileUpdateMode::NormalizeToLf,
-        &backend,
-        Some(&context),
-    )
-    .await;
+    let verified =
+        codex_apply_patch::verify_apply_patch_args(args, &cwd, &backend, Some(&context)).await;
 
     let action = match verified {
         codex_apply_patch::MaybeApplyPatchVerified::Body(action) => action,
@@ -683,14 +672,8 @@ async fn denied_read_policy_keeps_preverification_fail_closed_when_no_sandbox_ca
     );
     let backend = codex_exec_server::LocalFileSystem::unsandboxed();
 
-    let verified = codex_apply_patch::verify_apply_patch_args_with_mode(
-        args,
-        &cwd,
-        codex_apply_patch::ApplyPatchFileUpdateMode::NormalizeToLf,
-        &backend,
-        Some(&context),
-    )
-    .await;
+    let verified =
+        codex_apply_patch::verify_apply_patch_args(args, &cwd, &backend, Some(&context)).await;
 
     match verified {
         codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(_) => {}
@@ -719,14 +702,8 @@ async fn linux_platform_keeps_preverification_on_the_sandboxed_routing() {
     );
     let backend = codex_exec_server::LocalFileSystem::unsandboxed();
 
-    let verified = codex_apply_patch::verify_apply_patch_args_with_mode(
-        args,
-        &cwd,
-        codex_apply_patch::ApplyPatchFileUpdateMode::NormalizeToLf,
-        &backend,
-        Some(&context),
-    )
-    .await;
+    let verified =
+        codex_apply_patch::verify_apply_patch_args(args, &cwd, &backend, Some(&context)).await;
 
     match verified {
         codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(_) => {}

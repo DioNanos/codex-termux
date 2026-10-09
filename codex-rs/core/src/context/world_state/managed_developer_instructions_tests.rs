@@ -23,8 +23,9 @@ fn managed_policy_updates_and_removal_are_emitted_once() {
             instructions.map(|text| Sourced::new(text.to_string(), RequirementSource::Unknown));
         let mut world_state = WorldState::default();
         world_state.add_section(ManagedDeveloperInstructionsState::new(requirement.as_ref()));
-        let updates = world_state
-            .render_history_diff(previous.as_ref(), &history)
+        let (snapshot, fragments) =
+            world_state.render_history_fragment_diff(previous.as_ref(), &history);
+        let updates = fragments
             .into_iter()
             .map(ContextualUserFragment::into_boxed_response_item)
             .collect::<Vec<_>>();
@@ -38,10 +39,11 @@ fn managed_policy_updates_and_removal_are_emitted_once() {
                 .collect::<Vec<_>>()
         );
         history.extend(updates);
-        previous = Some(world_state.snapshot());
+        previous = Some(snapshot);
         assert!(
             world_state
-                .render_history_diff(previous.as_ref(), &history)
+                .render_history_fragment_diff(previous.as_ref(), &history)
+                .1
                 .is_empty()
         );
     }
@@ -62,7 +64,11 @@ fn managed_policy_updates_and_removal_are_emitted_once() {
         world_state.add_section(ManagedDeveloperInstructionsState::new(requirement.as_ref()));
         assert_eq!(
             world_state
-                .render_history_diff(/*previous*/ None, std::slice::from_ref(&legacy_policy))
+                .render_history_fragment_diff(
+                    /*previous*/ None,
+                    std::slice::from_ref(&legacy_policy)
+                )
+                .1
                 .into_iter()
                 .map(ContextualUserFragment::into_boxed_response_item)
                 .collect::<Vec<_>>(),

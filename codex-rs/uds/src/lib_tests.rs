@@ -358,3 +358,31 @@ async fn implicit_peer_validation_rejects_elevated_listener() {
         expected
     );
 }
+
+/// A path beyond the sockaddr_un limit must fail with an error that names
+/// the rejected path and the platform limit, so a long CODEX_HOME (or any
+/// other deep socket directory) produces an actionable message.
+#[cfg(unix)]
+#[tokio::test]
+async fn binding_beyond_sockaddr_un_names_the_path_and_limit() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let socket_path = temp_dir
+        .path()
+        .join("s".repeat(super::unix_socket_path_limit()));
+
+    let error = match UnixListener::bind(&socket_path).await {
+        Ok(_) => panic!("an overlong socket path must fail to bind"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    let message = error.to_string();
+    assert!(
+        message.contains(&socket_path.display().to_string()),
+        "the error must name the rejected path: {message}"
+    );
+    assert!(
+        message.contains(&super::unix_socket_path_limit().to_string()),
+        "the error must name the platform limit: {message}"
+    );
+}

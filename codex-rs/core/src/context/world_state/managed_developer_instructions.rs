@@ -1,6 +1,8 @@
 use super::PreviousSectionState;
+use super::SectionTransition;
 use super::WorldStateHash;
 use super::WorldStateSection;
+use super::WorldStateUpdate;
 use crate::context::ContextualUserFragment;
 use codex_config::Sourced;
 use codex_protocol::models::ContentItemKind;
@@ -28,10 +30,6 @@ impl ContextualUserFragment for ManagedDeveloperInstructions {
 
     fn role(&self) -> &'static str {
         "developer"
-    }
-
-    fn requires_separate_message(&self) -> bool {
-        true
     }
 
     fn markers(&self) -> (&'static str, &'static str) {
@@ -104,15 +102,6 @@ impl WorldStateSection for ManagedDeveloperInstructionsState {
     const ID: &'static str = "managed_developer_instructions";
     type Snapshot = ManagedDeveloperInstructionsSnapshot;
 
-    fn snapshot(&self) -> Self::Snapshot {
-        ManagedDeveloperInstructionsSnapshot {
-            instructions: self
-                .instructions
-                .as_ref()
-                .map(WorldStateHash::from_fragment),
-        }
-    }
-
     fn matches_legacy_fragment(role: &str, text: &str) -> bool {
         role == "developer" && ManagedDeveloperInstructions::matches_text(text)
     }
@@ -128,10 +117,15 @@ impl WorldStateSection for ManagedDeveloperInstructionsState {
     fn render_diff(
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn ContextualUserFragment>> {
-        if matches!(previous, PreviousSectionState::Known(previous) if previous == &self.snapshot())
-        {
-            return None;
+    ) -> SectionTransition<Self::Snapshot> {
+        let current = ManagedDeveloperInstructionsSnapshot {
+            instructions: self
+                .instructions
+                .as_ref()
+                .map(WorldStateHash::from_fragment),
+        };
+        if matches!(previous, PreviousSectionState::Known(previous) if previous == &current) {
+            return (None, Vec::new());
         }
         let previous_had_instructions = match previous {
             PreviousSectionState::Absent => false,
@@ -146,9 +140,12 @@ impl WorldStateSection for ManagedDeveloperInstructionsState {
             (None, true) => ManagedDeveloperInstructions {
                 instructions: REMOVAL_NOTICE.to_string(),
             },
-            (None, false) => return None,
+            (None, false) => return (Some(current), Vec::new()),
         };
-        Some(Box::new(fragment))
+        (
+            Some(current),
+            vec![WorldStateUpdate::fragment(fragment).standalone()],
+        )
     }
 }
 

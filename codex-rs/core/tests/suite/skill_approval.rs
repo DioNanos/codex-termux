@@ -17,7 +17,7 @@ use core_test_support::responses::mount_function_call_agent_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
-use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::local_requests;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
@@ -57,7 +57,7 @@ async fn submit_turn_with_policies(
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+                environments: Some(local_requests(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -83,8 +83,6 @@ fn write_skill_with_shell_script_contents(
     script_name: &str,
     script_contents: &str,
 ) -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-
     let skill_dir = home.join("skills").join(name);
     let scripts_dir = skill_dir.join("scripts");
     fs::create_dir_all(&scripts_dir)?;
@@ -100,10 +98,7 @@ description: {name} skill
     )?;
 
     let script_path = scripts_dir.join(script_name);
-    fs::write(&script_path, script_contents)?;
-    let mut permissions = fs::metadata(&script_path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script_path, permissions)?;
+    codex_utils_cargo_bin::write_executable(&script_path, script_contents)?;
     Ok(script_path)
 }
 

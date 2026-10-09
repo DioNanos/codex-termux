@@ -5,6 +5,8 @@
 //! Long text splits losslessly only after admission, preserving whole-entry selection.
 //! Action-specific attestations follow the transcript so they do not invalidate
 //! the reusable history prefix when previous decisions or tool evidence change.
+//! Async retained context also follows the transcript so its rolling window cannot
+//! invalidate that prefix. Sync retains its existing section order.
 
 use codex_context_fragments::ContextualUserFragment;
 use codex_history::CodexHarnessMetadata;
@@ -22,6 +24,8 @@ use crate::ContextSection;
 use crate::ConversationTranscriptEntry;
 use crate::SectionError;
 use crate::TranscriptContent;
+use crate::TranscriptFormat;
+use crate::TranscriptRecord;
 use crate::TruncationObservation;
 
 /// Consumer framing after the host has selected a full or delta transcript.
@@ -29,16 +33,18 @@ pub enum ContextPresentation<'a> {
     SyncFull { session_id: &'a str },
     SyncDelta { session_id: &'a str },
     Async,
+    AsyncDelta,
 }
 
 /// Host-selected transcript entries and omission notice, before request admission.
-pub struct RenderedTranscript {
+pub struct PreparedTranscript {
     pub items: Vec<Budgeted<TranscriptContent>>,
     pub omission_note: Option<String>,
     pub truncations: Vec<TruncationObservation>,
 }
 
 /// Evidence collected successfully before host transcript selection.
+#[derive(Clone)]
 pub struct CollectedContext {
     pub(crate) sections: Vec<ContextSection>,
 }
@@ -46,11 +52,74 @@ pub struct CollectedContext {
 /// One section's delivery; separate messages retain their roles and annotations.
 #[derive(Clone, PartialEq)]
 pub(crate) enum SectionDelivery {
-    UserContent(Vec<Budgeted<ContentItem>>),
-    Message(Budgeted<Box<ResponseItem>>),
+    UserContent(Vec<Budgeted<SectionContent>>),
+    Message(Budgeted<Box<ResponseItemEnvelope>>),
 }
 
-/// Rendered evidence with a stable identity, independent of its source type.
+impl SectionDelivery {
+    /// Ordinary sections keep native content; only transcript entries need a record.
+    pub(crate) fn user_content(items: Vec<Budgeted<ContentItem>>) -> Self {
+        Self::UserContent(
+            items
+                .into_iter()
+                .map(|item| Budgeted {
+                    content: SectionContent::Other(item.content),
+                    retention: item.retention,
+                    source: item.source,
+                })
+                .collect(),
+        )
+    }
+}
+
+/// JSON stays structured during admission; line mode keeps whole-entry truncation.
+#[derive(Clone, PartialEq)]
+pub(crate) enum SectionContent {
+    Transcript(TranscriptRecord),
+    Other(ContentItem),
+}
+
+impl From<TranscriptRecord> for SectionContent {
+    fn from(record: TranscriptRecord) -> Self {
+        match record.format() {
+            TranscriptFormat::Line => Self::Other(record.into_content_item()),
+            TranscriptFormat::Json => Self::Transcript(record),
+        }
+    }
+}
+
+impl From<ContentItem> for SectionContent {
+    fn from(item: ContentItem) -> Self {
+        Self::Other(item)
+    }
+}
+
+impl From<String> for SectionContent {
+    fn from(text: String) -> Self {
+        Self::Other(ContentItem::InputText { text })
+    }
+}
+
+impl SectionContent {
+    pub(crate) fn replace_text(&mut self, text: String) -> Option<String> {
+        match self {
+            Self::Transcript(record) => Some(record.replace_text(text)),
+            Self::Other(ContentItem::InputText { text: body }) => {
+                Some(std::mem::replace(body, text))
+            }
+            _ => None,
+        }
+    }
+
+    fn into_content_item(self) -> ContentItem {
+        match self {
+            Self::Transcript(record) => record.into_content_item(),
+            Self::Other(item) => item,
+        }
+    }
+}
+
+/// Prepared evidence with a stable identity, independent of its source type.
 #[derive(Clone, PartialEq)]
 pub(crate) struct SectionOutput {
     pub id: &'static str,
@@ -76,11 +145,11 @@ impl CollectedContext {
             .unwrap_or_default()
     }
 
-    /// Frames the selected transcript and renders all sections through one contract.
+    /// Frames the selected transcript while preserving structured text through admission.
     pub fn compose(
         self,
         presentation: ContextPresentation<'_>,
-        mut transcript: RenderedTranscript,
+        mut transcript: PreparedTranscript,
     ) -> Result<ComposedContext, SectionError> {
         let (action, intro, start, end, session_id) = match presentation {
             ContextPresentation::SyncFull { session_id } => (
@@ -108,6 +177,15 @@ impl CollectedContext {
                 ">>> TRANSCRIPT END\n\n",
                 None,
             ),
+            ContextPresentation::AsyncDelta => (
+                ActionPresentation::Async,
+                Some(
+                    "Continue the classification using the transcript added since your last assessment and the current action. Apply the same classifier policy to the whole conversation. Previous classifications are decisions, not authorization.\n",
+                ),
+                ">>> TRANSCRIPT DELTA START\n",
+                ">>> TRANSCRIPT DELTA END\n\n",
+                None,
+            ),
         };
         let mut sections = Vec::new();
         let mut truncations = std::mem::take(&mut transcript.truncations);
@@ -126,20 +204,22 @@ impl CollectedContext {
                 ContextSection::PreviousReviews(reviews) => (
                     6,
                     "previous_reviews",
-                    SectionDelivery::Message(Budgeted::required(Box::new(reviews.into_message()))),
+                    SectionDelivery::Message(Budgeted::required(Box::new(
+                        reviews.into_annotated_message(),
+                    ))),
                 ),
                 ContextSection::TrustedTool(tool) => (
                     7,
                     "trusted_tool",
                     SectionDelivery::Message(Budgeted::required(Box::new(
-                        ContextualUserFragment::into(tool),
+                        ResponseItemEnvelope::new(ContextualUserFragment::into(tool)),
                     ))),
                 ),
                 ContextSection::TrustedSkills(skills) => (
                     8,
                     "trusted_skills",
                     SectionDelivery::Message(Budgeted::required(Box::new(
-                        ContextualUserFragment::into(skills),
+                        ResponseItemEnvelope::new(ContextualUserFragment::into(skills)),
                     ))),
                 ),
                 ContextSection::RootConversation { items } => {
@@ -149,9 +229,9 @@ impl CollectedContext {
                     (1, "sender_user_messages", text_content(items))
                 }
                 ContextSection::RetainedUserInstructions { items } => (
-                    2,
+                    if session_id.is_some() { 2 } else { 9 },
                     "retained_user_instructions",
-                    SectionDelivery::UserContent(
+                    SectionDelivery::user_content(
                         items
                             .into_iter()
                             .map(|item| Budgeted {
@@ -172,26 +252,17 @@ impl CollectedContext {
                         transcript.take().ok_or(SectionError::UnsupportedDelivery {
                             section: "conversation_transcript",
                         })?;
-                    let mut items = vec![Budgeted::required(start.to_owned())];
+                    let mut items = vec![Budgeted::required(start.to_owned().into())];
                     for (index, entry) in transcript.items.into_iter().enumerate() {
-                        let text = match entry.content {
+                        let content = match entry.content {
                             TranscriptContent::AgentMessage(message) => {
                                 sections.push((
                                     4,
                                     SectionOutput {
                                         id: "conversation_transcript",
-                                        delivery: SectionDelivery::UserContent(
-                                            std::mem::take(&mut items)
-                                                .into_iter()
-                                                .map(|item| Budgeted {
-                                                    content: ContentItem::InputText {
-                                                        text: item.content,
-                                                    },
-                                                    retention: item.retention,
-                                                    source: item.source,
-                                                })
-                                                .collect(),
-                                        ),
+                                        delivery: SectionDelivery::UserContent(std::mem::take(
+                                            &mut items,
+                                        )),
                                     },
                                 ));
                                 sections.push((
@@ -199,7 +270,7 @@ impl CollectedContext {
                                     SectionOutput {
                                         id: "conversation_transcript",
                                         delivery: SectionDelivery::Message(Budgeted {
-                                            content: message,
+                                            content: Box::new(ResponseItemEnvelope::new(*message)),
                                             retention: entry.retention,
                                             source: entry.source,
                                         }),
@@ -207,40 +278,40 @@ impl CollectedContext {
                                 ));
                                 continue;
                             }
-                            TranscriptContent::Text(text) if session_id.is_some() => {
-                                let prefix = if index == 0 { "" } else { "\n" };
-                                format!("{prefix}{text}\n")
+                            TranscriptContent::Text(text) => ContentItem::InputText {
+                                text: if session_id.is_some() {
+                                    format!("{}{text}\n", if index == 0 { "" } else { "\n" })
+                                } else {
+                                    text
+                                },
                             }
-                            TranscriptContent::Text(text) => text,
+                            .into(),
+                            TranscriptContent::Record(mut record) => {
+                                if session_id.is_some() {
+                                    record.frame_for_sync(if index == 0 { "" } else { "\n" });
+                                }
+                                record.into()
+                            }
                         };
                         items.push(Budgeted {
-                            content: text,
+                            content,
                             retention: entry.retention,
                             source: entry.source,
                         });
                     }
-                    items.push(Budgeted::required(end.to_owned()));
+                    items.push(Budgeted::required(end.to_owned().into()));
                     if let Some(session_id) = session_id {
-                        items.push(Budgeted::required(format!(
-                            "Reviewed Codex session id: {session_id}\n"
-                        )));
+                        items.push(Budgeted::required(
+                            format!("Reviewed Codex session id: {session_id}\n").into(),
+                        ));
                     }
                     if let Some(note) = transcript.omission_note {
-                        items.push(Budgeted::required(format!("\n{note}\n")));
+                        items.push(Budgeted::required(format!("\n{note}\n").into()));
                     }
                     (
                         4,
                         "conversation_transcript",
-                        SectionDelivery::UserContent(
-                            items
-                                .into_iter()
-                                .map(|item| Budgeted {
-                                    content: ContentItem::InputText { text: item.content },
-                                    retention: item.retention,
-                                    source: item.source,
-                                })
-                                .collect(),
-                        ),
+                        SectionDelivery::UserContent(items),
                     )
                 }
                 ContextSection::PermissionContext { items } => {
@@ -257,7 +328,7 @@ impl CollectedContext {
                     (
                         if session_id.is_some() { 9 } else { 12 },
                         "transcript_images",
-                        SectionDelivery::UserContent(
+                        SectionDelivery::user_content(
                             images
                                 .images
                                 .into_iter()
@@ -296,7 +367,7 @@ impl CollectedContext {
                     (
                         10,
                         "node_repl_evidence",
-                        SectionDelivery::UserContent(items),
+                        SectionDelivery::user_content(items),
                     )
                 }
                 ContextSection::PlannedAction(planned) => {
@@ -311,7 +382,7 @@ impl CollectedContext {
                             BudgetPriority::ToolDescription,
                         ));
                     }
-                    (11, "planned_action", SectionDelivery::UserContent(items))
+                    (11, "planned_action", SectionDelivery::user_content(items))
                 }
             };
             sections.push((position, SectionOutput { id, delivery }));
@@ -325,7 +396,7 @@ impl CollectedContext {
 }
 
 fn text_content(items: Vec<String>) -> SectionDelivery {
-    SectionDelivery::UserContent(
+    SectionDelivery::user_content(
         items
             .into_iter()
             .map(|text| Budgeted::required(ContentItem::InputText { text }))
@@ -353,7 +424,7 @@ impl ComposedContext {
                 });
             };
             for item in content {
-                inputs.push(match item.content {
+                inputs.push(match item.content.into_content_item() {
                     ContentItem::InputText { text } => {
                         inputs.extend(bounded_text_parts(&text).map(|part| UserInput::Text {
                             text: part.to_owned(),
@@ -395,7 +466,7 @@ impl ComposedContext {
             match section.delivery {
                 SectionDelivery::UserContent(content) => {
                     for item in content {
-                        match item.content {
+                        match item.content.into_content_item() {
                             ContentItem::InputText { text } => {
                                 user_content.extend(bounded_text_parts(&text).map(|part| {
                                     ContentItem::InputText {
@@ -414,7 +485,7 @@ impl ComposedContext {
                             std::mem::take(&mut metadata),
                         ));
                     }
-                    messages.push(ResponseItemEnvelope::new(*message.content));
+                    messages.push(*message.content);
                 }
             }
         }
@@ -428,9 +499,13 @@ impl ComposedContext {
 impl SectionOutput {
     fn extend_delivery_metadata(&self, metadata: &mut CodexHarnessMetadata) {
         if let SectionDelivery::UserContent(items) = &self.delivery {
-            metadata.guardian_source_order_guidance |= self.id == "retained_user_instructions"
-                && items.iter().any(|item| matches!(&item.content, ContentItem::InputText { text }
-                    if text.strip_suffix('\n').is_some_and(|text| text == crate::retained_instructions::START || text == crate::retained_instructions::LEGACY_START)));
+            if self.id == "retained_user_instructions"
+                && items.iter().any(|item| matches!(&item.content, SectionContent::Other(ContentItem::InputText { text })
+                    if text.strip_suffix('\n').is_some_and(|text| text == crate::retained_instructions::START || text == crate::retained_instructions::LEGACY_START)))
+            {
+                metadata.guardian_source_order_guidance = true;
+                metadata.guardian_retained_omissions = Some(crate::retained_instructions::omission_state(items));
+            }
             metadata.guardian_sources.extend(
                 items
                     .iter()
@@ -454,13 +529,19 @@ fn delivered_message(
     }
 }
 
+// Preserve the delivery cap below the 10K-token context-item guidance. The
+// estimate uses four bytes per token, so each UTF-8-safe part is at most 36KB.
+const MAX_TEXT_PART_ESTIMATED_TOKENS: usize = 9_000;
+
 /// Bounds individual text parts without changing source text or entry identity.
 /// Budget estimates include the extra wire framing before transport conversion.
 pub(super) fn bounded_text_parts(text: &str) -> impl Iterator<Item = &str> {
     let mut remaining = Some(text);
     std::iter::from_fn(move || {
         let text = remaining.take()?;
-        let end = text.floor_char_boundary(TruncationPolicy::Tokens(9_000).byte_budget());
+        let end = text.floor_char_boundary(
+            TruncationPolicy::Tokens(MAX_TEXT_PART_ESTIMATED_TOKENS).byte_budget(),
+        );
         if end < text.len() {
             remaining = Some(&text[end..]);
         }

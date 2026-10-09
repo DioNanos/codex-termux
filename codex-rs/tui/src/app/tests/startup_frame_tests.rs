@@ -21,14 +21,8 @@ async fn owned_startup_hides_tip_in_transcript() -> Result<()> {
     let mut app = crate::app::test_support::make_test_app().await;
     app.local_settings.tui.show_tooltips = true;
     app.local_settings.tui.animations = false;
-    let greeting = Arc::new(std::sync::OnceLock::new());
-    greeting
-        .set(crate::empty_state_animation::Greeting {
-            phrase: "Pull up a prompt.",
-        })
-        .unwrap();
     let session = test_thread_session(ThreadId::new(), app.config.cwd.to_path_buf());
-    let mut session_info = new_session_info(
+    let session_info = new_session_info(
         &app.config,
         &app.local_settings,
         &session.model,
@@ -38,7 +32,6 @@ async fn owned_startup_hides_tip_in_transcript() -> Result<()> {
         Some("Use /mcp to list configured MCP tools.".into()),
         /*auth_plan*/ None,
     );
-    history_cell::set_session_greeting(&mut session_info, &greeting);
     app.transcript_cells = vec![
         Arc::new(session_info),
         Arc::new(AgentMessageCell::new(
@@ -80,9 +73,8 @@ async fn owned_startup_hides_tip_in_transcript() -> Result<()> {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("Pull up a prompt."));
         assert!(text.contains("Use /mcp"));
-        assert!(!text.contains("model:"));
+        assert_eq!(text.contains("model:"), mode == HistoryRenderMode::Raw);
         assert!(!text.contains('╭'));
     }
     app.transcript_view.begin_search();
@@ -118,7 +110,10 @@ async fn owned_startup_preserves_loading_until_resume_replay_is_applied() -> Res
         tui.set_owned_screen(/*owned*/ true)?;
         let thread_id = ThreadId::new();
         let mut startup = quiet_startup_test_pump();
-        startup.apply_config(&app.config);
+        startup.apply_settings(
+            &crate::local_settings::LocalSettings::from(&app.config),
+            app.config.cwd.as_path(),
+        );
         startup.update_session_selection(
             &mut tui,
             &SessionSelection::Resume(crate::resume_picker::SessionTarget {

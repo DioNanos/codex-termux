@@ -159,6 +159,7 @@ async fn steering_does_not_wait_for_realtime_history() {
         assert_eq!(
             submission,
             TurnInputSubmission::Steered {
+                root_turn_id: turn_context.sub_id.clone(),
                 turn_id: turn_context.sub_id.clone()
             }
         );
@@ -178,7 +179,7 @@ async fn accepted_input_applies_thread_settings() {
             text_elements: Vec::new(),
         }])
         .with_thread_settings(ThreadSettingsOverrides {
-            environments: Some(local_selections(config.cwd.clone())),
+            environments: Some(local_selections(config.cwd.clone()).into_requests()),
             approval_policy: Some(config.permissions.approval_policy.value()),
             approvals_reviewer: Some(codex_config::types::ApprovalsReviewer::AutoReview),
             sandbox_policy: Some(config.legacy_sandbox_policy()),
@@ -416,10 +417,13 @@ async fn prepared_user_updates_merge_with_settings_at_turn_start() {
             },
         };
         session
-            .update_settings(thread_settings::prepare_update(ThreadSettingsOverrides {
-                collaboration_mode: Some(initial.clone()),
-                ..Default::default()
-            }))
+            .update_settings(thread_settings::prepare_update(
+                ThreadSettingsOverrides {
+                    collaboration_mode: Some(initial.clone()),
+                    ..Default::default()
+                },
+                &session.services.selected_capability_roots,
+            ))
             .await
             .expect("set initial model and effort");
         let prepared =
@@ -427,7 +431,10 @@ async fn prepared_user_updates_merge_with_settings_at_turn_start() {
                 .await
                 .expect("prepare partial protocol update");
         session
-            .update_settings(thread_settings::prepare_update(intervening))
+            .update_settings(thread_settings::prepare_update(
+                intervening,
+                &session.services.selected_capability_roots,
+            ))
             .await
             .expect("commit intervening settings");
 
@@ -465,10 +472,13 @@ async fn automatic_admission_uses_current_candidate_after_plan_preview() {
     let mut plan_mode = default_mode.clone();
     plan_mode.mode = ModeKind::Plan;
     session
-        .update_settings(thread_settings::prepare_update(ThreadSettingsOverrides {
-            collaboration_mode: Some(plan_mode),
-            ..Default::default()
-        }))
+        .update_settings(thread_settings::prepare_update(
+            ThreadSettingsOverrides {
+                collaboration_mode: Some(plan_mode),
+                ..Default::default()
+            },
+            &session.services.selected_capability_roots,
+        ))
         .await
         .expect("enter Plan after the initial admission check");
     let prepared = PreparedTurnInputSettings::prepare(
@@ -482,10 +492,13 @@ async fn automatic_admission_uses_current_candidate_after_plan_preview() {
     .await
     .expect("validate the patch while the preview is Plan");
     session
-        .update_settings(thread_settings::prepare_update(ThreadSettingsOverrides {
-            collaboration_mode: Some(default_mode.clone()),
-            ..Default::default()
-        }))
+        .update_settings(thread_settings::prepare_update(
+            ThreadSettingsOverrides {
+                collaboration_mode: Some(default_mode.clone()),
+                ..Default::default()
+            },
+            &session.services.selected_capability_roots,
+        ))
         .await
         .expect("leave Plan before atomic admission");
 
@@ -555,7 +568,7 @@ async fn automatic_admission_rechecks_plan_mode_without_committing_sparse_settin
     let overrides = ThreadSettingsOverrides {
         model: Some("automatic-model-must-not-be-applied".to_string()),
         service_tier: Some(Some(ServiceTier::Fast.request_value().to_string())),
-        environments: Some(proposed_environments.clone()),
+        environments: Some(proposed_environments.clone().into_requests()),
         approval_policy: Some(AskForApproval::Never),
         approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
         ..Default::default()
@@ -641,7 +654,10 @@ async fn automatic_admission_rechecks_plan_mode_without_committing_sparse_settin
     // The rejected candidate is valid and would have real runtime effects if
     // accepted by an ordinary settings update.
     session
-        .update_settings(thread_settings::prepare_update(overrides))
+        .update_settings(thread_settings::prepare_update(
+            overrides,
+            &session.services.selected_capability_roots,
+        ))
         .await
         .expect("explicit settings update accepts the same patch");
     assert_eq!(
@@ -922,6 +938,7 @@ async fn steer_only_enforces_expected_turn_id() {
     assert_eq!(
         submission,
         TurnInputSubmission::Steered {
+            root_turn_id: turn_context.sub_id.clone(),
             turn_id: turn_context.sub_id.clone()
         }
     );

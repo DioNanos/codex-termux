@@ -3,8 +3,11 @@
 //! Owns the main app run loop from app-server bootstrap through terminal shutdown. Startup input
 //! remains isolated from protected interactive requests until the initialized composer owns it.
 //! Queued resume history replaces the provisional loading frame only when it is ready to render.
+//! Explicit local launch permissions remain runtime overrides across new sessions and reconnects.
 
 use super::reconnect::ReconnectState;
+use super::startup_bootstrap::bootstrap_server_owned_start;
+use super::startup_bootstrap::uses_server_owned_fresh_bootstrap;
 use super::*;
 use crate::session_start::SessionStartAction;
 use crate::session_start::SessionStartConfig;
@@ -17,6 +20,7 @@ fn spawn_startup_thread_start(
     app_server: &AppServerSession,
     local_settings: crate::local_settings::LocalSettings,
     config: Config,
+    launch_choices: crate::app_server_session::StartupLaunchChoices,
     app_event_tx: AppEventSender,
     worktree: Option<crate::ManagedTuiWorktree>,
 ) {
@@ -24,7 +28,6 @@ fn spawn_startup_thread_start(
     let thread_params_mode = app_server.thread_params_mode();
     let remote_cwd_override = app_server.remote_cwd_override().map(Path::to_path_buf);
     let thread_tool_transport = app_server.thread_tool_transport();
-    let model_provider_override = app_server.model_provider_override.clone();
     tokio::spawn(async move {
         let result = crate::app_server_session::start_thread_with_request_handle(
             request_handle,
@@ -33,7 +36,7 @@ fn spawn_startup_thread_start(
             thread_params_mode,
             remote_cwd_override,
             thread_tool_transport,
-            model_provider_override,
+            launch_choices,
         )
         .await
         .and_then(|started| {
@@ -55,13 +58,14 @@ pub(super) struct FreshStartupDefaults {
 pub(super) async fn prepare_fresh_startup_config(
     config: &mut Config,
     app_server: &AppServerSession,
+    app_server_target: &AppServerTarget,
     cli_kv_overrides: &[(String, TomlValue)],
     harness_overrides: &ConfigOverrides,
     environments: &EnvironmentManager,
 ) -> Result<FreshStartupDefaults> {
-    let defaults_cwd = match app_server.thread_params_mode() {
-        crate::app_server_session::ThreadParamsMode::Embedded => config.cwd.as_path(),
-        crate::app_server_session::ThreadParamsMode::Remote => {
+    let defaults_cwd = match app_server_target {
+        AppServerTarget::Embedded | AppServerTarget::LocalDaemon { .. } => config.cwd.as_path(),
+        AppServerTarget::Remote { .. } => {
             app_server.remote_cwd_override().unwrap_or(Path::new("."))
         }
     };
@@ -105,8 +109,8 @@ pub(super) fn startup_model(
 ) -> String {
     config.model.clone().unwrap_or_else(|| {
         if server_defaults_read {
-            // Bootstrap was seeded with local config, which may differ from a cleared server
-            // model. Use the server's model catalog when config/read returned model: null.
+            // Legacy bootstrap paths may be seeded with local config, which can differ from a
+            // cleared server model. Use the server catalog when config/read returned model: null.
             bootstrap
                 .available_models
                 .iter()
@@ -121,6 +125,41 @@ pub(super) fn startup_model(
 }
 
 impl App {
+    /// Keep explicit local launch choices available for new sessions and reconnect recovery.
+    pub(super) fn remember_launch_permissions(&mut self) {
+        if self.app_server_target.thread_params_mode()
+            == crate::app_server_session::ThreadParamsMode::Remote
+        {
+            return;
+        }
+        let selected = crate::resume_permissions::ResumePermissions::from_overrides(
+            &self.config,
+            &self.harness_overrides,
+        );
+        if selected.approval_policy {
+            self.runtime_approval_policy_override = Some(RuntimeApprovalPolicyOverride::Explicit(
+                self.config.permissions.approval_policy.value().into(),
+            ));
+        }
+        if selected.approvals_reviewer {
+            self.runtime_approvals_reviewer_override = Some(self.config.approvals_reviewer);
+        }
+        if selected.profile {
+            let profile = RuntimePermissionProfileOverride::from_config(&self.config);
+            // The server owns constrained profiles that legacy turn parameters cannot express.
+            self.runtime_permission_profile_override =
+                (profile.active_permission_profile.is_some()
+                    || crate::app_server_session::turn_permissions_overrides(
+                        TurnPermissionsOverride::LegacySandbox(
+                            self.config.permissions.effective_permission_profile(),
+                        ),
+                        self.config.cwd.as_path(),
+                    )
+                    .is_ok())
+                .then_some(profile);
+        }
+    }
+
     /// Keep the provisional loading frame until queued history reaches the owned transcript.
     /// Visible startup decisions and the agent overview must still render immediately.
     pub(super) fn render_startup_frame(
@@ -233,22 +272,27 @@ impl App {
         let harness_overrides =
             normalize_harness_overrides_for_cwd(harness_overrides, &config.cwd)?;
         app_server.model_provider_override = harness_overrides.model_provider.clone();
-        let bootstrap = match startup_bootstrap {
-            Some(bootstrap) => bootstrap,
-            None => match startup_draft
-                .run_until(tui, app_server.bootstrap(&config))
-                .await
-            {
-                Ok(bootstrap) => bootstrap?,
-                Err(err) => return shutdown_on_startup_error(app_server, err).await,
-            },
-        };
-        tracing::debug!(
-            has_platform_family = app_server.app_server_platform_family().is_some(),
-            has_platform_os = app_server.app_server_platform_os().is_some(),
-            "connected app-server platform"
+        let fresh_start = matches!(
+            &session_selection,
+            SessionSelection::StartFresh | SessionSelection::Exit
         );
-        let bootstrap_ms = bootstrap.duration.as_millis();
+        let server_owned_fresh_bootstrap = uses_server_owned_fresh_bootstrap(
+            &app_server_target,
+            &session_selection,
+            &loader_overrides,
+        );
+        let mut bootstrap = startup_bootstrap;
+        if bootstrap.is_none() && !server_owned_fresh_bootstrap {
+            bootstrap = Some(
+                match startup_draft
+                    .run_until(tui, app_server.bootstrap(&config))
+                    .await
+                {
+                    Ok(bootstrap) => bootstrap?,
+                    Err(err) => return shutdown_on_startup_error(app_server, err).await,
+                },
+            );
+        }
         if matches!(&session_selection, SessionSelection::Fork(_)) {
             // The app server resolves omitted overrides from the fork destination's config.
             if harness_overrides.model.is_none()
@@ -263,16 +307,14 @@ impl App {
                 config.model_reasoning_effort = None;
             }
         }
-        let startup_defaults = if matches!(
-            &session_selection,
-            SessionSelection::StartFresh | SessionSelection::Exit
-        ) {
+        let startup_defaults = if fresh_start {
             match startup_draft
                 .run_until(
                     tui,
                     prepare_fresh_startup_config(
                         &mut config,
                         &app_server,
+                        &app_server_target,
                         &cli_kv_overrides,
                         &harness_overrides,
                         &environment_manager,
@@ -287,7 +329,40 @@ impl App {
         } else {
             FreshStartupDefaults::default()
         };
-        if matches!(&session_selection, SessionSelection::AgentsOverview) {
+        let mut launch_choices = crate::app_server_session::StartupLaunchChoices::from_launch(
+            &cli_kv_overrides,
+            &harness_overrides,
+            &loader_overrides,
+        );
+        let bootstrap = match bootstrap {
+            Some(bootstrap) => bootstrap,
+            None => match startup_draft
+                .run_until(
+                    tui,
+                    bootstrap_server_owned_start(
+                        &mut app_server,
+                        &mut config,
+                        &mut launch_choices,
+                        startup_defaults.server_defaults_read,
+                        &cli_kv_overrides,
+                        &harness_overrides,
+                    ),
+                )
+                .await
+            {
+                Ok(bootstrap) => bootstrap?,
+                Err(err) => return shutdown_on_startup_error(app_server, err).await,
+            },
+        };
+        tracing::debug!(
+            has_platform_family = app_server.app_server_platform_family().is_some(),
+            has_platform_os = app_server.app_server_platform_os().is_some(),
+            "connected app-server platform"
+        );
+        let bootstrap_ms = bootstrap.duration.as_millis();
+        if !server_owned_fresh_bootstrap
+            && matches!(&session_selection, SessionSelection::AgentsOverview)
+        {
             apply_managed_new_thread_defaults(
                 &mut config,
                 app_server.managed_new_thread_defaults(),
@@ -325,6 +400,7 @@ impl App {
                     tui,
                     &mut config,
                     &local_settings,
+                    &mut launch_choices,
                     model.as_str(),
                     &app_event_tx,
                     &available_models,
@@ -344,19 +420,30 @@ impl App {
         if let Some(updated_model) = config.model.clone() {
             model = updated_model;
         }
+        let mut source_overrides = harness_overrides.clone();
+        source_overrides.cwd = None;
+        app_server.worktree_source_config_builder = Some(Box::new(
+            crate::legacy_core::config::ConfigBuilder::default()
+                .codex_home(config.codex_home.to_path_buf())
+                .cli_overrides(cli_kv_overrides.clone())
+                .harness_overrides(source_overrides)
+                .loader_overrides(loader_overrides.clone())
+                .cloud_config_bundle(cloud_config_bundle.clone()),
+        ));
         let dynamic_tool_status_updates = tokio::sync::broadcast::channel(/*capacity*/ 64).0;
-        if matches!(&app_server_target, AppServerTarget::LocalDaemon { .. })
-            && !crate::uses_remote_workspace_or_environment(
-                &app_server_target,
-                environment_manager.as_ref(),
+        if matches!(
+            &app_server_target,
+            AppServerTarget::LocalDaemon { .. } | AppServerTarget::Embedded
+        ) && !crate::uses_remote_workspace_or_environment(
+            &app_server_target,
+            environment_manager.as_ref(),
+        ) && let Err(error) = app_server
+            .start_dynamic_tool_mcp(
+                config.clone(),
+                app_event_tx.clone(),
+                dynamic_tool_status_updates.clone(),
             )
-            && let Err(error) = app_server
-                .start_dynamic_tool_mcp(
-                    config.clone(),
-                    app_event_tx.clone(),
-                    dynamic_tool_status_updates.clone(),
-                )
-                .await
+            .await
         {
             tracing::warn!(%error, "TUI task delegation is unavailable without its MCP server");
         }
@@ -425,6 +512,7 @@ impl App {
                         &app_server,
                         local_settings.clone(),
                         config.clone(),
+                        launch_choices,
                         app_event_tx.clone(),
                         managed_worktree.clone(),
                     );
@@ -775,6 +863,8 @@ See the Codex keymap documentation for supported actions and examples."
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
+        let agents_overview =
+            agents_overview::AgentsOverviewState::new(local_settings.tui.agents_overview_grouping);
         let mut app = Self {
             feature_write_lock: Arc::default(),
             model_catalog,
@@ -850,7 +940,7 @@ See the Codex keymap documentation for supported actions and examples."
             pending_thread_titles: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
-            agents_overview: Default::default(),
+            agents_overview,
             side_threads: HashMap::new(),
             abandoned_side_threads: HashSet::new(),
             active_thread_id: None,
@@ -879,14 +969,18 @@ See the Codex keymap documentation for supported actions and examples."
             pending_managed_worktree_attach: None,
             startup_protected_input_boundary: true,
             startup_pending_protected_request: false,
+            account_email_request_id: None,
             rate_limit_hard_stop_generation: 0,
             rate_limit_refresh_state: Default::default(),
+            pending_mcp_login_start: None,
+            active_mcp_login_ids: HashMap::new(),
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
             recap: recap::RecapState::default(),
             #[cfg(test)]
             _test_codex_home: None,
         };
+        app.remember_launch_permissions();
         if !tui.is_terminal_focused() {
             app.recap.note_focus_lost(Instant::now());
         }
@@ -1024,11 +1118,6 @@ See the Codex keymap documentation for supported actions and examples."
                 &app_server,
                 app.app_event_tx.clone(),
                 app.chat_widget.security_setup_request_id,
-            );
-            crate::daybreak::prefetch_notice(
-                &app.config,
-                &app_server,
-                app.chat_widget.cyber_policy_notice.clone(),
             );
             let reset_hint_request_id = app.chat_widget.start_rate_limit_reset_startup_check();
             app.refresh_rate_limits(

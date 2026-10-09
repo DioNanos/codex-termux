@@ -102,14 +102,14 @@ fn selection_at_bottom_restores_footer_without_resuming_following() {
         ));
     }
     insta::assert_snapshot!(observations.join("\n"), @"
-    Partial, selected at bottom: ctrl+c copy · enter copy & follow · esc clear
+    Partial, selected at bottom: ⌃c copy · enter copy & follow · esc clear
     Partial, clicked away: <composer hints>
     Partial, scrolled down at bottom: <composer hints>
-    Partial, selected above bottom: Earlier messages available.  ctrl+c copy · enter copy & follow · esc clear
-    Complete, selected at bottom: ctrl+c copy · enter copy & follow · esc clear
+    Partial, selected above bottom: Earlier messages available.  ⌃c copy · enter copy & follow · esc clear
+    Complete, selected at bottom: ⌃c copy · enter copy & follow · esc clear
     Complete, clicked away: <composer hints>
     Complete, scrolled down at bottom: <composer hints>
-    Complete, selected above bottom: ctrl+c copy · enter copy & follow · esc clear
+    Complete, selected above bottom: ⌃c copy · enter copy & follow · esc clear
     ");
 }
 
@@ -191,7 +191,7 @@ fn loading_preserves_selected_content_and_copy_action() {
             .expect("loading selection footer");
         assert_eq!((footer.cursor_column, footer.is_interactive), (None, true));
         insta::allow_duplicates! {
-            insta::assert_snapshot!(footer.text.to_string(), @"↑ Loading earlier messages… · ctrl+c copy · enter copy & follow · esc clear");
+            insta::assert_snapshot!(footer.text.to_string(), @"↑ Loading earlier messages… · ⌃c copy · enter copy & follow · esc clear");
         }
         let Some(ViewAction::Copy(copied)) = view.handle_key(
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -209,7 +209,7 @@ fn loading_preserves_selected_content_and_copy_action() {
     let footer = view
         .footer(/*width*/ 80, MotionMode::Reduced)
         .expect("selection footer after loading");
-    insta::assert_snapshot!(footer.text.to_string(), @"ctrl+c copy · enter copy & follow · esc clear");
+    insta::assert_snapshot!(footer.text.to_string(), @"⌃c copy · enter copy & follow · esc clear");
     assert_eq!(
         view.selected_text(&cells),
         Some("selected words".to_string())
@@ -221,7 +221,7 @@ fn loading_preserves_selected_content_and_copy_action() {
             .text
             .to_string(),
         format!(
-            "ctrl+c copy · enter copy & follow · esc clear · Retry: {}",
+            "⌃c copy · enter copy & follow · esc clear · Retry: {}",
             JumpTarget::Beginning.hint_label(),
         ),
     );
@@ -267,10 +267,46 @@ fn loading_and_failure_preserve_search_query_and_caret() {
     }
     insta::assert_snapshot!(hints.join("\n"));
     view.history = TranscriptHistoryState::Complete;
-    view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &cells);
-    assert!(!view.is_search_active());
+    assert!(!view.advance_search(&cells));
+    view.handle_key(KeyCode::Esc.into(), &cells);
+    assert!(!view.has_active_interaction());
+    view.handle_key(
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        &cells,
+    );
+    assert!(!view.is_search_editing());
     assert!(!view.is_detailed());
     assert!(view.footer(/*width*/ 32, MotionMode::Reduced).is_none());
+}
+
+#[test]
+fn reading_a_find_result_shows_history_loading_and_failure() {
+    let cells: Vec<Arc<dyn HistoryCell>> = vec![Arc::new(PlainHistoryCell::new(vec![
+        "visible needle".into(),
+    ]))];
+    let mut view = TranscriptView::default();
+    render(&mut view, &cells);
+    view.begin_search();
+    view.paste_search("needle");
+    assert!(!view.advance_search(&cells));
+    view.handle_key(KeyCode::Enter.into(), &cells);
+
+    let mut hints = Vec::new();
+    for history in [
+        TranscriptHistoryState::LoadingOlder,
+        TranscriptHistoryState::Failed,
+        TranscriptHistoryState::Complete,
+    ] {
+        view.history = history;
+        let footer = view.footer(/*width*/ 80, MotionMode::Reduced).unwrap();
+        assert_eq!((footer.cursor_column, footer.is_interactive), (None, false));
+        hints.push(footer.text.to_string());
+    }
+    insta::assert_snapshot!(hints.join("\n"), @"
+    ↑ Loading earlier messages… · esc latest
+    Retry history: ⌥</⌃home.  esc latest
+    Find · ctrl+p older · ctrl+n newer · esc latest
+    ");
 }
 
 #[test]
@@ -301,7 +337,7 @@ fn loading_completion_restores_unseen_activity_and_failure_stops_motion() {
     let failed = view
         .footer(/*width*/ 80, MotionMode::Reduced)
         .expect("failed history footer");
-    insta::assert_snapshot!(failed.text.to_string(), @"New activity · Retry history: ⌥</ctrl+home.  esc latest");
+    insta::assert_snapshot!(failed.text.to_string(), @"New activity · Retry history: ⌥</⌃home.  esc latest");
     view.history = TranscriptHistoryState::Complete;
     assert!(!view.is_loading_history());
     assert_eq!(

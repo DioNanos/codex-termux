@@ -118,7 +118,7 @@ pub struct AdditionalContextEntry {
     pub kind: AdditionalContextKind,
 }
 
-/// Requested cyber treatment for a ChatGPT-authenticated Codex turn.
+/// Requested cyber treatment for an OpenAI model turn.
 /// Authorization and model-tier restrictions remain server-owned.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -177,6 +177,21 @@ pub struct TurnStartParams {
     /// Ignored when this request steers an already-active turn.
     #[ts(optional = nullable)]
     pub turn_trigger: Option<String>,
+    /// ID of the turn that caused this new turn to start.
+    ///
+    /// Set this when starting work on behalf of another turn, such as delegated
+    /// work in a different thread. Leave unset for work started directly by the
+    /// user. Ignored when this request adds input to an active turn.
+    #[ts(optional = nullable)]
+    pub parent_turn_id: Option<String>,
+    /// ID of the first turn in the chain of work that led to this new turn.
+    ///
+    /// When setting `parentTurnId`, set this to the parent turn's `rootTurnId`
+    /// when known. This keeps descendant work attributed to the original turn.
+    /// If omitted, the new turn becomes its own root. Ignored when this request
+    /// adds input to an active turn.
+    #[ts(optional = nullable)]
+    pub root_turn_id: Option<String>,
     #[ts(optional = nullable)]
     pub tool_output: Option<Box<TurnToolOutput>>,
     /// Optional metadata to enrich Codex's ResponsesAPI turn metadata.
@@ -271,7 +286,7 @@ pub struct TurnStartParams {
     #[ts(optional = nullable)]
     pub multi_agent_mode: Option<MultiAgentMode>,
 
-    /// EXPERIMENTAL - Request a workspace-authorized cyber program for this
+    /// EXPERIMENTAL - Request an authorized cyber program for this
     /// turn. Omission preserves automatic behavior. This does not grant access.
     #[experimental("turn/start.cyberAccessProgram")]
     #[ts(optional = nullable)]

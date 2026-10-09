@@ -222,12 +222,9 @@ impl CommandExecutionItem {
             parsed_cmd: self.parsed_cmd.clone(),
             source: self.source,
             interaction_input: self.interaction_input.clone(),
-            stdout: self.stdout.clone().unwrap_or_default(),
-            stderr: self.stderr.clone().unwrap_or_default(),
             aggregated_output: self.aggregated_output.clone().unwrap_or_default(),
             exit_code: self.exit_code.unwrap_or_default(),
             duration: self.duration.unwrap_or_default(),
-            formatted_output: self.formatted_output.clone().unwrap_or_default(),
             status,
         }))
     }
@@ -438,6 +435,8 @@ impl CollabAgentToolCallItem {
 impl SubAgentActivityItem {
     pub(crate) fn as_legacy_event(&self, occurred_at_ms: i64) -> EventMsg {
         EventMsg::SubAgentActivity(SubAgentActivityEvent {
+            model: self.model.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
             event_id: self.id.clone(),
             occurred_at_ms,
             agent_thread_id: self.agent_thread_id,

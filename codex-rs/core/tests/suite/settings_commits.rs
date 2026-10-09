@@ -21,7 +21,7 @@ use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::TestCodex;
-use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::local_requests;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
@@ -86,7 +86,7 @@ async fn initial_plugin_ids_use_turn_context_without_extra_settings_checkpoints(
         .codex
         .start_turn_if_idle(TurnInputRequest::user_input(Vec::new()))
         .await?;
-    let StartIfIdleSubmission::Started { turn_id } = submission else {
+    let StartIfIdleSubmission::Started { turn_id, .. } = submission else {
         panic!("expected an accepted first turn, got {submission:?}");
     };
     wait_for_event(
@@ -220,7 +220,7 @@ async fn settings_notifications_keep_their_commit_across_postcommit_work(
                             .with_thread_settings(thread_settings),
                         )
                         .await?;
-                    let TurnInputSubmission::Started { turn_id } = result else {
+                    let TurnInputSubmission::Started { turn_id, .. } = result else {
                         panic!("expected a new turn, got {result:?}");
                     };
                     Ok(turn_id)
@@ -334,7 +334,7 @@ async fn compaction_checkpoints_settings_changed_during_its_model_request() -> R
     submit_thread_settings(
         &test.codex,
         ThreadSettingsOverrides {
-            environments: Some(local_selections(updated_cwd_path.clone())),
+            environments: Some(local_requests(updated_cwd_path.clone())),
             model: Some(COMMITTED_MODEL.to_string()),
             disabled_plugin_ids: Some(vec!["slack@openai".to_string()]),
             ..Default::default()

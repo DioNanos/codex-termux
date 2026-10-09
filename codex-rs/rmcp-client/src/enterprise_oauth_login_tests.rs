@@ -4,7 +4,9 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -19,7 +21,6 @@ use keyring::mock::MockCredential;
 use oauth2::TokenResponse;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use sha2::Digest;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tracing_test::traced_test;
@@ -239,12 +240,6 @@ async fn enterprise_public_api_storage_and_privacy() -> Result<()> {
     let server = MockServer::start().await;
     let issuer = format!("{}/idp", server.uri());
     metadata(&server, &issuer).await;
-    assert!(
-        login(&issuer, Some(&format!("{}/callback", server.uri())))
-            .await
-            .is_err(),
-        "an occupied registered callback port must not silently move"
-    );
     let assertion = format!(
         "{}.{}.signature",
         URL_SAFE_NO_PAD.encode(r#"{"alg":"ES256"}"#),
@@ -284,31 +279,31 @@ async fn enterprise_public_api_storage_and_privacy() -> Result<()> {
             })
             .collect::<Vec<_>>();
         assert_eq!(token_requests.len(), login_index + 1);
-        let token_form = url::form_urlencoded::parse(&token_requests[login_index].body)
+        let token_request = &token_requests[login_index];
+        assert!(!token_request.headers.contains_key("authorization"));
+        let mut token_form = url::form_urlencoded::parse(&token_request.body)
             .into_owned()
             .collect::<HashMap<_, _>>();
-        assert_eq!(
-            token_form.get("grant_type").map(String::as_str),
-            Some("authorization_code")
-        );
-        assert!(!token_form.contains_key("resource"));
-        assert_eq!(
-            token_form.get("redirect_uri"),
-            Some(
-                authorization_query
-                    .get("redirect_uri")
-                    .expect("authorization redirect URI")
-            )
+        let verifier = oauth2::PkceCodeVerifier::new(
+            token_form.remove("code_verifier").expect("PKCE verifier"),
         );
         assert_eq!(
-            authorization_query
-                .get("code_challenge_method")
-                .map(String::as_str),
-            Some("S256")
+            oauth2::PkceCodeChallenge::from_code_verifier_sha256(&verifier).as_str(),
+            authorization_query["code_challenge"],
         );
-        let verifier = token_form.get("code_verifier").expect("PKCE verifier");
-        let challenge = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()));
-        assert_eq!(authorization_query.get("code_challenge"), Some(&challenge));
+        assert_eq!(authorization_query["code_challenge_method"], "S256");
+        assert_eq!(
+            token_form,
+            HashMap::from([
+                ("grant_type".to_string(), "authorization_code".to_string()),
+                ("code".to_string(), SECRET.to_string()),
+                ("client_id".to_string(), "enterprise-client".to_string()),
+                (
+                    "redirect_uri".to_string(),
+                    authorization_query["redirect_uri"].clone()
+                ),
+            ])
+        );
         assert!(
             keyring
                 .values
@@ -349,6 +344,67 @@ async fn enterprise_public_api_storage_and_privacy() -> Result<()> {
                 .map(|token| token.secret().as_str()),
             Some(SECRET)
         );
+        // Exercise the production lease and keyring snapshot without installing another
+        // test backend. Use a non-sensitive name so routine keyring-read traces are safe.
+        let mut lease_tokens = stored.clone();
+        lease_tokens.server_name = "ema-idp:lease-snapshot".to_string();
+        crate::save_oauth_tokens(
+            &lease_tokens.server_name,
+            &lease_tokens,
+            OAuthCredentialsStoreMode::Keyring,
+            AuthKeyringBackendKind::Direct,
+        )
+        .await?;
+        let snapshot = crate::stored_oauth_credential_snapshot(
+            &lease_tokens.server_name,
+            &issuer,
+            OAuthCredentialsStoreMode::Keyring,
+            AuthKeyringBackendKind::Direct,
+        )?
+        .expect("keyring-backed snapshot");
+        let pinned = snapshot.clone().pin_ema_credentials().await?;
+        let accesses = keyring.accesses.load(Ordering::SeqCst);
+        keyring.fail.store(true, Ordering::SeqCst);
+        let leases = futures::future::try_join_all(
+            (0..32).map(|_| pinned.acquire_current_ema_credentials()),
+        )
+        .await?;
+        assert_eq!(keyring.accesses.load(Ordering::SeqCst), accesses);
+        drop(leases);
+        keyring.fail.store(false, Ordering::SeqCst);
+
+        // Even an identical replacement, or a failed write, revokes the old version.
+        for fail in [false, true] {
+            let pinned = snapshot.clone().pin_ema_credentials().await?;
+            keyring.fail.store(fail, Ordering::SeqCst);
+            let saved = crate::save_oauth_tokens(
+                &lease_tokens.server_name,
+                &lease_tokens,
+                OAuthCredentialsStoreMode::Keyring,
+                AuthKeyringBackendKind::Direct,
+            )
+            .await;
+            keyring.fail.store(false, Ordering::SeqCst);
+            assert_eq!(saved.is_err(), fail);
+            assert!(pinned.acquire_current_ema_credentials().await.is_err());
+        }
+        let pinned = snapshot.pin_ema_credentials().await?;
+        let first = pinned.acquire_current_ema_credentials().await?;
+        let second = pinned.acquire_current_ema_credentials().await?;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                delete_enterprise_oauth_tokens(
+                    &lease_tokens.server_name,
+                    &issuer,
+                    AuthKeyringBackendKind::Direct,
+                ),
+            )
+            .await??
+        );
+        drop(first);
+        drop(second);
+        assert!(pinned.acquire_current_ema_credentials().await.is_err());
         assert!(
             delete_enterprise_oauth_tokens(
                 CREDENTIAL_NAME,
@@ -381,13 +437,23 @@ async fn enterprise_public_api_storage_and_privacy() -> Result<()> {
             .all(|value| value.get_secret().is_err())
     );
 
-    // Rejected old attempts neither write nor delete a newer grant.
+    // Failed replacement setup leaves the existing attempt valid.
+    let retained = complete_login(&issuer).await?;
+    assert!(
+        login(&issuer, Some(&format!("{}/callback", server.uri())))
+            .await
+            .is_err(),
+        "an occupied registered callback port must not silently move"
+    );
+    retained.commit_if(|| async { Some(()) }).await?;
+
+    // A newer start fences a delayed callback even across Codex processes.
     let old = complete_login(&issuer).await?;
     complete_login(&issuer)
         .await?
         .commit_if(|| async { Some(()) })
         .await?;
-    assert!(old.commit_if(|| async { None::<()> }).await.is_err());
+    assert!(old.commit_if(|| async { Some(()) }).await.is_err());
     assert!(
         keyring
             .values
@@ -433,6 +499,7 @@ async fn enterprise_public_api_storage_and_privacy() -> Result<()> {
 struct TestKeyring {
     values: Arc<Mutex<HashMap<String, Arc<MockCredential>>>>,
     fail: Arc<AtomicBool>,
+    accesses: Arc<AtomicUsize>,
 }
 
 struct TestCredential(Arc<MockCredential>);
@@ -459,6 +526,7 @@ impl CredentialBuilderApi for TestKeyring {
         _service: &str,
         user: &str,
     ) -> keyring::Result<Box<Credential>> {
+        self.accesses.fetch_add(1, Ordering::SeqCst);
         if self.fail.load(Ordering::SeqCst) {
             return Err(keyring::Error::Invalid("account".into(), user.into()));
         }

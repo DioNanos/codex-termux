@@ -1,0 +1,74 @@
+---
+source: core/tests/suite/scenarios_incremental_tools.rs
+expression: "context_snapshot::format_request_history_snapshot(\"Tool definitions enter history in one batch; a catalog change appends only the changed exec definition with an incremental namespace hint. The next unchanged turn appends no tool definitions.\",\n&requests,\n&ContextSnapshotOptions::default().rewrite_known_segments().include_request_settings(),)"
+---
+Scenario: Tool definitions enter history in one batch; a catalog change appends only the changed exec definition with an incremental namespace hint. The next unchanged turn appends no tool definitions.
+
+## Window 1
+Settings:
+  include: ["reasoning.encrypted_content"]
+  model: "gpt-5.4"
+  parallel_tool_calls: false
+  prompt_cache_key: "<PROMPT_CACHE_KEY 1>"
+  reasoning: {"context":"all_turns","effort":"medium"}
+  store: false
+  stream: true
+  text: {"verbosity":"low"}
+  tool_choice: "auto"
+-- request 1 (turn) --
+00:additional_tools/developer (2; hash=49f981f03ae5c5ce):
+        - namespace/functions; hash=cc6e8cf0e5405f3a
+          - custom/exec
+          - function/wait
+          - function/exec_command
+          - function/write_stdin
+          - function/request_user_input
+          - custom/apply_patch
+          - function/view_image
+        - tool_search: # Tool discovery  Searches over deferred tool metadata with BM25 and exposes matching tools for t...; args=[limit, query]; hash=400cd6ac61d524a9
+01:message/developer:
+    <MODEL_INSTRUCTIONS>
+02:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
+03:message/user:
+    <ENVIRONMENT_CONTEXT>
+04:message/user:
+    Begin work.
+-- request 2 (turn) --
+05:message/user:
+    Continue with the same tools.
+
+## Window 2 (after request 2)
+Settings: relative to window 1
+  model: "updated-tools-model"
+-- request 3 (turn) --
+00:additional_tools/developer (2; hash=49f981f03ae5c5ce):
+        - namespace/functions; hash=cc6e8cf0e5405f3a
+          - custom/exec
+          - function/wait
+          - function/exec_command
+          - function/write_stdin
+          - function/request_user_input
+          - custom/apply_patch
+          - function/view_image
+        - tool_search: # Tool discovery  Searches over deferred tool metadata with BM25 and exposes matching tools for t...; args=[limit, query]; hash=400cd6ac61d524a9
+01:message/developer:
+    <MODEL_INSTRUCTIONS>
+02:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
+03:message/user:
+    <ENVIRONMENT_CONTEXT>
+04:message/user:
+    Begin work.
+05:message/user:
+    Continue with the same tools.
+06:additional_tools/developer (1; hash=fd00dfa0a0c11da2):
+        - namespace/functions: This is an incremental namespace update. Previously declared tools remain available for direct ca...; hash=dd09638a0d29d0ca
+          - custom/exec
+07:message/developer:
+    <MODEL_SWITCH>
+08:message/user:
+    Continue with the updated execution instructions.
+-- request 4 (turn) --
+09:message/user:
+    Continue with the same updated tools.

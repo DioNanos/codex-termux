@@ -1,6 +1,8 @@
 use super::PreviousSectionState;
+use super::SectionTransition;
 use super::WorldStateHash;
 use super::WorldStateSection;
+use super::WorldStateUpdate;
 use crate::context::ContextualUserFragment;
 use codex_prompts::ResolvedCollaborationModeMessages;
 use codex_prompts::ResolvedModelMessages;
@@ -94,10 +96,6 @@ impl WorldStateSection for CollaborationModeState {
     const ID: &'static str = "collaboration_mode";
     type Snapshot = CollaborationModeSnapshot;
 
-    fn snapshot(&self) -> Self::Snapshot {
-        self.snapshot.clone()
-    }
-
     fn matches_legacy_fragment(role: &str, text: &str) -> bool {
         role == "developer" && CollaborationModeInstructions::matches_text(text)
     }
@@ -113,7 +111,8 @@ impl WorldStateSection for CollaborationModeState {
     fn render_diff(
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn ContextualUserFragment>> {
+    ) -> SectionTransition<Self::Snapshot> {
+        let current = self.snapshot.clone();
         let unchanged = match previous {
             PreviousSectionState::Absent => self.instructions.is_none(),
             PreviousSectionState::Unknown => false,
@@ -136,12 +135,15 @@ impl WorldStateSection for CollaborationModeState {
             }
         };
         if unchanged {
-            return None;
+            return (Some(current), Vec::new());
         }
 
-        Some(Box::new(CollaborationModeInstructions {
-            instructions: self.instructions.clone().unwrap_or_default(),
-        }))
+        (
+            Some(current),
+            vec![WorldStateUpdate::fragment(CollaborationModeInstructions {
+                instructions: self.instructions.clone().unwrap_or_default(),
+            })],
+        )
     }
 }
 

@@ -1,3 +1,19 @@
+# [0.162.0-termux.1] - 2026-10-09
+
+## Codex Termux 0.162.0-termux.1 — upstream rust-v0.162.0
+
+- Merges upstream tag `rust-v0.162.0` into the Termux fork (jump from
+  `rust-v0.160.0`): remote-control reconnect backoff, managed-daemon launch of
+  `codex remote-control`, daemon update diagnostics, transcript copy and
+  clickable URLs in the TUI.
+- Android: exports the SELinux process context before any thread exists so
+  termux-exec's `execve()` hook cannot block a forked child that holds the
+  daemon control socket.
+- Daemon: `daemon stop` also stops the update loop, the loop ends when the fork
+  refuses a standalone update, and an overlong socket path is reported with its
+  limit.
+- Android packages are valid without a bundled ripgrep (`pkg install ripgrep`).
+
 # [0.160.0-termux.3] - 2026-10-05
 
 ## Codex Termux 0.160.0-termux.3 — upstream rust-v0.160.0

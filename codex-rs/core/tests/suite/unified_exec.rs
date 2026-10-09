@@ -6,7 +6,7 @@ use codex_features::Feature;
 use codex_protocol::approvals::ExecApprovalKind;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
-use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::local_requests;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -260,7 +260,7 @@ async fn create_workspace_directory(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exec_command_hides_and_rejects_login_when_disabled() -> Result<()> {
+async fn exec_command_rejects_login_when_disabled() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let builder = test_codex().with_model("gpt-5.4").with_config(|config| {
@@ -272,7 +272,7 @@ async fn exec_command_hides_and_rejects_login_when_disabled() -> Result<()> {
         "cmd": "echo should not run",
         "login": true,
     });
-    let responses = mount_sse_sequence(
+    mount_sse_sequence(
         harness.server(),
         vec![
             sse(vec![
@@ -294,14 +294,6 @@ async fn exec_command_hides_and_rejects_login_when_disabled() -> Result<()> {
         harness.function_call_stdout(call_id).await,
         "login shell is disabled by config; omit `login` or set it to false."
     );
-    let request = responses.requests()[0].body_json();
-    let exec_tool = request["tools"]
-        .as_array()
-        .expect("tools should be an array")
-        .iter()
-        .find(|tool| tool["name"] == "exec_command")
-        .expect("exec_command should be available");
-    assert!(exec_tool["parameters"]["properties"].get("login").is_none());
 
     Ok(())
 }
@@ -607,7 +599,7 @@ async fn unified_exec_intercepts_apply_patch_exec_command() -> Result<()> {
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd)),
+                environments: Some(local_requests(cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -1113,12 +1105,8 @@ async fn unified_exec_emits_output_delta_for_exec_command() -> Result<()> {
     );
     let end_event = end_event.expect("expected command completion");
     assert_eq!(
-        (
-            end_event.exit_code,
-            end_event.stdout,
-            end_event.aggregated_output
-        ),
-        (0, "HELLO-UEXECé�".to_string(), "HELLO-UEXECé�".to_string())
+        (end_event.exit_code, end_event.aggregated_output),
+        (0, "HELLO-UEXECé�".to_string())
     );
     Ok(())
 }
@@ -2896,7 +2884,7 @@ async fn unified_exec_keeps_long_running_session_after_turn_end() -> Result<()> 
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(turn_cwd)),
+                environments: Some(local_requests(turn_cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -2990,7 +2978,7 @@ async fn unified_exec_interrupt_preserves_long_running_session() -> Result<()> {
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(turn_cwd)),
+                environments: Some(local_requests(turn_cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -3591,7 +3579,7 @@ async fn unified_exec_runs_under_sandbox() -> Result<()> {
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(turn_cwd)),
+                environments: Some(local_requests(turn_cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -3707,7 +3695,7 @@ async fn unified_exec_enforces_glob_deny_read_policy() -> Result<()> {
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(turn_cwd)),
+                environments: Some(local_requests(turn_cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -3836,7 +3824,7 @@ async fn unified_exec_python_prompt_under_seatbelt() -> Result<()> {
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(turn_cwd)),
+                environments: Some(local_requests(turn_cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,

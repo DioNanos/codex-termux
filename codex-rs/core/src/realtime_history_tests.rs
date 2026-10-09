@@ -28,6 +28,7 @@ fn started_state() -> RealtimeHistoryState {
     let mut state = RealtimeHistoryState::default();
     state.observe(&EventMsg::TurnStarted(
         codex_protocol::protocol::TurnStartedEvent {
+            turn_attribution: None,
             turn_id: "turn-1".to_string(),
             root_turn_id: None,
             trace_id: None,
@@ -129,6 +130,7 @@ fn interrupted_turn_is_not_associated_with_a_new_voice_session(
     let mut state = RealtimeHistoryState::default();
     state.observe(&EventMsg::TurnStarted(
         codex_protocol::protocol::TurnStartedEvent {
+            turn_attribution: None,
             turn_id: "turn-1".to_string(),
             root_turn_id: None,
             trace_id: None,
@@ -138,6 +140,7 @@ fn interrupted_turn_is_not_associated_with_a_new_voice_session(
         },
     ));
     let aborted = EventMsg::TurnAborted(TurnAbortedEvent {
+        root_turn_id: None,
         turn_id: aborted_turn_id.map(str::to_string),
         reason: TurnAbortReason::Interrupted,
         error: None,
@@ -173,6 +176,7 @@ fn interrupted_turn_is_not_associated_with_a_new_voice_session(
 fn interrupted_turn_keeps_its_existing_voice_session_for_late_artifacts() {
     let mut state = started_state();
     state.observe(&EventMsg::TurnAborted(TurnAbortedEvent {
+        root_turn_id: None,
         turn_id: Some("turn-1".to_string()),
         reason: TurnAbortReason::Interrupted,
         error: None,
@@ -254,6 +258,8 @@ fn promotes_backing_agent_artifacts_once_without_a_client_request() {
         started_at_ms: 0,
     });
     let subagent = completed_item(TurnItem::SubAgentActivity(SubAgentActivityItem {
+        model: None,
+        reasoning_effort: None,
         id: "subagent-1".to_string(),
         kind: SubAgentActivityKind::Started,
         agent_thread_id: ThreadId::new(),

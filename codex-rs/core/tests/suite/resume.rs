@@ -1,4 +1,5 @@
 use anyhow::Result;
+use codex_config::types::Personality;
 use codex_core::TurnInputRequest;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
@@ -7,13 +8,10 @@ use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
-use codex_protocol::user_input::ByteRange;
-use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::LoadThreadHistoryParams;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
@@ -61,6 +59,7 @@ async fn local_thread_history_mode_survives_restart(
         .resume_thread_with_history(
             initial.config.clone(),
             InitialHistory::Resumed(ResumedHistory {
+                history_revision: None,
                 conversation_id: history.thread_id,
                 history: Arc::new(history.items),
                 rollout_path: initial.session_configured.rollout_path.clone(),
@@ -126,155 +125,21 @@ async fn resume_restores_windows_sandbox_override() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let mut builder = test_codex();
-    let initial = builder.build(&server).await?;
-    let codex = Arc::clone(&initial.codex);
-
-    let initial_sse = sse(vec![
-        ev_response_created("resp-initial"),
-        ev_assistant_message("msg-1", "Completed first turn"),
-        ev_completed("resp-initial"),
-    ]);
-    mount_sse_once(&server, initial_sse).await;
-
-    let text_elements = vec![TextElement::new(
-        ByteRange { start: 0, end: 6 },
-        Some("<note>".into()),
-    )];
-
-    codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "Record some messages".into(),
-            text_elements: text_elements.clone(),
-        }]))
-        .await?;
-
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-    let mut resumed = builder.restart(&server, &initial).await?;
-    let initial_messages = resumed
-        .session_configured
-        .initial_messages
-        .take()
-        .expect("expected initial messages to be present for resumed session");
-    match initial_messages.as_slice() {
-        [
-            EventMsg::TurnStarted(started),
-            EventMsg::UserMessage(first_user),
-            EventMsg::AgentMessage(assistant_message),
-            EventMsg::TokenCount(_),
-            EventMsg::TurnComplete(completed),
-        ] => {
-            assert_eq!(first_user.message, "Record some messages");
-            assert_eq!(first_user.text_elements, text_elements);
-            assert_eq!(assistant_message.message, "Completed first turn");
-            assert_eq!(completed.turn_id, started.turn_id);
-            assert_eq!(
-                completed.last_agent_message.as_deref(),
-                Some("Completed first turn")
-            );
-        }
-        other => panic!("unexpected initial messages after resume: {other:#?}"),
-    }
-
-    resumed.codex.flush_rollout().await?;
-    let mut rejoined = resumed
-        .thread_manager
-        .resume_legacy_thread_from_rollout(
-            resumed.config.clone(),
-            resumed.codex.rollout_path().expect("resumed rollout path"),
-            resumed.thread_manager.auth_manager(),
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
-        )
-        .await?;
-    assert!(Arc::ptr_eq(&rejoined.thread, &resumed.codex));
-    let rejoined_messages = rejoined
-        .session_configured
-        .initial_messages
-        .take()
-        .expect("rejoining a loaded thread must still provide replay messages");
-    assert_eq!(
-        serde_json::to_value(&rejoined.session_configured)?,
-        serde_json::to_value(&resumed.session_configured)?,
-    );
-    assert_eq!(
-        serde_json::to_value(&rejoined_messages[..initial_messages.len()])?,
-        serde_json::to_value(&initial_messages)?,
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        config.show_raw_agent_reasoning = true;
-    });
-    let initial = builder.build(&server).await?;
-    let codex = Arc::clone(&initial.codex);
-
-    let initial_sse = sse(vec![
-        ev_response_created("resp-initial"),
-        ev_reasoning_item("reason-1", &["Summarized step"], &["raw detail"]),
-        ev_assistant_message("msg-1", "Completed reasoning turn"),
-        ev_completed("resp-initial"),
-    ]);
-    mount_sse_once(&server, initial_sse).await;
-
-    codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "Record reasoning messages".into(),
-            text_elements: Vec::new(),
-        }]))
-        .await?;
-
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-    let resumed = builder.restart(&server, &initial).await?;
-    let initial_messages = resumed
-        .session_configured
-        .initial_messages
-        .expect("expected initial messages to be present for resumed session");
-    match initial_messages.as_slice() {
-        [
-            EventMsg::TurnStarted(started),
-            EventMsg::UserMessage(first_user),
-            EventMsg::AgentReasoning(reasoning),
-            EventMsg::AgentReasoningRawContent(raw),
-            EventMsg::AgentMessage(assistant_message),
-            EventMsg::TokenCount(_),
-            EventMsg::TurnComplete(completed),
-        ] => {
-            assert_eq!(first_user.message, "Record reasoning messages");
-            assert_eq!(reasoning.text, "Summarized step");
-            assert_eq!(raw.text, "raw detail");
-            assert_eq!(assistant_message.message, "Completed reasoning turn");
-            assert_eq!(completed.turn_id, started.turn_id);
-            assert_eq!(
-                completed.last_agent_message.as_deref(),
-                Some("Completed reasoning turn")
-            );
-        }
-        other => panic!("unexpected initial messages after resume: {other:#?}"),
-    }
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        config.model = Some("gpt-5.2".to_string());
-    });
+    let legacy_instructions = "Legacy model instructions\n# Personality\nBe pragmatic.";
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.2", move |model| {
+            model
+                .model_messages
+                .get_or_insert_default()
+                .instructions_template = Some(legacy_instructions.to_string());
+        })
+        .with_config(|config| {
+            config.personality = Some(Personality::Pragmatic);
+        });
     let initial = builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);
 
@@ -292,12 +157,8 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
         }]))
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-    let initial_body = initial_mock.single_request().body_json();
-    let initial_instructions = initial_body
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let initial_instructions = initial_mock.single_request().instructions_text();
+    assert_eq!(initial_instructions, legacy_instructions);
 
     let resumed_mock = mount_sse_sequence(
         &server,
@@ -318,8 +179,17 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
 
     let mut resume_builder = test_codex().with_config(|config| {
         config.model = Some("gpt-5.4".to_string());
+        config.personality = Some(Personality::None);
     });
     let resumed = resume_builder.restart(&server, &initial).await?;
+    assert_eq!(
+        resumed.session_configured.thread_id,
+        initial.session_configured.thread_id
+    );
+    assert_eq!(
+        resumed.codex.config_snapshot().await.personality,
+        Some(Personality::None)
+    );
     resumed
         .codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -349,6 +219,12 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
 
     let first_resumed = &requests[0];
     assert_eq!(first_resumed.instructions_text(), initial_instructions);
+    assert!(
+        first_resumed
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == "Record initial instructions")
+    );
     let first_developer_texts = first_resumed.message_input_texts("developer");
     let first_model_switch_count = first_developer_texts
         .iter()

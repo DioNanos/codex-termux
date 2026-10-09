@@ -48,6 +48,7 @@ use codex_skills::SkillRootLoadRequest;
 use codex_skills::SkillRootLoader;
 use codex_skills::SkillRootSnapshots;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use codex_utils_plugins::PluginIdentity;
 use codex_utils_plugins::PluginSkillRoot;
 use codex_utils_plugins::SkillDiscoveryMode;
@@ -966,9 +967,9 @@ async fn load_plugin(
 }
 
 fn apply_plugin_mcp_server_policy(config: &mut McpServerConfig, policy: &PluginMcpServerConfig) {
-    config.enabled = policy.enabled;
-    if let Some(ema) = &policy.ema_auth {
-        ema.apply(config);
+    config.enabled = policy.enabled && !policy.has_unsupported_ema_auth;
+    if policy.has_unsupported_ema_auth {
+        config.auth = codex_config::McpServerAuth::EmaAuth;
     }
     if let Some(approval_mode) = policy.default_tools_approval_mode {
         config.default_tools_approval_mode = Some(approval_mode);
@@ -1022,7 +1023,7 @@ impl PluginSkillInventory {
 #[derive(Debug, Clone)]
 pub struct ResolvedPluginSkills {
     pub skills: Vec<SkillMetadata>,
-    pub disabled_skill_paths: HashSet<AbsolutePathBuf>,
+    pub disabled_skill_paths: HashSet<PathUri>,
     pub had_errors: bool,
 }
 
@@ -1034,7 +1035,7 @@ impl ResolvedPluginSkills {
 
 fn contains_enabled_skill(
     skills: &[SkillMetadata],
-    disabled_skill_paths: &HashSet<AbsolutePathBuf>,
+    disabled_skill_paths: &HashSet<PathUri>,
 ) -> bool {
     skills
         .iter()
@@ -1437,9 +1438,9 @@ pub fn apply_configured_plugin_mcp_server_policies(
 ) {
     for (name, server) in servers {
         if let Some(policy) = policies.get(name) {
-            server.enabled &= policy.enabled;
-            if let Some(ema) = &policy.ema_auth {
-                ema.apply(server);
+            server.enabled &= policy.enabled && !policy.has_unsupported_ema_auth;
+            if policy.has_unsupported_ema_auth {
+                server.auth = codex_config::McpServerAuth::EmaAuth;
             }
             let declared_approval_mode = server.default_tools_approval_mode.unwrap_or_default();
 

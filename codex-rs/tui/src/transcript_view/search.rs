@@ -1,22 +1,24 @@
-//! Incremental literal search over the current transcript presentation.
+//! Incremental literal search over full transcript content, independent of collapsed display.
 //!
 //! Search retains one match and one entry being scanned. Each frame examines a bounded text
 //! chunk; reaching the oldest loaded entry asks the app's existing history pager to continue.
 //! The pager owns loading and failure status; search only remembers that it needs another page.
+//! Accepting a match keeps it readable; cancellation restores the original presentation.
 
 use crate::bottom_pane::TextArea;
-use crate::bottom_pane::TextAreaState;
 use crate::keymap::RuntimeKeymap;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
-use ratatui::text::Span;
-use ratatui::widgets::StatefulWidgetRef;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 use super::*;
+
+#[path = "search_footer.rs"]
+mod footer;
+#[path = "search_presentation.rs"]
+mod presentation;
 
 const QUERY_BYTES: usize = 4096;
 const SCAN_BYTES: usize = 16 * 1024;
@@ -48,10 +50,18 @@ enum Progress {
 struct Match {
     anchor: Anchor,
     end: usize,
+    layout: Arc<TextLayout>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SearchMode {
+    Closed,
+    Editing,
+    Reading,
 }
 
 pub(super) struct Search {
-    active: bool,
+    mode: SearchMode,
     editor: TextArea,
     folded_query: String,
     saved_position: Position,
@@ -62,12 +72,14 @@ pub(super) struct Search {
     scanning_layout: Option<(EntryKey, Arc<TextLayout>)>,
     page_start: Option<EntryKey>,
     query_truncated: bool,
+    pub(super) live: Option<Arc<TextLayout>>,
+    live_key: Option<(u16, ActiveCellTranscriptKey)>,
 }
 
 impl Default for Search {
     fn default() -> Self {
         Self {
-            active: false,
+            mode: SearchMode::Closed,
             editor: TextArea::new(),
             folded_query: String::new(),
             saved_position: Position::default(),
@@ -78,6 +90,8 @@ impl Default for Search {
             scanning_layout: None,
             page_start: None,
             query_truncated: false,
+            live: None,
+            live_key: None,
         }
     }
 }
@@ -85,19 +99,27 @@ impl Default for Search {
 impl TranscriptView {
     pub(crate) fn begin_search(&mut self) {
         self.cancel_beginning();
-        if self.search.active {
+        if self.is_search_editing() {
             return;
         }
+        self.copy_mode = None;
         let saved_position = self.position;
         let saved_snapshot = self
             .selection
             .take()
             .map(|selection| selection.snapshot)
             .or(self.held_reading.take());
+        if self.search.is_reading() {
+            self.held_reading = saved_snapshot;
+            self.search.mode = SearchMode::Editing;
+            if self.search.current.is_none() {
+                self.search.progress = Progress::Restart;
+            }
+            return;
+        }
         let saved_detailed = self.detailed;
-        self.search.active = true;
+        self.search.mode = SearchMode::Editing;
         self.disclosure.focused = None;
-        self.set_presentation(/*detailed*/ true, self.mode);
         self.search.saved_position = saved_position;
         self.search.saved_snapshot = saved_snapshot;
         self.search.saved_detailed = saved_detailed;
@@ -115,42 +137,8 @@ impl TranscriptView {
         self.live_key = None;
     }
 
-    pub(crate) fn is_search_active(&self) -> bool {
-        self.search.active
-    }
-
-    /// Project the editor and its caret from the same one-row viewport into the existing footer.
-    pub(crate) fn search_footer(&self, width: u16) -> Option<(Line<'static>, u16)> {
-        if !self.search.active || width == 0 {
-            return None;
-        }
-        let area = Rect::new(/*x*/ 0, /*y*/ 0, width, /*height*/ 1);
-        let mut buffer = Buffer::empty(area);
-        let prefix_width = width.saturating_sub(/*rhs*/ 1).min(/*other*/ 6);
-        Line::from("Find: ").dim().render(
-            Rect::new(/*x*/ 0, /*y*/ 0, prefix_width, /*height*/ 1),
-            &mut buffer,
-        );
-        let query_area = Rect::new(
-            prefix_width,
-            /*y*/ 0,
-            width - prefix_width,
-            /*height*/ 1,
-        );
-        let mut state = TextAreaState::default();
-        StatefulWidgetRef::render_ref(&&self.search.editor, query_area, &mut buffer, &mut state);
-        let (cursor_column, _) = self
-            .search
-            .editor
-            .cursor_pos_with_state(query_area, state)?;
-        let mut spans = Vec::new();
-        let mut column = 0;
-        while column < width {
-            let cell = &buffer[(column, 0)];
-            spans.push(Span::styled(cell.symbol().to_string(), cell.style()));
-            column += cell.symbol().width().max(/*other*/ 1) as u16;
-        }
-        Some((Line::from(spans), cursor_column))
+    pub(crate) fn is_search_editing(&self) -> bool {
+        self.search.mode == SearchMode::Editing
     }
 
     pub(super) fn handle_search_key(
@@ -158,21 +146,45 @@ impl TranscriptView {
         key: KeyEvent,
         cells: &[Arc<dyn HistoryCell>],
     ) -> bool {
-        if !self.search.active {
+        if !self.search.is_active() {
             return false;
         }
         let (code, modifiers) = crate::key_hint::normalize_key_parts(key.code, key.modifiers);
         match (code, modifiers) {
+            (KeyCode::Esc, _) if self.search.is_reading() => self.jump_to_latest(),
             (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.cancel_search();
             }
-            // Ctrl+N/P stay distinct when a legacy terminal encodes Shift+Enter as Enter.
-            (KeyCode::Enter, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            // Some terminals report held Enter as Press, indistinguishable from a fresh key.
+            // Keep it in Find so accepting a hit cannot submit the composer draft.
+            (KeyCode::Enter, _) if self.search.is_reading() => {
+                return modifiers == KeyModifiers::NONE;
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                // Accept the displayed match even if finding an older one is still pending.
+                // An idle nonempty query can also mean scrolling released a live match.
+                // Leave initial scans and empty/unmatched queries open until they find a hit.
+                if !self.search.editor.is_empty()
+                    && (self.search.current.is_some()
+                        || matches!(self.search.progress, Progress::Idle))
+                {
+                    self.search.mode = SearchMode::Reading;
+                    self.search.progress = match self.search.progress {
+                        Progress::Exhausted => Progress::Exhausted,
+                        _ if self.search.current.is_some() => Progress::Found,
+                        _ => Progress::Idle,
+                    };
+                    self.search.scanning_layout = None;
+                }
+            }
+            (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                 self.next_search_match(cells, Direction::Newer);
             }
-            (KeyCode::Enter, KeyModifiers::SHIFT) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                 self.next_search_match(cells, Direction::Older);
             }
+            (KeyCode::PageUp | KeyCode::PageDown, KeyModifiers::NONE) => return false,
+            _ if JumpTarget::from_key(key).is_some() || self.search.is_reading() => return false,
             _ => {
                 let before = self.search.editor.text().to_string();
                 let cursor = self.search.editor.cursor();
@@ -190,7 +202,7 @@ impl TranscriptView {
                 }
             }
         }
-        // Find owns every key until it closes, including unbound keys and editor chords.
+        // Query editing owns other keys; reading and page navigation use the transcript.
         true
     }
 
@@ -200,7 +212,7 @@ impl TranscriptView {
         cells: &[Arc<dyn HistoryCell>],
         retiring: std::ops::Range<usize>,
     ) {
-        if self.search.active
+        if self.search.is_active()
             && self.search.saved_snapshot.is_none()
             && let Position::Reading(anchor) = self.search.saved_position
             && cells[retiring]
@@ -218,7 +230,7 @@ impl TranscriptView {
 
     /// Restore the pre-search presentation before an explicit return or cancellation.
     pub(crate) fn cancel_search(&mut self) {
-        if !self.search.active {
+        if !self.search.is_active() {
             return;
         }
         let position = self.search.saved_position;
@@ -240,17 +252,19 @@ impl TranscriptView {
         });
         let detailed = self.search.saved_detailed;
         self.set_presentation(detailed, self.mode);
-        self.search.active = false;
+        self.search.mode = SearchMode::Closed;
         self.search.editor.set_text_clearing_elements("");
         self.search.query_changed();
         self.search.progress = Progress::Idle;
+        self.search.live = None;
+        self.search.live_key = None;
         self.position = position;
         self.held_reading = snapshot;
         self.rewrap_snapshot(self.area.width);
     }
 
     pub(crate) fn paste_search(&mut self, text: &str) -> bool {
-        if !self.search.active {
+        if !self.is_search_editing() {
             return false;
         }
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -275,8 +289,12 @@ impl TranscriptView {
 
     /// Restart after a presentation change invalidates the searched text and its source offsets.
     pub(crate) fn restart_search(&mut self) {
-        if self.search.active {
+        if self.search.is_active() {
             self.search.query_changed();
+            // Reading should not jump when scrolling releases a retained live revision.
+            if self.search.is_reading() {
+                self.search.progress = Progress::Idle;
+            }
         }
     }
 
@@ -302,6 +320,8 @@ impl TranscriptView {
     pub(super) fn invalidate_held_search(&mut self) {
         if self.search.has_active_query() {
             self.restart_search();
+            // Scrolling away from a retained match must not immediately find it again.
+            self.search.progress = Progress::Idle;
         }
     }
 
@@ -311,8 +331,13 @@ impl TranscriptView {
             return;
         }
         self.rewrap_snapshot(width);
+        if let Some(found) = &mut self.search.current {
+            found.layout = Arc::new(found.layout.rewrap(width));
+        }
         self.area.width = width;
-        if self.held_reading.is_none() || !matches!(self.search.progress, Progress::Found) {
+        if self.search.current.is_none()
+            || !matches!(self.search.progress, Progress::Found | Progress::Exhausted)
+        {
             self.restart_search();
         }
     }
@@ -366,14 +391,7 @@ impl TranscriptView {
                     offset: window.start + range.start,
                     ..cursor.anchor
                 };
-                self.position = Position::Reading(anchor);
-                self.hold_live_reading(current_cells, Arc::clone(&layout));
-                self.search.current = Some(Match {
-                    anchor,
-                    end: window.start + range.end,
-                });
-                self.search.progress = Progress::Found;
-                self.search.scanning_layout = None;
+                self.install_search_match(current_cells, anchor, window.start + range.end, layout);
                 return false;
             }
             scanned_bytes += window.len();
@@ -473,6 +491,7 @@ impl TranscriptView {
             };
             if direction == Direction::Newer
                 && let Some(snapshot) = self.held_reading.take()
+                && let Some(previous) = self.search.current.take()
             {
                 // Continue through newly committed output, or rejoin a surviving cell.
                 let index = if anchor.key == EntryKey::Live {
@@ -494,12 +513,20 @@ impl TranscriptView {
                     self.visible.clear();
                     return;
                 };
-                let prefix = snapshot
-                    .pinned
-                    .get(&anchor.key)
-                    .and_then(|layout| layout.text().get(..offset));
-                let same_prefix = self.current_layout(cells, index).is_some_and(|layout| {
-                    prefix.is_some_and(|prefix| layout.text().starts_with(prefix))
+                let layout = self.search_layout(
+                    cells,
+                    Anchor {
+                        key: cells.get(index).map_or(EntryKey::Live, EntryKey::cell),
+                        index,
+                        ..anchor
+                    },
+                );
+                let same_prefix = layout.as_ref().is_some_and(|layout| {
+                    previous
+                        .layout
+                        .text()
+                        .get(..offset)
+                        .is_some_and(|prefix| layout.text().starts_with(prefix))
                 });
                 anchor = Anchor {
                     key: cells.get(index).map_or(EntryKey::Live, EntryKey::cell),
@@ -507,12 +534,13 @@ impl TranscriptView {
                     offset: if same_prefix { offset } else { 0 },
                     row_bias: 0,
                 };
-                self.search.current = same_prefix.then_some(Match {
+                self.search.current = layout.filter(|_| same_prefix).map(|layout| Match {
                     anchor: Anchor {
                         offset: match_start,
                         ..anchor
                     },
                     end: match_end,
+                    layout,
                 });
                 self.visible.clear();
                 self.position = Position::Reading(
@@ -527,16 +555,21 @@ impl TranscriptView {
             }
             self.search.progress = Progress::Scanning(Cursor { anchor, direction });
         } else if matches!(self.search.progress, Progress::Idle | Progress::Exhausted) {
-            self.start_search_scan(cells, Direction::Older);
+            self.start_search_scan(cells, direction);
         }
     }
 
     fn start_search_scan(&mut self, cells: &[Arc<dyn HistoryCell>], direction: Direction) {
         self.search.page_start = None;
-        let count = cells.len() + usize::from(self.live.is_some());
-        let index = match direction {
-            Direction::Older => count.saturating_sub(/*rhs*/ 1),
-            Direction::Newer => 0,
+        let count = cells.len() + usize::from(self.live.is_some() || self.search.live.is_some());
+        let index = if self.search.is_reading() {
+            // Without a retained match, resume from the visible entry, not a transcript end.
+            self.start(cells).0
+        } else {
+            match direction {
+                Direction::Older => count.saturating_sub(/*rhs*/ 1),
+                Direction::Newer => 0,
+            }
         };
         let offset = match direction {
             Direction::Older => usize::MAX,
@@ -551,21 +584,6 @@ impl TranscriptView {
             },
             direction,
         });
-    }
-
-    fn search_layout(
-        &mut self,
-        cells: &[Arc<dyn HistoryCell>],
-        anchor: Anchor,
-    ) -> Option<Arc<TextLayout>> {
-        if let Some((key, layout)) = &self.search.scanning_layout
-            && *key == anchor.key
-        {
-            return Some(Arc::clone(layout));
-        }
-        let layout = self.layout(cells, anchor.index)?;
-        self.search.scanning_layout = Some((anchor.key, Arc::clone(&layout)));
-        Some(layout)
     }
 
     fn advance_search_cursor(
@@ -598,7 +616,7 @@ impl TranscriptView {
             Direction::Older if self.search.page_start == Some(cursor.anchor.key) => None,
             Direction::Older => cursor.anchor.index.checked_sub(/*rhs*/ 1),
             Direction::Newer => (cursor.anchor.index + 1
-                < cells.len() + usize::from(self.live.is_some()))
+                < cells.len() + usize::from(self.live.is_some() || self.search.live.is_some()))
             .then_some(cursor.anchor.index + 1),
         };
         self.search.progress = match next {
@@ -632,12 +650,27 @@ impl TranscriptView {
 }
 
 impl Search {
+    pub(super) fn match_layout(&self, key: EntryKey) -> Option<Arc<TextLayout>> {
+        self.current
+            .as_ref()
+            .filter(|found| found.anchor.key == key)
+            .map(|found| Arc::clone(&found.layout))
+    }
+
+    pub(super) fn match_anchor(&self) -> Option<Anchor> {
+        self.current.as_ref().map(|found| found.anchor)
+    }
+
     pub(super) fn is_active(&self) -> bool {
-        self.active
+        self.mode != SearchMode::Closed
+    }
+
+    pub(super) fn is_reading(&self) -> bool {
+        self.mode == SearchMode::Reading
     }
 
     pub(super) fn has_active_query(&self) -> bool {
-        self.active && !self.editor.is_empty()
+        self.is_active() && !self.editor.is_empty()
     }
 
     pub(super) fn needs_history(&self, history: TranscriptHistoryState) -> bool {
@@ -645,37 +678,13 @@ impl Search {
             && history == TranscriptHistoryState::Partial
     }
 
-    pub(super) fn status_line(&self, width: u16, history: TranscriptHistoryState) -> Line<'static> {
-        let (status, compact) = match self.progress {
-            Progress::Idle => ("Type to find", "Type to find"),
-            Progress::Restart | Progress::Scanning(_) => ("Searching…", "Searching…"),
-            Progress::AwaitingHistory if history == TranscriptHistoryState::Failed => {
-                ("History unavailable · ctrl+p retry", "ctrl+p retry")
-            }
-            Progress::AwaitingHistory => ("Searching earlier history…", "Loading…"),
-            Progress::Found => ("enter next · ctrl+p previous", "enter next"),
-            Progress::Exhausted if self.current.is_some() => (
-                "No more matches · enter next · ctrl+p previous",
-                "enter next",
-            ),
-            Progress::Exhausted => ("No matches", "No matches"),
-        };
-        let limit = if self.query_truncated {
-            " · query limited to 4 KiB"
-        } else {
-            ""
-        };
-        crate::footer_hint::first_fitting_line(
-            [
-                format!("{status} · full transcript · esc close{limit}"),
-                format!("{status} · esc close{limit}"),
-                format!("{compact} · esc close"),
-                format!("{compact} · esc"),
-                "esc close".to_owned(),
-            ]
-            .map(|hint| super::footer::navigation_line(&hint)),
-            width,
-        )
+    pub(super) fn allows_viewport_paging(&self) -> bool {
+        !self.is_active()
+            || (self.has_active_query()
+                && matches!(
+                    self.progress,
+                    Progress::Idle | Progress::Found | Progress::Exhausted
+                ))
     }
 
     fn query_changed(&mut self) {

@@ -1,8 +1,10 @@
 use super::*;
 use crate::context::APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX;
 use crate::context::UserInstructions;
+use crate::context::world_state::SectionTransition;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSection;
+use crate::context::world_state::WorldStateUpdateContent;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_history::CodexHarnessMetadata;
@@ -524,10 +526,6 @@ impl WorldStateSection for TestWorldStateSection {
     const ID: &'static str = "test";
     type Snapshot = bool;
 
-    fn snapshot(&self) -> Self::Snapshot {
-        true
-    }
-
     fn matches_legacy_fragment(role: &str, text: &str) -> bool {
         role == "user" && UserInstructions::matches_text(text)
     }
@@ -535,18 +533,23 @@ impl WorldStateSection for TestWorldStateSection {
     fn render_diff(
         &self,
         previous: crate::context::world_state::PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn crate::context::ContextualUserFragment>> {
+    ) -> SectionTransition<Self::Snapshot> {
+        let current = true;
         let text = match previous {
-            crate::context::world_state::PreviousSectionState::Known(true) => return None,
+            crate::context::world_state::PreviousSectionState::Known(true) => {
+                return (None, Vec::new());
+            }
             crate::context::world_state::PreviousSectionState::Unknown => "unknown",
             crate::context::world_state::PreviousSectionState::Absent
             | crate::context::world_state::PreviousSectionState::Known(false) => "test",
         };
-        Some(Box::new(UserInstructions {
-            directory: None,
-            text: text.to_string(),
-        })
-            as Box<dyn crate::context::ContextualUserFragment>)
+        (
+            Some(current),
+            vec![WorldStateUpdate::fragment(UserInstructions {
+                directory: None,
+                text: text.to_string(),
+            })],
+        )
     }
 }
 
@@ -575,6 +578,48 @@ fn world_state_baseline_deduplicates_until_history_is_replaced() {
 }
 
 #[test]
+fn world_state_transitions_persist_changed_state_and_skip_unchanged_state() {
+    use codex_extension_api::PreviousWorldStateSection;
+    use codex_extension_api::RenderedWorldStateFragment;
+    use codex_extension_api::WorldStateSectionContribution;
+
+    let world_state = |value: &'static str| {
+        let mut state = WorldState::default();
+        state.add_extension_section(WorldStateSectionContribution::new("test", move |previous| {
+            let snapshot = serde_json::json!(value);
+            if matches!(previous, PreviousWorldStateSection::Known(previous) if previous == &snapshot) {
+                return (None, None);
+            }
+            (Some(snapshot), Some(RenderedWorldStateFragment::new(
+                "developer", ("<test>", "</test>"), value,
+            )))
+        }));
+        state
+    };
+    let mut history = ContextManager::new();
+    let (_, full) = history.update_world_state(&world_state("before"));
+    let full = full.expect("full checkpoint");
+    assert!(full.full);
+
+    let (snapshot, fragments, patch) = history.render_step_world_state(&world_state("after"));
+    let WorldStateUpdateContent::Fragment(fragment) = &fragments[0].content else {
+        panic!("expected a text fragment");
+    };
+    assert_eq!(fragment.body(), "after");
+    let patch = patch.expect("changed snapshot must be persisted");
+    assert!(!patch.full);
+    let mut replayed = WorldStateSnapshot::from(&full.state);
+    replayed.apply_merge_patch(&patch.state);
+    assert_eq!(snapshot, replayed);
+    history.set_world_state_baseline(snapshot.clone());
+
+    let (unchanged, fragments, patch) = history.render_step_world_state(&world_state("after"));
+    assert_eq!(unchanged, snapshot);
+    assert!(fragments.is_empty());
+    assert_eq!(patch, None);
+}
+
+#[test]
 fn world_state_reconciles_matching_legacy_history_once() {
     let item = crate::context::ContextualUserFragment::into(UserInstructions {
         directory: None,
@@ -584,12 +629,17 @@ fn world_state_reconciles_matching_legacy_history_once() {
     let mut world_state = WorldState::default();
     world_state.add_section(TestWorldStateSection);
 
-    let (fragments, rollout_item) = history.update_world_state(&world_state);
+    let (snapshot, fragments, rollout_item) = history.render_step_world_state(&world_state);
+    history.set_world_state_baseline(snapshot);
     assert_eq!(
         vec!["\n\n<INSTRUCTIONS>\nunknown\n"],
         fragments
             .into_iter()
-            .map(|fragment| fragment.body())
+            .map(|update| match update.content {
+                WorldStateUpdateContent::Fragment(fragment) => fragment.body(),
+                WorldStateUpdateContent::Item(item) =>
+                    panic!("expected a text fragment, got {item:?}"),
+            })
             .collect::<Vec<_>>()
     );
     assert!(rollout_item.is_some_and(|item| item.full));
@@ -664,26 +714,20 @@ fn reference_context_item() -> TurnContextItem {
                 .join("reference-cwd"),
         )
         .expect("absolute reference cwd"),
-        workspace_roots: None,
-        current_date: Some("2026-03-23".to_string()),
-        timezone: Some("America/Los_Angeles".to_string()),
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: None,
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         permission_profile: None,
         active_permission_profile: None,
-        network: None,
         file_system_sandbox_policy: None,
         model: "gpt-test".to_string(),
         comp_hash: None,
-        personality: None,
         collaboration_mode: None,
         multi_agent_version: None,
-        multi_agent_mode: None,
         realtime_active: Some(false),
         cyber_access_program: None,
         effort: None,
-        summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        summary: Some(codex_protocol::config_types::ReasoningSummary::Auto),
     }
 }
 
@@ -1446,6 +1490,24 @@ fn estimate_token_count_with_base_instructions_uses_provided_text() {
     let expected_delta = approx_token_count_for_text(&long_base.text)
         - approx_token_count_for_text(&short_base.text);
     assert_eq!(long_estimate - short_estimate, expected_delta);
+}
+
+#[test]
+fn estimate_token_count_counts_recorded_base_instructions_once() {
+    use crate::context::ContextualUserFragment;
+
+    let base = BaseInstructions {
+        text: "base instructions ".repeat(100),
+        provenance: None,
+    };
+    let item =
+        ContextualUserFragment::into(crate::context::BaseInstructionsFragment(base.text.clone()));
+    let expected = estimate_item_token_count(&item);
+    let history = create_history_with_items(vec![item]);
+    assert_eq!(
+        history.estimate_token_count_with_base_instructions(&base),
+        Some(expected)
+    );
 }
 
 #[test]

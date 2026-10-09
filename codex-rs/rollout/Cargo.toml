@@ -24,7 +24,10 @@ codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 codex-state = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-output-truncation = { workspace = true }
 codex-utils-path = { workspace = true }
+codex-utils-string = { workspace = true }
+memchr = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

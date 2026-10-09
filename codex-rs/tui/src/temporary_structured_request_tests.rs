@@ -5,6 +5,7 @@ use super::start_temporary_thread;
 use crate::legacy_core::config::ConfigBuilder;
 use crate::test_support::PathBufExt;
 use codex_app_server_client::AppServerClient;
+use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::SandboxPolicy;
@@ -42,6 +43,7 @@ fn turn_completed_notification(turn_id: &str, status: TurnStatus) -> ServerNotif
         thread_id: "thread-1".to_string(),
         turn: Turn {
             id: turn_id.to_string(),
+            root_turn_id: None,
             items: Vec::new(),
             items_view: Default::default(),
             status,
@@ -61,7 +63,8 @@ async fn managed_workspace_default_respects_read_only_availability() -> color_ey
         std::fs::write(
             &requirements_path,
             format!(
-                "default_permissions = \":workspace\"\n\n\
+                "allowed_approval_policies = [\"on-request\"]\n\
+                 default_permissions = \":workspace\"\n\n\
                  [allowed_permission_profiles]\n\
                  \":read-only\" = {read_only_allowed}\n\
                  \":workspace\" = true\n"
@@ -103,8 +106,29 @@ async fn managed_workspace_default_respects_read_only_availability() -> color_ey
             Default::default(),
         )
         .await?;
-        let app_server = AppServerClient::InProcess(client);
+        let mut app_server = AppServerClient::InProcess(client);
         let result = start_temporary_thread(&app_server.request_handle(), options).await;
+        // Thread/start warnings precede thread/started on the connection.
+        tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), async {
+            loop {
+                let AppServerEvent::ServerNotification(notification) =
+                    app_server.next_event().await.expect("thread startup event")
+                else {
+                    continue;
+                };
+                match *notification {
+                    ServerNotification::ConfigWarning(warning) => {
+                        assert!(
+                            !warning.summary.contains("`approval_policy`"),
+                            "{warning:?}"
+                        );
+                    }
+                    ServerNotification::ThreadStarted(_) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await?;
         app_server.shutdown().await?;
 
         if read_only_allowed {
@@ -117,7 +141,7 @@ async fn managed_workspace_default_respects_read_only_availability() -> color_ey
                 ),
                 (
                     Some(":read-only".to_string()),
-                    AskForApproval::Never,
+                    AskForApproval::OnRequest,
                     SandboxPolicy::ReadOnly {
                         network_access: false,
                     },

@@ -67,6 +67,46 @@ fn write_config(codex_home: &TempDir, contents: &str) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_requirements_read_exposes_independent_speed_policy() -> Result<()> {
+    for (fast_enabled, ultrafast_enabled) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let codex_home = TempDir::new()?;
+        std::fs::write(
+            codex_home.path().join("requirements.toml"),
+            format!(
+                "[features]\nfast_mode = {fast_enabled}\nultrafast_mode = {ultrafast_enabled}\n"
+            ),
+        )?;
+        let mut app_server = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .without_auto_env()
+            .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+            .await?;
+        let request_id = app_server.send_config_requirements_read_request().await?;
+        let response: ConfigRequirementsReadResponse =
+            timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(request_id)).await??;
+        assert_eq!(
+            (
+                response.supports_independent_speed_modes,
+                response
+                    .requirements
+                    .expect("speed requirements")
+                    .feature_requirements
+            ),
+            (
+                Some(true),
+                Some(std::collections::BTreeMap::from([
+                    ("fast_mode".to_string(), fast_enabled),
+                    ("ultrafast_mode".to_string(), ultrafast_enabled),
+                ]))
+            ),
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn managed_auth_settings_are_exposed_enforced_and_read_only() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_config(
@@ -245,6 +285,9 @@ allow_history_access = false
 disable_auto_review = true
 allow_global_persistent_approval = false
 
+[browser_use.extension]
+request_headers = [{ name = "x-browser-agent", value = "ChatGPT/{{session_id}}" }]
+
 [browser_use.default_origin_policy]
 access = "deny"
 downloads = "allow"
@@ -298,6 +341,12 @@ access = "deny"
     assert_eq!(
         requirements.browser_use,
         Some(BrowserUseRequirements {
+            extension: Some(codex_app_server_protocol::BrowserUseExtensionRequirements {
+                request_headers: Some(vec![codex_app_server_protocol::RequestHeader {
+                    name: "x-browser-agent".to_string(),
+                    value: "ChatGPT/{{session_id}}".to_string(),
+                }]),
+            }),
             allow_webmcp: None,
             allow_history_access: Some(false),
             disable_auto_review: Some(true),
@@ -824,6 +873,7 @@ access = "deny"
     assert_eq!(
         requirements.browser_use,
         Some(BrowserUseRequirements {
+            extension: None,
             allow_webmcp: None,
             allow_history_access: Some(false),
             disable_auto_review: None,

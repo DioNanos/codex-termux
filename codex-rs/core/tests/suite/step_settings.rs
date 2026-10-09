@@ -1083,7 +1083,6 @@ async fn active_model_switch_updates_core_context_from_captured_settings(
                 }
                 let messages = model.model_messages.as_mut().expect("model messages");
                 messages.instructions_template = Some(format!("Instructions for {slug}."));
-                messages.instructions_variables = None;
                 messages.collaboration_modes = Some(CollaborationModeMessages {
                     default: Some(format!("Default collaboration for {slug}.")),
                     plan: None,
@@ -1948,6 +1947,7 @@ async fn sparse_updates_preserve_divergent_active_and_future_models() -> Result<
     .await;
     let test = step_settings_test().build_with_auto_env(&server).await?;
     let request = start_paused_turn(&test.codex).await?;
+    assert_eq!(test.codex.current_turn_model("other-turn").await, None);
 
     core_test_support::submit_thread_settings(
         &test.codex,
@@ -1957,6 +1957,10 @@ async fn sparse_updates_preserve_divergent_active_and_future_models() -> Result<
         },
     )
     .await?;
+    assert_eq!(
+        test.codex.current_turn_model(&request.turn_id).await,
+        Some(MODEL_A.to_string())
+    );
     apply_turn_settings(
         &test.codex,
         &request.turn_id,
@@ -1967,6 +1971,10 @@ async fn sparse_updates_preserve_divergent_active_and_future_models() -> Result<
         },
     )
     .await?;
+    assert_eq!(
+        test.codex.current_turn_model(&request.turn_id).await,
+        Some(MODEL_C.to_string())
+    );
     answer_paused_turn(&test.codex, &request.turn_id).await?;
     let second_request = wait_for_event_match(&test.codex, |event| match event {
         EventMsg::RequestUserInput(request) => Some(request.clone()),
@@ -2013,6 +2021,7 @@ async fn sparse_updates_preserve_divergent_active_and_future_models() -> Result<
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    assert_eq!(test.codex.current_turn_model(&request.turn_id).await, None);
     test.submit_text_turn("start the next turn").await?;
 
     let requests = response_mock.requests();
@@ -2426,7 +2435,7 @@ async fn tool_messages_follow_mid_turn_model_changes() -> Result<()> {
                     .collect::<serde_json::Map<String, Value>>(),
                 "channel_post_description": format!("post description for {model}."),
                 "channel_post_required": ["text"],
-                "exec_description": format!("Exec description for {model}."),
+                "exec_description": format!("Exec description for {model}.\n\nSome deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.\nTo find one, filter `ALL_TOOLS` by `name` and `description`.\n\nTool availability can change between calls."),
                 "wait_description": format!("Wait description for {model}."),
                 "wait_parameters": wait_parameters(model),
             }))
@@ -2805,8 +2814,6 @@ async fn captured_step_controls_exec_completion_and_write_stdin_output() -> Resu
     .await;
     let end = end.expect("exec completion");
 
-    use codex_utils_output_truncation::TruncationPolicy;
-    use codex_utils_output_truncation::formatted_truncate_text;
     let requests = responses.requests();
     let exec = requests[2]
         .function_call_output_text("exec-b")
@@ -2826,13 +2833,7 @@ async fn captured_step_controls_exec_completion_and_write_stdin_output() -> Resu
         "{stdin}"
     );
     assert_eq!(end.exit_code, 7);
-    // The formatting check needs an untruncated chunk, independent of how the executor
-    // aggregates output across the initial command and later stdin interactions.
     assert!(end.aggregated_output.contains(&output));
-    assert_eq!(
-        end.formatted_output,
-        formatted_truncate_text(&end.aggregated_output, TruncationPolicy::Bytes(400))
-    );
     Ok(())
 }
 

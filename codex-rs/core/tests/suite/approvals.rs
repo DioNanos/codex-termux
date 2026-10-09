@@ -49,7 +49,7 @@ use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
-use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::local_requests;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -677,7 +677,7 @@ async fn submit_turn(
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+                environments: Some(local_requests(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: Some(sandbox_policy),
@@ -711,7 +711,7 @@ async fn submit_turn_preserving_active_permission_profile(
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+                environments: Some(local_requests(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 collaboration_mode: Some(CollaborationMode {
@@ -2754,6 +2754,14 @@ async fn shell_startup_credentials_are_brokered(
     allow_login_shell: bool,
     login: bool,
 ) -> Result<()> {
+    use codex_otel::MetricsClient;
+    use codex_otel::MetricsConfig;
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::HistogramDataPoint;
+    use opentelemetry_sdk::metrics::data::MetricData;
+    use opentelemetry_sdk::metrics::data::SumDataPoint;
+    use std::collections::BTreeMap;
+
     skip_if_no_network!(Ok(()));
 
     const GH_HOST: &str = "github.example.com";
@@ -2832,9 +2840,9 @@ async fn shell_startup_credentials_are_brokered(
         };
         let zsh_path = zsh.derive_exec_args("", /*use_login_shell*/ false)[0].clone();
         let path = startup_dir.join("zsh");
-        fs::write(
+        codex_utils_cargo_bin::write_executable(
             &path,
-            format!(
+            &format!(
                 "#!/bin/sh\nexport GH_ENTERPRISE_TOKEN='{REAL_GITHUB_TOKEN}'\nexport CUSTOM_API_KEY='{REAL_CUSTOM_TOKEN}'\nexport AUTH_HEADER=\"Bearer $GH_ENTERPRISE_TOKEN\"\nexec {} \"$@\"\n",
                 shlex::try_quote(&zsh_path)?
             ),
@@ -2915,9 +2923,24 @@ ZDOTDIR = "{}"
         }
     });
     let server = start_mock_server().await;
-    let test = builder.build(&server).await?;
+    let mut test = builder.build(&server).await?;
+    let metrics = if login {
+        // Keep the collector local to this thread so parallel tests cannot affect counts.
+        let metrics = MetricsClient::new(
+            MetricsConfig::in_memory("test", "test", "1", Default::default()).with_runtime_reader(),
+        )?;
+        let mut options = test.start_thread_options().await;
+        options.thread_extension_init.insert(metrics.clone());
+        let thread = test.thread_manager.start_thread(options).await?;
+        test.codex.shutdown_and_wait().await?;
+        test.codex = thread.thread;
+        test.session_configured = thread.session_configured;
+        Some(metrics)
+    } else {
+        None
+    };
     let snapshot_dir = test.home.path().join("shell_snapshots");
-    let workdir = if allow_login_shell || shell_mode == "zsh_fork" {
+    let workdir = if (allow_login_shell && !login) || shell_mode == "zsh_fork" {
         test.cwd.path().to_path_buf()
     } else {
         let workdir = test.cwd.path().join("brokered-subdirectory");
@@ -3025,6 +3048,44 @@ ZDOTDIR = "{}"
     }
     let result = parse_result(&output);
     assert_eq!(result.exit_code, Some(0), "command failed: {result:?}");
+    if let Some(metrics) = metrics {
+        let snapshot = metrics.snapshot()?;
+        let mut counts = BTreeMap::new();
+        for metric in snapshot
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        {
+            let count = match (metric.name(), metric.data()) {
+                ("codex.shell_snapshot.command", AggregatedMetrics::U64(MetricData::Sum(sum))) => {
+                    for point in sum.data_points() {
+                        let tags = point
+                            .attributes()
+                            .map(|tag| (tag.key.as_str(), tag.value.to_string()))
+                            .collect::<BTreeMap<_, _>>();
+                        assert_eq!(
+                            ["version", "state", "outcome"]
+                                .map(|key| tags.get(key).map(String::as_str)),
+                            [Some("v1"), Some("protected"), Some("used")],
+                        );
+                    }
+                    sum.data_points().map(SumDataPoint::value).sum::<u64>()
+                }
+                (
+                    "codex.shell_snapshot.wait_ms",
+                    AggregatedMetrics::F64(MetricData::Histogram(histogram)),
+                ) => histogram.data_points().map(HistogramDataPoint::count).sum(),
+                _ => continue,
+            };
+            counts.insert(metric.name(), count);
+        }
+        assert_eq!(
+            counts,
+            BTreeMap::from([
+                ("codex.shell_snapshot.command", 1),
+                ("codex.shell_snapshot.wait_ms", 1),
+            ]),
+        );
+    }
     assert!(!result.stdout.contains(REAL_GITHUB_TOKEN));
     assert!(!result.stdout.contains(REAL_CUSTOM_TOKEN));
     let values = result.stdout.lines().collect::<Vec<_>>();
@@ -3476,15 +3537,12 @@ async fn env_zsh_script_spawned_by_python_can_request_escalation_under_zsh_fork(
     .await?;
 
     let script_path = test.cwd.path().join("runs-under-env-zsh");
-    fs::write(
+    codex_utils_cargo_bin::write_executable(
         &script_path,
-        format!(
+        &format!(
             "#!/usr/bin/env zsh\ntouch {outside_path_arg}\nprint -r -- nested-env-zsh-complete\n"
         ),
     )?;
-    let mut script_permissions = fs::metadata(&script_path)?.permissions();
-    script_permissions.set_mode(0o755);
-    fs::set_permissions(&script_path, script_permissions)?;
 
     let script_literal = serde_json::to_string(script_path.to_string_lossy().as_ref())?;
     let python_script = format!(
@@ -3527,7 +3585,7 @@ async fn env_zsh_script_spawned_by_python_can_request_escalation_under_zsh_fork(
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+                environments: Some(local_requests(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: Some(sandbox_policy),
@@ -3668,7 +3726,7 @@ async fn matched_prefix_rule_runs_unsandboxed_under_zsh_fork() -> Result<()> {
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+                environments: Some(local_requests(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: Some(sandbox_policy),
@@ -3802,6 +3860,102 @@ touch {outside_path:?}
     Ok(())
 }
 
+#[cfg(unix)]
+#[test_case(Some(ReviewDecision::Approved); "approved")]
+#[test_case(Some(ReviewDecision::denied("rejected by user")); "denied")]
+#[test_case(None; "allow_rule_skips_approval_without_widening")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_escalation_with_denied_reads(decision: Option<ReviewDecision>) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    if decision.is_none() {
+        let rules = home.path().join("rules");
+        fs::create_dir(&rules)?;
+        fs::write(
+            rules.join("default.rules"),
+            r#"prefix_rule(pattern=["/bin/sh", "escalation.sh"], decision="allow")"#,
+        )?;
+    }
+    let outside_marker = home.path().join("escalated-marker");
+    let quoted_marker = shlex::try_join([outside_marker.to_string_lossy().as_ref()])?;
+    let approval_policy = AskForApproval::OnRequest;
+    let mut builder = test_codex()
+        .with_home(home)
+        .with_config(move |config| {
+            config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+            config.features.enable(Feature::UnifiedExec).unwrap();
+            config.features.disable(Feature::ShellZshFork).unwrap();
+            let mut file_system =
+                restrictive_workspace_write_profile().file_system_sandbox_policy();
+            file_system.entries.push(FileSystemSandboxEntry::new(
+                config.cwd.join("secret.txt").into(),
+                FileSystemAccessMode::Deny,
+            ));
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::from_runtime_permissions(
+                    &file_system,
+                    NetworkSandboxPolicy::Restricted,
+                ))
+                .unwrap();
+        })
+        .with_workspace_setup(move |cwd, _fs| async move {
+            fs::write(cwd.join("secret.txt"), "secret")?;
+            fs::write(
+                cwd.join("escalation.sh"),
+                format!(
+                    "printf ran > ran || exit 10; (printf outside > {quoted_marker}) 2> errors; \
+                 if cat secret.txt > errors 2>&1; then exit 11; fi; \
+                 grep -q secret.txt errors || exit 12; printf 'protected\\n'"
+                ),
+            )?;
+            Ok(())
+        });
+    let test = builder.build(&server).await?;
+    let workspace_marker = test.cwd.path().join("ran");
+    let command = "/bin/sh escalation.sh";
+    let call_id = "explicit-deny-read-escalation";
+    let event = exec_command_event(
+        call_id,
+        command,
+        Some(10_000),
+        SandboxPermissions::RequireEscalated,
+        /*justification*/ None,
+    )?;
+    mount_sse_once(&server, sse(vec![event, ev_completed("run")])).await;
+    let response = mount_sse_once(&server, sse(vec![ev_completed("done")])).await;
+    submit_turn_preserving_active_permission_profile(&test, "run the command", approval_policy)
+        .await?;
+    let approved = decision == Some(ReviewDecision::Approved);
+    let rejected = decision.is_some() && !approved;
+    if let Some(decision) = decision {
+        let request = expect_exec_approval(&test, command).await;
+        assert!(!outside_marker.exists() && !workspace_marker.exists());
+        test.codex
+            .submit(Op::ExecApproval {
+                id: request.effective_approval_id(),
+                turn_id: None,
+                decision,
+            })
+            .await?;
+    }
+    wait_for_completion_without_approval(&test).await;
+    let result = parse_result(&response.single_request().function_call_output(call_id));
+    if rejected {
+        assert!(result.stdout.contains("rejected by user"), "{result:?}");
+        assert!(!workspace_marker.exists());
+    } else {
+        assert_eq!(
+            (result.exit_code, result.stdout.as_str()),
+            (Some(0), "protected\n")
+        );
+        assert_eq!(fs::read_to_string(workspace_marker)?, "ran");
+    }
+    assert_eq!(outside_marker.exists(), approved);
+    Ok(())
+}
+
 /// Verifies that zsh-fork applies an inner script's allow rule even when the
 /// model invokes an outer wrapper, and that the escalated script retains the
 /// named profile needed to reconstruct the original sandbox remotely without
@@ -3824,9 +3978,9 @@ async fn zsh_fork_inner_allowed_script_inherits_active_permission_profile() -> R
     let remote_bash_path = script_dir.path().join("remote_bash.py");
     let outside_path = script_dir.path().join("remote-bash-unsandboxed-marker");
     let outside_path_literal = serde_json::to_string(&outside_path.to_string_lossy())?;
-    fs::write(
+    codex_utils_cargo_bin::write_executable(
         &remote_bash_path,
-        format!(
+        &format!(
             r#"#!/usr/bin/env python3
 import argparse
 import os
@@ -3891,19 +4045,14 @@ if __name__ == "__main__":
         ),
     )?;
     let remote_bash_exec = shlex::try_join([remote_bash_path.to_string_lossy().as_ref()])?;
-    fs::write(
+    codex_utils_cargo_bin::write_executable(
         &wrapper_path,
-        format!(
+        &format!(
             r#"#!/usr/bin/env zsh
 exec {remote_bash_exec} "$@"
 "#
         ),
     )?;
-    for path in [&wrapper_path, &remote_bash_path] {
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)?;
-    }
 
     let remote_bash_pattern = serde_json::to_string(&remote_bash_path.to_string_lossy())?;
     let rules = format!(r#"prefix_rule(pattern=[{remote_bash_pattern}], decision="allow")"#);
@@ -4582,7 +4731,7 @@ allow_local_binding = true
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+                environments: Some(local_requests(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: Some(turn_sandbox_policy),

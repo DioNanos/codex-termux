@@ -94,8 +94,8 @@ stream_max_retries = 0
             /*summary*/ None,
             /*service_tier*/ None,
             /*collaboration_mode*/ None,
-            /*personality*/ None,
             /*output_schema*/ None,
+            /*cyber_access_program*/ None,
         )
         .await?;
     tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 30), async {
@@ -150,7 +150,12 @@ stream_max_retries = 0
         .await?;
     assert_eq!(forked.session.runtime_workspace_roots, expected_roots);
     let side = app_server
-        .fork_side_thread(&local_settings, session_config, thread_id)
+        .fork_side_thread(
+            &local_settings,
+            session_config,
+            thread_id,
+            /*selected_profile*/ None,
+        )
         .await?;
     assert_eq!(side.session.runtime_workspace_roots, expected_roots);
 

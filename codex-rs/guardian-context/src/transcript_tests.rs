@@ -135,6 +135,15 @@ fn registered_transcript_filters_roles_and_preserves_node_repl_tool_attribution(
             id: None,
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                text: "The first result is ready.".to_string(),
+            }],
+            phase: Some(MessagePhase::PartialAnswer),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
                 text: "Inspection complete.".to_string(),
             }],
             phase: Some(MessagePhase::FinalAnswer),
@@ -187,6 +196,10 @@ fn registered_transcript_filters_roles_and_preserves_node_repl_tool_attribution(
                     "Inspect the workspace."
                 ),
                 entry(ConversationTranscriptEntryKind::Developer, &approved_action),
+                entry(
+                    ConversationTranscriptEntryKind::ProtectedAssistant,
+                    "The first result is ready."
+                ),
                 entry(
                     ConversationTranscriptEntryKind::ProtectedAssistant,
                     "Inspection complete."
@@ -536,7 +549,7 @@ fn encrypted_messages_preserve_order_and_budget_for_both_reviewers() {
             ContextPresentation::SyncFull {
                 session_id: "worker",
             },
-            profile.render_transcript(&entries, /*entry_number_offset*/ 0),
+            profile.prepare_transcript(&entries, /*entry_number_offset*/ 0),
         )
         .unwrap();
         assert_eq!(

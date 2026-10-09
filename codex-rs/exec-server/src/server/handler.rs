@@ -50,6 +50,8 @@ use crate::protocol::FsRemoveParams;
 use crate::protocol::FsRemoveResponse;
 use crate::protocol::FsWalkParams;
 use crate::protocol::FsWalkResponse;
+use crate::protocol::FsWriteBlockParams;
+use crate::protocol::FsWriteBlockResponse;
 use crate::protocol::FsWriteFileParams;
 use crate::protocol::FsWriteFileResponse;
 use crate::protocol::HTTP_REQUEST_METHOD;
@@ -207,12 +209,16 @@ impl ExecServerHandler {
         params: EnvironmentConfigReadParams,
     ) -> Result<EnvironmentConfigReadResponse, JSONRPCErrorError> {
         self.require_initialized_for("environment config")?;
-        read_environment_config(crate::LOCAL_FS.as_ref(), params)
-            .await
-            .map_err(|error| match error {
-                ReadEnvironmentConfigError::InvalidParams(message) => invalid_params(message),
-                ReadEnvironmentConfigError::Internal(message) => internal_error(message),
-            })
+        read_environment_config(
+            crate::LOCAL_FS.as_ref(),
+            params,
+            self.runtime_paths.prefer_mxc,
+        )
+        .await
+        .map_err(|error| match error {
+            ReadEnvironmentConfigError::InvalidParams(message) => invalid_params(message),
+            ReadEnvironmentConfigError::Internal(message) => internal_error(message),
+        })
     }
 
     pub(crate) fn environment_status(&self) -> Result<EnvironmentStatus, JSONRPCErrorError> {
@@ -338,6 +344,14 @@ impl ExecServerHandler {
     ) -> Result<FsReadBlockResponse, JSONRPCErrorError> {
         self.require_initialized_for("filesystem")?;
         self.file_system.read_block(params).await
+    }
+
+    pub(crate) async fn fs_write_block(
+        &self,
+        params: FsWriteBlockParams,
+    ) -> Result<FsWriteBlockResponse, JSONRPCErrorError> {
+        self.require_initialized_for("filesystem")?;
+        self.file_system.write_block(params).await
     }
 
     pub(crate) async fn fs_close(

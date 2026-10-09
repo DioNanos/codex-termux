@@ -14,7 +14,10 @@ use crate::json_schema_types::render_json_schema_to_typescript_with_budget;
 
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r#"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
-To find one, filter `ALL_TOOLS` by `name` and `description`."#;
+To find one, filter `ALL_TOOLS` by `name` and `description`.
+
+Tool availability can change between calls."#;
+pub const TOOL_SEARCH_GUIDANCE: &str = r#"Use `await tools.tool_search({query: "...", limit: 8})` for BM25-ranked discovery of deferred tools (up to `limit` matches; 8 by default). It returns `{tools: [{name, description}]}` with callable names and full TypeScript declarations. Print results with `text()` and inspect unfamiliar declarations before calling `tools[result.name](arguments)` in a later execution."#;
 const LEGACY_IMAGE_HELPER_DESCRIPTION: &str = r#"`image(imageUrlOrItem: string | { image_url: string; detail?: "auto" | "low" | "high" | "original" | null } | ImageContent, detail?: "auto" | "low" | "high" | "original" | null)`: Appends an image item. `image_url` should be a base64-encoded `data:` URL. To forward an MCP tool image, pass an individual `ImageContent` block from `result.content`, for example `image(result.content[0])`. MCP image blocks may request detail with `_meta: { "codex/imageDetail": "original" }`. When provided, the second `detail` argument overrides any detail embedded in the first argument."#;
 const UNIFIED_IMAGE_HELPER_DESCRIPTION: &str = r#"`image(imageUrlOrItem: string | { image_url: string } | ImageContent)`: Appends an image item. `image_url` should be a base64-encoded `data:` URL. To forward an MCP tool image, pass an individual `ImageContent` block from `result.content`, for example `image(result.content[0])`."#;
 const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/compose tool calls
@@ -266,13 +269,21 @@ pub enum ImageDetailVisibility {
     Hidden,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeferredToolDiscovery {
+    Catalog,
+    RankedSearch,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn build_exec_tool_description(
     enabled_tools: &[ToolDefinition],
-    deferred_tools: &[ToolDefinition],
+    _deferred_tools: &[ToolDefinition],
     namespace_descriptions: &BTreeMap<String, ToolNamespaceDescription>,
     default_exec_yield_time_ms: u64,
     code_mode_only: bool,
     image_detail_visibility: ImageDetailVisibility,
+    deferred_tool_discovery: DeferredToolDiscovery,
     messages: Option<&CodeModeToolMessages>,
 ) -> String {
     let mut sections = Vec::new();
@@ -292,29 +303,30 @@ pub fn build_exec_tool_description(
     if !description.is_empty() {
         sections.push(description);
     }
-    if !deferred_tools.is_empty() {
-        let guidance = messages
-            .and_then(|messages| messages.deferred_nested_tools_guidance.as_deref())
-            .unwrap_or(DEFERRED_NESTED_TOOLS_GUIDANCE);
-        if !guidance.is_empty() {
-            sections.push(guidance.to_string());
+    let default_guidance = match deferred_tool_discovery {
+        // In Code Mode Only, the enabled search tool's description is rendered below.
+        DeferredToolDiscovery::RankedSearch if !code_mode_only => {
+            format!("{DEFERRED_NESTED_TOOLS_GUIDANCE}\n\n{TOOL_SEARCH_GUIDANCE}")
         }
+        DeferredToolDiscovery::Catalog | DeferredToolDiscovery::RankedSearch => {
+            DEFERRED_NESTED_TOOLS_GUIDANCE.to_string()
+        }
+    };
+    let guidance = messages
+        .and_then(|messages| messages.deferred_nested_tools_guidance.as_deref())
+        .unwrap_or(&default_guidance);
+    if !guidance.is_empty() {
+        sections.push(guidance.to_string());
     }
     if !code_mode_only {
         return sections.join("\n\n");
     }
 
-    let has_mcp_tools = enabled_tools
-        .iter()
-        .chain(deferred_tools)
-        .any(|tool| mcp_structured_content_schema(tool.output_schema.as_ref()).is_some());
-    if has_mcp_tools {
-        let preamble = messages
-            .and_then(|messages| messages.mcp_typescript_preamble.as_deref())
-            .unwrap_or(MCP_TYPESCRIPT_PREAMBLE);
-        if !preamble.is_empty() {
-            sections.push(format!("Shared MCP Types:\n```ts\n{preamble}\n```"));
-        }
+    let preamble = messages
+        .and_then(|messages| messages.mcp_typescript_preamble.as_deref())
+        .unwrap_or(MCP_TYPESCRIPT_PREAMBLE);
+    if !preamble.is_empty() {
+        sections.push(format!("Shared MCP Types:\n```ts\n{preamble}\n```"));
     }
 
     if !enabled_tools.is_empty() {
@@ -535,6 +547,7 @@ mod description_override_tests;
 #[cfg(test)]
 mod tests {
     use super::CodeModeToolKind;
+    use super::DeferredToolDiscovery;
     use super::ImageDetailVisibility;
     use super::ParsedExecSource;
     use super::ToolDefinition;
@@ -743,6 +756,7 @@ mod tests {
             crate::DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
             ImageDetailVisibility::Visible,
+            DeferredToolDiscovery::Catalog,
             /*messages*/ None,
         );
         assert!(description.contains(
@@ -761,6 +775,7 @@ bar"
             crate::DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ false,
             ImageDetailVisibility::Visible,
+            DeferredToolDiscovery::Catalog,
             /*messages*/ None,
         );
         assert!(description.contains("`audio(audioUrlOrItem:"));
@@ -819,6 +834,7 @@ bar"
             crate::DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
             ImageDetailVisibility::Visible,
+            DeferredToolDiscovery::Catalog,
             /*messages*/ None,
         );
         assert_eq!(description.matches("## mcp__sample").count(), 1);
@@ -863,6 +879,7 @@ bar"
             crate::DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
             ImageDetailVisibility::Visible,
+            DeferredToolDiscovery::Catalog,
             /*messages*/ None,
         );
 
@@ -969,6 +986,7 @@ bar"
             crate::DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
             ImageDetailVisibility::Visible,
+            DeferredToolDiscovery::Catalog,
             /*messages*/ None,
         );
 
@@ -1008,6 +1026,7 @@ bar"
             crate::DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
             ImageDetailVisibility::Visible,
+            DeferredToolDiscovery::Catalog,
             /*messages*/ None,
         );
 
@@ -1017,27 +1036,63 @@ bar"
     }
 
     #[test]
-    fn exec_description_mentions_deferred_nested_tools_when_available() {
-        let description = build_exec_tool_description(
-            &[],
-            &[ToolDefinition {
-                name: "deferred_tool".to_string(),
-                tool_name: ToolName::plain("deferred_tool"),
-                description: "Deferred tool".to_string(),
-                kind: CodeModeToolKind::Function,
-                input_schema: None,
-                input_schema_max_bytes: None,
-                output_schema: None,
-            }],
-            &BTreeMap::new(),
-            crate::DEFAULT_EXEC_YIELD_TIME_MS,
-            /*code_mode_only*/ false,
-            ImageDetailVisibility::Visible,
-            /*messages*/ None,
-        );
+    fn exec_description_preserves_discovery_guidance_across_catalog_changes() {
+        let deferred_tools = [ToolDefinition {
+            name: "deferred_tool".to_string(),
+            tool_name: ToolName::plain("deferred_tool"),
+            description: "Deferred tool".to_string(),
+            kind: CodeModeToolKind::Function,
+            input_schema: None,
+            input_schema_max_bytes: None,
+            output_schema: None,
+        }];
+        let search_tool = ToolDefinition {
+            name: "tool_search".to_string(),
+            tool_name: ToolName::plain("tool_search"),
+            description: super::TOOL_SEARCH_GUIDANCE.to_string(),
+            kind: CodeModeToolKind::Function,
+            input_schema: None,
+            input_schema_max_bytes: None,
+            output_schema: None,
+        };
+        for code_mode_only in [false, true] {
+            for discovery in [
+                DeferredToolDiscovery::Catalog,
+                DeferredToolDiscovery::RankedSearch,
+            ] {
+                let enabled_tools = match discovery {
+                    DeferredToolDiscovery::Catalog => Vec::new(),
+                    DeferredToolDiscovery::RankedSearch => vec![search_tool.clone()],
+                };
+                let description = build_exec_tool_description(
+                    &enabled_tools,
+                    &deferred_tools,
+                    &BTreeMap::new(),
+                    crate::DEFAULT_EXEC_YIELD_TIME_MS,
+                    code_mode_only,
+                    ImageDetailVisibility::Visible,
+                    discovery,
+                    /*messages*/ None,
+                );
+                assert!(description.contains("Some deferred nested tools may be omitted"));
+                assert!(description.contains("filter `ALL_TOOLS` by `name` and `description`"));
+                assert_eq!(
+                    description.matches("await tools.tool_search(").count(),
+                    usize::from(discovery == DeferredToolDiscovery::RankedSearch),
+                );
 
-        assert!(description.contains("Some deferred nested tools may be omitted"));
-        assert!(description.contains("filter `ALL_TOOLS` by `name` and `description`"));
-        assert!(!description.contains("do not print the full `ALL_TOOLS` array"));
+                let empty_catalog_description = build_exec_tool_description(
+                    &enabled_tools,
+                    &[],
+                    &BTreeMap::new(),
+                    crate::DEFAULT_EXEC_YIELD_TIME_MS,
+                    code_mode_only,
+                    ImageDetailVisibility::Visible,
+                    discovery,
+                    /*messages*/ None,
+                );
+                assert_eq!(description, empty_catalog_description);
+            }
+        }
     }
 }

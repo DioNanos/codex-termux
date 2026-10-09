@@ -182,14 +182,14 @@ fn guardian_bypasses_sandbox_for_explicit_escalation_on_first_attempt() {
             },
             &FileSystemSandboxPolicy::default(),
             /*sandbox_unavailable_by_construction*/ false,
-            /*already_approved*/ false,
+            /*already_approved*/ true,
         ),
         SandboxOverride::BypassSandboxFirstAttempt
     );
 }
 
 #[test]
-fn deny_read_blocks_explicit_escalation_and_policy_bypass() {
+fn deny_read_preserves_the_sandbox_for_explicit_escalation_and_blocks_policy_bypass() {
     let file_system_policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
         path: FileSystemPath::GlobPattern {
             pattern: "**/*.env".to_string(),
@@ -207,12 +207,16 @@ fn deny_read_blocks_explicit_escalation_and_policy_bypass() {
             },
             &file_system_policy,
             /*sandbox_unavailable_by_construction*/ false,
-            /*already_approved*/ false,
+            /*already_approved*/ true,
         ),
-        SandboxOverride::NoOverride,
-        "explicit escalation would drop deny-read filesystem policy, so keep the first attempt sandboxed",
+        SandboxOverride::EscalatedSandboxWithRestrictions,
+        "explicit escalation must widen the first attempt without dropping the sandbox",
     );
     assert!(!unsandboxed_execution_allowed(&file_system_policy));
+    assert!(matches!(
+        SandboxOverride::EscalatedSandboxWithRestrictions.ensure_native_sandbox(SandboxType::None),
+        Err(ToolError::Rejected(reason)) if reason.contains("requires an available filesystem sandbox"),
+    ));
     assert_eq!(
         sandbox_permissions_preserving_denied_reads(
             SandboxPermissions::RequireEscalated,
@@ -243,7 +247,7 @@ fn deny_read_blocks_explicit_escalation_and_policy_bypass() {
             },
             &file_system_policy,
             /*sandbox_unavailable_by_construction*/ false,
-            /*already_approved*/ false,
+            /*already_approved*/ true,
         ),
         SandboxOverride::NoOverride,
         "exec-policy allow rules would drop deny-read filesystem policy, so keep the first attempt sandboxed",
