@@ -1,6 +1,6 @@
 # Codex CLI for Termux
 
-> Android Termux package built from upstream OpenAI Codex `rust-v0.160.0`.
+> Android Termux package built from upstream OpenAI Codex `rust-v0.162.0`.
 
 Package metadata for the Termux-focused line `@mmmbuto/codex-cli-termux`.
 
@@ -17,7 +17,7 @@ codex login
 ## Notes
 
 - Android 10+ / API 29+ on Termux ARM64 (the release binary is built for API 29)
-- Built from upstream `rust-v0.160.0`
+- Built from upstream `rust-v0.162.0`
 - Carries only the Termux compatibility delta needed for packaging and runtime
 - Real code-mode (`exec`/`wait`) runs through the bundled `codex-code-mode-host` helper (out-of-process since rust-v0.147.0), shipped in `bin/` alongside `codex.bin`
 - Realtime voice/audio is not part of this build: upstream removed the TUI
