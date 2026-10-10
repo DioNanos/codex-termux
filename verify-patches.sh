@@ -569,6 +569,41 @@ else
   fail
 fi
 
+printf "Patch #31 (Embedded-server cell context gate): "
+# A launch that declares a cell isolation context must never attach to a shared
+# daemon: a shared server cannot bind per-connection identity. The fork keeps
+# four points in agreement -- the detector, the daemon-exclusion arm, the
+# startup bail and the CLI refusal. No other guard covers them, and the two
+# upstream files that carry two of them (tui/src/daemon_startup.rs,
+# tui/src/startup_orchestration.rs) are exactly the files upstream keeps
+# rewording: the 0.162.1 merge touched both. The detector is read as a block,
+# not by symbol, because both environment variables also appear elsewhere in
+# the same file and a bare grep stayed green with one of them deleted (found by
+# the negative test); the other three points are pinned by the label and the
+# two refusal messages, so emptying a hunk of its behaviour turns this red.
+if ! cell_gate_block="$(awk '
+  /^pub fn has_nexuscrew_context\(\) -> bool \{$/ { capture = 1 }
+  capture { print }
+  capture && /^\}$/ { exit }
+' codex-rs/tui/src/lib.rs)"; then
+  cell_gate_block=
+fi
+if [ -n "$cell_gate_block" ] \
+  && [[ "$cell_gate_block" == *'NEXUSCREW_MCP_SESSION'* ]] \
+  && [[ "$cell_gate_block" == *'NEXUSCREW_IDENTITY_FD'* ]] \
+  && grep -q 'pub fn has_nexuscrew_context() -> bool' codex-rs/tui/src/lib.rs \
+  && grep -q '} else if has_nexuscrew_context() {' codex-rs/tui/src/daemon_startup.rs \
+  && grep -q 'Some("NexusCrew cell context")' codex-rs/tui/src/daemon_startup.rs \
+  && grep -q 'if has_nexuscrew_context() && (explicit_remote_endpoint.is_some() || cli.agents_overview) {' codex-rs/tui/src/startup_orchestration.rs \
+  && grep -q 'NexusCrew cell identity requires an embedded server; --remote and agents are unavailable until shared servers support per-connection identity binding.' codex-rs/tui/src/startup_orchestration.rs \
+  && grep -q 'fn reject_unbound_cell_server(agents_overview: bool, remote: bool) -> Option<AppExitInfo>' codex-rs/cli/src/main.rs \
+  && grep -q 'if codex_tui::has_nexuscrew_context() && (agents_overview || remote) {' codex-rs/cli/src/main.rs \
+  && grep -q 'NexusCrew cell identity requires an embedded server; --remote and agents are unavailable until shared servers support per-connection identity binding.' codex-rs/cli/src/main.rs; then
+  pass
+else
+  fail
+fi
+
 printf "release version contract (Cargo/npm/notes/changelog): "
 if ! cargo_workspace_version="$(awk '
   /^\[workspace.package\]$/ { workspace_package = 1; next }

@@ -388,3 +388,34 @@ on every rebase rather than anchored at one location.
   shared servers support per-connection identity binding, instead of silently
   attaching to the wrong identity. A dedicated test suite covers the context
   detection.
+
+### Patch #31 - Embedded-server cell context gate
+
+- Files: `codex-rs/tui/src/lib.rs`, `codex-rs/tui/src/daemon_startup.rs`,
+  `codex-rs/tui/src/startup_orchestration.rs`, `codex-rs/cli/src/main.rs`
+- A launch that declares a cell isolation context (`NEXUSCREW_MCP_SESSION` or
+  `NEXUSCREW_IDENTITY_FD`) must not attach to a shared daemon. A shared server
+  cannot bind per-connection identity, so such a launch would run under the
+  wrong identity while looking healthy. Four points keep that true: the
+  detector, the daemon-exclusion arm that names the reason, the startup bail,
+  and the CLI refusal that exits fatally instead of continuing.
+- **Why this is guarded**: two of the four points live in
+  `tui/src/daemon_startup.rs` and `tui/src/startup_orchestration.rs`, files
+  upstream edits on almost every release — the rust-v0.162.1 merge alone
+  rewrote the surrounding regions of both. A merge that takes those files
+  wholesale, or an upstream refactor landing on top of the hunks, removes the
+  gate with **no compilation signal**: the crate builds and the CLI starts
+  under a shared identity. Until this patch landed no guard covered any of the
+  four points, and the dedicated integration test
+  (`codex-rs/tui/tests/suite/nexuscrew_context.rs`) was never executed by a
+  workflow.
+- The guard reads the detector as a block (both environment variables inside
+  `has_nexuscrew_context`) instead of by symbol, and pins the exclusion label
+  and the two refusal messages, so a hunk emptied of its behaviour fails it.
+  Verified by an independent negative test: removing any one of the four points
+  turns it red.
+- Executed by the `targeted tests` job of `.github/workflows/termux-gate.yml`
+  (`suite::nexuscrew_context::`), the first CI execution of that file.
+- This entry is the guard's own account of the gate. The gate is also listed
+  among the delta areas outside the numbered patches, which is where the
+  behaviour is described for the release reader.
