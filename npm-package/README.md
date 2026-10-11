@@ -20,10 +20,9 @@ codex login
 - Built from upstream `rust-v0.162.1`
 - Carries only the Termux compatibility delta needed for packaging and runtime
 - Real code-mode (`exec`/`wait`) runs through the bundled `codex-code-mode-host` helper (out-of-process since rust-v0.147.0), shipped in `bin/` alongside `codex.bin`
-- Realtime voice/audio is not part of this build: upstream removed the TUI
-  realtime voice surface, so the fork's former Android `cpal`/`oboe` toggle was
-  retired as well. A plain Termux CLI process has no Android `JavaVM`/`Activity`
-  for that backend; a future Termux-native audio path is tracked separately.
+- Realtime voice (`/voice`) is not available in this Termux build yet: the
+  upstream voice helper has no Android audio backend and is not shipped in this
+  package.
 - Ships a static `codex-package.json` manifest (`layoutVersion: 1`,
   `variant: "codex-termux"`, `target: "aarch64-linux-android"`,
   `entrypoint: "bin/codex.bin"`), so the managed daemon's variant check passes
