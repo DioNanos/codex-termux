@@ -8,6 +8,11 @@ use std::fs;
 use std::process::Command;
 use std::time::Duration;
 
+/// Matches `STATE_DIR_NAME` and the managed package root name in
+/// `codex_app_server_daemon`: the fork renamed both from `app-server-daemon`
+/// so its daemon state and packages never mix with upstream's.
+const STATE_DIR_NAME: &str = "app-server-daemon-termux";
+
 #[tokio::test]
 #[cfg(unix)]
 async fn auto_daemon_start_attaches_to_shared_server() -> Result<()> {
@@ -86,7 +91,7 @@ async fn elevated_local_tui_uses_embedded_without_starting_daemon() -> Result<()
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    ensure!(!home.path().join("app-server-daemon").exists());
+    ensure!(!home.path().join(STATE_DIR_NAME).exists());
     Ok(())
 }
 
@@ -198,21 +203,28 @@ async fn daemon_startup(command: &str) -> Result<()> {
     let mut steps: VecDeque<(&str, &[u8])> = VecDeque::new();
     if matches!(command, "start" | "bedrock-running" | "restrictive-job") || mismatch {
         // A selected package with a stopped daemon avoids installing a release.
-        let managed = home
-            .path()
-            .join("packages/app-server-daemon/current/bin")
-            .join(if cfg!(windows) { "codex.exe" } else { "codex" });
-        fs::create_dir_all(home.path().join("packages/app-server-daemon/current/bin"))?;
+        let package_dir = home.path().join(format!("packages/{STATE_DIR_NAME}"));
+        let managed =
+            package_dir
+                .join("current/bin")
+                .join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        fs::create_dir_all(package_dir.join("current/bin"))?;
         // Hard links change the executable's ctime and invalidate Rosetta's translation cache.
         #[cfg(unix)]
         std::os::unix::fs::symlink(&codex, &managed)?;
         #[cfg(not(unix))]
         fs::hard_link(&codex, &managed)
             .or_else(|_| codex_utils_cargo_bin::copy_executable(&codex, &managed))?;
+        // The daemon's fork-identity guard executes only a selection that
+        // carries its own codex-package.json manifest with variant "codex-termux".
+        fs::write(
+            package_dir.join("current/codex-package.json"),
+            r#"{"variant":"codex-termux"}"#,
+        )?;
         if command != "restrictive-job" {
-            fs::create_dir(home.path().join("app-server-daemon"))?;
+            fs::create_dir(home.path().join(STATE_DIR_NAME))?;
             fs::write(
-                home.path().join("app-server-daemon/settings.json"),
+                home.path().join(format!("{STATE_DIR_NAME}/settings.json")),
                 if persisted {
                     r#"{"shutdownGraceSeconds":0,"updater":{"autoUpdateEnabled":false},"featureOverrides":{"api_key_model_discovery":true}}"#
                 } else {
@@ -221,7 +233,7 @@ async fn daemon_startup(command: &str) -> Result<()> {
             )?;
         }
     }
-    let pid_file = home.path().join("app-server-daemon/daemon.pid");
+    let pid_file = home.path().join(format!("{STATE_DIR_NAME}/daemon.pid"));
     let result = async {
         let mut existing_daemon = if command == "bedrock-running" || (mismatch && !disabling) {
             let started = Command::new(&codex)
@@ -346,7 +358,7 @@ async fn daemon_startup(command: &str) -> Result<()> {
                 {
                     if disabling && *ready == "Backgroundserverhasincompatiblefeaturesettings" {
                         existing_daemon = Some(fs::read(&pid_file)?);
-                        let settings: serde_json::Value = serde_json::from_slice(&fs::read(home.path().join("app-server-daemon/settings.json"))?)?;
+                        let settings: serde_json::Value = serde_json::from_slice(&fs::read(home.path().join(format!("{STATE_DIR_NAME}/settings.json")))?)?;
                         if persisted {
                             ensure!(settings["featureOverrides"]["api_key_model_discovery"] == true);
                         } else {
@@ -364,15 +376,26 @@ async fn daemon_startup(command: &str) -> Result<()> {
                             ensure!(text.contains("Cannotusethesharedbackgroundserver:Thissessionrequiresapi_key_model_discoverytobedisabled."));
                         } else {
                             ensure!(text.contains("Server:Localbackgroundserver") == restart);
+                            if restart {
+                                let settings: serde_json::Value = serde_json::from_slice(
+                                    &fs::read(home.path().join(format!("{STATE_DIR_NAME}/settings.json")))?
+                                )?;
+                                let flag = if disabling && !persisted {
+                                    "auth_elicitation"
+                                } else {
+                                    "api_key_model_discovery"
+                                };
+                                assert_eq!(settings["featureOverrides"], serde_json::json!({(flag): false}));
+                            }
                         }
                     } else if command == "start" {
                         ensure!(text.contains("Server:Localbackgroundserver"));
-                        ensure!(home.path().join("app-server-daemon/daemon.pid").exists());
+                        ensure!(home.path().join(format!("{STATE_DIR_NAME}/daemon.pid")).exists());
                     } else if let Some(existing_daemon) = &existing_daemon {
                         ensure!(fs::read(&pid_file)? == *existing_daemon);
                     } else if elevated_launch {
-                        ensure!(!home.path().join("app-server-daemon").exists());
-                        ensure!(!home.path().join("packages/app-server-daemon").exists());
+                        ensure!(!home.path().join(STATE_DIR_NAME).exists());
+                        ensure!(!home.path().join(format!("packages/{STATE_DIR_NAME}")).exists());
                     } else if bedrock_onboarding || command == "restrictive-job" {
                         ensure!(!pid_file.exists());
                         if command == "restrictive-job" && !elevated {

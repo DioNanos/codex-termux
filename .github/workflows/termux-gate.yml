@@ -274,6 +274,21 @@ jobs:
           grep -F 'model_message_text_cap_reports_field_slug_size_and_no_content ... ok' termux-gate-model-protocol-caps.out
           grep -F 'model_message_text_cap_counts_utf8_bytes_without_truncating ... ok' termux-gate-model-protocol-caps.out
 
+      - name: Test the cell context gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The gate is exercised through a PTY against the real CLI binary, so the
+          # binary must exist before the tests resolve it. Point the tests at the
+          # build explicitly instead of relying on the fallback path lookup.
+          cargo build -p codex-cli --bin codex
+          CARGO_BIN_EXE_codex="$PWD/target/debug/codex" \
+            cargo test -p codex-tui --test all -- suite::nexuscrew_context:: 2>&1 | tee termux-gate-cell-context.out
+          grep -E 'test result: ok\. [1-9][0-9]* passed' termux-gate-cell-context.out
+          grep -F 'test suite::nexuscrew_context::cell_context_rejects_unbound_remote_and_agents ... ok' termux-gate-cell-context.out
+          grep -F 'test suite::nexuscrew_context::cell_context_rejects_agents_before_daemon_start_with_pty ... ok' termux-gate-cell-context.out
+          grep -F 'test suite::nexuscrew_context::cell_context_skips_shared_daemon_autostart ... ok' termux-gate-cell-context.out
+
   workspace-tests-compile:
     name: workspace tests compile
     runs-on: ubuntu-24.04

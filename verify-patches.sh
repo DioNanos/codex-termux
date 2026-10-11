@@ -52,6 +52,21 @@ fork_internal_surfaces_match_contract() {
   fi
 }
 
+fork_ci_overlay_matches_contract() {
+  # The public fork carries a deliberately reduced CI overlay: the Bazel jobs are
+  # disabled, blocking-ci does not wait on them, the fork CI reference document
+  # ships with the tree, and the upstream cargo-shear stub stays excluded. Losing
+  # the overlay is silent -- nothing fails to compile -- and it puts the uncached
+  # Bazel job back on the blocking path while dropping the CI documentation.
+  # Anchors read from the v0.162.0-termux.1 release tree.
+  [ -f docs/ci.md ] \
+    && grep -Fq "Disabled on this fork. Bazel is upstream's build system" .github/workflows/bazel.yml \
+    && grep -Eq '^[[:space:]]*if: false[[:space:]]*$' .github/workflows/bazel.yml \
+    && ! grep -Eq '^[[:space:]]*-[[:space:]]*bazel[[:space:]]*$' .github/workflows/blocking-ci.yml \
+    && grep -Fq '`bazel` is disabled on this fork. Bazel is upstream' .github/workflows/blocking-ci.yml \
+    && grep -Fq 'tests/suite/scenarios_read_only_mcp.rs' codex-rs/core/Cargo.toml
+}
+
 printf "Patch #1 (Browser Login): "
 if grep -q "termux-open-url" codex-rs/login/src/server.rs; then
   pass
@@ -430,7 +445,8 @@ if grep -q 'CODEX_PUBLIC_SANITIZED_TREE=1 bash verify-patches.sh' .github/workfl
   && grep -q 'persist-credentials: false' .github/workflows/rusty-v8-android-release.yml \
   && grep -q 'contents: read' .github/workflows/rusty-v8-android-release.yml \
   && ! grep -q 'publish_release\|release_repository\|GH_TOKEN\|gh release' .github/workflows/rusty-v8-android-release.yml \
-  && fork_internal_surfaces_match_contract; then
+  && fork_internal_surfaces_match_contract \
+  && fork_ci_overlay_matches_contract; then
   pass
 else
   fail
@@ -564,6 +580,41 @@ if grep -q 'p codex-code-mode-host' .github/workflows/termux-npm-build-publish.y
   && node -p "require('./npm-package/package.json').files.includes('bin/codex-code-mode-host')" | grep -q true \
   && grep -qE '^ *for required in .*(^| )package/bin/codex-code-mode-host( |;)' .github/workflows/termux-npm-build-publish.yml \
   && grep -q 'packaged tarball is missing' .github/workflows/termux-npm-build-publish.yml; then
+  pass
+else
+  fail
+fi
+
+printf "Patch #31 (Embedded-server cell context gate): "
+# A launch that declares a cell isolation context must never attach to a shared
+# daemon: a shared server cannot bind per-connection identity. The fork keeps
+# four points in agreement -- the detector, the daemon-exclusion arm, the
+# startup bail and the CLI refusal. No other guard covers them, and the two
+# upstream files that carry two of them (tui/src/daemon_startup.rs,
+# tui/src/startup_orchestration.rs) are exactly the files upstream keeps
+# rewording: the 0.162.1 merge touched both. The detector is read as a block,
+# not by symbol, because both environment variables also appear elsewhere in
+# the same file and a bare grep stayed green with one of them deleted (found by
+# the negative test); the other three points are pinned by the label and the
+# two refusal messages, so emptying a hunk of its behaviour turns this red.
+if ! cell_gate_block="$(awk '
+  /^pub fn has_nexuscrew_context\(\) -> bool \{$/ { capture = 1 }
+  capture { print }
+  capture && /^\}$/ { exit }
+' codex-rs/tui/src/lib.rs)"; then
+  cell_gate_block=
+fi
+if [ -n "$cell_gate_block" ] \
+  && [[ "$cell_gate_block" == *'NEXUSCREW_MCP_SESSION'* ]] \
+  && [[ "$cell_gate_block" == *'NEXUSCREW_IDENTITY_FD'* ]] \
+  && grep -q 'pub fn has_nexuscrew_context() -> bool' codex-rs/tui/src/lib.rs \
+  && grep -q '} else if has_nexuscrew_context() {' codex-rs/tui/src/daemon_startup.rs \
+  && grep -q 'Some("NexusCrew cell context")' codex-rs/tui/src/daemon_startup.rs \
+  && grep -q 'if has_nexuscrew_context() && (explicit_remote_endpoint.is_some() || cli.agents_overview) {' codex-rs/tui/src/startup_orchestration.rs \
+  && grep -q 'NexusCrew cell identity requires an embedded server; --remote and agents are unavailable until shared servers support per-connection identity binding.' codex-rs/tui/src/startup_orchestration.rs \
+  && grep -q 'fn reject_unbound_cell_server(agents_overview: bool, remote: bool) -> Option<AppExitInfo>' codex-rs/cli/src/main.rs \
+  && grep -q 'if codex_tui::has_nexuscrew_context() && (agents_overview || remote) {' codex-rs/cli/src/main.rs \
+  && grep -q 'NexusCrew cell identity requires an embedded server; --remote and agents are unavailable until shared servers support per-connection identity binding.' codex-rs/cli/src/main.rs; then
   pass
 else
   fail

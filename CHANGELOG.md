@@ -1,3 +1,18 @@
+# [0.162.1-termux.1] - 2026-10-11
+
+## Codex Termux 0.162.1-termux.1 — upstream rust-v0.162.1
+
+- Merges upstream tag `rust-v0.162.1` into the Termux fork: multiline async
+  question titles keep their line breaks and links (openai/codex#51866), and
+  the shared server's feature compatibility check applies only to explicit
+  CLI overrides, not to configuration files or defaults (openai/codex#52648).
+- CI: the embedded-server cell context gate is guarded in `verify-patches.sh`
+  and its dedicated integration test suite now runs in CI.
+- Tests: the upstream scheduled-update tests are marked ignored with the
+  reason on the attribute, and the `daemon_startup` fixture stages its
+  selection under the fork package root with the `codex-package.json` variant
+  manifest, so the suite exercises the fork's real state paths.
+
 # [0.162.0-termux.1] - 2026-10-09
 
 ## Codex Termux 0.162.0-termux.1 — upstream rust-v0.162.0
