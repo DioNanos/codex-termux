@@ -46,9 +46,12 @@ use crate::process::ExecProcessEvent;
 use crate::process::ExecProcessEventLog;
 use crate::process::ExecProcessEventReceiver;
 use crate::process_telemetry::trace_process_id;
+use crate::protocol::CAPABILITIES_DISCOVER_V2_METHOD;
 use crate::protocol::CAPABILITY_ROOTS_DISCOVER_METHOD;
 use crate::protocol::CapabilityRootsDiscoverParams;
 use crate::protocol::CapabilityRootsDiscoverResponse;
+use crate::protocol::DiscoverV2CapabilitiesRequest;
+use crate::protocol::DiscoverV2CapabilitiesResponse;
 use crate::protocol::ENVIRONMENT_CONFIG_READ_METHOD;
 use crate::protocol::ENVIRONMENT_INFO_METHOD;
 use crate::protocol::ENVIRONMENT_STATUS_METHOD;
@@ -390,6 +393,8 @@ impl Drop for PendingProcessStartSession {
 }
 
 type ConnectionResult = Result<ExecServerClient, Arc<ExecServerError>>;
+pub(super) type ConnectionObserver =
+    Arc<dyn Fn(Duration, crate::ConnectionAttemptOutcome) + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct LazyRemoteExecServerClient {
@@ -402,6 +407,7 @@ pub(crate) struct LazyRemoteExecServerClient {
     current_client: Arc<StdMutex<Option<ExecServerClient>>>,
     reconnect: Arc<StdMutex<Option<Arc<ConnectionAttempt>>>>,
     refresh_lock: Arc<Mutex<()>>,
+    pub(super) connection_observer: Arc<OnceLock<ConnectionObserver>>,
     environment_connection_state_tx: watch::Sender<EnvironmentConnectionState>,
 }
 
@@ -418,6 +424,7 @@ impl LazyRemoteExecServerClient {
             current_client: Arc::new(StdMutex::new(None)),
             reconnect: Arc::new(StdMutex::new(None)),
             refresh_lock: Arc::new(Mutex::new(())),
+            connection_observer: Default::default(),
             environment_connection_state_tx: watch::channel(
                 EnvironmentConnectionState::Disconnected,
             )
@@ -676,6 +683,10 @@ pub enum ExecServerError {
     WebSocketConfiguration(String),
     #[error("timed out waiting for exec-server initialize handshake after {timeout:?}")]
     InitializeTimedOut { timeout: Duration },
+    #[error(
+        "exec-server protocol error: timed out waiting for exec-server `{method}` response after {timeout:?}"
+    )]
+    RpcTimedOut { method: String, timeout: Duration },
     #[error(transparent)]
     ApplicationNetworkPolicy(#[from] codex_http_client::NetworkPolicyDenied),
     #[error("exec-server transport closed")]
@@ -845,33 +856,27 @@ impl ExecServerClient {
     /// Fetches executor metadata over RPC without reading or updating the cache.
     // TODO: Remove after app-server migrates off this call.
     pub async fn force_environment_info(&self) -> Result<EnvironmentInfo, ExecServerError> {
-        let rpc_client = self.rpc_client().await?;
-        // Bound sending as well as receiving: a stuck transport can fill the outbound queue.
-        let result = timeout(
-            ENVIRONMENT_INFO_TIMEOUT,
-            rpc_client.call(ENVIRONMENT_INFO_METHOD, &()),
-        )
-        .await;
-        match result {
-            Ok(result) => self.map_rpc_call_result(result),
-            Err(_) => {
-                let error = ExecServerError::from(RpcCallError::TimedOut {
-                    method: ENVIRONMENT_INFO_METHOD.to_string(),
-                    timeout: ENVIRONMENT_INFO_TIMEOUT,
-                });
-                // Retire only the connection we probed; recovery ignores a stale client.
-                rpc_client.close_transport().await;
-                self.inner.request_recovery(rpc_client, error.to_string());
-                Err(error)
-            }
-        }
+        self.call_with_timeout_recovery(ENVIRONMENT_INFO_METHOD, &(), ENVIRONMENT_INFO_TIMEOUT)
+            .await
     }
 
+    /// Reads configuration without imposing an additional RPC timeout.
     pub async fn read_environment_config(
         &self,
         params: EnvironmentConfigReadParams,
     ) -> Result<EnvironmentConfigReadResponse, ExecServerError> {
         self.call(ENVIRONMENT_CONFIG_READ_METHOD, &params).await
+    }
+
+    /// Bounds the RPC after connecting, recovering reconnectable transports on timeout.
+    /// Transports without a reconnect strategy remain open after a timeout.
+    pub async fn read_environment_config_with_timeout(
+        &self,
+        params: EnvironmentConfigReadParams,
+        rpc_timeout: Duration,
+    ) -> Result<EnvironmentConfigReadResponse, ExecServerError> {
+        self.call_with_timeout_recovery(ENVIRONMENT_CONFIG_READ_METHOD, &params, rpc_timeout)
+            .await
     }
 
     pub async fn environment_status(&self) -> Result<EnvironmentStatus, ExecServerError> {
@@ -889,6 +894,13 @@ impl ExecServerClient {
         params: CapabilityRootsDiscoverParams,
     ) -> Result<CapabilityRootsDiscoverResponse, ExecServerError> {
         self.call(CAPABILITY_ROOTS_DISCOVER_METHOD, &params).await
+    }
+
+    pub async fn discover_capabilities_v2(
+        &self,
+        params: DiscoverV2CapabilitiesRequest,
+    ) -> Result<DiscoverV2CapabilitiesResponse, ExecServerError> {
+        self.call(CAPABILITIES_DISCOVER_V2_METHOD, &params).await
     }
 
     pub async fn read(&self, params: ReadParams) -> Result<ReadResponse, ExecServerError> {
@@ -1343,6 +1355,35 @@ impl ExecServerClient {
         self.call_rpc(&rpc_client, method, params).await
     }
 
+    async fn call_with_timeout_recovery<P, T>(
+        &self,
+        method: &str,
+        params: &P,
+        call_timeout: Duration,
+    ) -> Result<T, ExecServerError>
+    where
+        P: serde::Serialize,
+        T: serde::de::DeserializeOwned,
+    {
+        let rpc_client = self.rpc_client().await?;
+        // Bound sending as well as receiving: a stuck transport can fill the outbound queue.
+        match timeout(call_timeout, rpc_client.call(method, params)).await {
+            Ok(result) => self.map_rpc_call_result(result),
+            Err(_) => {
+                let error = ExecServerError::RpcTimedOut {
+                    method: method.to_string(),
+                    timeout: call_timeout,
+                };
+                if self.inner.reconnect_strategy.is_some() {
+                    // Retire only the connection we probed; recovery ignores a stale client.
+                    rpc_client.close_transport().await;
+                    self.inner.request_recovery(rpc_client, error.to_string());
+                }
+                Err(error)
+            }
+        }
+    }
+
     async fn call_rpc<P, T>(
         &self,
         rpc_client: &Arc<RpcClient>,
@@ -1413,9 +1454,7 @@ impl From<RpcCallError> for ExecServerError {
                 code: error.code,
                 message: error.message,
             },
-            RpcCallError::TimedOut { method, timeout } => Self::Protocol(format!(
-                "timed out waiting for exec-server `{method}` response after {timeout:?}"
-            )),
+            RpcCallError::TimedOut { method, timeout } => Self::RpcTimedOut { method, timeout },
             RpcCallError::PendingRequestLimitExceeded { limit } => Self::Protocol(format!(
                 "exec-server has reached its limit of {limit} pending requests"
             )),
@@ -2273,6 +2312,7 @@ mod tests {
             codex_http_client::HttpClientFactory::new(
                 codex_http_client::OutboundProxyPolicy::ReqwestDefault,
             ),
+            /*started*/ &mut None,
         )
         .await
         .expect("stdio transport should connect");
@@ -3211,6 +3251,17 @@ mod tests {
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         );
 
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(
+            client
+                .connection_observer
+                .set(Arc::new(move |_, outcome| {
+                    observed_tx
+                        .send(outcome)
+                        .expect("record connection outcome");
+                }))
+                .is_ok()
+        );
         let failed_startup = match client.get().await {
             Ok(_) => panic!("initial connection should fail"),
             Err(error) => error,
@@ -3235,6 +3286,14 @@ mod tests {
         replacement_initialized_rx
             .await
             .expect("server should observe replacement initialization");
+
+        assert_eq!(
+            std::iter::from_fn(|| observed_rx.try_recv().ok()).collect::<Vec<_>>(),
+            [
+                crate::ConnectionAttemptOutcome::Failure,
+                crate::ConnectionAttemptOutcome::Success
+            ],
+        );
 
         drop(first);
         drop(second);
@@ -3443,5 +3502,6 @@ mod tests {
         server.await.expect("server task should finish");
     }
 
+    mod config_timeout_tests;
     mod network_policy_tests;
 }

@@ -14,6 +14,7 @@ use crate::session::tests::make_session_and_context;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
+use codex_extension_api::SessionIsolation;
 use codex_extension_api::empty_extension_registry;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
@@ -581,9 +582,13 @@ impl codex_agent_graph_store::AgentGraphStore for FakeAgentGraphStore {
 
 fn user_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: text.to_string(),
         }],
         phase: None,
@@ -592,9 +597,13 @@ fn user_msg(text: &str) -> ResponseItem {
 }
 fn assistant_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: text.to_string(),
         }],
         phase: None,
@@ -695,6 +704,8 @@ fn truncates_before_requested_user_message() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             call_id: "c1".to_string(),
             name: "tool".to_string(),
@@ -1576,6 +1587,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
     struct InitialDataRecorder {
         lifecycle_observed: Arc<std::sync::Mutex<Vec<(String, String)>>>,
         mcp_observed: Arc<std::sync::Mutex<Vec<(String, SessionSource)>>>,
+        mcp_loaded: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl codex_extension_api::ThreadLifecycleContributor<Config> for InitialDataRecorder {
@@ -1616,6 +1628,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
         fn selected_plugins<'a>(
             &'a self,
             context: codex_extension_api::McpServerContributionContext<'a, Config>,
+            _plugins_config: &'a codex_config::types::PluginsConfigToml,
         ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::SelectedPlugin<'a>>>
         {
             Box::pin(async move {
@@ -1651,16 +1664,19 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
                 let source_environment_id = environment_id.clone();
                 server.environment_id = source_environment_id.clone();
                 server.enabled = false;
-                let plugin_id = format!("plugin-{}", selected_root.id);
+                let selected_root_id = selected_root.id;
+                let plugin_id = format!("plugin-{selected_root_id}");
+                let mcp_loaded = Arc::clone(&self.mcp_loaded);
                 vec![codex_extension_api::SelectedPlugin {
-                    selected_root_id: selected_root.id.clone(),
+                    selected_root_id: selected_root_id.clone(),
                     plugin_id: plugin_id.clone(),
                     mcp: Box::pin(async move {
+                        mcp_loaded.fetch_add(1, Ordering::Relaxed);
                         codex_extension_api::SelectedPluginContribution {
                             plugin_display_name: plugin_id,
                             source_environment_id,
-                            connector_ids: vec![format!("{}-connector", selected_root.id)],
-                            servers: vec![(selected_root.id, server)],
+                            connector_ids: vec![format!("{selected_root_id}-connector")],
+                            servers: vec![(selected_root_id, server)],
                         }
                     }),
                 }]
@@ -1684,9 +1700,11 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
 
     let lifecycle_observed = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mcp_observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mcp_loaded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let recorder = Arc::new(InitialDataRecorder {
         lifecycle_observed: Arc::clone(&lifecycle_observed),
         mcp_observed: Arc::clone(&mcp_observed),
+        mcp_loaded: Arc::clone(&mcp_loaded),
     });
     let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
     extensions.thread_lifecycle_contributor(recorder.clone());
@@ -1858,7 +1876,29 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             .get("originator"),
         Some(&"codex_work_desktop".to_string())
     );
-    for disabled_plugin_ids in [vec!["plugin-selected-a".to_string()], vec![]] {
+    for (policy, disabled_plugin_ids, selected_enabled, expected_mcp_loads) in [
+        ("", vec!["plugin-selected-a".to_string()], false, 1),
+        ("", vec![], true, 1),
+        ("[plugins._default]\nenabled = false", vec![], false, 0),
+        (
+            "[plugins._default]\nenabled = false\n[plugins.plugin-selected-a]\nenabled = true",
+            vec![],
+            true,
+            1,
+        ),
+    ] {
+        let mut config = config.clone();
+        config.config_layer_stack = config
+            .config_layer_stack
+            .with_user_config(
+                &config.codex_home.join("config.toml").abs(),
+                toml::from_str(policy).expect("plugin policy"),
+            )
+            .expect("plugin policy layers");
+        config.plugins = toml::from_str::<codex_config::config_toml::ConfigToml>(policy)
+            .unwrap()
+            .plugins;
+        let loaded_before = mcp_loaded.load(Ordering::Relaxed);
         let projection = first_session
             .services
             .mcp_manager
@@ -1881,7 +1921,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             .await;
         assert_eq!(
             projection.selected_plugins.disabled_plugin_roots,
-            if disabled_plugin_ids.is_empty() {
+            if selected_enabled {
                 vec![]
             } else {
                 vec!["selected-a".to_string()]
@@ -1889,7 +1929,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
         );
         assert_eq!(
             selected_servers(&projection.config).contains_key("selected-a"),
-            disabled_plugin_ids.is_empty()
+            selected_enabled
         );
         assert_eq!(
             projection
@@ -1901,7 +1941,11 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
         );
         assert_eq!(
             projection.selected_plugins.plugins.len(),
-            usize::from(disabled_plugin_ids.is_empty())
+            usize::from(selected_enabled)
+        );
+        assert_eq!(
+            mcp_loaded.load(Ordering::Relaxed) - loaded_before,
+            expected_mcp_loads
         );
     }
 }
@@ -1962,6 +2006,107 @@ async fn selected_capability_roots_round_trip_through_fork() {
         inherited_history.get_selected_capability_roots(),
         selected_roots
     );
+}
+
+/// Shared startup honors explicit root selections and only inherits roots when isolation permits.
+#[tokio::test]
+async fn selected_capability_roots_respect_startup_precedence_and_isolation() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let root = |id: &str| SelectedCapabilityRoot {
+        id: id.to_string(),
+        location: CapabilityRootLocation::Environment {
+            environment_id: "local".to_string(),
+            path: PathUri::from_abs_path(&config.cwd),
+        },
+    };
+    let mut parent_init = ExtensionDataInit::new();
+    parent_init.insert(vec![root("parent")]);
+    let parent = manager
+        .start_thread(StartThreadOptions {
+            thread_extension_init: parent_init,
+            ..StartThreadOptions::new(config.clone())
+        })
+        .await
+        .expect("start parent");
+    let parent_environments = parent
+        .thread
+        .session
+        .services
+        .turn_environments
+        .snapshot()
+        .await;
+
+    for (isolation, explicit_roots, expected_roots) in [
+        (SessionIsolation::Inherit, None, vec![root("parent")]),
+        (
+            SessionIsolation::Inherit,
+            Some(vec![root("explicit")]),
+            vec![root("explicit")],
+        ),
+        (SessionIsolation::Inherit, Some(Vec::new()), Vec::new()),
+        (SessionIsolation::Isolated, None, vec![root("saved")]),
+        (
+            SessionIsolation::Isolated,
+            Some(vec![root("explicit")]),
+            vec![root("explicit")],
+        ),
+    ] {
+        let mut thread_extension_init = ExtensionDataInit::new();
+        thread_extension_init.insert(isolation);
+        if let Some(roots) = explicit_roots {
+            thread_extension_init.insert(roots);
+        }
+        let child = manager
+            .start_thread(StartThreadOptions {
+                initial_history: InitialHistory::Forked(vec![RolloutItem::SessionMeta(
+                    SessionMetaLine {
+                        meta: SessionMeta {
+                            selected_capability_roots: vec![root("saved")],
+                            ..SessionMeta::default()
+                        },
+                        git: None,
+                    },
+                )]),
+                inherited_environments: Some(parent_environments.clone()),
+                thread_extension_init,
+                ..StartThreadOptions::new(config.clone())
+            })
+            .await
+            .expect("start child");
+        assert_eq!(
+            child.thread.session.services.selected_capability_roots,
+            expected_roots
+        );
+        assert_eq!(
+            child
+                .thread
+                .session
+                .services
+                .turn_environments
+                .snapshot()
+                .await
+                .selected_capability_roots(),
+            expected_roots
+        );
+        child.thread.ensure_rollout_materialized().await;
+        child.thread.flush_rollout().await.expect("flush child");
+        let history = RolloutRecorder::get_rollout_history(
+            &child.thread.rollout_path().expect("child rollout path"),
+        )
+        .await
+        .expect("read child rollout");
+        assert_eq!(history.get_selected_capability_roots(), expected_roots);
+    }
 }
 
 #[tokio::test]
@@ -2925,6 +3070,8 @@ fn multi_agent_v2_interrupted_marker_uses_developer_input_message() {
     assert_eq!(
         developer_interrupted_marker(),
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "developer".to_string(),
             content: vec![ContentItem::InputText {

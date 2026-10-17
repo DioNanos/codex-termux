@@ -9,6 +9,8 @@ mod ssh_config_dependencies;
 pub mod environment_transport;
 #[cfg(any(windows, test))]
 mod launch_environment;
+#[cfg(any(windows, test))]
+mod setup_acl_error;
 
 use std::fmt;
 use std::sync::Arc;
@@ -234,6 +236,8 @@ pub use acl::ensure_allow_write_aces;
 #[cfg(target_os = "windows")]
 pub use acl::fetch_dacl_handle;
 #[cfg(target_os = "windows")]
+pub use acl::grant_read_execute_aces;
+#[cfg(target_os = "windows")]
 pub use acl::path_has_standard_user_mutation_allow;
 #[cfg(target_os = "windows")]
 pub use acl::path_has_trusted_system_owner;
@@ -263,7 +267,9 @@ pub use conpty::spawn_conpty_process_as_user;
 pub use deny_read_acl::apply_deny_read_acls;
 #[cfg(target_os = "windows")]
 pub use deny_read_acl::plan_deny_read_acl_paths;
+pub use deny_read_resolver::GLOB_SCAN_PROGRAM;
 pub use deny_read_resolver::resolve_windows_deny_read_paths;
+pub use deny_read_resolver::resolve_windows_deny_read_paths_in_environment;
 #[cfg(target_os = "windows")]
 pub use deny_read_state::sync_persistent_deny_read_acls;
 #[cfg(target_os = "windows")]

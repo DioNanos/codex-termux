@@ -61,6 +61,7 @@ use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::PermissionProfileSnapshot;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SandboxPermissions;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -1915,13 +1916,6 @@ async fn pending_attachment_installs_configuration_before_waiting_turn_resumes()
                 .enable(Feature::StableEnvironmentTools)
                 .expect("enable stable environment tools");
             assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
-            if cfg!(unix) {
-                assert!(config.features.enable(Feature::ShellZshFork).is_ok());
-                // Calls stop at environment/login validation, so these paths are never executed.
-                let executable = std::env::current_exe().expect("current executable");
-                config.zsh_path = Some(executable.clone());
-                config.main_execve_wrapper_exe = Some(executable);
-            }
             assert!(
                 config
                     .features
@@ -2445,7 +2439,14 @@ async fn future_pending_environment_can_finish_without_retargeting_the_active_tu
         }])
     };
     thread.start_or_steer_turn(request("wait")).await?;
-    wait_for_response_request_count(&response_mock, /*expected_count*/ 1).await;
+    // The HTTP request can arrive before its tool call is recorded. Steering
+    // at that point can preempt the response and discard the wait call.
+    wait_for_event(&thread, |event| {
+        matches!(event, EventMsg::RawResponseItem(raw)
+            if matches!(&raw.item, ResponseItem::FunctionCall { call_id, .. }
+                if call_id == "wait-for-active-environment"))
+    })
+    .await;
     assert!(matches!(
         thread
             .start_or_steer_turn(
@@ -2621,11 +2622,14 @@ async fn active_environment_update_wakes_the_old_wait_with_the_new_selection() -
     Ok(())
 }
 
-#[test_case(true; "uses refreshed executor root")]
-#[test_case(false; "preserves persisted root when executor reports none")]
+#[test_case(true, false; "uses refreshed executor root")]
+#[test_case(false, false; "preserves persisted root when executor reports none")]
+#[test_case(true, true; "uses refreshed owner root")]
+#[test_case(false, true; "preserves persisted root when owner reports none")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ready_before_selection_resolves_resumed_thread_capability_root_after_wait(
-    executor_reports_refreshed_root: bool,
+    reports_refreshed_root: bool,
+    owner_provided: bool,
 ) -> Result<()> {
     const WAIT_CALL_ID: &str = "wait-ready-before-selection";
 
@@ -2737,11 +2741,17 @@ async fn ready_before_selection_resolves_resumed_thread_capability_root_after_wa
             path: PathUri::parse("file:///stale-ready-first-root")?,
         },
     };
-    let expected_root = if executor_reports_refreshed_root {
+    let expected_root = if reports_refreshed_root {
         refreshed_root.clone()
     } else {
         stale_root.clone()
     };
+    let mut executor_root = refreshed_root.clone();
+    if owner_provided {
+        // Owner configuration must not inherit the executor's shared root location.
+        let CapabilityRootLocation::Environment { path, .. } = &mut executor_root.location;
+        *path = PathUri::parse("file:///shared-root-not-selected-by-owner")?;
+    }
     let provider = Arc::new(OfflineThenReadyNoiseConnectProvider {
         websocket_url: format!("{rendezvous_url}/relay?role=harness"),
         executor_public_key,
@@ -2753,8 +2763,8 @@ async fn ready_before_selection_resolves_resumed_thread_capability_root_after_wa
         .report_environment_provisioning_status(
             REMOTE_ENVIRONMENT_ID.to_string(),
             Ok(EnvironmentReadyInfo {
-                selected_capability_roots: if executor_reports_refreshed_root {
-                    vec![refreshed_root.clone()]
+                selected_capability_roots: if reports_refreshed_root || owner_provided {
+                    vec![executor_root]
                 } else {
                     Vec::new()
                 },
@@ -2792,7 +2802,7 @@ async fn ready_before_selection_resolves_resumed_thread_capability_root_after_wa
         anyhow::Ok(())
     });
 
-    let selection = TurnEnvironmentSelection::new(
+    let mut selection = TurnEnvironmentSelection::new(
         TurnEnvironmentRequest {
             environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
             cwd: PathUri::from_abs_path(&test.config.cwd),
@@ -2801,6 +2811,13 @@ async fn ready_before_selection_resolves_resumed_thread_capability_root_after_wa
         },
         std::slice::from_ref(&stale_root),
     );
+    if owner_provided {
+        let mut config = environment_config_for_selection(&test.config, &selection);
+        if reports_refreshed_root {
+            config.selected_capability_roots = vec![refreshed_root];
+        }
+        selection.config = EnvironmentConfigState::Ready(config);
+    }
     let mut thread_extension_init = ExtensionDataInit::new();
     thread_extension_init.insert(vec![stale_root]);
     let resumed = test

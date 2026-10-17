@@ -1,5 +1,5 @@
-//! Local daemon maintenance only records an update action after explicit confirmation.
-//! The CLI executes it in the foreground after the TUI restores the terminal.
+//! Local daemon maintenance confirms restarts and updates before acting.
+//! Restarts use normal TUI reconnection; updates run after restoring the terminal.
 
 use super::*;
 use crate::bottom_pane::SelectionItem;
@@ -26,6 +26,21 @@ impl Renderable for DaemonMenuHeader {
 }
 
 impl App {
+    pub(super) async fn verify_managed_daemon(&mut self) {
+        // A discovered socket alone does not prove it belongs to a managed daemon.
+        // Probe only when the user opens a view that offers restart, never during startup.
+        if !self.reconnect.offline
+            && let Some(connection) = &mut self.chat_widget.remote_connection
+            && connection.is_local_daemon
+            && !connection.is_managed_daemon
+        {
+            connection.is_managed_daemon =
+                codex_app_server_daemon::run(codex_app_server_daemon::LifecycleCommand::Version)
+                    .await
+                    .is_ok_and(|output| output.backend.is_some());
+        }
+    }
+
     pub(super) fn open_daemon_menu(&mut self) {
         let status = self
             .chat_widget
@@ -56,7 +71,7 @@ impl App {
             .package_layout
             .is_some()
         });
-        let items = [
+        let mut items: Vec<SelectionItem> = [
             (
                 DaemonUpdateSource::PublicStable,
                 "Install latest public stable",
@@ -78,10 +93,66 @@ impl App {
             ..Default::default()
         })
         .collect();
+        items.push(SelectionItem {
+            name: "Restart background server".to_string(),
+            is_disabled: !self
+                .chat_widget
+                .remote_connection
+                .as_ref()
+                .is_some_and(|connection| connection.is_managed_daemon)
+                || self.reconnect.offline
+                || self.daemon_restart.is_some(),
+            disabled_reason: self
+                .chat_widget
+                .remote_connection
+                .as_ref()
+                .filter(|connection| connection.is_local_daemon && !connection.is_managed_daemon)
+                .map(|_| {
+                    "Codex hasn't verified it manages this server. Restart it where it was started."
+                        .to_string()
+                }),
+            actions: vec![Box::new(|tx| tx.send(AppEvent::ConfirmDaemonRestart))],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
         self.chat_widget.show_selection_view(SelectionViewParams {
             header: Box::new(DaemonMenuHeader(header)),
             items,
             ..SelectionViewParams::picker()
+        });
+    }
+
+    pub(super) fn confirm_daemon_restart(&mut self) {
+        if !self
+            .chat_widget
+            .remote_connection
+            .as_ref()
+            .is_some_and(|connection| connection.is_managed_daemon)
+            || self.daemon_restart.is_some()
+        {
+            return;
+        }
+        self.chat_widget.show_selection_view(SelectionViewParams {
+            header: Box::new(DaemonMenuHeader(vec![
+                Line::from("Restart background server?".bold()),
+                Line::from("Active or queued work in other chats may be interrupted."),
+                Line::from("Codex will reconnect automatically."),
+            ])),
+            items: vec![
+                SelectionItem {
+                    name: "Cancel".to_string(),
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Restart".to_string(),
+                    actions: vec![Box::new(|tx| tx.send(AppEvent::RunDaemonRestart))],
+                    require_explicit_confirmation: true,
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+            ],
+            ..SelectionViewParams::confirmation()
         });
     }
 

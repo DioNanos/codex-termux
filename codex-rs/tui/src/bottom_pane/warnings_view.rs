@@ -33,6 +33,8 @@ pub(super) struct WarningsView {
     tx: AppEventSender,
     pub(super) pending_hint: Option<Vec<(String, String)>>,
     pub(super) flash: Option<(ratatui::text::Line<'static>, std::time::Instant)>,
+    /// Display only: copying or dismissing a warning must use its original diagnostic.
+    pub(super) daemon_restart_hint_at: Option<usize>,
 }
 
 impl WarningsView {
@@ -55,6 +57,7 @@ impl WarningsView {
             tx,
             pending_hint: None,
             flash: None,
+            daemon_restart_hint_at: None,
         }
     }
 

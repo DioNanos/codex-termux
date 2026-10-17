@@ -304,18 +304,21 @@ impl PasteBurst {
         let timed_out = self
             .last_plain_char_time
             .is_some_and(|t| now.duration_since(t) > timeout);
-        if timed_out && self.is_active_internal() {
+        if timed_out {
+            self.flush_pending()
+        } else {
+            FlushResult::None
+        }
+    }
+
+    /// Flush without waiting, retaining the typed-key versus paste distinction.
+    pub(crate) fn flush_pending(&mut self) -> FlushResult {
+        if self.is_active_internal() {
             self.active = false;
             let out = std::mem::take(&mut self.buffer);
             FlushResult::Paste(out)
-        } else if timed_out {
-            // If we were saving a single fast char and no burst followed,
-            // flush it as normal typed input.
-            if let Some((ch, _at)) = self.pending_first_char.take() {
-                FlushResult::Typed(ch)
-            } else {
-                FlushResult::None
-            }
+        } else if let Some((ch, _at)) = self.pending_first_char.take() {
+            FlushResult::Typed(ch)
         } else {
             FlushResult::None
         }

@@ -38,6 +38,9 @@ impl Renderable for WarningsView {
         };
         Line::from(title.bold()).render(header, buf);
         let details = entry.map_or("No warnings", |entry| entry.details.as_str());
+        let restart_hint = (self.daemon_restart_hint_at == Some(self.current)).then_some(
+            "\nThese warnings may reflect settings from when the background server started. If you’ve already fixed them, use /daemon to restart it.",
+        );
         if body.width > 0
             && body.height > 0
             && let Some(visited) = self.visited.get(self.current)
@@ -46,6 +49,7 @@ impl Renderable for WarningsView {
         }
         let lines: Vec<_> = details
             .lines()
+            .chain(restart_hint.into_iter().flat_map(str::lines))
             .flat_map(|text| {
                 let source =
                     crate::terminal_hyperlinks::annotate_web_urls_in_line(text.to_owned().into());

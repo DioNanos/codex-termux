@@ -5,8 +5,9 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_mac
 load("//bazel/rules/testing:foreign_platform_binary.bzl", "foreign_platform_binary")
 load("//bazel/rules/testing/wine:wine_runtime.bzl", "WINE_TEST_TARGET_COMPATIBLE_WITH", "wine_test_runtime")
 
-# Match Cargo's Windows linker behavior so Bazel-built binaries and tests use
-# the same stack reserve on both Windows ABIs and resolve UCRT imports on MSVC.
+# Reserve 8 MiB of stack on Windows and statically link the CRT on MSVC.
+# V8's x64 allocator shim defines malloc/free; importing them from dynamic UCRT
+# as well replaces the import thunks during linking.
 WINDOWS_GNULLVM_RUSTC_LINK_FLAGS = [
     "-C",
     "link-arg=-Wl,--stack,8388608",  # 8 MiB
@@ -18,9 +19,7 @@ WINDOWS_RUSTC_LINK_FLAGS = select({
         "-C",
         "link-arg=/STACK:8388608",  # 8 MiB
         "-C",
-        "link-arg=/NODEFAULTLIB:libucrt.lib",
-        "-C",
-        "link-arg=ucrt.lib",
+        "target-feature=+crt-static",
     ],
     "//conditions:default": [],
 })
@@ -299,8 +298,10 @@ def codex_rust_crate(
         visibility = ["//visibility:public"],
     )
 
+    package_data = DEP_DATA.get(native.package_name())
     rustc_env = {
         "BAZEL_PACKAGE": native.package_name(),
+        "CARGO_PKG_NAME": package_data["package_name"],
     } | rustc_env
 
     manifest_relpath = native.package_name()
@@ -308,7 +309,6 @@ def codex_rust_crate(
         manifest_relpath = manifest_relpath[len("codex-rs/"):]
     manifest_path = manifest_relpath + "/Cargo.toml"
 
-    package_data = DEP_DATA.get(native.package_name())
     crate_version = package_data["version"]
     binaries = package_data["binaries"]
 
@@ -319,6 +319,7 @@ def codex_rust_crate(
     if build_script_enabled and native.glob(["build.rs"], allow_empty = True):
         cargo_build_script(
             name = name + "-build-script",
+            pkg_name = package_data["package_name"],
             srcs = ["build.rs"],
             deps = all_crate_deps(build = True),
             data = build_script_data,
@@ -412,10 +413,11 @@ def codex_rust_crate(
             crate_root = main,
             deps = all_crate_deps() + maybe_deps + deps_extra,
             edition = crate_edition,
-            # Keep per-binary Cargo link behavior scoped to the matching
-            # generated rust_binary instead of leaking it to sibling binaries.
+            # Scope each binary's compile data and linker flags to its generated
+            # rust_binary so they do not affect sibling binaries.
             compile_data = binary_compile_data_extra.get(binary, []),
             rustc_flags = rustc_flags_extra + binary_rustc_flags_extra.get(binary, []) + WINDOWS_RUSTC_LINK_FLAGS,
+            rustc_env = rustc_env,
             # Keep stamp = 0: rules_rust otherwise makes stable-status.txt and
             # volatile-status.txt compiler inputs, even though we only consume
             # STABLE_GIT_COMMIT. BUILD_USER and BUILD_HOST vary across developers

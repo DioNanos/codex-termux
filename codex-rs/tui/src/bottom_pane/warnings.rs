@@ -5,13 +5,20 @@ use crate::history_cell::WarningEntry;
 use std::sync::Arc;
 
 impl BottomPane {
-    pub(crate) fn show_warnings(&mut self, entries: Vec<WarningEntry>, transcript: Arc<()>) {
-        self.warnings_view = Some(warnings_view::WarningsView::new(
+    pub(crate) fn show_warnings(
+        &mut self,
+        entries: Vec<WarningEntry>,
+        transcript: Arc<()>,
+        daemon_restart_hint_at: Option<usize>,
+    ) {
+        let mut view = warnings_view::WarningsView::new(
             entries,
             transcript,
             self.keymap.clone(),
             self.app_event_tx.clone(),
-        ));
+        );
+        view.daemon_restart_hint_at = daemon_restart_hint_at;
+        self.warnings_view = Some(view);
         self.record_composer_activity_at(Instant::now());
         self.request_redraw();
     }

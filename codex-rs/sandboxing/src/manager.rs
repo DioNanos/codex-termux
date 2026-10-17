@@ -23,6 +23,7 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::sandbox::SandboxOverride;
 pub use codex_protocol::sandbox::SandboxType;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -97,8 +98,10 @@ pub struct SandboxCommand {
 /// Build this only at the execution boundary: in exec-server, or in its logical equivalent within
 /// app-server. Orchestration and transport code should retain [`PathUri`] values and defer
 /// conversion to native paths until this request is created.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SandboxExecRequest {
+    /// Controller-selected override, retained for observations without altering the sandbox command.
+    pub sandbox_override: SandboxOverride,
     pub command: Vec<String>,
     pub cwd: PathUri,
     pub sandbox_policy_cwd: PathUri,
@@ -548,6 +551,7 @@ impl SandboxManager {
             });
 
         Ok(SandboxExecRequest {
+            sandbox_override: SandboxOverride::NoOverride,
             command: argv,
             cwd: command.cwd,
             sandbox_policy_cwd: sandbox_policy_cwd.clone(),

@@ -52,7 +52,10 @@ const TOOL_SUGGESTION_TOOL_TYPE_KEY: &str = "tool_type";
 enum GuardianElicitationReview {
     NotRequested,
     Decline(&'static str),
-    ApprovalRequest(Box<crate::guardian::GuardianApprovalRequest>),
+    ApprovalRequest {
+        request: Box<crate::guardian::GuardianApprovalRequest>,
+        tool_call_id: Option<String>,
+    },
 }
 
 struct GuardianMcpElicitationReviewer {
@@ -509,12 +512,9 @@ impl Session {
         let combined_roots = combine_selected_capability_roots(
             &thread_roots,
             environments.turn_environments().map(|environment| {
-                (
-                    environment.config_origin,
-                    environment
-                        .config_origin
-                        .selected_capability_roots(&environment.environment, environment.config()),
-                )
+                environment
+                    .config_origin
+                    .selected_capability_roots(&environment.environment, environment.config())
             }),
         );
         for (index, root) in combined_roots.into_iter().enumerate() {
@@ -687,8 +687,7 @@ impl Session {
 
     pub(crate) async fn refresh_mcp_servers_now(
         &self,
-        turn_context: &TurnContext,
-        refresh_config: &Config,
+        added_servers: HashMap<String, McpServerConfig>,
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
     ) {
         let Ok(_refresh) = self.mcp_refresh.acquire().await else {
@@ -696,24 +695,29 @@ impl Session {
             return;
         };
         let auth = self.services.auth_manager.auth().await;
-        let disabled_plugin_ids = {
+        {
             let mut state = self.state.lock().await;
             let mut config = (*state.session_configuration.original_config_do_not_use).clone();
-            config.mcp_servers = refresh_config.mcp_servers.clone();
+            let mut servers = config.mcp_servers.get().clone();
+            for (name, server) in added_servers {
+                servers.entry(name).or_insert(server);
+            }
+            if let Err(err) = config.mcp_servers.set(servers) {
+                warn!("failed to refresh MCP dependencies for mentioned skills: {err}");
+                return;
+            }
             state.session_configuration.original_config_do_not_use = Arc::new(config);
-            state.active_disabled_plugin_ids.clone()
-        };
+        }
         let ready_selected_capability_roots = self
             .services
             .mcp_runtime
             .current_ready_selected_capability_roots();
         let environments = self.services.turn_environments.snapshot().await;
         let environment_selections = environments.all_selections();
-        let mut desired = self.latest_mcp_desired_state(auth, environments).await;
-        desired.config = Arc::new(refresh_config.clone());
+        let desired = self.latest_mcp_desired_state(auth, environments).await;
         let executor_capability_discovery = self
             .executor_capability_discovery_for_step(
-                refresh_config,
+                &desired.config,
                 &ready_selected_capability_roots,
                 &desired.environments,
             )
@@ -722,7 +726,7 @@ impl Session {
             .services
             .mcp_manager
             .runtime_config_for_step(
-                refresh_config,
+                &desired.config,
                 &self.services.mcp_thread_init,
                 &self.services.thread_extension_data,
                 McpThreadIdentity {
@@ -730,9 +734,9 @@ impl Session {
                         .services
                         .mcp_runtime
                         .current_auth_matches(desired.auth.as_ref()),
-                    session_source: &turn_context.session_source,
-                    originator: &turn_context.originator,
-                    disabled_plugin_ids: &disabled_plugin_ids,
+                    session_source: &desired.session_source,
+                    originator: &desired.originator,
+                    disabled_plugin_ids: &desired.disabled_plugin_ids,
                     environments: McpEnvironmentScope::Selected(&environment_selections),
                 },
                 &ready_selected_capability_roots,
@@ -927,12 +931,20 @@ async fn review_guardian_mcp_elicitation(
             return Ok(None);
         }
 
-        let GuardianElicitationReview::ApprovalRequest(guardian_request) =
-            guardian_elicitation_review_request(&request, originating_call_id)
+        let GuardianElicitationReview::ApprovalRequest {
+            request: guardian_request,
+            tool_call_id,
+        } = guardian_elicitation_review_request(&request, originating_call_id)
         else {
             return Ok(None);
         };
-        trusted_guardian_request.unwrap_or(*guardian_request).into()
+        match trusted_guardian_request {
+            Some(request) => request.into(),
+            None => crate::guardian::ReviewAction {
+                tool_call_id,
+                ..(*guardian_request).into()
+            },
+        }
     } else {
         let approval_policy = mcp_config.approval_policy.value();
         match approval_policy {
@@ -1000,12 +1012,17 @@ async fn review_guardian_mcp_elicitation(
                         })
                         .map_err(|error| error.to_string()),
                     category: GuardianScope::for_mcp_server(&request.server_name),
+                    tool_call_id: None,
                     request: Err(reason.to_owned()),
                 }
             }
-            GuardianElicitationReview::ApprovalRequest(guardian_request) => {
-                (*guardian_request).into()
-            }
+            GuardianElicitationReview::ApprovalRequest {
+                request: guardian_request,
+                tool_call_id,
+            } => crate::guardian::ReviewAction {
+                tool_call_id,
+                ..(*guardian_request).into()
+            },
         }
     };
     guardian_request.category = guardian_scope;
@@ -1108,8 +1125,10 @@ fn guardian_elicitation_review_request(
         None => Some(Value::Object(Map::new())),
     };
 
-    GuardianElicitationReview::ApprovalRequest(Box::new(
-        crate::guardian::GuardianApprovalRequest::McpToolCall {
+    GuardianElicitationReview::ApprovalRequest {
+        // Synthetic display IDs must not participate in tool observation ordering.
+        tool_call_id: originating_call_id.map(str::to_owned),
+        request: Box::new(crate::guardian::GuardianApprovalRequest::McpToolCall {
             id: originating_call_id.map(str::to_owned).unwrap_or_else(|| {
                 format!(
                     "mcp_elicitation:{}:{}",
@@ -1130,8 +1149,8 @@ fn guardian_elicitation_review_request(
             tool_title: metadata_owned_string(meta, MCP_ELICITATION_TOOL_TITLE_KEY),
             tool_description: metadata_owned_string(meta, MCP_ELICITATION_TOOL_DESCRIPTION_KEY),
             annotations: None,
-        },
-    ))
+        }),
+    }
 }
 
 fn elicitation_connector_id(elicitation: &Elicitation) -> Option<&str> {

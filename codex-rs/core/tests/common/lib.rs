@@ -25,7 +25,10 @@ use std::path::Path;
 use std::path::PathBuf;
 
 pub mod apps_test_server;
+#[cfg(unix)]
+pub mod code_mode_host;
 pub mod context_snapshot;
+pub mod exec_server;
 pub mod hooks;
 pub mod process;
 pub mod responses;
@@ -35,7 +38,6 @@ pub mod test_codex;
 pub mod test_codex_exec;
 mod test_environment;
 pub mod tracing;
-pub mod zsh_fork;
 
 pub(crate) use test_environment::TestEnvironment;
 pub use test_environment::TestTargetOs;

@@ -53,9 +53,24 @@ fn fallback_model_metadata_warning_slug(message: &str) -> Option<&str> {
 impl super::ChatWidget {
     pub(crate) fn open_warnings(&mut self, cells: &[Arc<dyn HistoryCell>]) {
         self.empty_state_animation.borrow_mut().pause_clock();
+        let entries = self.warning_display_state.visible_entries(cells);
+        let daemon_restart_hint_at = self
+            .remote_connection
+            .as_ref()
+            .filter(|connection| connection.is_managed_daemon)
+            .and_then(|_| {
+                entries.iter().position(|entry| match &entry.id {
+                    WarningId::Message(message) => self
+                        .warning_display_state
+                        .startup_config_warnings
+                        .contains(message),
+                    WarningId::McpServer(_) => false,
+                })
+            });
         self.bottom_pane.show_warnings(
-            self.warning_display_state.visible_entries(cells),
+            entries,
             Arc::clone(&self.warning_display_state.transcript),
+            daemon_restart_hint_at,
         );
     }
 

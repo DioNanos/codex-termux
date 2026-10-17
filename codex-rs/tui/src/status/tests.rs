@@ -1728,6 +1728,7 @@ async fn status_snapshot_uses_default_reasoning_when_config_empty() {
                 .to_string(),
             version: "v0.133.0".to_string(),
             is_local_daemon,
+            is_managed_daemon: is_local_daemon,
         });
 
         let model_slug = get_model_offline_for_tests(config.model.as_deref());

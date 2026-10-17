@@ -1,3 +1,7 @@
+// Release builds exceed rustc's default query depth when laying out the async
+// MessageProcessor::handle_initialized_client_request future.
+#![recursion_limit = "256"]
+
 //! Shared in-process app-server client facade for CLI surfaces.
 //!
 //! This crate wraps [`codex_app_server::in_process`] behind a single async API
@@ -18,6 +22,8 @@
 
 mod path;
 mod remote;
+mod server_request;
+pub use server_request::AppServerReplyHandle;
 
 use std::error::Error;
 use std::fmt;
@@ -545,26 +551,9 @@ impl InProcessAppServerClient {
         request_id: RequestId,
         result: JsonRpcResult,
     ) -> IoResult<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(ClientCommand::ResolveServerRequest {
-                request_id,
-                result,
-                response_tx,
-            })
+        self.request_handle()
+            .resolve_server_request(request_id, result)
             .await
-            .map_err(|_| {
-                IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "in-process app-server worker channel is closed",
-                )
-            })?;
-        response_rx.await.map_err(|_| {
-            IoError::new(
-                ErrorKind::BrokenPipe,
-                "in-process app-server resolve channel is closed",
-            )
-        })?
     }
 
     /// Rejects a pending server request with JSON-RPC error payload.
@@ -573,26 +562,9 @@ impl InProcessAppServerClient {
         request_id: RequestId,
         error: JSONRPCErrorError,
     ) -> IoResult<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(ClientCommand::RejectServerRequest {
-                request_id,
-                error,
-                response_tx,
-            })
+        self.request_handle()
+            .reject_server_request(request_id, error)
             .await
-            .map_err(|_| {
-                IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "in-process app-server worker channel is closed",
-                )
-            })?;
-        response_rx.await.map_err(|_| {
-            IoError::new(
-                ErrorKind::BrokenPipe,
-                "in-process app-server reject channel is closed",
-            )
-        })?
     }
 
     /// Returns the next in-process event, or `None` when worker exits.
@@ -639,6 +611,61 @@ impl InProcessAppServerClient {
 }
 
 impl InProcessAppServerRequestHandle {
+    pub(crate) async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ClientCommand::ResolveServerRequest {
+                request_id,
+                result,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "in-process app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "in-process app-server resolve channel is closed",
+            )
+        })?
+    }
+
+    /// Rejects a pending server request with JSON-RPC error payload.
+    pub(crate) async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ClientCommand::RejectServerRequest {
+                request_id,
+                error,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "in-process app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "in-process app-server reject channel is closed",
+            )
+        })?
+    }
+
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -672,6 +699,28 @@ impl InProcessAppServerRequestHandle {
 }
 
 impl AppServerRequestHandle {
+    pub(crate) async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
+        match self {
+            Self::InProcess(handle) => handle.resolve_server_request(request_id, result).await,
+            Self::Remote(handle) => handle.resolve_server_request(request_id, result).await,
+        }
+    }
+
+    pub(crate) async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        match self {
+            Self::InProcess(handle) => handle.reject_server_request(request_id, error).await,
+            Self::Remote(handle) => handle.reject_server_request(request_id, error).await,
+        }
+    }
+
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         match self {
             Self::InProcess(handle) => handle.request(request).await,
@@ -785,6 +834,8 @@ impl AppServerClient {
 
 #[cfg(test)]
 mod tests {
+    #[path = "reply_tests.rs"]
+    mod replies;
     use super::*;
     use codex_app_server_protocol::AccountUpdatedNotification;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
@@ -1695,24 +1746,25 @@ mod tests {
 
     #[tokio::test]
     async fn remote_notifications_arrive_over_websocket() {
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
-            write_websocket_message(
-                &mut websocket,
-                JSONRPCMessage::Notification(
-                    serde_json::from_value(
-                        serde_json::to_value(ServerNotification::AccountUpdated(
-                            AccountUpdatedNotification {
-                                auth_mode: None,
-                                plan_type: None,
-                            },
-                        ))
-                        .expect("notification should serialize"),
-                    )
-                    .expect("notification should convert to JSON-RPC"),
-                ),
-            )
-            .await;
+            let notification = JSONRPCMessage::Notification(
+                serde_json::from_value(
+                    serde_json::to_value(ServerNotification::AccountUpdated(
+                        AccountUpdatedNotification {
+                            auth_mode: None,
+                            plan_type: None,
+                        },
+                    ))
+                    .expect("notification should serialize"),
+                )
+                .expect("notification should convert to JSON-RPC"),
+            );
+            // Only the first notification is consumed; the other can arrive during shutdown.
+            write_websocket_message(&mut websocket, notification.clone()).await;
+            write_websocket_message(&mut websocket, notification).await;
+            let _ = close_tx.send(websocket.next().await);
         })
         .await;
         let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
@@ -1727,6 +1779,14 @@ mod tests {
         ));
 
         client.shutdown().await.expect("shutdown should complete");
+        assert_eq!(
+            close_rx
+                .await
+                .expect("server should observe shutdown")
+                .expect("server should receive a frame")
+                .expect("websocket should close cleanly"),
+            Message::Close(None),
+        );
     }
 
     #[tokio::test]

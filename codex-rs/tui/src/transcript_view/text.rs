@@ -314,6 +314,53 @@ impl TextLayout {
         row.source.end
     }
 
+    /// Resolve a keyboard caret to a grapheme start while leaving truly empty rows blank.
+    pub(super) fn cursor_position_at(&self, row: usize, column: u16) -> usize {
+        let offset = self.position_at(row, column);
+        let Some(row) = self.rows.get(row) else {
+            return offset;
+        };
+        if row.source.start == row.source.end || offset < row.source.end {
+            return offset;
+        }
+        self.text[row.source.clone()]
+            .grapheme_indices(/*is_extended*/ true)
+            .next_back()
+            .map_or(row.source.start, |(offset, _)| row.source.start + offset)
+    }
+
+    /// Return the first selectable source grapheme on a display row, excluding synthetic rows.
+    pub(super) fn first_cursor_position(&self, row: usize) -> Option<usize> {
+        let row = self.rows.get(row)?;
+        self.text[row.source.clone()]
+            .grapheme_indices(/*is_extended*/ true)
+            .next()
+            .map(|(offset, _)| row.source.start + offset)
+    }
+
+    /// Whether a source grapheme is actually painted on a display row.
+    pub(super) fn is_cursor_position(&self, offset: usize) -> bool {
+        self.rows.iter().any(|row| row.source.contains(&offset))
+    }
+
+    /// Advance one grapheme inside the caret's display row without crossing an empty row.
+    pub(super) fn after_cursor_grapheme(&self, row: usize, offset: usize) -> usize {
+        let Some(row) = self.rows.get(row) else {
+            return offset;
+        };
+        if row.source.start == row.source.end {
+            return offset;
+        }
+        let offset = self
+            .text
+            .floor_char_boundary(offset.clamp(row.source.start, row.source.end));
+        offset
+            + self.text[offset..row.source.end]
+                .graphemes(/*is_extended*/ true)
+                .next()
+                .map_or(/*default*/ 0, str::len)
+    }
+
     /// Find the display row containing a source position, including omitted wrapping whitespace.
     pub(super) fn row_for_offset(&self, offset: usize) -> usize {
         let before_control = if let Some(control_row) = self.disclosure_row() {
@@ -332,7 +379,12 @@ impl TextLayout {
     }
 
     pub(super) fn column_for_offset(&self, offset: usize) -> u16 {
-        let Some(row) = self.rows.get(self.row_for_offset(offset)) else {
+        self.column_for_offset_on_row(self.row_for_offset(offset), offset)
+    }
+
+    /// Resolve a source position within a specific display row when offsets are shared.
+    pub(super) fn column_for_offset_on_row(&self, row: usize, offset: usize) -> u16 {
+        let Some(row) = self.rows.get(row) else {
             return 0;
         };
         let offset = self

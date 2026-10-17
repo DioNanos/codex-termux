@@ -78,9 +78,13 @@ pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageErro
         img
     } else {
         let _span = tracing::debug_span!("get_image").entered();
-        let img = cb
-            .get_image()
-            .map_err(|e| PasteImageError::NoImage(e.to_string()))?;
+        let img = cb.get_image().map_err(|e| {
+            if cfg!(windows) && !matches!(e, arboard::Error::ContentNotAvailable) {
+                PasteImageError::ClipboardUnavailable(e.to_string())
+            } else {
+                PasteImageError::NoImage(e.to_string())
+            }
+        })?;
         let w = img.width as u32;
         let h = img.height as u32;
         tracing::debug!("clipboard image opened from image: {}x{}", w, h);

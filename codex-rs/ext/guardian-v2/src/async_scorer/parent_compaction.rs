@@ -7,6 +7,7 @@ use codex_extension_api::ResponseItem;
 use codex_protocol::protocol::TruncationPolicy;
 
 use super::config::GuardianV2Config;
+use super::config::MAX_MODEL_CONTEXT_ITEM_TOKENS;
 use super::sampler::LunaSampler;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -72,7 +73,10 @@ fn encrypted_parent_compaction(
     checkpoint: Option<codex_history::CompactionCheckpoint<'_>>,
     max_parent_compaction_tokens: usize,
 ) -> Result<Option<ResponseItem>, ParentCompactionError> {
-    let max_compaction_bytes = TruncationPolicy::Tokens(max_parent_compaction_tokens).byte_budget();
+    // Keep the previous maximum configured wire allowance as a separate hard
+    // bound; the configured token budget measures model cost, not ciphertext.
+    let max_compaction_bytes =
+        TruncationPolicy::Tokens(MAX_MODEL_CONTEXT_ITEM_TOKENS).byte_budget();
     let Some(checkpoint) = checkpoint else {
         return Ok(None);
     };
@@ -81,7 +85,10 @@ fn encrypted_parent_compaction(
     }
     let item = checkpoint.item;
     let serialized = serde_json::to_vec(item).map_err(|_| ParentCompactionError::Serialization)?;
-    if serialized.len() > max_compaction_bytes {
+    if serialized.len() > max_compaction_bytes
+        || codex_guardian_context::estimate_input_tokens_from_serialized_len(item, serialized.len())
+            > max_parent_compaction_tokens
+    {
         return Err(ParentCompactionError::Oversized);
     }
 

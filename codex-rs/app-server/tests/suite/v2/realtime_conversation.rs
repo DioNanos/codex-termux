@@ -1273,6 +1273,16 @@ async fn realtime_timeline_splits_accepted_steering_and_persists_promoted_artifa
         .read_notification::<TurnStartedNotification>("turn/started")
         .await?;
 
+    // The initial user item also seals realtime transcript segments. Wait for
+    // it before speaking so only the steering under test can split this segment.
+    let initial_message = harness
+        .read_notification::<ItemCompletedNotification>("item/completed")
+        .await?;
+    assert!(matches!(
+        initial_message.item,
+        ThreadItem::UserMessage { .. }
+    ));
+
     harness
         .append_text(harness.thread_id.clone(), "Trigger speech")
         .await?;
@@ -1711,6 +1721,7 @@ async fn realtime_list_voices_returns_supported_names() -> Result<()> {
                     RealtimeVoice::Marin,
                     RealtimeVoice::Cedar,
                 ],
+                v3: RealtimeVoicesList::builtin().v3,
                 default_v1: RealtimeVoice::Cove,
                 default_v2: RealtimeVoice::Marin,
             },

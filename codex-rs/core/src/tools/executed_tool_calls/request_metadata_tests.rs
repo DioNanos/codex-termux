@@ -886,11 +886,11 @@ fn tool_call_completeness_survives_waits_without_changing_deltas() {
             if index < 2 {
                 // Identical calls are distinct submissions; truncation stays sticky across waits.
                 let original_bytes = if truncated && index == 1 { 9_000 } else { 2 };
-                let call = if original_bytes > MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES {
+                let call = if truncated && index == 1 {
                     ExecutedToolCall::truncated(
                         "nested_tool".to_string(),
                         original_bytes,
-                        MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES,
+                        /*max_bytes*/ 8_192,
                     )
                 } else {
                     ExecutedToolCall::new("nested_tool".to_string(), json!({}))
@@ -928,10 +928,10 @@ fn tool_call_completeness_survives_waits_without_changing_deltas() {
             } else if index == 3 {
                 recorder.finish_cell_recording(&cell_id);
             }
-            if index < 2 || index == 3 && !truncated {
+            if index < 2 || index == 3 {
                 expected_output.set_tool_call_cell_id("exec");
             }
-            if index == 3 && !truncated {
+            if index == 3 {
                 expected_output.mark_tool_calls_complete();
             }
             expected.push(expected_output);
@@ -1156,46 +1156,39 @@ fn completeness_rejects_direct_id_collision_and_late_calls() {
 }
 
 #[test]
-fn newly_normalized_arguments_keep_later_wait_incomplete() {
+fn large_wrapped_arguments_preserve_later_wait_completeness() {
     let recorder = new_recorder(InitialHistory::New);
     let cell = CellId::new("active-cell".to_string());
     recorder.start_cell(&cell, "exec");
     let arguments = json!({
         "_codex_executed_tool_call_truncated": true,
-        "padding": "x".repeat(8_120),
-    })
-    .to_string();
+        "padding": "x".repeat(40 * 1024),
+    });
     let (call, original_bytes) = recorded_call(&ToolCall {
         tool_name: codex_tools::ToolName::plain("nested_tool"),
         call_id: "nested".to_string(),
-        payload: ToolPayload::Function { arguments },
+        payload: ToolPayload::Function {
+            arguments: arguments.to_string(),
+        },
         encrypted_function_args: None,
     });
-    assert!(original_bytes <= MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES);
-    assert!(
-        serialized_json_bytes(call.arguments()).unwrap() > MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES
-    );
     recorder.record_nested_tool_call(cell.clone(), "nested".to_string(), call, original_bytes);
     let mut initial = [exec_input("exec"), exec_output("exec")];
     recorder.attach_to_prompt(&mut initial, &mut HashMap::new());
-    assert!(
+    assert_eq!(
         initial[1]
             .executed_tool_call_metadata()
             .unwrap()
             .executed_tool_calls
             .as_ref()
-            .unwrap()
-            .iter()
-            .any(|call| matches!(
-                call.arguments(),
-                ExecutedToolCallArguments::Truncated { .. }
-            ))
+            .unwrap(),
+        &vec![ExecutedToolCall::new("nested_tool".to_string(), arguments)],
     );
     recorder.register_cell(&cell, "wait");
     recorder.finish_cell_recording(&cell);
     let mut wait = [wait_input("wait", &cell), output("wait")];
     recorder.attach_to_prompt(&mut wait, &mut HashMap::new());
-    assert_eq!(tool_calls_complete(&wait[1]), None);
+    assert_eq!(tool_calls_complete(&wait[1]), Some(true));
 }
 
 #[test]
@@ -1360,6 +1353,8 @@ fn late_truncated_metadata_survives_subsequent_waits() {
         recorder.finish_cell_recording(&cell);
         history.extend([wait_input("wait-2", &cell), output("wait-2")]);
         expected.extend([wait_input("wait-2", &cell), output("wait-2")]);
+        expected[5].set_tool_call_cell_id("exec");
+        expected[5].mark_tool_calls_complete();
         recorder.attach_pending_to_prompt(&mut history, &mut retry_cache);
         assert_eq!(history, expected);
     }
@@ -1385,15 +1380,19 @@ fn late_truncated_metadata_survives_close_before_first_attachment() {
     let mut expected = history.clone();
     expected[1].append_executed_tool_calls(vec![call]);
     expected[1].set_tool_call_cell_id("exec");
+    expected[1].mark_tool_calls_complete();
     for wait in ["wait-1", "wait-2"] {
         recorder.finish_cell_recording(&cell);
         recorder.register_cell(&cell, wait);
         history.extend([wait_input(wait, &cell), output(wait)]);
-        expected.extend([wait_input(wait, &cell), output(wait)]);
+        let mut expected_output = output(wait);
+        expected_output.set_tool_call_cell_id("exec");
+        expected_output.mark_tool_calls_complete();
+        expected.extend([wait_input(wait, &cell), expected_output]);
         let mut request = history.clone();
         recorder.attach_pending_to_prompt(&mut request, &mut retry_cache);
         assert_eq!(request, expected);
-        assert_eq!(tool_calls_complete(&request[1]), None);
+        assert_eq!(tool_calls_complete(&request[1]), Some(true));
     }
 }
 
@@ -1606,13 +1605,12 @@ fn late_truncated_metadata_preserves_large_result_on_retry() {
 }
 
 #[test]
-fn late_truncated_metadata_is_not_reused_after_budget_changes_calls() {
+fn late_truncated_metadata_with_wrapped_arguments_rejects_ambiguous_outputs() {
     let recorder = new_recorder(InitialHistory::New);
     let cell = CellId::new("late-truncated-cell".to_string());
     recorder.start_cell(&cell, "exec");
     record_truncated_call(&recorder, &cell, "nested");
-    // The reserved key requires a wrapper in recorded arguments. The wrapper can
-    // put an otherwise accepted function argument over the later prompt limit.
+    // The reserved key requires a wrapper in recorded arguments.
     let arguments = json!({
         "_codex_executed_tool_call_truncated": true,
         "padding": "x".repeat(8_120),
@@ -1624,11 +1622,6 @@ fn late_truncated_metadata_is_not_reused_after_budget_changes_calls() {
         payload: ToolPayload::Function { arguments },
         encrypted_function_args: None,
     });
-    assert!(original_bytes <= MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES);
-    assert!(
-        serialized_json_bytes(wrapped_call.arguments()).unwrap()
-            > MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES
-    );
     recorder.record_nested_tool_call(
         cell.clone(),
         "other".to_string(),
@@ -1765,7 +1758,7 @@ fn finished_cells_without_more_waits_do_not_block_new_calls() {
 fn wire_inventory_loss_keeps_later_wait_incomplete() {
     for (scenario, expect_complete) in [
         ("metadata_only", true),
-        ("arguments", false),
+        ("arguments", true),
         ("name", false),
         ("removed", false),
     ] {

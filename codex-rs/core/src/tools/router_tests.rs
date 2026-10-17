@@ -190,8 +190,8 @@ async fn parallel_support_does_not_match_namespaced_local_tool_names() -> anyhow
 
     assert_eq!(
         router
-            .tool_runtime(&ToolName::plain(parallel_tool_name))
-            .map(|runtime| runtime.tool_name()),
+            .registered_tool(&ToolName::plain(parallel_tool_name))
+            .map(|tool| tool.runtime.tool_name()),
         Some(ToolName::plain(parallel_tool_name))
     );
 
@@ -212,6 +212,8 @@ async fn build_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()
     let tool_name = "create_event".to_string();
 
     let call = ToolRouter::build_tool_call(ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
         id: None,
         name: tool_name.clone(),
         namespace: Some("mcp__codex_apps__calendar".to_string()),
@@ -244,6 +246,7 @@ async fn build_custom_tool_call_uses_namespace_for_registry_name() -> anyhow::Re
     let tool_name = "exec".to_string();
 
     let call = ToolRouter::build_tool_call(ResponseItem::CustomToolCall {
+        encrypted_content: None,
         id: None,
         status: None,
         call_id: "call-namespace".to_string(),
@@ -273,6 +276,8 @@ async fn build_custom_tool_call_uses_namespace_for_registry_name() -> anyhow::Re
 fn build_tool_call_normalizes_default_function_and_custom_namespaces() -> anyhow::Result<()> {
     for namespace in [None, Some(""), Some(DEFAULT_FUNCTION_NAMESPACE)] {
         let function_call = ToolRouter::build_tool_call(ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "lookup".to_string(),
             namespace: namespace.map(str::to_string),
@@ -283,6 +288,7 @@ fn build_tool_call_normalizes_default_function_and_custom_namespaces() -> anyhow
         })?
         .expect("function_call should produce a tool call");
         let custom_call = ToolRouter::build_tool_call(ResponseItem::CustomToolCall {
+            encrypted_content: None,
             id: None,
             status: None,
             call_id: "call-custom".to_string(),
@@ -362,8 +368,8 @@ async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()> {
     assert!(router.tool_supports_parallel(&call));
     assert_eq!(
         router
-            .tool_runtime(&call.tool_name)
-            .map(|runtime| runtime.tool_name()),
+            .registered_tool(&call.tool_name)
+            .map(|tool| tool.runtime.tool_name()),
         Some(call.tool_name.clone())
     );
 
@@ -378,8 +384,8 @@ async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()> {
     assert!(!router.tool_supports_parallel(&different_server_call));
     assert_eq!(
         router
-            .tool_runtime(&different_server_call.tool_name)
-            .map(|runtime| runtime.tool_name()),
+            .registered_tool(&different_server_call.tool_name)
+            .map(|tool| tool.runtime.tool_name()),
         Some(different_server_call.tool_name.clone())
     );
 
@@ -392,7 +398,7 @@ async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()> {
         encrypted_function_args: None,
     };
     assert!(!router.tool_supports_parallel(&hidden_call));
-    assert!(router.tool_runtime(&hidden_call.tool_name).is_some());
+    assert!(router.registered_tool(&hidden_call.tool_name).is_some());
 
     let nested_only_call = ToolCall {
         tool_name: ToolName::namespaced("mcp__nested_echo__", "query_with_delay"),
@@ -524,6 +530,7 @@ fn mcp_runtime(tool_info: codex_mcp::ToolInfo) -> RegisteredTool {
     RegisteredTool {
         exposure: runtime.exposure(),
         runtime,
+        model_spec: None,
     }
 }
 
@@ -534,6 +541,8 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
     let turn = Arc::new(turn);
     let step_context = StepContext::for_test(Arc::clone(&turn));
     let history_item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -580,6 +589,8 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
     );
 
     let call = ToolRouter::build_tool_call(ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
         id: None,
         name: "echo".to_string(),
         namespace: Some("extension/".to_string()),

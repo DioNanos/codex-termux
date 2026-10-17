@@ -109,7 +109,8 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                 .config
                 .features
                 .enabled(Feature::GuardianV2DecisionsComparison)
-                && let Some(decisions_sampler) = super::startup::decisions_sampler(&input)
+                && let Some(decisions_sampler) =
+                    super::startup::decisions_sampler(&input, &self.auth_manager)
             {
                 input.thread_store.insert(decisions_sampler);
             }

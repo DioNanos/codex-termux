@@ -578,6 +578,204 @@ async fn synchronous_exit_returns_successfully() {
 }
 
 #[tokio::test]
+async fn exit_stops_the_whole_cell_and_preserves_only_prior_writes() {
+    for (label, source) in [
+        ("exit inside infinite loop", r#"for (;;) { exit(); }"#),
+        ("infinite loop after exit", r#"exit(); for (;;) {}"#),
+        (
+            "invalid helper after exit",
+            r#"try { exit(); image(null); } catch { for (;;) {} }"#,
+        ),
+        (
+            "catch and finally",
+            r#"try { exit(); } catch { text("caught"); } finally { store("phase", "finally"); text("finally"); }"#,
+        ),
+        (
+            "queued microtask",
+            r#"Promise.resolve().then(() => { store("phase", "microtask"); text("microtask"); }); exit();"#,
+        ),
+        (
+            "unawaited promise",
+            r#"Promise.resolve().then(() => exit()).catch(() => text("caught")); await new Promise(() => {});"#,
+        ),
+        (
+            "async module",
+            r#"await Promise.resolve(); try { exit(); } finally { text("finally"); }"#,
+        ),
+        (
+            "parallel promises",
+            r#"await Promise.all([Promise.resolve().then(() => exit()), Promise.resolve().then(() => { store("phase", "sibling"); text("sibling"); })]);"#,
+        ),
+        (
+            "timer callback",
+            r#"setTimeout(() => { try { exit(); } catch { text("caught"); } finally { text("finally"); } }, 0); await new Promise(() => {});"#,
+        ),
+        (
+            "timer microtask",
+            r#"setTimeout(() => { Promise.resolve().then(() => exit()); }, 0); await new Promise(() => {});"#,
+        ),
+        (
+            "after awaited timer",
+            r#"await new Promise((resolve) => setTimeout(resolve, 0)); try { exit(); } catch { text("caught"); }"#,
+        ),
+        (
+            "text toJSON",
+            r#"try { text({ toJSON() { exit(); } }); } catch { text("caught"); } finally { text("finally"); }"#,
+        ),
+        (
+            "store toJSON",
+            r#"try { store("phase", { toJSON() { exit(); } }); } catch { text("caught"); } finally { text("finally"); }"#,
+        ),
+        (
+            "store key coercion",
+            r#"try { store({ toString() { exit(); } }, "late"); } catch { text("caught"); } finally { text("finally"); }"#,
+        ),
+        (
+            "image getter",
+            r#"try { image({ get image_url() { exit(); } }); } catch { text("caught"); } finally { text("finally"); }"#,
+        ),
+        (
+            "exception stack getter",
+            r#"store("phase", "before formatting");
+throw {
+    get stack() { store("phase", "before"); exit(); for (;;) {} },
+    toString() { for (;;) {} }
+};"#,
+        ),
+    ] {
+        let service = InProcessCodeModeSession::new();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            execute(
+                &service,
+                ExecuteRequest {
+                    source: format!(
+                        r#"store("phase", "before"); text("before"); {source} store("phase", "after"); text("after");"#
+                    ),
+                    yield_time_ms: Some(30_000),
+                    ..execute_request("")
+                },
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("exit did not stop {label}"));
+        assert_eq!(
+            response,
+            RuntimeResponse::Result {
+                code_mode_host_duration: None,
+                cell_id: cell_id("1"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "before".to_string(),
+                }],
+                error_text: None,
+            },
+            "{label}"
+        );
+
+        let response = execute(
+            &service,
+            ExecuteRequest {
+                yield_time_ms: None,
+                ..execute_request(r#"text(load("phase"));"#)
+            },
+        )
+        .await;
+        assert_eq!(
+            response,
+            RuntimeResponse::Result {
+                code_mode_host_duration: None,
+                cell_id: cell_id("2"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "before".to_string(),
+                }],
+                error_text: None,
+            },
+            "{label}: next cell"
+        );
+    }
+}
+
+#[tokio::test]
+async fn exit_after_yield_and_tool_response_finishes_successfully() {
+    let delegate = Arc::new(ReleasableToolDelegate::default());
+    let service = InProcessCodeModeSession::new();
+    let yield_signal = CancellationToken::new();
+    let started = service
+        .execute(
+            ExecuteRequest {
+                enabled_tools: vec![echo_tool()],
+                source: r#"
+text("before yield");
+await tools.echo({});
+store("phase", "after tool");
+text("after tool");
+try { exit(); } catch { text("caught"); } finally { text("finally"); }
+text("after exit");
+"#
+                .to_string(),
+                yield_time_ms: Some(30_000),
+                ..execute_request("")
+            },
+            delegate.clone(),
+            Some(yield_signal.clone()),
+        )
+        .await
+        .unwrap();
+    let response = tokio::spawn(started.initial_response());
+    wait_until_tool_started(&delegate).await.unwrap();
+    yield_signal.cancel();
+    assert_eq!(
+        response.await.unwrap().unwrap(),
+        RuntimeResponse::Yielded {
+            code_mode_host_duration: None,
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "before yield".to_string(),
+            }],
+        }
+    );
+    delegate.release_tool();
+    assert_eq!(
+        service
+            .wait(
+                WaitRequest {
+                    cell_id: cell_id("1"),
+                    yield_time_ms: 30_000,
+                },
+                /*preempt*/ None,
+            )
+            .await
+            .unwrap(),
+        WaitOutcome::LiveCell(RuntimeResponse::Result {
+            code_mode_host_duration: None,
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "after tool".to_string(),
+            }],
+            error_text: None,
+        })
+    );
+    assert_eq!(
+        execute(
+            &service,
+            ExecuteRequest {
+                yield_time_ms: None,
+                ..execute_request(r#"text(load("phase"));"#)
+            },
+        )
+        .await,
+        RuntimeResponse::Result {
+            code_mode_host_duration: None,
+            cell_id: cell_id("2"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "after tool".to_string(),
+            }],
+            error_text: None,
+        }
+    );
+}
+
+#[tokio::test]
 async fn stored_values_are_shared_between_cells_but_not_sessions() {
     let first_session = InProcessCodeModeSession::new();
     let second_session = InProcessCodeModeSession::new();
@@ -684,6 +882,105 @@ text(load("key"));
             error_text: None,
         }
     );
+}
+
+#[tokio::test]
+async fn json_conversion_rejects_serde_markers_without_poisoning_sessions() {
+    let first = InProcessCodeModeSession::new();
+    let second = InProcessCodeModeSession::new();
+    let source = r#"
+store("healthy", 42);
+function rejects(value, message) {
+    let error;
+    try { store("healthy", value); } catch (e) { error = String(e); }
+    if (!message.test(error ?? "")) throw new Error(`expected ${message}; got ${error ?? "no error"}`);
+}
+const keys = ["$serde_json::private::RawValue", "$serde_json::private::Number"];
+for (const key of keys) {
+    for (const value of [
+        {[key]: "123"},
+        {first: 0, [key]: "null"},
+        [{[key]: "123"}],
+        JSON.parse('{"\\u0024' + key.slice(1) + '":"123"}'),
+    ]) rejects(value, /reserved JSON object key/);
+
+    // Marker text in strings and longer keys must remain valid.
+    const literal = ['{"' + key + '":"123"}', {['prefix"' + key]: key}];
+    store("literal", literal);
+    if (JSON.stringify(load("literal")) !== JSON.stringify(literal)) throw "changed literal";
+}
+for (const segments of [2, 5]) {
+    let encoded = "0";
+    for (let i = 0; i < segments; i++) {
+        encoded = "[".repeat(80) + encoded + "]".repeat(80);
+        if (i < segments - 1) encoded = JSON.stringify({[keys[0]]: encoded});
+    }
+    // Exercise Serde's depth reset without first requiring a deep V8 object.
+    rejects({[keys[0]]: encoded}, /reserved JSON object key/);
+}
+let value = 0;
+for (let depth = 1; depth <= 160; depth++) {
+    value = [value];
+    if (depth === 127) {
+        try {
+            store("boundary", value);
+            if (JSON.stringify(load("boundary")) !== JSON.stringify(value)) throw "changed boundary";
+        } catch (e) {
+            // V8 can reach its stack limit before Serde's depth limit on Windows.
+            if (!String(e).includes("Maximum call stack size exceeded")) throw e;
+        }
+    }
+    if (depth === 128 || depth === 160) rejects(value, /recursion limit exceeded|Maximum call stack size exceeded/);
+}
+const normal = {toJSON() { return [undefined, NaN, Infinity, 1.25, 1e100]; }};
+store("normal", normal);
+if (JSON.stringify(load("normal")) !== JSON.stringify(normal)) throw "changed normal JSON";
+text("ok");
+store("healthy", {[keys[0]]: "null"});
+"#;
+
+    for (session, source, expected_text, expected_error) in [
+        (
+            &second,
+            r#"store("healthy", 42); text(load("healthy"));"#,
+            "42",
+            None,
+        ),
+        (
+            &first,
+            source,
+            "ok",
+            Some("failed to serialize JavaScript value: reserved JSON object key"),
+        ),
+        (&first, r#"text(load("healthy"));"#, "42", None),
+        (&second, r#"text(load("healthy"));"#, "42", None),
+    ] {
+        let response = execute(
+            session,
+            ExecuteRequest {
+                yield_time_ms: None,
+                ..execute_request(source)
+            },
+        )
+        .await;
+        let RuntimeResponse::Result {
+            content_items,
+            error_text,
+            ..
+        } = response
+        else {
+            panic!("unexpected response: {response:?}");
+        };
+        assert_eq!(
+            (content_items, error_text),
+            (
+                vec![FunctionCallOutputContentItem::InputText {
+                    text: expected_text.to_string()
+                }],
+                expected_error.map(str::to_string)
+            )
+        );
+    }
 }
 
 #[tokio::test]
@@ -1346,45 +1643,53 @@ async fn text_helper_serializes_objects() {
 }
 
 #[tokio::test]
-async fn text_helper_surfaces_stringify_errors() {
-    let service = InProcessCodeModeSession::new();
+async fn output_helpers_surface_serialization_errors() {
+    for (source, expected_error) in [
+        (
+            "const circular = {}; circular.self = circular; text(circular);",
+            "Converting circular structure to JSON",
+        ),
+        (
+            "image({get image_url() { throw new Error('image getter failed'); }});",
+            "image getter failed",
+        ),
+        (
+            "image({type: 'image', get data() { throw new Error('MCP getter failed'); }});",
+            "MCP getter failed",
+        ),
+    ] {
+        let service = InProcessCodeModeSession::new();
+        let response = execute(
+            &service,
+            ExecuteRequest {
+                yield_time_ms: None,
+                ..execute_request(source)
+            },
+        )
+        .await;
 
-    let response = execute(
-        &service,
-        ExecuteRequest {
-            source: r#"
-const circular = {};
-circular.self = circular;
-text(circular);
-"#
-            .to_string(),
-            yield_time_ms: None,
-            ..execute_request("")
-        },
-    )
-    .await;
-
-    let RuntimeResponse::Result {
-        error_text: Some(error_text),
-        ..
-    } = &response
-    else {
-        panic!("circular stringify unexpectedly succeeded: {response:?}");
-    };
-    assert!(
-        error_text.contains("Converting circular structure to JSON"),
-        "unexpected circular stringify error: {error_text}"
-    );
-    let error_text = error_text.clone();
-    assert_eq!(
-        response,
-        RuntimeResponse::Result {
-            code_mode_host_duration: None,
-            cell_id: cell_id("1"),
-            content_items: Vec::new(),
+        let RuntimeResponse::Result {
             error_text: Some(error_text),
-        }
-    );
+            ..
+        } = &response
+        else {
+            panic!("serialization unexpectedly succeeded: {response:?}");
+        };
+        assert!(
+            error_text.contains(expected_error),
+            "unexpected serialization error: {error_text}"
+        );
+        let error_text = error_text.clone();
+        assert_eq!(
+            response,
+            RuntimeResponse::Result {
+                code_mode_host_duration: None,
+                cell_id: cell_id("1"),
+                content_items: Vec::new(),
+                error_text: Some(error_text),
+            }
+        );
+    }
 }
 
 #[tokio::test]

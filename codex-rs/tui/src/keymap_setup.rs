@@ -9,8 +9,8 @@
 //!
 //! The flow is intentionally split into three steps: choose an action, choose
 //! whether to replace/add/remove a binding, then capture either one terminal
-//! key event or a bounded two-stroke key chord. Validation happens after
-//! capture by reusing runtime keymap resolution, so conflict rules stay
+//! key event, a bounded two-stroke chord, or the key following the configured
+//! leader. Validation reuses runtime keymap resolution, so conflict rules stay
 //! centralized in `keymap.rs` instead of being duplicated in the UI.
 //!
 //! This module does not persist config files directly. It emits app events with
@@ -249,7 +249,35 @@ pub(crate) fn build_keymap_action_menu_params(
             ));
         }
     }
-    if active_binding_count == 0 {
+    if action != "leader" {
+        let leader_available = !runtime_keymap.chords.leader.is_empty();
+        items.push(SelectionItem {
+            name: "Use leader...".to_string(),
+            description: Some("Capture the key that follows the configured leader".to_string()),
+            disabled_reason: (!leader_available).then(|| "The leader is unbound".to_string()),
+            actions: vec![open_capture_action(
+                context.clone(),
+                action.clone(),
+                KeymapEditIntent::ReplaceAll,
+                KeymapCaptureMode::LeaderChord,
+            )],
+            ..Default::default()
+        });
+        if !leader_available {
+            items.push(SelectionItem {
+                name: "Configure leader...".to_string(),
+                description: Some("Set a leader before assigning this shortcut".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::OpenKeymapActionMenu {
+                        context: "global".to_string(),
+                        action: "leader".to_string(),
+                    });
+                })],
+                ..Default::default()
+            });
+        }
+    }
+    if action != "leader" && active_binding_count == 0 {
         items.push(action_menu_item(
             "Set key chord",
             "Capture two consecutive keys for this action".to_string(),
@@ -258,7 +286,7 @@ pub(crate) fn build_keymap_action_menu_params(
             KeymapEditIntent::ReplaceAll,
             KeymapCaptureMode::Chord,
         ));
-    } else {
+    } else if action != "leader" {
         items.push(action_menu_item(
             "Replace with key chord",
             format!("Replace `{current_binding}` with a two-stroke key chord"),
@@ -297,6 +325,7 @@ pub(crate) fn build_keymap_action_menu_params(
     });
 
     SelectionViewParams {
+        allow_input_when_disconnected: true,
         view_id: Some(KEYMAP_ACTION_MENU_VIEW_ID),
         header: Box::new(Paragraph::new(header).wrap(Wrap { trim: false })),
         footer_note: Some(Line::from(vec![
@@ -358,10 +387,13 @@ pub(crate) fn build_keymap_replace_binding_menu_params(
                     ..Default::default()
                 },
             ]
+            .into_iter()
+            .take(if action == "leader" { 1 } else { 2 })
         })
         .collect();
 
     SelectionViewParams {
+        allow_input_when_disconnected: true,
         view_id: Some(KEYMAP_REPLACE_BINDING_MENU_VIEW_ID),
         header: Box::new(Paragraph::new(header).wrap(Wrap { trim: false })),
         footer_hint: Some(picker_hint_line_for_keymap(&runtime_keymap.list)),
@@ -378,12 +410,15 @@ pub(crate) fn build_keymap_conflict_params(
     error: String,
     runtime_keymap: &RuntimeKeymap,
 ) -> SelectionViewParams {
-    let capture_mode = if key.contains(' ') {
+    let capture_mode = if key.starts_with("leader ") {
+        KeymapCaptureMode::LeaderChord
+    } else if key.contains(' ') {
         KeymapCaptureMode::Chord
     } else {
         KeymapCaptureMode::SingleKey
     };
     SelectionViewParams {
+        allow_input_when_disconnected: true,
         header: Box::new(
             Paragraph::new(vec![
                 Line::from("Shortcut Conflict".bold()),
@@ -643,6 +678,10 @@ fn key_parts_to_config_key_spec(
     let key = match code {
         KeyCode::Enter => "enter".to_string(),
         KeyCode::Tab => "tab".to_string(),
+        KeyCode::BackTab => {
+            modifiers.insert(KeyModifiers::SHIFT);
+            "tab".to_string()
+        }
         KeyCode::Backspace => "backspace".to_string(),
         KeyCode::Esc => "esc".to_string(),
         KeyCode::Delete => "delete".to_string(),
@@ -1733,6 +1772,14 @@ mod tests {
         assert_eq!(
             key_event_to_config_key_spec(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT)),
             Ok("shift-page-down".to_string())
+        );
+        assert_eq!(
+            key_event_to_config_key_spec(KeyEvent::from(KeyCode::BackTab)),
+            Ok("shift-tab".to_string())
+        );
+        assert_eq!(
+            key_event_to_config_key_spec(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)),
+            Ok("shift-tab".to_string())
         );
     }
 

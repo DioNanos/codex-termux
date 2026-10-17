@@ -71,6 +71,7 @@ mod input_boundary;
 mod job_control;
 mod keyboard_modes;
 mod link_pointer;
+mod notification_preview;
 #[cfg(test)]
 #[path = "tui/owned_screen_tests.rs"]
 mod owned_screen_tests;
@@ -406,6 +407,9 @@ pub fn restore_after_exit() -> Result<()> {
     )
     .err();
     if let Err(err) = terminal_stderr::finish() {
+        first_error.get_or_insert(err);
+    }
+    if let Err(err) = crate::terminal_program_status::clear_terminal_program_status() {
         first_error.get_or_insert(err);
     }
 
@@ -842,6 +846,10 @@ impl Tui {
         self.notification_condition = condition;
     }
 
+    pub(crate) fn set_notification_condition(&mut self, condition: NotificationCondition) {
+        self.notification_condition = condition;
+    }
+
     pub(crate) fn is_terminal_focused(&self) -> bool {
         self.terminal_focused.load(Ordering::Relaxed)
     }
@@ -901,12 +909,12 @@ impl Tui {
         Ok(())
     }
 
-    /// Discard buffered typeahead before a startup screen that can confirm an action.
+    /// Discard buffered typeahead before an interactive screen that can confirm an action.
     ///
-    /// Startup probes can leave parsed key events in crossterm's queue, while later bootstrap
-    /// work can leave additional bytes in the terminal input buffer. Neither should activate an
-    /// update, trust, or migration prompt before the user has seen it. Pause the event stream,
-    /// drain all input through crossterm so incomplete bracketed paste remains safely framed.
+    /// Earlier work can leave parsed key events in crossterm's queue and additional bytes in the
+    /// terminal input buffer. Neither should activate the next screen before the user has seen it.
+    /// Pause the event stream and drain all input through crossterm so incomplete bracketed paste
+    /// remains safely framed.
     pub(crate) fn discard_pending_input_before_interactive_screen(&mut self) -> Result<()> {
         self.pause_events();
         let drain_result = discard_pending_terminal_input();
@@ -973,6 +981,9 @@ impl Tui {
         if let Err(err) = terminal_stderr::pause() {
             tracing::warn!("failed to restore terminal stderr before external program: {err}");
         }
+        if let Err(err) = crate::terminal_program_status::clear_terminal_program_status() {
+            tracing::debug!(error = %err, "failed to clear terminal program status before external program");
+        }
 
         let output = f().await;
 
@@ -996,6 +1007,7 @@ impl Tui {
             let _ = self.enter_alt_screen();
         }
 
+        crate::terminal_program_status::invalidate_terminal_program_status();
         self.resume_events();
         self.schedule_screen_size_recheck(Duration::ZERO);
         output

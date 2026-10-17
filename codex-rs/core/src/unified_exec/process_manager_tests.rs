@@ -355,6 +355,8 @@ async fn output_collection_stays_bounded_across_repeated_drains() {
         output_closed: Arc::clone(&output_closed),
         output_closed_notify: Arc::clone(&output_closed_notify),
         cancellation_token: cancellation_token.clone(),
+        collection_finished: CancellationToken::new(),
+        drain_policy: OutputDrainPolicy::BoundedAfterExit,
     };
 
     let collect = UnifiedExecProcessManager::collect_output_until_deadline(
@@ -413,6 +415,8 @@ async fn output_collection_preserves_omissions_from_drained_buffer() {
         output_closed,
         output_closed_notify,
         cancellation_token,
+        collection_finished: CancellationToken::new(),
+        drain_policy: OutputDrainPolicy::BoundedAfterExit,
     };
 
     let collected = UnifiedExecProcessManager::collect_output_until_deadline(
@@ -482,7 +486,6 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
             .primary()
             .cloned()
             .expect("primary environment"),
-        shell_mode: codex_tools::UnifiedExecShellMode::Direct,
         network: None,
         tty: true,
         sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
@@ -496,7 +499,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
     output_buffer.lock().await.push_chunk(b"PARTIAL_TRANSCRIPT");
 
     emit_failed_initial_exec_end_if_unstored(
-        /*process_started_alive*/ false,
+        /*process_stored*/ false,
         Some(codex_protocol::sandbox::SandboxType::WindowsMxc),
         &context,
         &request,

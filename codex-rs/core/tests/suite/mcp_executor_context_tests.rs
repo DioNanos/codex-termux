@@ -38,6 +38,7 @@ impl McpServerContributor<Config> for ExecutorSelectionRecorder {
     fn selected_plugins<'a>(
         &'a self,
         context: McpServerContributionContext<'a, Config>,
+        _plugins_config: &'a codex_config::types::PluginsConfigToml,
     ) -> ExtensionFuture<'a, Vec<SelectedPlugin<'a>>> {
         Box::pin(async move {
             self.plugin_contexts
@@ -103,6 +104,7 @@ async fn thread_projection_preserves_executor_order_and_unavailable_selections()
             vec![unavailable.clone(), ready.clone()],
             vec![ready.clone(), unavailable.clone()],
         ] {
+            // These synthetic executor selections have no capability roots.
             let selections = requests
                 .iter()
                 .cloned()

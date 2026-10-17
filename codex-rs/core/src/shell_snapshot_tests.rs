@@ -17,6 +17,8 @@ use codex_network_proxy::NetworkProxyConfig;
 use codex_protocol::config_types::EnvironmentVariablePattern;
 #[cfg(unix)]
 use codex_protocol::models::PermissionProfile;
+#[cfg(unix)]
+use codex_protocol::sandbox::SandboxOverride;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
@@ -161,6 +163,80 @@ async fn get_snapshot(shell_type: ShellType) -> Result<String> {
     .await?;
     let content = fs::read_to_string(&path).await?;
     Ok(content)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_helpers_preserve_thread_without_caching_exec_metadata() -> Result<()> {
+    let output = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("shell_snapshot::tests::snapshot_helper_exec_metadata_child")
+        .arg("--nocapture")
+        .env("CODEX_TEST_SNAPSHOT_HELPER_CHILD", "1")
+        .env("CODEX_THREAD_ID", "helper-thread")
+        .env("CODEX_TOOL_CALL_ID", "stale-call")
+        .env("BASH_ENV", "/dev/null")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "snapshot helper child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_helper_exec_metadata_child() -> Result<()> {
+    if std::env::var_os("CODEX_TEST_SNAPSHOT_HELPER_CHILD").is_none() {
+        return Ok(());
+    }
+    assert_eq!(
+        std::env::var("CODEX_THREAD_ID").as_deref(),
+        Ok("helper-thread")
+    );
+    assert_eq!(
+        std::env::var("CODEX_TOOL_CALL_ID").as_deref(),
+        Ok("stale-call")
+    );
+
+    let dir = tempdir()?;
+    let shell = crate::shell::get_shell(ShellType::Bash).context("No available Bash shell")?;
+    let helper_env = run_script_with_timeout(
+        &shell,
+        "printf '%s|%s' \"${CODEX_THREAD_ID-unset}\" \"${CODEX_TOOL_CALL_ID-unset}\"",
+        SNAPSHOT_TIMEOUT,
+        SnapshotShellMode::NonLogin,
+        &dir.path().abs(),
+        /*credential_broker*/ None,
+        /*sandbox*/ None,
+    )
+    .await?;
+    assert_eq!(helper_env, "helper-thread|unset");
+    let snapshot = get_snapshot(ShellType::Bash).await?;
+    assert!(!snapshot.contains("CODEX_THREAD_ID"));
+    assert!(!snapshot.contains("CODEX_TOOL_CALL_ID"));
+    assert!(!snapshot.contains("helper-thread"));
+    assert!(!snapshot.contains("stale-call"));
+
+    let validation_path = dir.path().join("validation.sh").abs();
+    fs::write(
+        &validation_path,
+        "test \"${CODEX_THREAD_ID-missing}\" = helper-thread && \
+         test \"${CODEX_TOOL_CALL_ID-missing}\" = missing\n",
+    )
+    .await?;
+    validate_snapshot(
+        &shell,
+        &validation_path,
+        &dir.path().abs(),
+        /*credential_broker*/ None,
+        /*sandbox*/ None,
+    )
+    .await?;
+    Ok(())
 }
 
 #[test]
@@ -411,6 +487,7 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
     let permissions = PermissionProfile::Disabled;
     let cancellation = CancellationToken::new();
     let mut attempt = SandboxAttempt {
+        sandbox_override: SandboxOverride::NoOverride,
         sandbox: SandboxType::None,
         sandbox_requested: false,
         permissions: &permissions,
@@ -592,8 +669,12 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
 
 #[cfg(unix)]
 async fn credential_snapshot_proxy() -> Result<crate::config::StartedNetworkProxy> {
-    let mut network_config = NetworkProxyConfig::default();
+    let mut network_config = NetworkProxyConfig {
+        enabled: true,
+        ..NetworkProxyConfig::default()
+    };
     network_config.set_credential_broker_enabled(/*enabled*/ true);
+    network_config.set_allowed_domains(vec!["*".to_string()]);
     network_config.allow_local_binding = Some(true);
     network_config.credential_providers.insert(
         "local".to_string(),

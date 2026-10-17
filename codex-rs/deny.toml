@@ -73,6 +73,7 @@ ignore = [
     # Reviewed 2026-07-02. Keep this list in sync with .cargo/audit.toml.
     # Each exception must identify the dependency path and removal condition.
     { id = "RUSTSEC-2024-0388", reason = "derivative is unmaintained; pulled in via starlark/starlark_syntax v0.14.2 used by execpolicy/cli/core; no fixed starlark release yet" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml 0.2.11 is unmaintained; pulled in via serde_yaml 0.9 by skills, ext/skills, core-plugins, and external-agent-migration; no patched release; remove when these users migrate off serde_yaml/unsafe-libyaml" },
     { id = "RUSTSEC-2025-0057", reason = "fxhash is unmaintained; pulled in via starlark_map under starlark v0.14.2 used by execpolicy/cli/core and bm25 used by core; remove when upstream dependencies drop fxhash" },
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; pulled in via starlark/v8 used by execpolicy/code-mode; no fixed release yet" },
     { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill is unmaintained; pulled in via postcard/heapless/pagable under starlark v0.14.2 used by execpolicy/cli/core; no fixed starlark release yet" },

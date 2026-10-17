@@ -87,15 +87,12 @@ async fn discovery_preserves_inventory_and_v1_metadata() -> anyhow::Result<()> {
     // V1 keeps undeclared/migrated skills and excludes the skill beyond its depth limit.
     assert_eq!(v1.skills.len(), 4);
     let manager = CapabilityManager::new(file_system);
-    manager.prewarm_locations(request.clone()).await?;
+    manager.seed_prewarmed_locations(request.clone()).await?;
     let response = manager
-        .get_or_refresh_discovery(
-            request.clone(),
-            DiscoverV2CapabilitiesRequest {
-                cwd: PathUri::from_host_native_path(temp.path().join("project"))?,
-                sandbox: None,
-            },
-        )
+        .get_or_refresh_discovery(DiscoverV2CapabilitiesRequest {
+            cwd: PathUri::from_host_native_path(temp.path().join("project"))?,
+            sandbox: None,
+        })
         .await?;
     assert_eq!(
         response

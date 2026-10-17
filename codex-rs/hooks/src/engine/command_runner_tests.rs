@@ -512,9 +512,9 @@ fn write_handler(temp: &TempDir, source: &str) -> ConfiguredHandler {
 
 async fn schedule(runtime: &CommandHookRuntime, handler: ConfiguredHandler, cwd: &Path) {
     let engine = ClaudeHooksEngine {
-        handlers: vec![handler],
-        warnings: Vec::new(),
-        required_load_errors: Vec::new(),
+        handlers: Arc::new(vec![handler]),
+        warnings: Arc::default(),
+        required_load_errors: Arc::default(),
         command_runtime: runtime.clone(),
         mcp_executor: mcp_executor(),
     };

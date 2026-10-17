@@ -88,9 +88,9 @@ impl<T: HttpTransport> ModelsClient<T> {
                     body.len()
                 ))
             })?;
-        // Un modello con un messaggio fuori misura viene SCARTATO LUI, con un
-        // avviso che ne dice slug, campo e byte: gli altri restano serviti. Se
-        // non ne resta nessuno valido l'errore resta, com'era.
+        // An oversized message makes that one model be DROPPED, with a warning
+        // that names its slug, field and byte count: the others stay served. If
+        // none is left valid the error stays, as before.
         let (models, invalid) = partition_model_infos(models);
         for error in &invalid {
             warn!("discarding model with an oversized message: {error}");
@@ -480,13 +480,13 @@ mod tests {
 
     #[tokio::test]
     async fn remote_models_loader_drops_only_the_oversized_model() {
-        // Un modello fuori misura non deve azzerare il catalogo: si scarta lui,
-        // gli altri restano serviti. Prima un solo campo troppo lungo rendeva
-        // illeggibile TUTTA la risposta e il chiamante ripiegava sull'elenco
-        // compilato nel binario — dove i modelli nuovi non ci sono.
+        // An oversized model must not wipe the catalog: it is the one dropped,
+        // the others stay served. Before, a single overlong field made the WHOLE
+        // response unreadable and the caller fell back to the list compiled
+        // into the binary — where the new models are not.
         let response = ModelsResponse {
             models: vec![
-                model_with_slug_and_instructions("gpt-ok-1", /*len*/ 0),
+                model_with_slug_and_instructions("gpt-ok-1", 0),
                 model_with_slug_and_instructions("gpt-too-long", 8 * 1024 + 1),
                 model_with_slug_and_instructions("gpt-ok-2", 8 * 1024),
             ],
@@ -539,8 +539,8 @@ mod tests {
 
     #[tokio::test]
     async fn remote_models_loader_still_fails_when_every_model_is_oversized() {
-        // Se non ne resta nemmeno uno valido l'errore resta, com'era: non c'e'
-        // un catalogo da servire, e fingere il contrario sarebbe peggio.
+        // If not even one valid entry is left the error stays, as before: there
+        // is no catalog to serve, and pretending otherwise would be worse.
         let response = ModelsResponse {
             models: vec![
                 model_with_slug_and_instructions("bad-1", 8 * 1024 + 1),

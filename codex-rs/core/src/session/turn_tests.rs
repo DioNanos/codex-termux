@@ -29,9 +29,13 @@ impl TurnItemContributor for RewriteAgentMessageContributor {
 
 fn assistant_output_text(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: Some(ResponseItemId::with_suffix("msg", "1")),
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: text.to_string(),
         }],
         phase: None,
@@ -216,13 +220,8 @@ fn post_sampling_token_estimate_is_disabled_by_always_on_sinks() {
         "positive control: the log-db sink must capture an ordinary event, got: {captured}"
     );
 
-    let feedback_logs = String::from_utf8(
-        feedback
-            .snapshot(/*session_id*/ None)
-            .log_attachment(/*logs_override*/ None)
-            .buffer,
-    )
-    .expect("feedback ring buffer is utf-8");
+    let feedback_logs = String::from_utf8(feedback.snapshot(None).log_attachment(None).buffer)
+        .expect("feedback ring buffer is utf-8");
     assert!(
         !feedback_logs.contains("estimate payload"),
         "always-on feedback sink must not capture the token-estimate payload, got: {feedback_logs}"

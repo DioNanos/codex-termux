@@ -19,6 +19,7 @@ use crate::ResponseItemId;
 use crate::SanitizedGitUrl;
 use crate::SessionId;
 use crate::ThreadId;
+use crate::approvals::ElicitationAbandonedEvent;
 use crate::approvals::ElicitationRequestEvent;
 use crate::capabilities::SelectedCapabilityRoot;
 use crate::config_types::ApprovalsReviewer;
@@ -173,7 +174,7 @@ pub struct W3cTraceContext {
     pub tracestate: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ConversationStartParams {
     /// Whether Codex response handoffs are managed through explicit client append calls.
     pub client_managed_handoffs: bool,
@@ -214,6 +215,17 @@ pub struct ConversationStartParams {
     pub voice: Option<RealtimeVoice>,
 }
 
+impl fmt::Debug for ConversationStartParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Text, instructions, and transport endpoints can contain credentials.
+        f.debug_struct("ConversationStartParams")
+            .field("output_modality", &self.output_modality)
+            .field("initial_items_count", &self.initial_items.len())
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConversationStartTransport {
     Websocket,
@@ -245,22 +257,38 @@ pub enum RealtimeVoice {
     Alloy,
     Arbor,
     Ash,
+    Aube,
     Ballad,
     Breeze,
+    Bubbie,
     Cedar,
     Coral,
     Cove,
     Echo,
     Ember,
+    Haetsal,
+    Hanul,
+    Himari,
     Juniper,
+    Leher,
     Maple,
     Marin,
+    Miko,
+    Neer,
+    Porto,
+    Rindo,
+    Rio,
+    Rivage,
     Sage,
+    Selva,
     Shimmer,
     Sol,
+    Sonna,
     Spruce,
+    Tinta,
     Vale,
     Verse,
+    Viola,
 }
 
 impl RealtimeVoice {
@@ -269,22 +297,38 @@ impl RealtimeVoice {
             Self::Alloy => "alloy",
             Self::Arbor => "arbor",
             Self::Ash => "ash",
+            Self::Aube => "aube",
             Self::Ballad => "ballad",
             Self::Breeze => "breeze",
+            Self::Bubbie => "bubbie",
             Self::Cedar => "cedar",
             Self::Coral => "coral",
             Self::Cove => "cove",
             Self::Echo => "echo",
             Self::Ember => "ember",
+            Self::Haetsal => "haetsal",
+            Self::Hanul => "hanul",
+            Self::Himari => "himari",
             Self::Juniper => "juniper",
+            Self::Leher => "leher",
             Self::Maple => "maple",
             Self::Marin => "marin",
+            Self::Miko => "miko",
+            Self::Neer => "neer",
+            Self::Porto => "porto",
+            Self::Rindo => "rindo",
+            Self::Rio => "rio",
+            Self::Rivage => "rivage",
             Self::Sage => "sage",
+            Self::Selva => "selva",
             Self::Shimmer => "shimmer",
             Self::Sol => "sol",
+            Self::Sonna => "sonna",
             Self::Spruce => "spruce",
+            Self::Tinta => "tinta",
             Self::Vale => "vale",
             Self::Verse => "verse",
+            Self::Viola => "viola",
         }
     }
 }
@@ -295,6 +339,9 @@ impl RealtimeVoice {
 pub struct RealtimeVoicesList {
     pub v1: Vec<RealtimeVoice>,
     pub v2: Vec<RealtimeVoice>,
+    #[serde(default)]
+    #[ts(as = "Option<_>", optional)]
+    pub v3: Vec<RealtimeVoice>,
     pub default_v1: RealtimeVoice,
     pub default_v2: RealtimeVoice,
 }
@@ -324,6 +371,33 @@ impl RealtimeVoicesList {
                 RealtimeVoice::Verse,
                 RealtimeVoice::Marin,
                 RealtimeVoice::Cedar,
+            ],
+            v3: vec![
+                RealtimeVoice::Juniper,
+                RealtimeVoice::Maple,
+                RealtimeVoice::Spruce,
+                RealtimeVoice::Ember,
+                RealtimeVoice::Vale,
+                RealtimeVoice::Breeze,
+                RealtimeVoice::Arbor,
+                RealtimeVoice::Sol,
+                RealtimeVoice::Cove,
+                RealtimeVoice::Aube,
+                RealtimeVoice::Bubbie,
+                RealtimeVoice::Haetsal,
+                RealtimeVoice::Hanul,
+                RealtimeVoice::Himari,
+                RealtimeVoice::Leher,
+                RealtimeVoice::Miko,
+                RealtimeVoice::Neer,
+                RealtimeVoice::Porto,
+                RealtimeVoice::Rindo,
+                RealtimeVoice::Rio,
+                RealtimeVoice::Rivage,
+                RealtimeVoice::Selva,
+                RealtimeVoice::Sonna,
+                RealtimeVoice::Tinta,
+                RealtimeVoice::Viola,
             ],
             default_v1: RealtimeVoice::Cove,
             default_v2: RealtimeVoice::Marin,
@@ -594,6 +668,12 @@ pub enum Op {
     #[debug("RealtimeConversationStart {{ session_id: {:?}, version: {:?}, output_modality: {:?} }}", _0.realtime_session_id, _0.version, _0.output_modality)]
     RealtimeConversationStart(ConversationStartParams),
 
+    /// Start a realtime conversation and report completion of the connection attempt.
+    RealtimeConversationAttach {
+        params: ConversationStartParams,
+        reply: oneshot::Sender<CodexResult<()>>,
+    },
+
     /// Send audio input to the running realtime conversation stream.
     #[debug("RealtimeConversationAudio {{ item_id: {:?}, sample_rate: {}, num_channels: {}, samples_per_channel: {:?} }}", _0.frame.item_id, _0.frame.sample_rate, _0.frame.num_channels, _0.frame.samples_per_channel)]
     RealtimeConversationAudio(ConversationAudioParams),
@@ -608,6 +688,12 @@ pub enum Op {
 
     /// Close the running realtime conversation stream.
     RealtimeConversationClose,
+
+    /// Close only the matching session after earlier start operations finish.
+    RealtimeConversationDetach {
+        realtime_session_id: String,
+        reply: oneshot::Sender<CodexResult<()>>,
+    },
 
     /// Request the list of voices supported by realtime conversation streams.
     RealtimeConversationListVoices,
@@ -890,6 +976,8 @@ impl InterAgentCommunication {
         ResponseInputItem::Message {
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: serde_json::to_string(&communication).unwrap_or_default(),
             }],
             phase: Some(MessagePhase::Commentary),
@@ -937,7 +1025,7 @@ impl InterAgentCommunication {
 
     pub fn from_message_content(content: &[ContentItem]) -> Option<Self> {
         match content {
-            [ContentItem::InputText { text }] | [ContentItem::OutputText { text }] => {
+            [ContentItem::InputText { text }] | [ContentItem::OutputText { text, .. }] => {
                 serde_json::from_str(text).ok()
             }
             _ => None,
@@ -952,10 +1040,12 @@ impl Op {
             Self::InterruptIfNoPendingInput { .. } => "interrupt_if_no_pending_input",
             Self::CleanBackgroundTerminals => "clean_background_terminals",
             Self::RealtimeConversationStart(_) => "realtime_conversation_start",
+            Self::RealtimeConversationAttach { .. } => "realtime_conversation_attach",
             Self::RealtimeConversationAudio(_) => "realtime_conversation_audio",
             Self::RealtimeConversationText(_) => "realtime_conversation_text",
             Self::RealtimeConversationSpeech(_) => "realtime_conversation_speech",
             Self::RealtimeConversationClose => "realtime_conversation_close",
+            Self::RealtimeConversationDetach { .. } => "realtime_conversation_detach",
             Self::RealtimeConversationListVoices => "realtime_conversation_list_voices",
             Self::TurnInput { .. } => "turn_input",
             Self::RecoverTurn { .. } => "recover_turn",
@@ -1510,6 +1600,9 @@ pub enum EventMsg {
     DynamicToolCallResponse(DynamicToolCallResponseEvent),
 
     ElicitationRequest(ElicitationRequestEvent),
+
+    /// An unanswered MCP responder was abandoned at its original unbounded source.
+    ElicitationAbandoned(ElicitationAbandonedEvent),
 
     ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent),
 
@@ -3387,6 +3480,19 @@ impl TurnContextItem {
     }
 }
 
+/// Estimate the model-visible content length of an encrypted compaction.
+///
+/// The payload can contain summary text, sampled-token replay caches, and
+/// encryption/base64 overhead. Normalize the roughly threefold payload growth
+/// observed with replay caches before applying the usual four-byte text
+/// heuristic: twelve ciphertext bytes per estimated token, rounded up.
+/// This restores the earlier budgeting scale, not exact tokenizer counts, and
+/// can underestimate legacy checkpoints without caches. Callers must enforce
+/// transport-size limits separately.
+pub fn estimate_compaction_content_length(encoded_len: usize) -> usize {
+    encoded_len.div_ceil(3)
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(tag = "mode", content = "limit", rename_all = "snake_case")]
 pub enum TruncationPolicy {
@@ -4516,6 +4622,10 @@ pub struct CollabResumeEndEvent {
 }
 
 #[cfg(test)]
+#[path = "conversation_start_params_tests.rs"]
+mod conversation_start_params_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::items::CommandExecutionItem;
@@ -4737,6 +4847,8 @@ mod tests {
             ResponseInputItem::Message {
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: serde_json::to_string(&serialized_communication)
                         .expect("serialize communication"),
                 }],
@@ -5952,6 +6064,7 @@ mod tests {
                     RealtimeVoice::Marin,
                     RealtimeVoice::Cedar,
                 ],
+                v3: RealtimeVoicesList::builtin().v3,
                 default_v1: RealtimeVoice::Cove,
                 default_v2: RealtimeVoice::Marin,
             }

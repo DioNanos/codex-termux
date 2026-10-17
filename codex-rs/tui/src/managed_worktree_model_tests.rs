@@ -61,7 +61,11 @@ async fn model_call(
                     let ServerRequest::McpServerElicitationRequest { request_id, params } = *request else { panic!("unexpected server request: {request:?}"); };
                     assert_eq!(params.thread_id, thread);
                     approvals += 1;
-                    server.resolve_server_request(request_id, json!({"action":"accept","content":null,"_meta":null})).await?;
+                    server
+                        .request_handle()
+                        .server_request_reply_handle(request_id)
+                        .resolve(json!({"action":"accept","content":null,"_meta":null}))
+                        .await?;
                 }
                 AppServerEvent::ServerNotification(notification) if matches!(notification.as_ref(), ServerNotification::TurnCompleted(event) if event.thread_id == thread) => break,
                 _ => {},

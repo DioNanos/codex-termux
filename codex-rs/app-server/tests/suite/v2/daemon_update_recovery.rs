@@ -641,7 +641,7 @@ async fn managed_shutdown_records_interrupted_turn(outcome: &str) -> Result<()> 
         daemon_recovery::write_snapshot(&path, &snapshot)?;
     }
     let mut successor = spawn_server(home.path(), &socket)?;
-    if !matches!(outcome, "running" | "plan") {
+    if !matches!(outcome, "running" | "plan" | "read_only") {
         let mut client = connect_default_daemon_client(&socket).await?;
         timeout(DEFAULT_READ_TIMEOUT, async {
             loop {
@@ -801,19 +801,25 @@ async fn connect_default_daemon_client(socket_path: &Path) -> Result<WebSocketSt
     connect_daemon_client(socket_path, InitializeCapabilities::default()).await
 }
 
-async fn connect_daemon_client(
+pub(super) async fn connect_daemon_client(
     socket_path: &Path,
     capabilities: InitializeCapabilities,
 ) -> Result<WebSocketStream<UnixStream>> {
     connect_initialized(socket_path, capabilities, "daemon_recovery_test", "0.1.0").await
 }
 
-fn spawn_server(home: &Path, socket_path: &Path) -> Result<Child> {
+pub(super) fn spawn_server(home: &Path, socket_path: &Path) -> Result<Child> {
     let binary = codex_utils_cargo_bin::cargo_bin("codex-app-server")?;
     Ok(Command::new(binary)
         .args(["--listen", &format!("unix://{}", socket_path.display())])
         .arg(DISABLE_PLUGIN_STARTUP_TASKS_ARG)
         .env("CODEX_HOME", home)
+        // Match TestAppServer's isolation from the host's managed configuration.
+        .env(
+            "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+            home.join("managed_config.toml"),
+        )
+        .current_dir(home)
         .arg("--managed-daemon")
         .env(
             codex_app_server_transport::DAEMON_SHUTDOWN_SOCKET_ENV,
@@ -888,7 +894,7 @@ async fn connect_initialized(
     Ok(websocket)
 }
 
-async fn request(
+pub(super) async fn request(
     websocket: &mut WebSocketStream<UnixStream>,
     id: i64,
     method: &str,

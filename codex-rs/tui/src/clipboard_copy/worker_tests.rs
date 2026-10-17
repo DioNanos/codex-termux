@@ -8,6 +8,7 @@ use crate::pager_overlay::Overlay;
 use crate::tui::TuiEvent;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
@@ -28,7 +29,7 @@ async fn blocked_copy_allows_overlay_exit_rejects_backlog_and_wakes_completion()
                 released.recv().unwrap();
                 (Ok(CopyOutcome::Copied(Some(ClipboardLease::test()))), None)
             },
-            |_| unreachable!("copy-only backend"),
+            || |_| unreachable!("copy-only backend"),
         )
         .unwrap();
     let mut app = Box::new(crate::app::test_support::make_test_app().await);
@@ -137,7 +138,7 @@ fn dropping_worker_does_not_wait_for_blocked_backend() {
                 finished.send(()).unwrap();
                 (Err("unavailable".into()), None)
             },
-            |_| unreachable!("copy-only backend"),
+            || |_| unreachable!("copy-only backend"),
         )
         .unwrap();
     worker
@@ -178,7 +179,7 @@ async fn expired_setup_discards_delivery_and_keeps_worker_busy_until_it_returns(
                     });
                     (outcome, None)
                 },
-                |_| unreachable!("copy-only backend"),
+                || |_| unreachable!("copy-only backend"),
             )
             .unwrap();
         worker
@@ -293,10 +294,12 @@ async fn right_click_paste_uses_normal_input_and_discards_stale_reads() {
         .start(
             tui.frame_requester(),
             |_, _, _| unreachable!("no selection"),
-            move |_| {
-                started.send(()).unwrap();
-                released.recv().unwrap();
-                Ok("café\r\nsecond line\n".into())
+            move || {
+                move |_| {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok("café\r\nsecond line\n".into())
+                }
             },
         )
         .unwrap();
@@ -315,20 +318,75 @@ async fn right_click_paste_uses_normal_input_and_discards_stale_reads() {
         .await
         .unwrap();
     assert!(!tui.clipboard.is_busy());
-    tui.set_owned_screen(/*owned*/ true).unwrap();
-    for (change, expected) in [
-        ("none", "draft café\nsecond line\n"),
-        ("native", "draft native"),
-        ("edit", "replacement"),
-        ("disable", "draft "),
+    let ctrl_v = KeyCode::Char('v');
+    let shift_insert = KeyCode::Insert;
+    for (shortcut, change, expected) in [
+        (None, "none", "draft café\nsecond line\n"),
+        (None, "native", "draft native"),
+        (None, "edit", "replacement"),
+        (None, "disable", "draft "),
+        (Some(ctrl_v), "none", "draft café\nsecond line\n"),
+        (Some(shift_insert), "none", "draft café\nsecond line\n"),
+        (Some(ctrl_v), "native", "draft native"),
+        (Some(shift_insert), "edit", "replacement"),
+        (Some(ctrl_v), "click", "draft "),
+        // Last, since parent-owned threads no longer allow editing the draft.
+        (Some(shift_insert), "readonly", "draft "),
     ] {
-        app.local_settings.tui.right_click_paste = RightClickPaste::On;
+        // Shortcuts remain eligible inline, with mouse paste disabled.
+        tui.set_owned_screen(shortcut.is_none()).unwrap();
+        app.local_settings.tui.right_click_paste = if shortcut.is_some() {
+            RightClickPaste::Off
+        } else {
+            RightClickPaste::On
+        };
         app.chat_widget.apply_external_edit("draft ".into());
-        app.handle_tui_event(&mut tui, &mut server, TuiEvent::Mouse(click))
+        // Cover a read still running, and a completed read awaiting its Draw.
+        let read_completed = shortcut == Some(ctrl_v) && change == "none";
+        if shortcut.is_some() {
+            // Enter at the NoImage fallback, independently of the host clipboard.
+            app.start_clipboard_text_paste(&mut tui, PasteSource::Clipboard, shortcut);
+        } else {
+            app.handle_tui_event(&mut tui, &mut server, TuiEvent::Mouse(click))
+                .await
+                .unwrap();
+        }
+        start_rx.recv_timeout(SETUP_TIMEOUT).unwrap();
+        if let Some(key) = shortcut {
+            app.handle_tui_event(
+                &mut tui,
+                &mut server,
+                TuiEvent::Key(KeyEvent {
+                    kind: KeyEventKind::Release,
+                    ..KeyEvent::from(key)
+                }),
+            )
             .await
             .unwrap();
-        start_rx.recv_timeout(SETUP_TIMEOUT).unwrap();
-        if change == "none" {
+            if read_completed {
+                // The read may complete on a key event, before Draw delivers the paste.
+                release.send(()).unwrap();
+                tokio::time::timeout(SETUP_TIMEOUT, async {
+                    while tui.clipboard.is_busy() {
+                        tui.clipboard.poll();
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            if change == "none" {
+                // Shift+Insert is a native paste shortcut only on Windows.
+                let other = if cfg!(windows) && key == ctrl_v {
+                    KeyEvent::new(shift_insert, KeyModifiers::SHIFT)
+                } else {
+                    KeyEvent::new(ctrl_v, KeyModifiers::CONTROL)
+                };
+                app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(other))
+                    .await
+                    .unwrap();
+            }
+        } else if change == "none" {
             app.handle_tui_event(&mut tui, &mut server, TuiEvent::Mouse(click))
                 .await
                 .unwrap();
@@ -348,7 +406,8 @@ async fn right_click_paste_uses_normal_input_and_discards_stale_reads() {
             )
             .await
             .unwrap();
-        } else if change == "native" {
+        }
+        if change == "native" {
             app.handle_tui_event(&mut tui, &mut server, TuiEvent::Paste("native".into()))
                 .await
                 .unwrap();
@@ -356,8 +415,16 @@ async fn right_click_paste_uses_normal_input_and_discards_stale_reads() {
             app.chat_widget.apply_external_edit("replacement".into());
         } else if change == "disable" {
             app.local_settings.tui.right_click_paste = RightClickPaste::Off;
+        } else if change == "click" {
+            app.handle_tui_event(&mut tui, &mut server, TuiEvent::Mouse(click))
+                .await
+                .unwrap();
+        } else if change == "readonly" {
+            app.chat_widget.set_parent_owned_thread();
         }
-        release.send(()).unwrap();
+        if !read_completed {
+            release.send(()).unwrap();
+        }
         tokio::time::timeout(SETUP_TIMEOUT, async {
             while tui.clipboard.is_busy() {
                 app.handle_tui_event(&mut tui, &mut server, TuiEvent::Draw)
@@ -368,7 +435,25 @@ async fn right_click_paste_uses_normal_input_and_discards_stale_reads() {
         })
         .await
         .unwrap();
-        assert_eq!(app.chat_widget.composer_text_with_pending(), expected);
+        app.handle_tui_event(&mut tui, &mut server, TuiEvent::Draw)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.chat_widget.composer_text_with_pending(),
+            expected,
+            "{shortcut:?} {change}"
+        );
+        if shortcut.is_some() && change == "none" {
+            insta::assert_snapshot!(
+                "shortcut_clipboard_paste",
+                crate::chatwidget::tests::helpers::normalize_snapshot_paths(
+                    crate::chatwidget::tests::helpers::render_bottom_popup(
+                        &app.chat_widget,
+                        /*width*/ 80
+                    )
+                )
+            );
+        }
     }
 }
 
@@ -380,9 +465,11 @@ fn expired_text_read_rejects_backlog_and_discards_late_completion() {
         .start(
             FrameRequester::test_dummy(),
             |_, _, _| unreachable!(),
-            move |_| {
-                released.recv().unwrap();
-                Ok("late".into())
+            move || {
+                move |_| {
+                    released.recv().unwrap();
+                    Ok("late".into())
+                }
             },
         )
         .unwrap();

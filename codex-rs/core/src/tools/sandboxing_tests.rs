@@ -9,6 +9,7 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::GranularApprovalConfig;
+use codex_protocol::sandbox::SandboxOverride;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
@@ -214,7 +215,7 @@ fn deny_read_preserves_the_sandbox_for_explicit_escalation_and_blocks_policy_byp
     );
     assert!(!unsandboxed_execution_allowed(&file_system_policy));
     assert!(matches!(
-        SandboxOverride::EscalatedSandboxWithRestrictions.ensure_native_sandbox(SandboxType::None),
+        ensure_native_sandbox(SandboxOverride::EscalatedSandboxWithRestrictions, SandboxType::None),
         Err(ToolError::Rejected(reason)) if reason.contains("requires an available filesystem sandbox"),
     ));
     assert_eq!(
@@ -430,8 +431,8 @@ fn linux_platform_keeps_sandboxed_first_attempt() {
     );
 }
 
-#[test]
-fn windows_sandbox_env_preserves_denied_reads_or_rejects_unsupported_backend() {
+#[tokio::test]
+async fn windows_sandbox_env_preserves_denied_reads_or_rejects_unsupported_backend() {
     let temp_dir = tempfile::TempDir::new().expect("create sandbox workspace");
     let cwd = AbsolutePathBuf::from_absolute_path(
         dunce::canonicalize(temp_dir.path()).expect("canonicalize sandbox workspace"),
@@ -473,6 +474,7 @@ fn windows_sandbox_env_preserves_denied_reads_or_rejects_unsupported_backend() {
     let cwd_uri = PathUri::from_abs_path(&cwd);
     let manager = SandboxManager::new();
     let mut attempt = SandboxAttempt {
+        sandbox_override: SandboxOverride::NoOverride,
         sandbox: SandboxType::WindowsRestrictedToken,
         sandbox_requested: true,
         permissions: &permissions,
@@ -508,6 +510,7 @@ fn windows_sandbox_env_preserves_denied_reads_or_rejects_unsupported_backend() {
             /*network*/ None,
             /*environment_id*/ None,
         )
+        .await
         .expect("prepare elevated Windows sandbox request");
     let overrides = request
         .windows_sandbox_filesystem_overrides
@@ -524,6 +527,7 @@ fn windows_sandbox_env_preserves_denied_reads_or_rejects_unsupported_backend() {
             /*network*/ None,
             /*environment_id*/ None,
         )
+        .await
         .expect_err("restricted-token Windows sandbox cannot enforce deny-read restrictions");
     assert_eq!(
         error.to_string(),
@@ -531,8 +535,8 @@ fn windows_sandbox_env_preserves_denied_reads_or_rejects_unsupported_backend() {
     );
 }
 
-#[test]
-fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
+#[tokio::test]
+async fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
     let cwd: AbsolutePathBuf = std::env::current_dir()
         .expect("current dir")
         .try_into()
@@ -544,6 +548,7 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&cwd));
     let manager = SandboxManager::new();
     let mut attempt = SandboxAttempt {
+        sandbox_override: SandboxOverride::NoOverride,
         sandbox: SandboxType::None,
         sandbox_requested: true,
         permissions: &permissions,
@@ -578,6 +583,7 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
     };
     let request = attempt
         .env_for_exec_server(command(), options())
+        .await
         .expect("prepare remote exec request");
     assert!(!attempt.is_escalated());
 
@@ -594,6 +600,7 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
     assert_eq!(
         request.exec_server_sandbox,
         Some(codex_exec_server::FileSystemSandboxContext {
+            sandbox_override: SandboxOverride::NoOverride,
             permissions: exec_server_permissions.clone(),
             cwd: cwd_uri.clone(),
             workspace_roots: vec![cwd_uri.clone()],
@@ -615,9 +622,22 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         Some(managed_network.clone())
     );
 
+    attempt.sandbox_override = SandboxOverride::EscalatedSandboxWithRestrictions;
+    let escalated_request = attempt
+        .env_for_exec_server(command(), options())
+        .await
+        .expect("prepare approved escalation with retained sandbox restrictions");
+    let mut expected_context = request.exec_server_sandbox.expect("sandbox context");
+    expected_context.sandbox_override = SandboxOverride::EscalatedSandboxWithRestrictions;
+    assert_eq!(
+        escalated_request.exec_server_sandbox,
+        Some(expected_context)
+    );
+
     attempt.sandbox_requested = false;
     let request = attempt
         .env_for_exec_server(command(), options())
+        .await
         .expect("prepare unsandboxed remote exec request");
     assert!(attempt.is_escalated());
 

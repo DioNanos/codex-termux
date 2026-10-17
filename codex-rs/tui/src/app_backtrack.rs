@@ -166,13 +166,21 @@ impl App {
             return;
         }
         let _ = tui.enter_alt_screen();
-        self.overlay = Some(Overlay::new_transcript(
-            self.transcript_cells.clone(),
-            self.keymap.pager.clone(),
-            self.local_settings
-                .copy_on_select(&codex_terminal_detection::terminal_info()),
-            self.local_settings.tui.mouse_scroll_speed.unwrap_or(1.0),
-        ));
+        self.overlay = Some(
+            Overlay::new_transcript(
+                self.transcript_cells.clone(),
+                self.keymap.pager.clone(),
+                self.local_settings
+                    .copy_on_select(&codex_terminal_detection::terminal_info()),
+                self.local_settings
+                    .tui
+                    .mouse_scroll_speed
+                    .unwrap_or(/*default*/ 1.0),
+            )
+            .with_copy_on_select_clear_selection(
+                self.local_settings.tui.copy_on_select_clear_selection,
+            ),
+        );
         if self.scrollback_has_older_history
             && let Some(Overlay::Transcript(overlay)) = self.overlay.as_mut()
         {
@@ -349,6 +357,12 @@ impl App {
     /// source of truth for the active cell and its cache invalidation key, and because `App` owns
     /// overlay lifecycle and frame scheduling for animations.
     fn overlay_forward_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
+        if matches!(
+            &event,
+            TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained
+        ) {
+            self.chat_widget.refresh_terminal_program_status();
+        }
         let width = tui.terminal.last_known_screen_size.width.max(/*other*/ 1);
         let footer = self.prompt_navigation_footer(width.saturating_sub(/*rhs*/ 2));
         if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {

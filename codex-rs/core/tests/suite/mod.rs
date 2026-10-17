@@ -80,6 +80,7 @@ mod cyber_exec_policy;
 mod daybreak_access;
 mod deprecation_notice;
 mod direct_tool_metadata;
+mod dynamic_tool_cancellation;
 mod exec;
 mod exec_policy;
 #[cfg(not(target_os = "windows"))]
@@ -96,8 +97,11 @@ mod guardian_checkpoint_migration;
 // Uses the same command-approval harness as guardian_review below.
 mod canonical_plugin_connectors;
 mod gateway_auth;
+mod guardian_connector_trust;
 #[cfg(not(target_os = "windows"))]
 mod guardian_context_budget;
+#[path = "guardian_cyber_access_program_tests.rs"]
+mod guardian_cyber_access_program;
 mod guardian_history;
 mod guardian_mcp_elicitation;
 #[cfg(not(target_os = "windows"))]
@@ -117,6 +121,7 @@ mod hooks;
 mod hooks_executor;
 #[cfg(not(target_os = "windows"))]
 mod hooks_mcp;
+mod hooks_plugin_policy_refresh;
 mod image_rollout;
 mod injected_models_cache;
 #[cfg(not(target_os = "windows"))]
@@ -158,6 +163,7 @@ mod multi_exec_server_sandbox;
 mod network_approval;
 mod openai_file_mcp;
 mod otel;
+mod output_token_replay;
 mod override_updates;
 mod pending_input;
 mod pending_input_persistence;
@@ -168,6 +174,7 @@ mod prompt_cache_key;
 mod prompt_caching;
 mod prompt_debug_tests;
 mod quota_exceeded;
+mod realtime_attachment;
 mod realtime_conversation;
 mod realtime_initial_items;
 mod realtime_misalignment;
@@ -203,7 +210,6 @@ mod search_tool;
 mod settings_commits;
 mod settings_constraints;
 mod shell_snapshot;
-mod skill_approval;
 mod skills;
 mod skills_extension;
 mod spawn_agent_description;
@@ -221,6 +227,7 @@ mod token_usage_rollout;
 mod tool_harness;
 mod tool_lifecycle;
 mod tool_parallelism;
+mod tool_registration_metrics;
 mod tools;
 mod truncation;
 #[path = "turn_error_details_tests.rs"]
@@ -237,8 +244,6 @@ mod unified_exec_mxc_powershell;
 mod unified_exec_process_events;
 mod unified_exec_stdin_approval;
 mod unified_exec_stdin_review_size;
-#[cfg(unix)]
-mod unified_exec_zsh_fork_approvals;
 mod unstable_features_warning;
 mod user_notification;
 mod user_shell_cmd;
@@ -249,8 +254,6 @@ mod web_search;
 mod web_search_system_proxy;
 mod websocket_fallback;
 mod window_headers;
-#[cfg(target_os = "windows")]
-mod windows_sandbox;
 mod workspace_roots;
 mod worktree_trust;
 

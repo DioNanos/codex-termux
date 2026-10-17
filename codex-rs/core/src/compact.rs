@@ -62,6 +62,10 @@ pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 
+/// Thread-local policy that preserves inherited context without changing model or skill budgets.
+/// Insert into `StartThreadOptions::thread_extension_init` to disable automatic compaction.
+pub struct AutoCompactionDisabled;
+
 /// Metadata for a new compaction checkpoint, kept separate from its replacement history.
 ///
 /// `Session::replace_compacted_history` assigns missing item IDs before constructing the persisted
@@ -332,7 +336,13 @@ async fn run_compact_task_inner_impl(
             {
                 return Err(err);
             }
-            Err(e) if matches!(e.details(), CodexErrorDetails::SessionBudgetExceeded) => {
+            Err(e)
+                if matches!(
+                    e.details(),
+                    CodexErrorDetails::SessionBudgetExceeded
+                        | CodexErrorDetails::ResponseIncomplete(_)
+                ) =>
+            {
                 return Err(e);
             }
             Err(e) if matches!(e.details(), CodexErrorDetails::ContextWindowExceeded) => {
@@ -538,7 +548,7 @@ pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
     let mut pieces = Vec::new();
     for item in content {
         match item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
                 if !text.is_empty() {
                     pieces.push(text.as_str());
                 }
@@ -602,11 +612,26 @@ pub(crate) fn is_summary_message(message: &str) -> bool {
     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
 }
 
+pub(crate) fn is_real_user_or_agent_message(item: &ResponseItem) -> bool {
+    if let ResponseItem::AgentMessage { content, .. } = item {
+        return !matches!(
+            content.first(),
+            Some(AgentMessageInputContent::InputText { text })
+                if text.starts_with("Message Type: FINAL_ANSWER\n")
+        );
+    }
+    matches!(item, ResponseItem::Message { role, .. } if role == "user")
+        && matches!(
+            crate::event_mapping::parse_turn_item(item),
+            Some(TurnItem::UserMessage(user)) if !is_summary_message(&user.message())
+        )
+}
+
 /// Inserts canonical initial context into compacted replacement history at the
 /// model-expected boundary.
 ///
 /// Placement rules:
-/// - Prefer immediately before the last real user or agent message.
+/// - Prefer immediately before the last real user, agent message, or retained standalone output.
 /// - If no real user messages remain, insert before the compaction summary so
 ///   the summary stays last.
 /// - If there are no user messages, insert before the last compaction item so
@@ -619,27 +644,20 @@ pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
     let mut last_user_or_summary_index = None;
     let mut last_real_user_index = None;
     for (i, item) in compacted_history.iter().enumerate().rev() {
-        if let ResponseItem::AgentMessage { content, .. } = &item.item
-            && !matches!(
-                content.first(),
-                Some(AgentMessageInputContent::InputText { text })
-                    if text.starts_with("Message Type: FINAL_ANSWER\n")
-            )
+        if crate::compact_retained_tool_outputs::is_retained_tool_output(item)
+            || is_real_user_or_agent_message(&item.item)
         {
             last_real_user_index = Some(i);
             break;
         }
-        let Some(TurnItem::UserMessage(user)) = crate::event_mapping::parse_turn_item(&item.item)
-        else {
-            continue;
-        };
         // Compaction summaries are encoded as user messages, so track both:
         // the last real user message (preferred insertion point) and the last
         // user-message-like item (fallback summary insertion point).
-        last_user_or_summary_index.get_or_insert(i);
-        if !is_summary_message(&user.message()) {
-            last_real_user_index = Some(i);
-            break;
+        if matches!(
+            crate::event_mapping::parse_turn_item(&item.item),
+            Some(TurnItem::UserMessage(_))
+        ) {
+            last_user_or_summary_index.get_or_insert(i);
         }
     }
     let last_compaction_index = compacted_history
@@ -733,6 +751,8 @@ fn build_compacted_history_with_limit(
             }
             selected_messages.push(ResponseItemEnvelope {
                 item: ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: id.clone(),
                     role: "user".to_owned(),
                     content,
@@ -850,7 +870,18 @@ async fn drain_to_completed(
                 });
             }
             Ok(_) => continue,
-            Err(e) => return Err(e),
+            Err(e) => {
+                if let CodexErrorDetails::ResponseIncomplete(incomplete) = e.details() {
+                    sess.record_incomplete_response_usage(
+                        turn_context,
+                        &turn_context.initial_settings,
+                        incomplete,
+                    )
+                    .await;
+                    sess.send_token_count_event(turn_context).await;
+                }
+                return Err(e);
+            }
         }
     }
 }

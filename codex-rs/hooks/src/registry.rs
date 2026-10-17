@@ -61,10 +61,10 @@ pub struct Hooks {
     // TODO: Once legacy `notify` is removed, capture this snapshot in `CommandHookRuntime::new`
     // and remove the environment plumbing from `Hooks` and `from_config`.
     environment: Arc<Vec<(OsString, OsString)>>,
-    after_agent: Vec<Hook>,
+    after_agent: Arc<[Hook]>,
     engine: ClaudeHooksEngine,
-    plugin_hook_sources: Vec<PluginHookSource>,
-    plugin_hook_load_warnings: Vec<String>,
+    plugin_hook_sources: Arc<[PluginHookSource]>,
+    plugin_hook_load_warnings: Arc<[String]>,
 }
 
 impl Hooks {
@@ -144,8 +144,8 @@ impl Hooks {
             environment,
             after_agent,
             engine,
-            plugin_hook_sources: config.plugin_hook_sources,
-            plugin_hook_load_warnings: config.plugin_hook_load_warnings,
+            plugin_hook_sources: config.plugin_hook_sources.into(),
+            plugin_hook_load_warnings: config.plugin_hook_load_warnings.into(),
         }
     }
 

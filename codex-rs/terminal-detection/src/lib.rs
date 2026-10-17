@@ -248,7 +248,8 @@ pub fn terminal_info() -> TerminalInfo {
 /// - `TERM_PROGRAM` (plus `TERM_PROGRAM_VERSION`) drives the detected terminal name,
 ///   except when it identifies tmux rather than the underlying terminal.
 ///   This means `TERM_PROGRAM` can mask later probes (for example `WT_SESSION`).
-/// - Next, terminal-specific variables (WEZTERM, iTerm2, Apple Terminal, kitty, etc.) are checked.
+/// - Next, terminal-specific variables (WEZTERM, iTerm2, kitty, etc.) are checked.
+///   `TERM_SESSION_ID` is not terminal-specific and cannot identify Apple Terminal.
 /// - Finally, `TERM` is used as the capability fallback.
 fn detect_terminal_info_from_env(env: &dyn Environment) -> TerminalInfo {
     let multiplexer = detect_multiplexer(env);
@@ -272,14 +273,6 @@ fn detect_terminal_info_from_env(env: &dyn Environment) -> TerminalInfo {
 
     if env.has("ITERM_SESSION_ID") || env.has("ITERM_PROFILE") || env.has("ITERM_PROFILE_NAME") {
         return TerminalInfo::from_name(TerminalName::Iterm2, /*version*/ None, multiplexer);
-    }
-
-    if env.has("TERM_SESSION_ID") {
-        return TerminalInfo::from_name(
-            TerminalName::AppleTerminal,
-            /*version*/ None,
-            multiplexer,
-        );
     }
 
     if env.has("KITTY_WINDOW_ID")

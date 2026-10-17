@@ -340,6 +340,7 @@ struct SessionPickerViewPersistence {
 struct SessionPickerRunOptions {
     use_theme_colors: bool,
     copy_on_select: bool,
+    copy_on_select_clear_selection: bool,
     mouse_scroll_speed: f64,
     show_all: bool,
     filter_cwd: Option<PathBuf>,
@@ -452,6 +453,7 @@ async fn run_resume_picker_with_launch_context(
     let options = SessionPickerRunOptions {
         use_theme_colors: local_settings.tui.status_line_use_colors,
         copy_on_select: local_settings.copy_on_select(&codex_terminal_detection::terminal_info()),
+        copy_on_select_clear_selection: local_settings.tui.copy_on_select_clear_selection,
         mouse_scroll_speed: local_settings.tui.mouse_scroll_speed.unwrap_or(1.0),
         show_all,
         filter_cwd: cwd_filter,
@@ -513,6 +515,7 @@ pub async fn run_fork_picker_with_app_server(
     let options = SessionPickerRunOptions {
         use_theme_colors: local_settings.tui.status_line_use_colors,
         copy_on_select: local_settings.copy_on_select(&codex_terminal_detection::terminal_info()),
+        copy_on_select_clear_selection: local_settings.tui.copy_on_select_clear_selection,
         mouse_scroll_speed: local_settings.tui.mouse_scroll_speed.unwrap_or(1.0),
         show_all,
         filter_cwd: cwd_filter,
@@ -569,6 +572,7 @@ async fn run_session_picker_with_loader(
     state.local_filter_cwd = options.local_filter_cwd;
     state.use_theme_colors = options.use_theme_colors;
     state.copy_on_select = options.copy_on_select;
+    state.copy_on_select_clear_selection = options.copy_on_select_clear_selection;
     state.mouse_scroll_speed = options.mouse_scroll_speed;
     state.worktrees_enabled = options.worktrees_enabled;
     state.density = options.initial_density;
@@ -596,6 +600,11 @@ async fn run_session_picker_with_loader(
             Some(ev) = tui_events.next() => {
                 alt.tui.clipboard.poll();
                 let screen_size = alt.tui.screen_size_for_event(&ev)?;
+                if matches!(&ev, TuiEvent::Paste(_) | TuiEvent::FocusLost)
+                    || matches!(&ev, TuiEvent::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved)
+                {
+                    state.chord_matcher.cancel();
+                }
                 let ev = if let TuiEvent::Key(key) = ev {
                     let Some(key) = state.route_key_chord(key) else {
                         continue;
@@ -843,6 +852,7 @@ struct PickerState {
     clock_format: ClockFormat,
     use_theme_colors: bool,
     copy_on_select: bool,
+    copy_on_select_clear_selection: bool,
     mouse_scroll_speed: f64,
     // Resolve local filesystem membership once per cwd for each page-loading cycle.
     local_cwd_matches: HashMap<PathBuf, bool>,
@@ -1045,6 +1055,7 @@ impl PickerState {
             clock_format: ClockFormat::system(),
             use_theme_colors: true,
             copy_on_select: false,
+            copy_on_select_clear_selection: false,
             mouse_scroll_speed: 1.0,
             requester,
             relative_time_reference: None,
@@ -1152,10 +1163,12 @@ impl PickerState {
             self.keymap.pager.clone(),
             self.copy_on_select,
             self.mouse_scroll_speed,
-        );
+        )
+        .with_copy_on_select_clear_selection(self.copy_on_select_clear_selection);
         if let Overlay::Transcript(view) = &mut overlay {
             view.set_keymap_bindings(&self.keymap);
         }
+        self.chord_matcher.cancel();
         self.overlay = Some(overlay);
         self.pending_transcript_open = None;
         self.transcript_loading_frame_shown = false;
@@ -1576,6 +1589,7 @@ impl PickerState {
                     self.transcript_cells
                         .insert(thread_id, SessionTranscriptState::Failed);
                     if self.pending_transcript_open == Some(thread_id) {
+                        self.chord_matcher.cancel();
                         self.pending_transcript_cancellation = None;
                         self.pending_transcript_open = None;
                         self.transcript_loading_frame_shown = false;
@@ -1652,6 +1666,7 @@ impl PickerState {
     }
 
     fn apply_filter(&mut self) {
+        self.chord_matcher.cancel();
         let base_iter = self
             .all_rows
             .iter()
@@ -2090,6 +2105,7 @@ fn thread_list_params(
     use_state_db_only: bool,
 ) -> ThreadListParams {
     ThreadListParams {
+        excluded_thread_ids: None,
         originators: None,
         cursor,
         limit: Some(PAGE_SIZE as u32),

@@ -24,7 +24,7 @@ mod settings;
 pub use assessment::GuardianAssessment;
 pub use assessment::guardian_output_contract_prompt;
 pub use assessment::guardian_output_schema;
-pub(crate) use assessment::parse_guardian_assessment;
+pub use assessment::parse_guardian_assessment;
 pub(crate) use circuit_breaker::AUTO_REVIEW_DENIAL_WINDOW_SIZE;
 pub(crate) use circuit_breaker::GuardianRejectionCircuitBreaker;
 pub(crate) use circuit_breaker::GuardianRejectionCircuitBreakerAction;
@@ -59,6 +59,7 @@ pub use execution::start_review_turn;
 pub use execution::wait_for_guardian_review;
 pub use settings::ReviewerConfig;
 pub use settings::ReviewerTurn;
+pub use settings::guardian_cyber_access_program;
 pub use settings::reviewer_permission_profile;
 pub use settings::reviewer_tool_policy;
 

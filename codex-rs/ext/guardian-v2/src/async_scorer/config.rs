@@ -24,7 +24,7 @@ use super::transcript::TranscriptSource;
 pub(crate) const DEFAULT_MODEL_CONTEXT_ITEM_TOKENS: usize = 10_000;
 pub(crate) const DEFAULT_PARENT_COMPACTION_TOKENS: usize = 25_000;
 const MIN_MODEL_CONTEXT_ITEM_TOKENS: usize = 100;
-const MAX_MODEL_CONTEXT_ITEM_TOKENS: usize = 100_000;
+pub(super) const MAX_MODEL_CONTEXT_ITEM_TOKENS: usize = 100_000;
 const DEFAULT_REVIEW_THRESHOLD: f64 = 0.5;
 const LEGACY_REVIEW_THRESHOLD: f64 = 0.8;
 const DEFAULT_MAX_TOOL_CALL_LAG: usize = 2;

@@ -21,6 +21,18 @@ async fn auto_daemon_start_attaches_to_shared_server() -> Result<()> {
 
 #[tokio::test]
 #[cfg(unix)]
+async fn agents_can_offer_restart_for_managed_daemon() -> Result<()> {
+    daemon_startup("agents").await
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn discovered_managed_daemon_can_restart_with_auto_start_disabled() -> Result<()> {
+    daemon_startup("discovered").await
+}
+
+#[tokio::test]
+#[cfg(unix)]
 async fn incompatible_daemon_can_cancel() -> Result<()> {
     daemon_startup("mismatch-cancel").await
 }
@@ -164,8 +176,14 @@ async fn daemon_startup(command: &str) -> Result<()> {
          suppress_unstable_features_warning = true\nanalytics.enabled = false\n\
          windows.sandbox = \"unelevated\"\n\
          tui.disable_paste_burst = true\n\
+         {}\n\
          notice.model_migrations.\"gpt-5.6-terra\" = \"gpt-6-sol\"\n\
          [projects.{}]\ntrust_level = \"trusted\"\n",
+            if command == "discovered" {
+                "tui.status_line=[\"model\",\"thread-id\",\"thread-name\"]"
+            } else {
+                ""
+            },
             serde_json::to_string(&workspace_path)?,
         ),
     )?;
@@ -201,7 +219,11 @@ async fn daemon_startup(command: &str) -> Result<()> {
     env.insert("TERM".into(), "xterm-256color".into());
     let mut args = vec!["--no-alt-screen".to_string()];
     let mut steps: VecDeque<(&str, &[u8])> = VecDeque::new();
-    if matches!(command, "start" | "bedrock-running" | "restrictive-job") || mismatch {
+    if matches!(
+        command,
+        "start" | "agents" | "discovered" | "bedrock-running" | "restrictive-job"
+    ) || mismatch
+    {
         // A selected package with a stopped daemon avoids installing a release.
         let package_dir = home.path().join(format!("packages/{STATE_DIR_NAME}"));
         let managed =
@@ -235,7 +257,9 @@ async fn daemon_startup(command: &str) -> Result<()> {
     }
     let pid_file = home.path().join(format!("{STATE_DIR_NAME}/daemon.pid"));
     let result = async {
-        let mut existing_daemon = if command == "bedrock-running" || (mismatch && !disabling) {
+        let mut existing_daemon = if matches!(command, "bedrock-running" | "discovered")
+            || (mismatch && !disabling)
+        {
             let started = Command::new(&codex)
                 .env_clear()
                 .envs(&env)
@@ -253,6 +277,22 @@ async fn daemon_startup(command: &str) -> Result<()> {
         };
         let expected = if command == "start" {
             // The draft header is visible before the session's command composer is ready.
+            steps.push_back(("GPT-5.6-Terra", b"/status\r"));
+            "Server:Localbackgroundserver"
+        } else if command == "agents" {
+            args.push("agents".into());
+            steps.push_back(("Notasksyet", b"\x1b"));
+            steps.push_back(("GPT-5.6-Terra", b"/daemon\r"));
+            steps.push_back(("Restartbackgroundserver", b"\x1b[F\r"));
+            "Restartbackgroundserver?"
+        } else if command == "discovered" {
+            args.extend(["--disable".into(), "daemon_auto_start".into()]);
+            // Empty drafts need not survive a daemon restart. Renaming materializes the
+            // thread; wait for the confirmed footer name, not the echoed command.
+            steps.push_back(("GPT-5.6-Terra", b"/rename daemon-restart-test\r"));
+            steps.push_back(("·daemon-restart-test", b"/daemon\r"));
+            steps.push_back(("Restartbackgroundserver", b"2"));
+            steps.push_back(("Restartbackgroundserver?", b"2\r"));
             steps.push_back(("GPT-5.6-Terra", b"/status\r"));
             "Server:Localbackgroundserver"
         } else if elevated_launch || command == "restrictive-job" && elevated {
@@ -356,6 +396,27 @@ async fn daemon_startup(command: &str) -> Result<()> {
                 if let Some((ready, input)) = steps.front()
                     && text.contains(ready)
                 {
+                    if command == "discovered" {
+                        if *ready == "Restartbackgroundserver?" {
+                            existing_daemon = Some(fs::read(&pid_file)?);
+                        } else if *ready == "GPT-5.6-Terra" {
+                            // The header renders before thread/start completes. Wait for the
+                            // live status line to confirm there is a session to reconnect.
+                            if !screen.screen().contents().split_whitespace().any(|part| {
+                                codex_protocol::ThreadId::from_string(part).is_ok()
+                            }) {
+                                continue;
+                            }
+                            // The old header can linger while the daemon stops. Do not send
+                            // /status until the new process is up and reconnect has finished.
+                            if steps.len() == 1
+                                && (!fs::read(&pid_file).is_ok_and(|pid| Some(pid) != existing_daemon)
+                                    || text.contains("Reconnecting"))
+                            {
+                                continue;
+                            }
+                        }
+                    }
                     if disabling && *ready == "Backgroundserverhasincompatiblefeaturesettings" {
                         existing_daemon = Some(fs::read(&pid_file)?);
                         let settings: serde_json::Value = serde_json::from_slice(&fs::read(home.path().join(format!("{STATE_DIR_NAME}/settings.json")))?)?;
@@ -391,6 +452,9 @@ async fn daemon_startup(command: &str) -> Result<()> {
                     } else if command == "start" {
                         ensure!(text.contains("Server:Localbackgroundserver"));
                         ensure!(home.path().join(format!("{STATE_DIR_NAME}/daemon.pid")).exists());
+                    } else if command == "discovered" {
+                        let previous_pid = existing_daemon.as_ref().context("missing original daemon PID")?;
+                        ensure!(fs::read(&pid_file)? != *previous_pid, "daemon PID did not change");
                     } else if let Some(existing_daemon) = &existing_daemon {
                         ensure!(fs::read(&pid_file)? == *existing_daemon);
                     } else if elevated_launch {

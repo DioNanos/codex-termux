@@ -20,6 +20,7 @@ use codex_protocol::mcp::is_node_repl_backed_connector;
 use codex_protocol::openai_models::GuardianReviewMode;
 use codex_protocol::openai_models::GuardianScope;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::turn_input::CyberAccessProgram;
 
 use super::action::ActionRenderError;
 use super::action::GuardianAction;
@@ -37,6 +38,18 @@ use super::score::GuardianV2ScoreProgress;
 use codex_protocol::openai_models::GuardianUnscoredAction as UnscoredAction;
 
 impl GuardianV2Extension {
+    #[tracing::instrument(
+        name = "guardian_scoring_observation",
+        level = "debug",
+        skip_all,
+        fields(
+            thread_id = input.thread_store.level_id(),
+            turn_id = input.turn_id,
+            call_id = input.call_id,
+            tool_name = %input.tool_name,
+            tool_call_index = tracing::field::Empty,
+        )
+    )]
     pub(super) async fn score_tool(&self, input: ToolStartInput<'_>) {
         // Polling a code cell does not introduce another action or age its score.
         if input.tool_name.is_default_namespace() && input.tool_name.name == "wait" {
@@ -129,6 +142,7 @@ impl GuardianV2Extension {
             }
             None => (score_progress.observe(&input), Ok(None)),
         };
+        tracing::Span::current().record("tool_call_index", tool_call_index);
         let reservation = match reservation {
             Ok(reservation) => reservation,
             Err(error) => {
@@ -148,6 +162,10 @@ impl GuardianV2Extension {
         let thread_id = input.thread_store.level_id().to_owned();
         let turn_id = input.turn_id.to_owned();
         let root_turn_id = input.root_turn_id.map(str::to_owned);
+        let cyber_access_program = input
+            .turn_store
+            .get::<CyberAccessProgram>()
+            .map(|program| *program);
         let parent_response_id = input
             .turn_store
             .get::<codex_api::ResponseId>()
@@ -252,11 +270,20 @@ impl GuardianV2Extension {
         ) {
             Ok(compaction) => compaction,
             Err(error) => {
-                let (outcome, failure_reason) = if error == ParentCompactionError::RequiresSync {
-                    score_progress.invalidate(tool_call_index);
-                    ("skipped", None)
-                } else {
-                    ("failure", Some("parent_compaction_error"))
+                let (outcome, failure_reason) = match error {
+                    ParentCompactionError::RequiresSync => {
+                        score_progress.invalidate(tool_call_index);
+                        ("skipped", None)
+                    }
+                    ParentCompactionError::Serialization => {
+                        ("failure", Some("parent_compaction_serialization"))
+                    }
+                    ParentCompactionError::Oversized => {
+                        ("failure", Some("parent_compaction_oversized"))
+                    }
+                    ParentCompactionError::Unusable => {
+                        ("failure", Some("parent_compaction_unusable"))
+                    }
                 };
                 score_progress.fail_closed(sampled_at);
                 record_classification(
@@ -367,6 +394,7 @@ impl GuardianV2Extension {
             thread_id,
             turn_id,
             root_turn_id,
+            cyber_access_program,
             parent_response_id,
             manager,
             thread,

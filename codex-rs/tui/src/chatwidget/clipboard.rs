@@ -12,25 +12,18 @@ pub(super) enum PendingCopy {
 }
 
 impl ChatWidget {
-    pub(crate) fn paste_image(&mut self) {
-        match paste_image_to_temp_png() {
-            Ok((path, info)) => {
-                tracing::debug!(
-                    "pasted image size={}x{} format={}",
-                    info.width,
-                    info.height,
-                    info.encoded_format.label()
-                );
-                self.attach_image(path);
-            }
-            Err(err) => {
-                tracing::warn!("failed to paste image: {err}");
-                self.add_to_history(history_cell::new_error_event(format!(
-                    "Failed to paste image: {err}",
-                )));
-            }
-        }
+    pub(crate) fn paste_image(&mut self) -> Result<(), crate::clipboard_paste::PasteImageError> {
+        let result = paste_image_to_temp_png();
         self.suppress_image_paste_until = Instant::now() + IMAGE_PASTE_REPEAT_WINDOW;
+        let (path, info) = result?;
+        tracing::debug!(
+            "pasted image size={}x{} format={}",
+            info.width,
+            info.height,
+            info.encoded_format.label()
+        );
+        self.attach_image(path);
+        Ok(())
     }
 
     pub(super) fn show_clipboard_flash(&mut self, result: &CopyResult) {

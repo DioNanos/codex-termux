@@ -119,7 +119,7 @@ impl TextArea {
         self.vim_commands.replace_steps.clear();
     }
 
-    pub(super) fn replace_vim_text(&mut self, text: &str) {
+    pub(in crate::bottom_pane) fn replace_vim_text(&mut self, text: &str) {
         for grapheme in text.graphemes(/*is_extended*/ true) {
             let cursor_before = self.cursor_pos;
             while let Some(element) = self

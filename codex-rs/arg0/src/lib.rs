@@ -21,8 +21,6 @@ use tempfile::TempDir;
 const APPLY_PATCH_ARG0: &str = "apply_patch";
 const MISSPELLED_APPLY_PATCH_ARG0: &str = "applypatch";
 const CODEX_SELF_EXE_ENV: &str = "CODEX_SELF_EXE";
-#[cfg(unix)]
-const EXECVE_WRAPPER_ARG0: &str = "codex-execve-wrapper";
 const LOCK_FILENAME: &str = ".lock";
 
 /// Filesystems that do not support advisory file locking (observed on
@@ -71,6 +69,7 @@ pub struct Arg0DispatchPaths {
     /// instead of the real Codex CLI.
     pub codex_self_exe: Option<PathBuf>,
     pub codex_linux_sandbox_exe: Option<PathBuf>,
+    /// Always absent; retained for clients that still pass the retired wrapper path.
     pub main_execve_wrapper_exe: Option<PathBuf>,
 }
 
@@ -108,32 +107,6 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-
-    #[cfg(unix)]
-    if exe_name == EXECVE_WRAPPER_ARG0 {
-        let mut args = std::env::args();
-        let _ = args.next();
-        let file = match args.next() {
-            Some(file) => file,
-            None => std::process::exit(1),
-        };
-        let argv = args.collect::<Vec<_>>();
-
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(_) => std::process::exit(1),
-        };
-        let exit_code = runtime.block_on(
-            codex_shell_escalation::run_shell_escalation_execve_wrapper(file, argv),
-        );
-        match exit_code {
-            Ok(exit_code) => std::process::exit(exit_code),
-            Err(_) => std::process::exit(1),
-        }
-    }
 
     if exe_name == CODEX_LINUX_SANDBOX_ARG0 {
         // Safety: [`run_main`] never returns.
@@ -303,15 +276,13 @@ where
     Fut: Future<Output = anyhow::Result<()>>,
 {
     let paths = Arg0DispatchPaths {
+        main_execve_wrapper_exe: None,
         codex_self_exe: current_exe.clone(),
         codex_linux_sandbox_exe: if cfg!(target_os = "linux") {
             linux_sandbox_exe_path(path_entry_guard.as_ref(), current_exe)
         } else {
             None
         },
-        main_execve_wrapper_exe: path_entry_guard
-            .as_ref()
-            .and_then(|path_entry| path_entry.paths().main_execve_wrapper_exe.clone()),
     };
 
     let result = main_fn(paths).await;
@@ -416,9 +387,21 @@ fn prepare_path_entry_for_codex_aliases(
         }
     }
 
-    std::fs::create_dir_all(&codex_home)?;
-    // Use a CODEX_HOME-scoped temp root to avoid cluttering the top-level directory.
-    let temp_root = codex_home.join("tmp").join("arg0");
+    prepare_aliases_in_home(&codex_home, existing_path)
+}
+
+// The production entry point validates the home before reaching this filesystem seam.
+fn prepare_aliases_in_home(
+    codex_home: &Path,
+    existing_path: Option<OsString>,
+) -> std::io::Result<(Arg0PathEntryGuard, OsString)> {
+    std::fs::create_dir_all(codex_home)?;
+    // Windows and WSL can share CODEX_HOME without sharing a lock namespace.
+    // Keep each OS outside the legacy `tmp/arg0` root so older clients cannot
+    // delete these helpers while their owning process is still running.
+    let temp_root = codex_home
+        .join("tmp")
+        .join(format!("arg0-{}", std::env::consts::OS));
     std::fs::create_dir_all(&temp_root)?;
     #[cfg(unix)]
     {
@@ -457,8 +440,6 @@ fn prepare_path_entry_for_codex_aliases(
         MISSPELLED_APPLY_PATCH_ARG0,
         #[cfg(target_os = "linux")]
         CODEX_LINUX_SANDBOX_ARG0,
-        #[cfg(unix)]
-        EXECVE_WRAPPER_ARG0,
     ] {
         let exe = resolve_codex_self_exe().ok_or_else(|| {
             std::io::Error::new(
@@ -491,6 +472,7 @@ fn prepare_path_entry_for_codex_aliases(
     let updated_path_env_var = path_env_with_entry(path, existing_path);
 
     let paths = Arg0DispatchPaths {
+        main_execve_wrapper_exe: None,
         codex_self_exe: resolve_codex_self_exe(),
         codex_linux_sandbox_exe: {
             #[cfg(target_os = "linux")]
@@ -498,16 +480,6 @@ fn prepare_path_entry_for_codex_aliases(
                 Some(path.join(CODEX_LINUX_SANDBOX_ARG0))
             }
             #[cfg(not(target_os = "linux"))]
-            {
-                None
-            }
-        },
-        main_execve_wrapper_exe: {
-            #[cfg(unix)]
-            {
-                Some(path.join(EXECVE_WRAPPER_ARG0))
-            }
-            #[cfg(not(unix))]
             {
                 None
             }
@@ -737,9 +709,9 @@ mod tests {
             temp_dir,
             lock_file,
             Arg0DispatchPaths {
+                main_execve_wrapper_exe: None,
                 codex_self_exe: Some(PathBuf::from("/usr/bin/codex")),
                 codex_linux_sandbox_exe: Some(alias_path.clone()),
-                main_execve_wrapper_exe: None,
             },
         );
 
@@ -818,20 +790,16 @@ mod tests {
             temp_dir,
             lock_file,
             Arg0DispatchPaths {
+                main_execve_wrapper_exe: None,
                 codex_self_exe: Some(PathBuf::from("/usr/bin/codex")),
                 codex_linux_sandbox_exe: Some(alias_path.clone()),
-                main_execve_wrapper_exe: Some(alias_path),
             },
         );
 
         super::build_runtime()?.block_on(run_main_with_arg0_guard(
             /*path_entry_guard*/ Some(path_entry),
             Some(PathBuf::from("/usr/bin/codex")),
-            |paths| async move {
-                let alias_path = paths
-                    .codex_linux_sandbox_exe
-                    .or(paths.main_execve_wrapper_exe)
-                    .expect("unix dispatch should create at least one alias path");
+            |_paths| async move {
                 ensure!(
                     alias_path.exists(),
                     "alias path disappeared before main future was polled: {}",
@@ -848,6 +816,49 @@ mod tests {
                 Ok(())
             },
         ))
+    }
+
+    #[test]
+    fn helper_cleanup_is_isolated_from_other_platforms_and_legacy_clients() -> std::io::Result<()> {
+        let home = tempfile::tempdir()?;
+        let temporary = home.path().join("tmp");
+        let own_root = temporary.join(format!("arg0-{}", std::env::consts::OS));
+        let foreign_os = if cfg!(windows) { "linux" } else { "windows" };
+        let foreign_root = temporary.join(format!("arg0-{foreign_os}"));
+        let legacy_root = temporary.join("arg0");
+        // Unlocked foreign directories model a live peer whose lock is invisible
+        // to this kernel. Only stale directories in our own namespace may go.
+        for root in [&own_root, &foreign_root, &legacy_root] {
+            let stale = root.join("codex-arg0-existing");
+            fs::create_dir_all(&stale)?;
+            create_lock(&stale)?;
+            fs::write(stale.join("helper"), b"keep foreign helpers")?;
+        }
+
+        let (guard, _) = super::prepare_aliases_in_home(home.path(), /*existing_path*/ None)?;
+        assert!(!own_root.join("codex-arg0-existing").exists());
+        assert_eq!(
+            [&foreign_root, &legacy_root]
+                .map(|root| fs::read(root.join("codex-arg0-existing/helper")))
+                .into_iter()
+                .collect::<std::io::Result<Vec<_>>>()?,
+            vec![b"keep foreign helpers".to_vec(); 2],
+        );
+
+        // Older versions clean only this root. Run that cleanup while a new
+        // helper is live, then confirm the advertised helper remains usable.
+        janitor_cleanup(&legacy_root)?;
+        let helper = guard._temp_dir.path().join(if cfg!(windows) {
+            "apply_patch.bat"
+        } else {
+            "apply_patch"
+        });
+        assert!(helper.is_file());
+        assert_eq!(
+            fs::read(foreign_root.join("codex-arg0-existing/helper"))?,
+            b"keep foreign helpers",
+        );
+        Ok(())
     }
 
     #[test]
@@ -903,9 +914,8 @@ mod tests {
     #[test]
     fn resolve_codex_self_exe_falls_back_to_current_exe() {
         let current_exe = PathBuf::from("/tmp/current-exe");
-        let resolved =
-            resolve_codex_self_exe_with(/*override_path*/ None, Some(current_exe.clone()))
-                .expect("resolve codex self exe");
+        let resolved = resolve_codex_self_exe_with(None, Some(current_exe.clone()))
+            .expect("resolve codex self exe");
         assert_eq!(resolved, current_exe);
     }
 

@@ -271,6 +271,7 @@ metrics_exporter = {{ otlp-http = {{ endpoint = "{collector_url}/v1/metrics", pr
         )
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
+        .env("RUST_LOG", "error,codex_exec_server::remote=info")
         .args([
             "exec-server",
             "--remote",
@@ -281,7 +282,7 @@ metrics_exporter = {{ otlp-http = {{ endpoint = "{collector_url}/v1/metrics", pr
             "2",
         ])
         .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .kill_on_drop(true);
 
     let mut child = command.spawn()?;
@@ -290,7 +291,31 @@ metrics_exporter = {{ otlp-http = {{ endpoint = "{collector_url}/v1/metrics", pr
         .take()
         .ok_or_else(|| anyhow::anyhow!("remote exec-server stdin was not piped"))?;
 
-    let environment_websocket = accept_parent_lifetime_websocket(&listener, TEST_TIMEOUT).await?;
+    // An executor that exits during startup cannot reach the rendezvous. Report that
+    // exit immediately instead of hiding it behind the connection timeout.
+    let environment_websocket = tokio::select! {
+        status = child.wait() => {
+            let status = status.context("failed to wait for remote exec-server")?;
+            Err(anyhow::anyhow!("remote exec-server exited before connecting: {status}"))
+        }
+        result = accept_parent_lifetime_websocket(&listener, TEST_TIMEOUT) => result,
+    };
+    let environment_websocket = match environment_websocket {
+        Ok(websocket) => websocket,
+        Err(error) => {
+            let registration_requests = registry.received_requests().await.map(|requests| {
+                requests
+                    .iter()
+                    .filter(|request| request.url.path().ends_with("/register"))
+                    .count()
+            });
+            // Inspect only the stage reached, not request headers or bodies containing auth.
+            let child_status = child.try_wait();
+            return Err(error.context(format!(
+                "remote executor failed to attach (registration requests: {registration_requests:?}, child status: {child_status:?})"
+            )));
+        }
+    };
     // Remote startup must capture the version before registration, not on the first initialize.
     std::fs::write(&manifest, r#"{"version":"9.9.9"}"#)?;
     let executor_public_key = registered_parent_lifetime_executor_public_key(&registry).await?;
@@ -311,7 +336,9 @@ metrics_exporter = {{ otlp-http = {{ endpoint = "{collector_url}/v1/metrics", pr
     };
     let client_task =
         tokio::spawn(async move { ExecServerClient::connect_noise_rendezvous(harness_args).await });
-    let harness_websocket = accept_parent_lifetime_websocket(&listener, TEST_TIMEOUT).await?;
+    let harness_websocket = accept_parent_lifetime_websocket(&listener, TEST_TIMEOUT)
+        .await
+        .context("harness failed to attach")?;
     let relay_task = tokio::spawn(proxy_parent_lifetime_relay(
         environment_websocket,
         harness_websocket,
@@ -342,9 +369,12 @@ metrics_exporter = {{ otlp-http = {{ endpoint = "{collector_url}/v1/metrics", pr
 
     #[cfg(windows)]
     let argv = vec![
-        "cmd.exe",
-        "/C",
-        "if defined CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE (exit /b 1) else ping -n 61 127.0.0.1",
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "if (Test-Path Env:CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE) { exit 1 }; Start-Sleep -Seconds 60",
     ];
     #[cfg(not(windows))]
     let argv = vec![
@@ -385,15 +415,10 @@ metrics_exporter = {{ otlp-http = {{ endpoint = "{collector_url}/v1/metrics", pr
 
     drop(stdin);
 
-    let output = tokio::time::timeout(TEST_TIMEOUT, child.wait_with_output())
+    let status = tokio::time::timeout(TEST_TIMEOUT, child.wait())
         .await
         .map_err(|_| anyhow::anyhow!("remote exec-server did not exit after stdin closed"))??;
-    anyhow::ensure!(
-        output.status.success(),
-        "remote exec-server exited with {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
+    anyhow::ensure!(status.success(), "remote exec-server exited with {status}");
 
     relay_task.abort();
     let _ = relay_task.await;

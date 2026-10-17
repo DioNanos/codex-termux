@@ -7,7 +7,7 @@ use super::*;
 
 /// The selection to replace, or an empty range at the insertion cursor.
 /// Vim Replace without a selection computes its overwrite span as it inserts each grapheme.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct EditTarget {
     range: Range<usize>,
 }

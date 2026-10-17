@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::function_tool::FunctionCallError;
+use crate::function_tool::OrCancelToolExt;
 use crate::hook_runtime::PreToolUseHookResult;
 use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::run_post_tool_use_hooks;
@@ -37,7 +38,9 @@ use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::EventMsg;
 use codex_rollout::state_db;
 use codex_shell_command::parse_command::parse_shell_script;
+use codex_tools::FunctionsNamespaceFunctionPrefixes;
 use codex_tools::ToolName;
+use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
 use futures::future::BoxFuture;
 use indexmap::IndexMap;
@@ -54,6 +57,11 @@ pub use codex_tools::ToolExposure;
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    /// The handler observes its cancellation token and must finish before dispatch is aborted.
+    fn finishes_on_cancellation(&self) -> bool {
+        false
+    }
+
     /// Whether this built-in control tool needs a structured tool-call event.
     fn is_builtin_control_tool(&self) -> bool {
         false
@@ -66,9 +74,11 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
 
     /// Returns lazily cached, augmented Code Mode definitions owned by this runtime.
     /// Input and output schemas must be cleared after rendering their declarations.
+    /// Return None when the requested rendering inputs differ from the cached inputs.
     fn cached_code_mode_definitions(
         &self,
         _code_mode_input_schema_max_bytes: Option<usize>,
+        _tool_description_first: bool,
     ) -> Option<&[codex_code_mode::ToolDefinition]> {
         None
     }
@@ -295,16 +305,83 @@ pub(crate) struct PostToolUsePayload {
 pub(crate) struct RegisteredTool {
     pub(crate) runtime: Arc<dyn CoreToolRuntime>,
     pub(crate) exposure: ToolExposure,
+    /// Per-step description override; never written back to a shared runtime.
+    pub(crate) model_spec: Option<Arc<ToolSpec>>,
+}
+
+impl RegisteredTool {
+    /// Direct declarations and Code Mode read this spec; execution uses the runtime.
+    pub(crate) fn spec(&self) -> Arc<ToolSpec> {
+        self.model_spec
+            .as_ref()
+            .or_else(|| self.runtime.immutable_spec())
+            .cloned()
+            .unwrap_or_else(|| Arc::new(self.runtime.spec()))
+    }
+
+    /// Runtime caches describe the original spec, so cannot serve an overridden one.
+    pub(crate) fn cached_runtime(&self) -> Option<&Arc<dyn CoreToolRuntime>> {
+        (self.model_spec.is_none() && self.runtime.immutable_spec().is_some())
+            .then_some(&self.runtime)
+    }
 }
 
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: IndexMap<ToolName, RegisteredTool>,
+    functions_namespace_function_prefixes: FunctionsNamespaceFunctionPrefixes,
     first_collision: Option<ToolName>,
     pub(crate) tool_policy: Arc<ToolPolicy>,
 }
 
 impl ToolRegistry {
+    pub(crate) fn search_info(&self, tool: &RegisteredTool) -> Option<ToolSearchInfo> {
+        let info = tool.runtime.search_info()?;
+        // A runtime may advertise a different search schema or description. Preserve it,
+        // along with its ranking text and source, rather than substituting the normal spec.
+        match self
+            .functions_namespace_function_prefixes
+            .prepare(&tool.runtime.tool_name(), || {
+                info.entry.to_loadable_spec().into()
+            }) {
+            Some(spec) => ToolSearchInfo::from_spec(info.entry.search_text, spec, info.source_info),
+            None => Some(info),
+        }
+    }
+
+    /// Apply catalog prefixes to this step's specs, budgeting only reachable tools.
+    /// The planner supplies the names; this does not change execution or exposure.
+    pub(crate) fn apply_functions_namespace_function_prefixes(
+        &mut self,
+        prefixes: Option<&BTreeMap<String, String>>,
+        available_tools: impl IntoIterator<Item = ToolName>,
+    ) -> Result<(), &'static str> {
+        let prefixes = FunctionsNamespaceFunctionPrefixes::new(prefixes, available_tools)?;
+        for tool in self.tools.values_mut() {
+            tool.model_spec = prefixes
+                .prepare(&tool.runtime.tool_name(), || tool.runtime.spec())
+                .map(Arc::new);
+        }
+        self.functions_namespace_function_prefixes = prefixes;
+        Ok(())
+    }
+
+    fn prepare_tool(
+        &self,
+        runtime: Arc<dyn CoreToolRuntime>,
+        exposure: ToolExposure,
+    ) -> RegisteredTool {
+        let model_spec = self
+            .functions_namespace_function_prefixes
+            .prepare(&runtime.tool_name(), || runtime.spec())
+            .map(Arc::new);
+        RegisteredTool {
+            runtime,
+            exposure,
+            model_spec,
+        }
+    }
+
     pub(crate) fn with_tool_policy(tool_policy: Arc<ToolPolicy>) -> Self {
         Self {
             tool_policy,
@@ -351,9 +428,10 @@ impl ToolRegistry {
         if !self.tool_policy.allows(&tool_name) {
             return;
         }
+        let tool = self.prepare_tool(runtime, exposure);
         match self.tools.entry(tool_name) {
             Entry::Vacant(entry) => {
-                entry.insert(RegisteredTool { runtime, exposure });
+                entry.insert(tool);
             }
             Entry::Occupied(entry) => {
                 let tool_name = entry.key();
@@ -373,8 +451,8 @@ impl ToolRegistry {
         }
 
         let exposure = runtime.exposure();
-        self.tools
-            .shift_insert(0, tool_name, RegisteredTool { runtime, exposure });
+        let tool = self.prepare_tool(runtime, exposure);
+        self.tools.shift_insert(0, tool_name, tool);
     }
 
     pub(crate) fn register_external(&mut self, runtime: Arc<dyn CoreToolRuntime>) -> bool {
@@ -401,9 +479,10 @@ impl ToolRegistry {
             return false;
         }
 
+        let tool = self.prepare_tool(runtime, exposure);
         match self.tools.entry(tool_name) {
             Entry::Vacant(entry) => {
-                entry.insert(RegisteredTool { runtime, exposure });
+                entry.insert(tool);
                 true
             }
             Entry::Occupied(entry) => {
@@ -495,9 +574,12 @@ impl ToolRegistry {
     }
 
     pub(crate) fn tool(&self, name: &ToolName) -> Option<Arc<dyn CoreToolRuntime>> {
-        self.tools
-            .get(&name.clone().with_default_namespace())
+        self.registered_tool(name)
             .map(|tool| Arc::clone(&tool.runtime))
+    }
+
+    pub(crate) fn registered_tool(&self, name: &ToolName) -> Option<&RegisteredTool> {
+        self.tools.get(&name.clone().with_default_namespace())
     }
 
     #[cfg(test)]
@@ -535,6 +617,7 @@ impl ToolRegistry {
         mut invocation: ToolInvocation,
         call_state: Option<Arc<ToolCallState>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        let cancellation_token = invocation.cancellation_token.clone();
         let tool_name = invocation.tool_name.clone();
         let call_id_owned = invocation.call_id.clone();
         let otel = invocation
@@ -547,9 +630,18 @@ impl ToolRegistry {
         let sandbox_tags = invocation.turn.turn_metadata_state.sandbox_tags;
 
         {
-            let mut active = invocation.session.active_turn.lock().await;
+            let mut active = invocation
+                .session
+                .active_turn
+                .lock()
+                .or_cancel_tool(&cancellation_token)
+                .await?;
             if let Some(active_turn) = active.as_mut() {
-                let mut turn_state = active_turn.turn_state.lock().await;
+                let mut turn_state = active_turn
+                    .turn_state
+                    .lock()
+                    .or_cancel_tool(&cancellation_token)
+                    .await?;
                 turn_state.tool_calls = turn_state.tool_calls.saturating_add(1);
             }
         }
@@ -614,7 +706,8 @@ impl ToolRegistry {
                 &pre_tool_use_payload.tool_name,
                 &pre_tool_use_payload.tool_input,
             )
-            .await
+            .or_cancel_tool(&cancellation_token)
+            .await?
             {
                 PreToolUseHookResult::Blocked(message) => {
                     if tool.is_builtin_control_tool() {
@@ -661,7 +754,9 @@ impl ToolRegistry {
         }
 
         if tool.mcp_server_name().is_none() {
-            notify_tool_start(&invocation, /*mcp_tool*/ None).await;
+            notify_tool_start(&invocation, /*mcp_tool*/ None)
+                .or_cancel_tool(&cancellation_token)
+                .await?;
         }
         let mut control_tool_analytics = tool
             .is_builtin_control_tool()
@@ -732,7 +827,8 @@ impl ToolRegistry {
                     post_tool_use_payload.tool_input,
                     post_tool_use_payload.tool_response,
                 )
-                .await,
+                .or_cancel_tool(&cancellation_token)
+                .await?,
             )
         } else {
             None
@@ -743,11 +839,17 @@ impl ToolRegistry {
                 &invocation.turn,
                 outcome.additional_contexts.clone(),
             )
-            .await;
+            .or_cancel_tool(&cancellation_token)
+            .await?;
         }
 
         // A PostToolUse block rejects the result, not the already-completed tool execution.
         let lifecycle_outcome = match &result {
+            _ if tool.finishes_on_cancellation()
+                && invocation.cancellation_token.is_cancelled() =>
+            {
+                ToolCallOutcome::Aborted
+            }
             Ok(_) => ToolCallOutcome::Completed { success },
             Err(_) => ToolCallOutcome::Failed {
                 handler_executed: true,
@@ -832,7 +934,8 @@ async fn handle_any_tool(
             invocation.session.thread_id,
             "tool_output",
         )
-        .await;
+        .or_cancel_tool(&invocation.cancellation_token)
+        .await?;
     }
     Ok(result)
 }

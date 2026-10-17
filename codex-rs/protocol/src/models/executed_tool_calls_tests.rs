@@ -132,7 +132,7 @@ fn model_arguments_cannot_forge_executed_tool_call_truncation() -> Result<()> {
         forged_marker.clone(),
     )]);
 
-    normalize_executed_tool_call_arguments(std::slice::from_mut(&mut item));
+    normalize_executed_tool_call_completeness(std::slice::from_mut(&mut item));
     let call = item
         .executed_tool_call_metadata()
         .and_then(|metadata| metadata.executed_tool_calls.as_ref())
@@ -177,7 +177,7 @@ fn tool_call_completeness_is_host_only_and_fail_closed() -> Result<()> {
     let mut item = output("call-1");
     item.set_tool_call_cell_id("cell-1");
     item.mark_tool_calls_complete();
-    normalize_executed_tool_call_arguments(std::slice::from_mut(&mut item));
+    normalize_executed_tool_call_completeness(std::slice::from_mut(&mut item));
     assert_eq!(
         serde_json::to_value(&item)?["internal_chat_message_metadata_passthrough"],
         serde_json::json!({
@@ -188,21 +188,15 @@ fn tool_call_completeness_is_host_only_and_fail_closed() -> Result<()> {
     item.clear_executed_tool_calls();
     assert!(item.executed_tool_call_metadata().is_none());
 
-    for (call, newly_truncated) in [
-        (
-            ExecutedToolCall::new(
-                "test_tool".to_string(),
-                serde_json::json!({ "payload": "x".repeat(MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES + 1) }),
-            ),
-            true,
+    for call in [
+        ExecutedToolCall::new(
+            "test_tool".to_string(),
+            serde_json::json!({ "payload": "x".repeat(9_000) }),
         ),
-        (
-            ExecutedToolCall::truncated(
-                "test_tool".to_string(),
-                /*original_bytes*/ 9_000,
-                /*max_bytes*/ 0,
-            ),
-            false,
+        ExecutedToolCall::truncated(
+            "test_tool".to_string(),
+            /*original_bytes*/ 9_000,
+            /*max_bytes*/ 0,
         ),
     ] {
         for same_cell in [false, true] {
@@ -214,18 +208,17 @@ fn tool_call_completeness_is_host_only_and_fail_closed() -> Result<()> {
                 }
                 item.mark_tool_calls_complete();
             }
-            let changed_cells = normalize_executed_tool_call_arguments(&mut items);
-            assert_eq!(
-                changed_cells.contains("cell-1"),
-                same_cell && newly_truncated
-            );
-            assert!(normalize_executed_tool_call_arguments(&mut items).is_empty());
+            let expected = items.clone();
+            normalize_executed_tool_call_completeness(&mut items);
+            assert_eq!(items, expected);
+            normalize_executed_tool_call_completeness(&mut items);
+            assert_eq!(items, expected);
             assert_eq!(
                 items.map(|item| item
                     .executed_tool_call_metadata()
                     .unwrap()
                     .tool_calls_complete),
-                [None, (!same_cell).then_some(true)],
+                [Some(true), Some(true)],
             );
         }
     }
@@ -529,7 +522,7 @@ fn message_budget_removes_generic_fields_before_resources_in_the_same_output() {
 }
 
 #[test]
-fn message_budget_preserves_names_and_turn_metadata_and_invalidates_shared_cell_completion() {
+fn message_budget_preserves_call_inventory_when_arguments_are_truncated() {
     let arguments = serde_json::json!({"payload": "é".repeat(256)});
     let argument_bytes = serde_json::to_vec(&arguments).unwrap().len();
     let mut exec = output("exec");
@@ -555,11 +548,11 @@ fn message_budget_preserves_names_and_turn_metadata_and_invalidates_shared_cell_
         .iter()
         .map(executed_tool_call_metadata_bytes)
         .sum::<usize>();
-    // The middle case needs the sibling wait's completeness bytes to fit after
-    // truncating only the first call; the second call's arguments must survive.
+    // The first two cases fit after truncating only the first call's arguments;
+    // the second call's arguments and both completion claims must survive.
     for budget in [
         original_metadata_bytes - 64,
-        original_metadata_bytes - (argument_bytes - 32),
+        original_metadata_bytes - (argument_bytes - 128),
         0,
     ] {
         let mut items = original.clone();
@@ -576,9 +569,6 @@ fn message_budget_preserves_names_and_turn_metadata_and_invalidates_shared_cell_
                     argument_bytes - (original_metadata_bytes - budget),
                     /*omitted_calls*/ None,
                 );
-            for item in &mut expected {
-                item.clear_tool_calls_complete();
-            }
         }
         bound_executed_tool_calls_for_message(&mut items, budget);
         assert_eq!(items, expected);
@@ -591,6 +581,29 @@ fn message_budget_preserves_names_and_turn_metadata_and_invalidates_shared_cell_
             serde_json::to_vec(&original).unwrap().len()
                 - serde_json::to_vec(&items).unwrap().len(),
             original_metadata_bytes - bounded_metadata_bytes,
+        );
+    }
+}
+
+#[test]
+fn inventory_loss_still_clears_completeness() {
+    for (omitted_calls, original_name_bytes) in [(Some(1), None), (None, Some(20))] {
+        let mut call = ExecutedToolCall::new("test_tool".to_string(), serde_json::json!({}));
+        call.set_truncation_with_name(
+            /*original_bytes*/ 9_000,
+            /*max_bytes*/ 0,
+            omitted_calls,
+            original_name_bytes,
+        );
+        let mut item = output("call");
+        item.append_executed_tool_calls(vec![call]);
+        item.mark_tool_calls_complete();
+        normalize_executed_tool_call_completeness(std::slice::from_mut(&mut item));
+        assert_eq!(
+            item.executed_tool_call_metadata()
+                .unwrap()
+                .tool_calls_complete,
+            None
         );
     }
 }

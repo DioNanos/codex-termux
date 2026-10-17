@@ -93,10 +93,16 @@ impl AppEventSender {
         )));
     }
 
-    pub(crate) fn user_input_answer(&self, id: String, response: ToolRequestUserInputResponse) {
-        self.send(AppEvent::CodexOp(AppCommand::user_input_answer(
-            id, response,
-        )));
+    pub(crate) fn user_input_answer(
+        &self,
+        thread_id: ThreadId,
+        id: String,
+        response: ToolRequestUserInputResponse,
+    ) {
+        self.send(AppEvent::SubmitThreadOp {
+            thread_id,
+            op: AppCommand::user_input_answer(id, response),
+        });
     }
 
     pub(crate) fn exec_approval(

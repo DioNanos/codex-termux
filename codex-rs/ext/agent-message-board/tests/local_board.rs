@@ -624,6 +624,7 @@ async fn check_queries_enforce_page_and_preview_caps(backend: Backend) {
             root,
             CreateChannelRequest {
                 channel_name: "Straße".into(),
+                description: None,
                 subscription: SubscriptionChange::Unsubscribe,
             },
         )
@@ -655,7 +656,8 @@ async fn check_queries_enforce_page_and_preview_caps(backend: Backend) {
         )
         .await
         .unwrap();
-    assert_eq!(channels.results.len(), 1);
+    assert_eq!(channels.channels.results.len(), 1);
+    assert_eq!(channels.channels.results[0].description, None);
     let query = PostQuery {
         channel_name: None,
         query: Some("STRASSE".into()),
@@ -903,8 +905,11 @@ async fn check_queries_page_discussions_and_search_unicode(backend: Backend) {
         )
         .await
         .unwrap();
-    assert_eq!(channels.results[0].message_count, 3);
-    assert_eq!(channels.results[0].last_message_id, Some(reply.message_id));
+    assert_eq!(channels.channels.results[0].message_count, 3);
+    assert_eq!(
+        channels.channels.results[0].last_message_id,
+        Some(reply.message_id)
+    );
     assert!(
         board
             .read_thread(
@@ -993,11 +998,23 @@ async fn check_tools_cover_channel_discussions_subscriptions_and_escaped_preview
     let created = tool("create_channel")
         .handle(board_tool_call(
             "create_channel",
-            json!({"channel_name":"Workflow"}),
+            json!({"channel_name":"Workflow", "description":"é".repeat(256)}),
         ))
         .await
         .unwrap();
     let created: ChannelSummary = serde_json::from_str(&created.log_output()).unwrap();
+    assert_eq!(
+        created,
+        ChannelSummary {
+            channel_name: "Workflow".into(),
+            description: Some("é".repeat(256)),
+            permissions: None,
+            created_at: "2026-09-18T12:00:00Z".parse().unwrap(),
+            created_by: AgentPath::root(),
+            message_count: 0,
+            last_message_id: None,
+        }
+    );
     let channels = tool("get_channels")
         .handle(board_tool_call("get_channels", json!({"query":"WORK"})))
         .await
@@ -1197,6 +1214,22 @@ async fn check_tools_validate_arguments_deduplicate_calls_and_bound_unicode_resu
         assert!(tool(name).handle(limited).await.is_err());
     }
     assert!(
+        tool("create_channel")
+            .handle(call(
+                "create_channel",
+                json!({"channel_name":"too-long", "description":"é".repeat(257)}),
+            ))
+            .await
+            .is_err()
+    );
+    // Escaped descriptions must fit before creation, rather than failing after commit.
+    let mut small_budget = call(
+        "create_channel",
+        json!({"channel_name":"too-small-budget", "description":"\u{1}".repeat(512)}),
+    );
+    small_budget.truncation_policy = TruncationPolicy::Bytes(4096);
+    assert!(tool("create_channel").handle(small_budget).await.is_err());
+    assert!(
         tool("post")
             .handle(call(
                 "post",
@@ -1229,6 +1262,7 @@ async fn check_tools_validate_arguments_deduplicate_calls_and_bound_unicode_resu
             )
             .await
             .unwrap()
+            .channels
             .results
             .is_empty()
     );
@@ -1356,4 +1390,180 @@ async fn check_tools_validate_arguments_deduplicate_calls_and_bound_unicode_resu
             .len()
             <= 8000
     );
+}
+
+#[test]
+fn channel_descriptions_validate_construction_and_serialization() {
+    use serde_json::json;
+
+    let description = "é".repeat(256);
+    let request_json = json!({
+        "channel_name": "design",
+        "description": description,
+        "subscription": "Unsubscribe",
+    });
+    let request: CreateChannelRequest = serde_json::from_value(request_json.clone()).unwrap();
+    assert_eq!(
+        request.description,
+        Some(ChannelDescription::try_from(description).unwrap())
+    );
+    assert_eq!(serde_json::to_value(request).unwrap(), request_json);
+
+    let too_long = "é".repeat(257);
+    assert!(ChannelDescription::try_from(too_long.clone()).is_err());
+    assert!(
+        serde_json::from_value::<CreateChannelRequest>(json!({
+            "channel_name": "too-long",
+            "description": too_long,
+            "subscription": "Unsubscribe",
+        }))
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn channel_descriptions_migrate_legacy_storage_and_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let sqlite = SqliteConfig::new_for_testing(dir.path().to_path_buf().try_into().unwrap());
+    let root = ThreadId::new();
+    let host = Arc::new(Host {
+        clock: AtomicI64::default(),
+        agent_path_calls: AtomicUsize::default(),
+        members: [(root, AgentPath::root())].into(),
+        active: AtomicBool::new(true),
+        fail_notifications: AtomicBool::new(false),
+        notifications: Mutex::default(),
+    });
+    let pool = sqlite
+        .open_read_write_pool(&dir.path().join("agent_message_board_1.sqlite"))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE channels (board TEXT NOT NULL, name TEXT NOT NULL, name_search TEXT NOT NULL, created_at TEXT NOT NULL, timestamp INTEGER NOT NULL, author TEXT NOT NULL, PRIMARY KEY(board,name))").execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO channels VALUES (?, 'legacy', 'legacy', '2026-09-17T12:00:00Z', 0, '/root')",
+    )
+    .bind(root.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    let board = LocalAgentMessageBoard::open(&sqlite, root.into(), host.clone())
+        .await
+        .unwrap();
+    let legacy = ChannelSummary {
+        channel_name: "legacy".into(),
+        description: None,
+        permissions: None,
+        created_at: "2026-09-17T12:00:00Z".parse().unwrap(),
+        created_by: AgentPath::root(),
+        message_count: 0,
+        last_message_id: None,
+    };
+    let created = board
+        .create_channel(
+            root,
+            CreateChannelRequest {
+                channel_name: "design".into(),
+                description: Some(
+                    "Design decisions and tradeoffs."
+                        .to_string()
+                        .try_into()
+                        .unwrap(),
+                ),
+                subscription: SubscriptionChange::Unsubscribe,
+            },
+        )
+        .await
+        .unwrap();
+    drop(board);
+    let reopened = LocalAgentMessageBoard::open(&sqlite, root.into(), host)
+        .await
+        .unwrap();
+    let listed = reopened
+        .list_channels(
+            root,
+            ChannelQuery {
+                query: None,
+                direction: SortDirection::NewestFirst,
+                page: PageRequest::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.channels,
+        Page {
+            results: vec![created, legacy],
+            next_cursor: None
+        }
+    );
+}
+
+#[tokio::test]
+async fn local_board_setup_survives_reopen() -> Result<()> {
+    use serde_json::json;
+    let dir = tempfile::tempdir()?;
+    let sqlite = SqliteConfig::new_for_testing(dir.path().to_path_buf().try_into().unwrap());
+    let root = ThreadId::new();
+    let host = Arc::new(Host {
+        clock: AtomicI64::default(),
+        agent_path_calls: AtomicUsize::default(),
+        members: [(root, AgentPath::root())].into(),
+        active: AtomicBool::new(true),
+        fail_notifications: AtomicBool::new(false),
+        notifications: Mutex::default(),
+    });
+    let setup = json!({"timestamp":"2026-09-18T12:00:00Z","template":{"version":1,"channels":{"policy":{"description":"Shared policies"}}}});
+    configure_local_board(&sqlite, root.into(), serde_json::from_value(setup.clone())?).await?;
+    configure_local_board(&sqlite, root.into(), serde_json::from_value(setup.clone())?).await?;
+    let board = LocalAgentMessageBoard::open(&sqlite, root.into(), host.clone()).await?;
+    drop(board);
+    let board = LocalAgentMessageBoard::open(&sqlite, root.into(), host.clone()).await?;
+    let query = ChannelQuery {
+        query: None,
+        direction: SortDirection::NewestFirst,
+        page: PageRequest::default(),
+    };
+    let channels = board.list_channels(root, query.clone()).await?;
+    assert_eq!(
+        serde_json::to_value(channels)?,
+        json!({"results":[{
+        "channel_name":"policy", "description":"Shared policies", "created_at":"2026-09-18T12:00:00Z",
+        "created_by":"/root", "message_count":0, "last_message_id":null
+    }],"n_returned":1,"has_more":false,"next_cursor":null})
+    );
+    let mut changed = setup.clone();
+    changed["template"]["channels"]["policy"]["description"] = json!("Changed");
+    assert!(
+        configure_local_board(&sqlite, root.into(), serde_json::from_value(changed)?)
+            .await
+            .is_err()
+    );
+    board
+        .create_channel(
+            root,
+            CreateChannelRequest {
+                channel_name: "new".into(),
+                description: None,
+                subscription: SubscriptionChange::Unsubscribe,
+            },
+        )
+        .await?;
+    configure_local_board(&sqlite, root.into(), serde_json::from_value(setup.clone())?).await?;
+    assert_eq!(
+        board
+            .list_channels(root, query)
+            .await?
+            .channels
+            .results
+            .len(),
+        2
+    );
+    LocalAgentMessageBoard::delete_boards(&sqlite, &[root.into()]).await?;
+    assert!(
+        configure_local_board(&sqlite, root.into(), serde_json::from_value(setup)?)
+            .await
+            .is_err()
+    );
+    Ok(())
 }

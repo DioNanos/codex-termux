@@ -10,6 +10,7 @@ use crate::protocol::ErrorEvent;
 use crate::protocol::MisalignmentErrorDetails;
 use crate::protocol::RateLimitReachedType;
 use crate::protocol::RateLimitSnapshot;
+use crate::protocol::TokenUsage;
 use crate::protocol::TruncationPolicy;
 use chrono::DateTime;
 use chrono::Datelike;
@@ -80,6 +81,16 @@ pub struct CodexErr {
     agent_context: Option<AgentErrorContext>,
 }
 
+/// A terminal response that stopped before the model finished, with any reported usage.
+/// Content-filter retries and explicit interruptions have separate handling.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("Incomplete response returned, reason: {reason}")]
+pub struct ResponseIncompleteError {
+    pub reason: String,
+    pub response_id: Option<String>,
+    pub token_usage: Option<TokenUsage>,
+}
+
 /// The semantic category and diagnostic payload for a [`CodexErr`].
 #[derive(Error, Debug, EnumDiscriminants)]
 #[strum_discriminants(name(CodexErrKind))]
@@ -105,6 +116,8 @@ pub enum CodexErrorDetails {
         "stream disconnected before completion: Incomplete response returned, reason: content_filter"
     )]
     ContentFilter,
+    #[error(transparent)]
+    ResponseIncomplete(Box<ResponseIncompleteError>),
     /// A retryable upstream rate limit received inside the response stream.
     #[error("rate limit exceeded: {0}")]
     RateLimitExceeded(String),
@@ -405,6 +418,7 @@ impl CodexErr {
             | CodexErrorDetails::QuotaExceeded
             | CodexErrorDetails::InvalidImageRequest()
             | CodexErrorDetails::InvalidRequest(_)
+            | CodexErrorDetails::ResponseIncomplete(_)
             | CodexErrorDetails::InvalidPrompt { .. }
             | CodexErrorDetails::ToolCollision(_)
             | CodexErrorDetails::RefreshTokenFailed(_)

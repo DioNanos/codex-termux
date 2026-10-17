@@ -124,17 +124,21 @@ impl SessionInner {
                 .saturating_add(Duration::from_secs(1));
         let opening = async {
             let mut client = self.client();
-            let mut request = tonic::Request::new(request);
+            let mut request = self.request(request);
             if let Some(traceparent) = trace.and_then(|trace| trace.traceparent)
                 && let Ok(traceparent) = traceparent.parse()
             {
                 request.metadata_mut().insert("traceparent", traceparent);
             }
-            let mut stream =
-                deadline::request(&self, "execution", Duration::ZERO, client.execute(request))
-                    .await?
-                    .into_inner();
-            let first = deadline::request(
+            let mut stream = deadline::session_request(
+                &self,
+                "execution",
+                Duration::ZERO,
+                client.execute(request),
+            )
+            .await?
+            .into_inner();
+            let first = deadline::session_request(
                 &self,
                 "execution starting event",
                 Duration::ZERO,
@@ -217,7 +221,7 @@ impl SessionInner {
         let outcome = tokio::select! {
             biased;
             _ = response_tx.closed() => return,
-            outcome = deadline::request(
+            outcome = deadline::session_request(
                 &self,
                 "execution outcome",
                 runtime_timeout,
@@ -317,7 +321,13 @@ impl SessionInner {
                 grpc::yield_observation_request::Observation::WaitId(wait_id),
             )
         });
-        let response = deadline::request(self, "wait", runtime_timeout, client.wait(request)).await;
+        let response = deadline::session_request(
+            self,
+            "wait",
+            runtime_timeout,
+            client.wait(self.request(request)),
+        )
+        .await;
         drop(watcher);
         cancellation.disarm();
         self.prune_wait_slots();
@@ -331,10 +341,10 @@ impl SessionInner {
         observation: grpc::yield_observation_request::Observation,
     ) -> AbortOnDropHandle<()> {
         let mut client = self.client();
-        let request = grpc::YieldObservationRequest {
+        let request = self.request(grpc::YieldObservationRequest {
             session_id: self.id.clone(),
             observation: Some(observation),
-        };
+        });
         AbortOnDropHandle::new(tokio::spawn(async move {
             yield_signal.cancelled().await;
             if let Err(error) = deadline::startup("yield observation", async move {
@@ -351,14 +361,14 @@ impl SessionInner {
     pub(super) async fn terminate(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
         self.require_open()?;
         let mut client = self.client();
-        let response = deadline::request(
+        let response = deadline::session_request(
             self,
             "termination",
             Duration::ZERO,
-            client.terminate(grpc::TerminateRequest {
+            client.terminate(self.request(grpc::TerminateRequest {
                 session_id: self.id.clone(),
                 cell_id: cell_id.as_str().to_string(),
-            }),
+            })),
         )
         .await?
         .into_inner();
@@ -462,10 +472,10 @@ impl Drop for WaitCancellation {
                 &session,
                 "wait cancellation",
                 Duration::ZERO,
-                client.cancel_wait(grpc::CancelWaitRequest {
+                client.cancel_wait(session.request(grpc::CancelWaitRequest {
                     session_id: session.id.clone(),
                     wait_id,
-                }),
+                })),
             )
             .await;
             if let Err(error) = result

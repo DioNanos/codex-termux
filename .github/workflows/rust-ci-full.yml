@@ -102,20 +102,13 @@ jobs:
         include:
           - name: Linux
             runner: ubuntu-24.04
-          # macOS and Windows
-          # Disabled on this fork: the macOS leg needs paid GitHub runners and
-          # the Windows leg requires the upstream-only private runner group
-          # `codex-termux-runners`, so neither can run here. GitHub applies
-          # `include` entries after `exclude` entries, so an exclude cannot
-          # remove these legs; they are commented out instead. Uncomment both
-          # entries to restore them.
-          # - name: macOS
-          #   runner: macos-15-xlarge
-          # - name: Windows
-          #   runner: windows-x64
-          #   runs_on:
-          #     group: ${{ github.event.repository.name }}-runners
-          #     labels: ${{ github.event.repository.name }}-windows-x64
+          - name: macOS
+            runner: macos-15-xlarge
+          - name: Windows
+            runner: windows-x64
+            runs_on:
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-x64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -158,10 +151,6 @@ jobs:
 
   # --- CI to validate on different os/targets --------------------------------
   lint_build:
-    # Disabled on this fork. Every live leg asks for the private runner
-    # group `<repo>-runners`, which is upstream's and does not exist here.
-    # Remove this `if` to restore the job.
-    if: false
     name: Lint/Build — ${{ matrix.runner }} - ${{ matrix.target }}${{ matrix.profile == 'release' && ' (release)' || '' }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
     timeout-minutes: 30
@@ -180,18 +169,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS
-          # Disabled on this fork: these legs need paid GitHub runners and the
-          # account spending limit stops them from starting. GitHub applies
-          # `include` entries after `exclude` entries, so an exclude cannot
-          # remove these legs; they are commented out instead. Uncomment them
-          # to restore them.
-          # - runner: macos-15-xlarge
-          #   target: aarch64-apple-darwin
-          #   profile: dev
-          # - runner: macos-15-xlarge
-          #   target: x86_64-apple-darwin
-          #   profile: dev
+          - runner: macos-15-xlarge
+            target: aarch64-apple-darwin
+            profile: dev
+          - runner: macos-15-xlarge
+            target: x86_64-apple-darwin
+            profile: dev
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             profile: dev
@@ -216,32 +199,26 @@ jobs:
             runs_on:
               group: ${{ github.event.repository.name }}-runners
               labels: ${{ github.event.repository.name }}-linux-arm64
-          # Windows
-          # Disabled on this fork: these legs require the upstream-only
-          # private runner group `codex-termux-runners`, so they cannot be
-          # scheduled here. Uncomment them to restore them.
-          # - runner: windows-x64
-          #   target: x86_64-pc-windows-msvc
-          #   profile: dev
-          #   runs_on:
-          #     group: ${{ github.event.repository.name }}-runners
-          #     labels: ${{ github.event.repository.name }}-windows-x64
-          # - runner: windows-arm64
-          #   target: aarch64-pc-windows-msvc
-          #   profile: dev
-          #   runs_on:
-          #     group: ${{ github.event.repository.name }}-runners
-          #     labels: ${{ github.event.repository.name }}-windows-arm64
+          - runner: windows-x64
+            target: x86_64-pc-windows-msvc
+            profile: dev
+            runs_on:
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-x64
+          - runner: windows-arm64
+            target: aarch64-pc-windows-msvc
+            profile: dev
+            runs_on:
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-arm64
 
           # Also run representative release builds on Mac and Linux because
           # there could be release-only build errors we want to catch.
           # Hopefully this also pre-populates the build cache to speed up
-          # releases. (The macOS and Windows entries below are disabled on
-          # this fork, same reasons as above; uncomment them to restore
-          # them.)
-          # - runner: macos-15-xlarge
-          #   target: aarch64-apple-darwin
-          #   profile: release
+          # releases.
+          - runner: macos-15-xlarge
+            target: aarch64-apple-darwin
+            profile: release
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             profile: release
@@ -254,18 +231,18 @@ jobs:
             runs_on:
               group: ${{ github.event.repository.name }}-runners
               labels: ${{ github.event.repository.name }}-linux-arm64
-          # - runner: windows-x64
-          #   target: x86_64-pc-windows-msvc
-          #   profile: release
-          #   runs_on:
-          #     group: ${{ github.event.repository.name }}-runners
-          #     labels: ${{ github.event.repository.name }}-windows-x64
-          # - runner: windows-arm64
-          #   target: aarch64-pc-windows-msvc
-          #   profile: release
-          #   runs_on:
-          #     group: ${{ github.event.repository.name }}-runners
-          #     labels: ${{ github.event.repository.name }}-windows-arm64
+          - runner: windows-x64
+            target: x86_64-pc-windows-msvc
+            profile: release
+            runs_on:
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-x64
+          - runner: windows-arm64
+            target: aarch64-pc-windows-msvc
+            profile: release
+            runs_on:
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-arm64
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -481,10 +458,6 @@ jobs:
           key: apt-${{ matrix.runner }}-${{ matrix.target }}-v1
 
   tests_macos_aarch64:
-    # Disabled on this fork: this leg needs paid GitHub runners and the
-    # account spending limit stops it from starting. The `results` gate below
-    # accepts `skipped` for it. Remove this `if` to restore it.
-    if: false
     name: Tests — macos-15-xlarge - aarch64-apple-darwin
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
@@ -496,11 +469,6 @@ jobs:
     secrets: inherit
 
   tests_linux_x64_remote:
-    # Disabled on this fork. This leg asks for the private runner group
-    # `<repo>-runners`, which is upstream's and does not exist here.
-    # The `results` gate accepts `skipped` for it. Remove this `if` to
-    # restore it.
-    if: false
     name: Tests — ubuntu-24.04 - x86_64-unknown-linux-gnu (remote)
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
@@ -515,11 +483,6 @@ jobs:
     secrets: inherit
 
   tests_linux_arm64:
-    # Disabled on this fork. This leg asks for the private runner group
-    # `<repo>-runners`, which is upstream's and does not exist here.
-    # The `results` gate accepts `skipped` for it. Remove this `if` to
-    # restore it.
-    if: false
     name: Tests — ubuntu-24.04-arm - aarch64-unknown-linux-gnu
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
@@ -533,11 +496,6 @@ jobs:
     secrets: inherit
 
   tests_windows_x64:
-    # Disabled on this fork: this leg requires the upstream-only private
-    # runner group `codex-termux-runners`, so it cannot be scheduled here.
-    # The `results` gate below accepts `skipped` for it. Remove this `if` to
-    # restore it.
-    if: false
     name: Tests — windows-x64 - x86_64-pc-windows-msvc
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
@@ -551,11 +509,6 @@ jobs:
     secrets: inherit
 
   tests_windows_arm64:
-    # Disabled on this fork: this leg and its archive leg require the
-    # upstream-only private runner group `codex-termux-runners`, so they
-    # cannot be scheduled here. The `results` gate below accepts `skipped`
-    # for it. Remove this `if` to restore it.
-    if: false
     name: Tests — windows-arm64 - aarch64-pc-windows-msvc
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
@@ -608,17 +561,12 @@ jobs:
           [[ '${{ needs.argument_comment_lint_prebuilt.result }}' == 'success' ]] || { echo 'argument_comment_lint_prebuilt failed'; exit 1; }
           [[ '${{ needs.general.result }}' == 'success' ]] || { echo 'general failed'; exit 1; }
           [[ '${{ needs.cargo_shear.result }}' == 'success' ]] || { echo 'cargo_shear failed'; exit 1; }
-          # lint_build and the Linux test legs ask for the private runner
-          # group `<repo>-runners`, which does not exist on this fork, so
-          # they are disabled and the gate accepts `skipped`. Remove their
-          # `if` and require `success` again to restore them. The argument
-          # comment jobs, general, and cargo shear stay strict.
-          [[ '${{ needs.lint_build.result }}' == 'success' || '${{ needs.lint_build.result }}' == 'skipped' ]] || { echo 'lint_build failed'; exit 1; }
-          [[ '${{ needs.tests_macos_aarch64.result }}' == 'success' || '${{ needs.tests_macos_aarch64.result }}' == 'skipped' ]] || { echo 'tests_macos_aarch64 failed'; exit 1; }
-          [[ '${{ needs.tests_linux_x64_remote.result }}' == 'success' || '${{ needs.tests_linux_x64_remote.result }}' == 'skipped' ]] || { echo 'tests_linux_x64_remote failed'; exit 1; }
-          [[ '${{ needs.tests_linux_arm64.result }}' == 'success' || '${{ needs.tests_linux_arm64.result }}' == 'skipped' ]] || { echo 'tests_linux_arm64 failed'; exit 1; }
-          [[ '${{ needs.tests_windows_x64.result }}' == 'success' || '${{ needs.tests_windows_x64.result }}' == 'skipped' ]] || { echo 'tests_windows_x64 failed'; exit 1; }
-          [[ '${{ needs.tests_windows_arm64.result }}' == 'success' || '${{ needs.tests_windows_arm64.result }}' == 'skipped' ]] || { echo 'tests_windows_arm64 failed'; exit 1; }
+          [[ '${{ needs.lint_build.result }}' == 'success' ]] || { echo 'lint_build failed'; exit 1; }
+          [[ '${{ needs.tests_macos_aarch64.result }}' == 'success' ]] || { echo 'tests_macos_aarch64 failed'; exit 1; }
+          [[ '${{ needs.tests_linux_x64_remote.result }}' == 'success' ]] || { echo 'tests_linux_x64_remote failed'; exit 1; }
+          [[ '${{ needs.tests_linux_arm64.result }}' == 'success' ]] || { echo 'tests_linux_arm64 failed'; exit 1; }
+          [[ '${{ needs.tests_windows_x64.result }}' == 'success' ]] || { echo 'tests_windows_x64 failed'; exit 1; }
+          [[ '${{ needs.tests_windows_arm64.result }}' == 'success' ]] || { echo 'tests_windows_arm64 failed'; exit 1; }
 
       - name: sccache summary note
         if: always()

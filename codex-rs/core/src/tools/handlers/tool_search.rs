@@ -15,6 +15,7 @@ use bm25::Embedder;
 use bm25::EmbedderBuilder;
 use bm25::Language;
 use bm25::Scorer;
+use codex_features::Feature;
 use codex_prompts::ResolvedModelMessages;
 use codex_tools::IndirectNamespacePrefixes;
 use codex_tools::JsonToolOutput;
@@ -73,11 +74,11 @@ impl ToolSearchHandlerCache {
             .entries()
             .filter(|tool| tool.exposure.is_deferred())
             .filter_map(|tool| {
-                if tool.runtime.immutable_spec().is_some() {
-                    Some(ToolSearchSource::Immutable(Arc::downgrade(&tool.runtime)))
+                if let Some(runtime) = tool.cached_runtime() {
+                    Some(ToolSearchSource::Immutable(Arc::downgrade(runtime)))
                 } else {
-                    tool.runtime
-                        .search_info()
+                    registry
+                        .search_info(tool)
                         .map(Box::new)
                         .map(ToolSearchSource::Dynamic)
                 }
@@ -259,6 +260,11 @@ impl ToolSearchHandler {
                     .config
                     .code_mode
                     .tool_input_schema_max_bytes,
+                step_context
+                    .turn
+                    .config
+                    .features
+                    .enabled(Feature::CodeModeToolDescriptionFirst),
                 &indirect_prefixes,
             );
             return Ok(boxed_tool_output(JsonToolOutput::new(serde_json::json!({
@@ -286,6 +292,7 @@ impl ToolSearchHandler {
         limit: usize,
         router: &ToolRouter,
         code_mode_input_schema_max_bytes: Option<usize>,
+        tool_description_first: bool,
         indirect_prefixes: &IndirectNamespacePrefixes<'_>,
     ) -> Vec<CodeModeSearchResult> {
         let mut tools = Vec::new();
@@ -306,13 +313,14 @@ impl ToolSearchHandler {
                 else {
                     continue;
                 };
-                let Some(runtime) = router.tool_runtime(tool_name) else {
+                let Some(tool) = router.registered_tool(tool_name) else {
                     continue;
                 };
                 let definitions = prepare_code_mode_tool_definitions(
-                    Some(runtime.as_ref()),
-                    || Cow::Owned(runtime.spec()),
+                    tool.cached_runtime().map(Arc::as_ref),
+                    || Cow::Owned(Arc::unwrap_or_clone(tool.spec())),
                     code_mode_input_schema_max_bytes,
+                    tool_description_first,
                 );
                 let Some(definition) = definitions.iter().find(|definition| {
                     definition.tool_name.clone().with_default_namespace() == candidate_name
@@ -367,10 +375,10 @@ mod tests {
     #[test]
     fn cache_reuses_immutable_handlers_and_rebuilds_for_current_registry_changes() {
         let cache = ToolSearchHandlerCache::default();
-        let runtime: Arc<dyn CoreToolRuntime> = Arc::new(
-            McpHandler::new(tool_info("calendar", "create_event", "Create events"))
-                .expect("MCP tool should convert"),
-        );
+        let mut info = tool_info("calendar", "create_event", "Create events");
+        info.callable_namespace = "functions".to_string();
+        let runtime: Arc<dyn CoreToolRuntime> =
+            Arc::new(McpHandler::new(info.clone()).expect("MCP tool should convert"));
         let mut registry = ToolRegistry::default();
         registry.register_trusted_with_exposure(Arc::clone(&runtime), ToolExposure::Deferred);
 
@@ -382,13 +390,45 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &without_sources));
 
         let mut replacement_registry = ToolRegistry::default();
-        let replacement = Arc::new(
-            McpHandler::new(tool_info("calendar", "create_event", "Create events"))
-                .expect("replacement MCP tool should convert"),
-        );
+        let replacement =
+            Arc::new(McpHandler::new(info).expect("replacement MCP tool should convert"));
         replacement_registry.register_trusted_with_exposure(replacement, ToolExposure::Deferred);
         let replacement = cache.get_or_build(&replacement_registry, ToolSearchSourceListing::Omit);
         assert!(!Arc::ptr_eq(&without_sources, &replacement));
+
+        registry
+            .apply_functions_namespace_function_prefixes(
+                Some(&std::collections::BTreeMap::from([(
+                    "create_event".to_string(),
+                    "Guidance.".to_string(),
+                )])),
+                [ToolName::plain("create_event")],
+            )
+            .expect("valid function prefixes");
+        let prefixed = cache.get_or_build(&registry, ToolSearchSourceListing::Include);
+        let reused = cache.get_or_build(&registry, ToolSearchSourceListing::Include);
+        assert!(Arc::ptr_eq(&prefixed, &reused));
+        assert_eq!(
+            prefixed.search_infos[0].entry.search_text,
+            first.search_infos[0].entry.search_text
+        );
+        let mut expected = first.search("Create events", /*limit*/ 1);
+        let LoadableToolSpec::Namespace(namespace) = &mut expected[0] else {
+            panic!("namespace")
+        };
+        let ResponsesApiNamespaceTool::Function(tool) = &mut namespace.tools[0] else {
+            panic!("function")
+        };
+        tool.description = format!("Guidance.\n\n{}", tool.description);
+        assert_eq!(prefixed.search("Create events", /*limit*/ 1), expected);
+        registry
+            .apply_functions_namespace_function_prefixes(/*prefixes*/ None, [])
+            .expect("clear prefixes");
+        let cleared = cache.get_or_build(&registry, ToolSearchSourceListing::Include);
+        assert_eq!(
+            cleared.search("Create events", /*limit*/ 1),
+            first.search("Create events", /*limit*/ 1)
+        );
 
         let mut disabled_registry = ToolRegistry::default();
         disabled_registry.register_trusted_with_exposure(runtime, ToolExposure::Direct);

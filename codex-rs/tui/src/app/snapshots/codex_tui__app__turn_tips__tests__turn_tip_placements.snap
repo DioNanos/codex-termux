@@ -1,5 +1,6 @@
 ---
 source: tui/src/app/turn_tips_tests.rs
+assertion_line: 387
 expression: "crate::chatwidget::tests::helpers::normalize_snapshot_paths(screens.join(\"\\n\\n\"))"
 ---
 working=true, response rows=1, 80x12
@@ -32,6 +33,58 @@ working=false, response rows=1, 80x12
 
   Worked for [duration] • [completion time]
 
+
+› Ask Codex to do anything
+
+  gpt-test default · /tmp/project
+  ? for shortcuts
+
+working=false, response rows=1, 80x24
+
+› Show a response.
+
+
+Response row 0
+
+• Done.
+  └ Tip: Try /help.
+
+  Worked for [duration] • [completion time]
+
+
+
+
+
+
+
+
+
+
+› Ask Codex to do anything
+
+  gpt-test default · /tmp/project
+  ? for shortcuts
+
+Completion tip selected, 80x24
+
+› Show a response.
+
+
+Response row 0
+
+• Done.
+  └ Tip: Try /help.
+
+  Worked for [duration] • [completion time]
+
+
+
+
+
+
+
+
+                                                               Copying 5 chars…
 
 › Ask Codex to do anything
 

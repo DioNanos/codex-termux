@@ -87,8 +87,9 @@ pub(crate) async fn load_capability_discovery_batch(
     };
     let mut budget = ResponseBudget::default();
     // Use V1 concurrency; admit results in location order.
-    let mut discoveries = futures::stream::iter(locations)
-        .map(|location| load_capability_discovery(file_system, location.clone()))
+    // Yield owned locations to satisfy the RPC router's Send future bound.
+    let mut discoveries = futures::stream::iter(locations.iter().cloned())
+        .map(|location| load_capability_discovery(file_system, location))
         .buffered(MAX_CONCURRENT_ROOTS)
         .enumerate();
     while let Some((index, discovery)) = discoveries.next().await {

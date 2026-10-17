@@ -174,8 +174,21 @@ impl App {
         self.chat_widget.pre_draw_tick();
         self.render_chat_widget_frame(tui, tui.terminal.last_known_screen_size)?;
         if self.chat_widget.has_active_modal() && self.startup_protected_input_boundary {
-            tui.discard_pending_input_before_interactive_screen()?;
-            self.startup_pending_protected_request = false;
+            self.discard_startup_modal_input(tui)?;
+        }
+        Ok(())
+    }
+
+    /// Keep a visible modal closed to input if the terminal has not settled yet. The next input
+    /// event retries the drain instead of acting on the modal; server events can continue meanwhile.
+    pub(super) fn discard_startup_modal_input(&mut self, tui: &mut tui::Tui) -> Result<()> {
+        match tui.discard_pending_input_before_interactive_screen() {
+            Ok(()) => self.startup_pending_protected_request = false,
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                self.startup_pending_protected_request = true;
+                tracing::warn!(%err, "keeping startup modal input quarantined");
+            }
+            Err(err) => return Err(err.into()),
         }
         Ok(())
     }
@@ -236,6 +249,7 @@ impl App {
         startup_bootstrap: Option<AppServerBootstrap>,
         startup_hooks_browser: Option<HooksListEntry>,
         daemon_startup_warning: Option<String>,
+        managed_daemon: bool,
         mut startup_draft: StartupDraftPump,
         managed_worktree: Option<crate::ManagedTuiWorktree>,
         daemon_cli_executable: Option<AbsolutePathBuf>,
@@ -372,10 +386,14 @@ impl App {
         }
         let mut model = startup_model(&config, &bootstrap, startup_defaults.server_defaults_read);
         let available_models = bootstrap.available_models;
-        let remote_connection = crate::status::remote_connection::remote_connection_status_value(
-            &app_server_target,
-            app_server.server_version(),
-        );
+        let mut remote_connection =
+            crate::status::remote_connection::remote_connection_status_value(
+                &app_server_target,
+                app_server.server_version(),
+            );
+        if let Some(connection) = &mut remote_connection {
+            connection.is_managed_daemon = connection.is_local_daemon && managed_daemon;
+        }
         let initial_server_version_notice =
             if !matches!(app_server_target, AppServerTarget::Embedded) {
                 crate::status::remote_connection::pending_server_version_notice(
@@ -867,6 +885,8 @@ See the Codex keymap documentation for supported actions and examples."
             agents_overview::AgentsOverviewState::new(local_settings.tui.agents_overview_grouping);
         let mut app = Self {
             feature_write_lock: Arc::default(),
+            config_notification_test_generation: 0,
+            config_notification_test_pending: None,
             model_catalog,
             session_telemetry: session_telemetry.clone(),
             app_event_tx,
@@ -889,6 +909,7 @@ See the Codex keymap documentation for supported actions and examples."
             enhanced_keys_supported,
             keymap: runtime_keymap,
             key_chord_matcher: KeyChordMatcher::default(),
+            routed_key_activation: None,
             transcript_cells: Vec::new(),
             native_history: Default::default(),
             turn_tips: Default::default(),
@@ -924,6 +945,7 @@ See the Codex keymap documentation for supported actions and examples."
             },
             daemon_cli_executable,
             pending_update_action: None,
+            daemon_restart: None,
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState {
                 prompt_after_trust: should_prompt_windows_sandbox_nux_at_startup
@@ -980,6 +1002,16 @@ See the Codex keymap documentation for supported actions and examples."
             #[cfg(test)]
             _test_codex_home: None,
         };
+        if tui.is_owned_screen()
+            && app.right_click_paste_environment.wsl
+            && app.right_click_paste_environment.allows(
+                app.local_settings.tui.right_click_paste,
+                app.local_settings.transcript_mode,
+            )
+        {
+            // Prewarm WSL interop off the UI thread, without accessing clipboard contents.
+            let _ = tui.clipboard.warm_text_reader(tui.frame_requester());
+        }
         app.remember_launch_permissions();
         if !tui.is_terminal_focused() {
             app.recap.note_focus_lost(Instant::now());
@@ -1236,6 +1268,18 @@ See the Codex keymap documentation for supported actions and examples."
                     .rate_limit_refresh_interval()
                     .and_then(|interval| app.rate_limit_refresh_state.poll_deadline(interval));
                 let control = select! {
+                    result = async {
+                        match app.daemon_restart.as_mut() {
+                            Some(task) => task.await,
+                            None => std::future::pending().await,
+                        }
+                    }, if app.daemon_restart.is_some() => {
+                        app.daemon_restart = None;
+                        if let Err(err) = result.unwrap_or_else(|err| Err(err.into())) {
+                            app.chat_widget.add_error_message(format!("Could not restart the background server: {err:#}"));
+                        }
+                        AppRunControl::Continue
+                    }
                     Some(event) = app_event_rx.recv() => {
                         let is_initial_session_header = matches!(
                             &event,
@@ -1329,7 +1373,9 @@ See the Codex keymap documentation for supported actions and examples."
                         reconnect = None;
                         match result {
                             Ok(connected) => {
-                                app.finish_reconnect(tui, &mut app_server, &mut app_event_rx, connected, CODEX_CLI_VERSION).await?;
+                                if let Err(err) = app.finish_reconnect(tui, &mut app_server, &mut app_event_rx, connected, CODEX_CLI_VERSION).await {
+                                    break Err(err);
+                                }
                                 listen_for_app_server_events = true;
                                 waiting_for_initial_session_configured = false;
                             }
@@ -1426,6 +1472,11 @@ See the Codex keymap documentation for supported actions and examples."
         }
         let clear_pet_result = tui.clear_ambient_pet_image();
         let clear_result = tui.terminal.clear();
+        if let Some(task) = app.daemon_restart.take()
+            && let Err(err) = task.await.unwrap_or_else(|err| Err(err.into()))
+        {
+            tracing::warn!(error = %err, "failed to finish background server restart during exit");
+        }
         // Keep the alternate screen active until the outer guard restores both keyboard stacks.
         let exit_reason = match exit_reason_result {
             Ok(exit_reason) => {

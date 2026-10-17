@@ -1378,7 +1378,7 @@ async fn cli_main(
                             .build()
                             .await
                             .map_err(anyhow::Error::from);
-                        let http_client_factory = updater_http_client_factory(config);
+                        let http_client_factory = updater_http_client_factory(config)?;
                         if matches!(
                             daemon_cli.subcommand,
                             AppServerDaemonSubcommand::Update { .. }
@@ -2041,7 +2041,6 @@ async fn run_debug_prompt_input_command(
         cwd: shared.cwd,
         codex_self_exe: arg0_paths.codex_self_exe,
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe,
-        main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe,
         show_raw_agent_reasoning: shared.oss.then_some(true),
         ephemeral: Some(true),
         bypass_hook_trust: shared.bypass_hook_trust.then_some(true),
@@ -2373,16 +2372,10 @@ async fn print_app_server_daemon_output(command: AppServerLifecycleCommand) -> a
 
 fn updater_http_client_factory(
     config: anyhow::Result<codex_core::config::Config>,
-) -> codex_http_client::HttpClientFactory {
-    match config {
-        Ok(config) => config.http_client_factory(),
-        Err(error) => {
-            eprintln!("warning: failed to load updater network configuration: {error}");
-            codex_http_client::HttpClientFactory::new(
-                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
-            )
-        }
-    }
+) -> anyhow::Result<codex_http_client::HttpClientFactory> {
+    let mut config = config?;
+    codex_app_server::in_process::EmbeddedNetworkPolicy::default().activate(&mut config);
+    Ok(config.http_client_factory())
 }
 
 async fn print_app_server_remote_control_output(
@@ -2480,11 +2473,12 @@ async fn run_interactive_tui(
         cloud_config::load_config(&interactive.config_overrides, LoaderOverrides::default())
             .await
             .map_err(std::io::Error::other)?;
-        codex_app_server_daemon::run(AppServerLifecycleCommand::Start)
+        let output = codex_app_server_daemon::run(AppServerLifecycleCommand::Start)
             .await
             .map_err(|err| std::io::Error::other(format!(
                 "{err:#}\nThe agents overview requires a shared server. Use codex --no-daemon to work without it."
             )))?;
+        interactive.managed_daemon = output.backend.is_some();
     }
 
     let remote_endpoint = match resolve_remote_endpoint(remote, remote_auth_token_env.clone()) {
@@ -2834,17 +2828,66 @@ mod tests {
             .expect("config should load");
 
         assert_eq!(
-            updater_http_client_factory(Ok(config)).outbound_proxy_policy(),
+            updater_http_client_factory(Ok(config))
+                .expect("updater configuration")
+                .outbound_proxy_policy(),
             codex_http_client::OutboundProxyPolicy::RespectSystemProxy
         );
     }
 
     #[test]
-    fn updater_http_client_factory_falls_back_when_config_load_fails() {
+    fn updater_http_client_factory_propagates_config_errors() {
         assert_eq!(
             updater_http_client_factory(Err(anyhow::anyhow!("invalid config")))
-                .outbound_proxy_policy(),
-            codex_http_client::OutboundProxyPolicy::ReqwestDefault
+                .expect_err("invalid configuration must prevent updates")
+                .to_string(),
+            "invalid config"
+        );
+    }
+
+    #[tokio::test]
+    async fn updater_http_client_factory_enforces_application_requirements() {
+        let home = tempfile::tempdir().expect("temporary Codex home");
+        let requirements = home.path().join("requirements.toml");
+        std::fs::write(
+            &requirements,
+            r#"
+[application.network]
+enabled = true
+[application.network.domains]
+"bedrock-mantle.us-gov-west-1.api.aws" = "allow"
+"chatgpt.com" = "deny"
+"releases.openai.com" = "deny"
+"#,
+        )
+        .expect("write managed requirements");
+        let mut overrides = LoaderOverrides::without_managed_config_for_tests();
+        overrides.system_requirements_path = Some(requirements);
+        let config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .loader_overrides(overrides)
+            .build()
+            .await
+            .expect("load managed configuration");
+        let factory = updater_http_client_factory(Ok(config)).expect("updater configuration");
+        for host in ["chatgpt.com", "releases.openai.com", "unlisted.example"] {
+            assert_eq!(
+                factory
+                    .network_policy()
+                    .acquire(&format!("https://{host}/").parse().expect("URL"))
+                    .err(),
+                Some(codex_http_client::NetworkPolicyDenied::Destination)
+            );
+        }
+        assert!(
+            factory
+                .network_policy()
+                .acquire(
+                    &"https://bedrock-mantle.us-gov-west-1.api.aws/"
+                        .parse()
+                        .expect("URL")
+                )
+                .is_ok()
         );
     }
 

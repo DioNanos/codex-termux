@@ -9,11 +9,14 @@ use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::ConfigOverrides;
 use crate::legacy_core::config::ConfigTomlLoadResult;
 use crate::legacy_core::config::bootstrap_auth_config;
+use crate::legacy_core::config::edit::ConfigEdit;
+use crate::legacy_core::config::edit::ConfigEditsBuilder;
 use crate::legacy_core::config::load_config_toml_with_layer_stack;
 #[cfg(test)]
 use crate::legacy_core::config::resolve_bootstrap_http_client_factory;
 use crate::legacy_core::config::resolve_oss_provider;
 use crate::legacy_core::config::resolve_profile_v2_config_path;
+use crate::onboarding::check_gov_cloud;
 use crate::session_resume::ResolveCwdOutcome;
 use crate::session_resume::ResumeCwdContext;
 use crate::session_resume::effective_resume_cwd_mode;
@@ -101,6 +104,7 @@ pub(crate) use codex_app_server_client::legacy_core;
 
 pub(crate) use worktree_startup::ManagedTuiWorktree;
 
+mod activation_key_guard;
 mod additional_dirs;
 mod analytics;
 mod app;
@@ -125,6 +129,7 @@ mod clipboard_paste;
 mod clock_format;
 mod collaboration_modes;
 mod color;
+mod config_panel;
 mod config_update;
 mod copy_input_guard;
 pub(crate) mod custom_terminal;
@@ -161,6 +166,7 @@ mod inline_visualization;
 pub(crate) mod insert_history;
 mod managed_worktree_tool_specs;
 mod managed_worktree_tools;
+mod terminal_program_status;
 pub use insert_history::insert_history_lines;
 mod footer_hint;
 mod key_hint;
@@ -169,6 +175,7 @@ mod keymap_setup;
 mod line_truncation;
 pub(crate) mod live_wrap;
 mod local_settings;
+mod rendered_selection;
 pub use live_wrap::RowBuilder;
 mod local_chatgpt_auth;
 mod managed_new_thread_defaults;
@@ -267,6 +274,7 @@ pub(crate) mod test_backend;
 pub(crate) mod test_support;
 
 use crate::onboarding::onboarding_screen::OnboardingScreenArgs;
+use crate::onboarding::onboarding_screen::run_gov_cloud_guidance;
 use crate::onboarding::onboarding_screen::run_onboarding_app;
 use crate::startup_hooks_review::StartupHooksReviewOutcome;
 use crate::startup_hooks_review::load_startup_hooks_review_entry;
@@ -879,6 +887,7 @@ fn latest_session_lookup_params(
     lookup_mode: LatestSessionLookupMode,
 ) -> ThreadListParams {
     ThreadListParams {
+        excluded_thread_ids: None,
         originators: None,
         cursor: None,
         limit: Some(1),
@@ -1149,6 +1158,7 @@ async fn run_ratatui_app(
     embedded_network_policy: codex_app_server_client::EmbeddedNetworkPolicy,
     managed_worktree: Option<ManagedTuiWorktree>,
     daemon_startup_warning: Option<String>,
+    managed_daemon: bool,
     launch_telemetry: daemon_telemetry::Launch<impl FnOnce(&AppServerTarget, bool)>,
     startup_draft: startup_draft::StartupDraft,
 ) -> color_eyre::Result<AppExitInfo> {
@@ -1999,6 +2009,11 @@ async fn run_ratatui_app(
         &session_selection,
         &loader_overrides,
     );
+    // Connected servers resolve their own provider; the local config may differ.
+    let check_gov_cloud_guidance = config.notices.hide_gov_cloud_guidance != Some(true)
+        && (config.model_provider.is_amazon_bedrock()
+            || !matches!(app_server_target, AppServerTarget::Embedded));
+    let guidance_request_handle = app_server.request_handle();
     let startup_prefetch_started_at = Instant::now();
     let startup_prefetch = startup_draft
         .run_until(&mut tui, async {
@@ -2014,10 +2029,13 @@ async fn run_ratatui_app(
                     Ok(Some(bootstrap))
                 },
                 load_startup_hooks_review_entry(hooks_request_handle, hooks_cwd),
+                async {
+                    check_gov_cloud_guidance && check_gov_cloud(guidance_request_handle).await
+                },
             )
         })
         .await;
-    let (startup_bootstrap, startup_hooks_entry) = match startup_prefetch {
+    let (startup_bootstrap, startup_hooks_entry, show_gov_cloud_guidance) = match startup_prefetch {
         Ok(startup_prefetch) => startup_prefetch,
         Err(err) => {
             shutdown_startup_session(Some(app_server), &mut terminal_restore_guard).await;
@@ -2036,6 +2054,22 @@ async fn run_ratatui_app(
         }
     };
     let startup_elapsed_before_app = startup_prefetch_started_at.elapsed();
+    if show_gov_cloud_guidance {
+        if let Err(err) = run_gov_cloud_guidance(&mut tui).await {
+            shutdown_startup_session(Some(app_server), &mut terminal_restore_guard).await;
+            return Err(err);
+        }
+        if let Err(err) = ConfigEditsBuilder::for_config(&config)
+            .with_edits([ConfigEdit::SetPath {
+                segments: vec!["notice".into(), "hide_gov_cloud_guidance".into()],
+                value: toml_edit::value(true),
+            }])
+            .apply()
+            .await
+        {
+            tracing::warn!(%err, "Failed to save GovCloud guidance acknowledgment");
+        }
+    }
     let startup_hooks_review = maybe_run_startup_hooks_review(
         &mut app_server,
         &mut tui,
@@ -2077,6 +2111,7 @@ async fn run_ratatui_app(
         startup_bootstrap,
         startup_hooks_browser,
         daemon_startup_warning,
+        managed_daemon,
         startup_draft,
         managed_worktree,
         daemon_cli_executable,

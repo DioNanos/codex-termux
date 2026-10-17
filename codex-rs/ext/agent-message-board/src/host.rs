@@ -14,7 +14,7 @@ pub enum NotificationDelivery {
     SkippedInactive,
 }
 
-/// Tree-scoped membership, clock and notification access supplied by the host.
+/// Board-scoped membership, clock and notification access supplied by the host.
 ///
 /// The host remains authoritative for membership even when runtimes are unloaded.
 /// Clock reads use the posting agent's configured source, including simulated

@@ -160,9 +160,14 @@ async fn start_retries_stale_empty_pid_file_under_its_own_lock() {
 async fn legacy_launch_clears_recovery_best_effort() {
     for snapshot_is_directory in [false, true] {
         let home = TempDir::new().expect("temp dir");
-        let state_dir = home.path().join("app-server-daemon");
-        std::fs::create_dir_all(&state_dir).expect("state dir");
+        // Derive the state directory from the recovery file location instead of
+        // hardcoding a directory name: the fork keeps its daemon state separate.
         let recovery_file = codex_app_server_transport::daemon_recovery_file_path(home.path());
+        let state_dir = recovery_file
+            .parent()
+            .expect("daemon state directory")
+            .to_path_buf();
+        std::fs::create_dir_all(&state_dir).expect("state dir");
         if snapshot_is_directory {
             std::fs::create_dir(&recovery_file).expect("invalid snapshot directory");
         } else {

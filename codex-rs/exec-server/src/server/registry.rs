@@ -5,7 +5,9 @@ use opentelemetry::trace::TraceContextExt;
 use std::sync::Arc;
 
 use crate::local_file_system::resolve_existing_path;
+use crate::protocol::CAPABILITIES_DISCOVER_V2_METHOD;
 use crate::protocol::CAPABILITY_ROOTS_DISCOVER_METHOD;
+use crate::protocol::DiscoverV2CapabilitiesRequest;
 use crate::protocol::ENVIRONMENT_CONFIG_READ_METHOD;
 use crate::protocol::ENVIRONMENT_INFO_METHOD;
 use crate::protocol::ENVIRONMENT_STATUS_METHOD;
@@ -107,6 +109,12 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
         |handler: Arc<ExecServerHandler>, params: WireCapabilityRootsDiscoverParams| async move {
             let params = params.try_into_request(resolve_filesystem_sandbox)?;
             handler.discover_capability_roots(params).await
+        },
+    );
+    router.request(
+        CAPABILITIES_DISCOVER_V2_METHOD,
+        |handler: Arc<ExecServerHandler>, params: DiscoverV2CapabilitiesRequest| async move {
+            handler.discover_capabilities_v2(params).await
         },
     );
     router.request(

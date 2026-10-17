@@ -37,13 +37,17 @@ use codex_features::Feature;
 use codex_protocol::config_types::EnvironmentVariablePattern;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
+use codex_utils_path_uri::Platform;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -1992,14 +1996,139 @@ enable_socks5 = false
 }
 
 #[tokio::test]
+async fn credential_masking_respects_config_precedence() -> std::io::Result<()> {
+    for (features, requirements, expected_proxy, expected_broker) in [
+        (
+            "credential_masking = true\n[features.network_proxy]\nenabled = true\ncredential_broker = false",
+            "",
+            true,
+            true,
+        ),
+        (
+            "credential_masking = false\n[features.network_proxy]\nenabled = true\ncredential_broker = true",
+            "",
+            true,
+            true,
+        ),
+        (
+            r#"credential_masking = false
+[features.network_proxy]
+enabled = false
+[features.network_proxy.credentials.vendor]
+env = ["VENDOR_TOKEN"]
+patterns = ["vendor_[a-z]{8}"]
+url_prefixes = ["https://api.vendor.example"]
+auth = ["bearer"]"#,
+            "[features]\ncredential_masking = true\n[experimental_network]\nenabled = true",
+            true,
+            true,
+        ),
+        (
+            "credential_masking = true\nnetwork_proxy = true",
+            "[features]\ncredential_masking = false",
+            true,
+            false,
+        ),
+        (
+            "credential_masking = true\nnetwork_proxy = true",
+            "[experimental_network]\nenabled = false",
+            false,
+            false,
+        ),
+        (
+            "credential_masking = true",
+            "[experimental_network]\nallow_local_binding = true",
+            false,
+            false,
+        ),
+    ] {
+        let home = tempdir()?;
+        let source =
+            format!("openai_base_url = 'https://api.example.test/v1'\n[features]\n{features}\n");
+        let configured: ConfigToml = toml::from_str(&source).expect("valid config");
+        tokio::fs::write(home.path().join(CONFIG_TOML_FILE), source).await?;
+        let config = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(home.path().to_path_buf())
+            .harness_overrides(ConfigOverrides {
+                cwd: Some(home.path().to_path_buf()),
+                permission_profile: Some(PermissionProfile::Managed {
+                    file_system: ManagedFileSystemPermissions::Unrestricted,
+                    network: NetworkSandboxPolicy::Enabled,
+                }),
+                ..Default::default()
+            })
+            .cloud_config_bundle(
+                CloudConfigBundleFixture::loader_with_enterprise_requirement(requirements),
+            )
+            .build()
+            .await?;
+        let network = config.permissions.network.as_ref().expect("proxy settings");
+        assert_eq!(
+            (network.enabled(), network.credential_broker_enabled()),
+            (expected_proxy, expected_broker),
+            "{features}; {requirements}"
+        );
+        let proxy = network
+            .build_config_state_for_spec(Platform::native())?
+            .config;
+        assert_eq!(
+            (proxy.enabled, proxy.credential_broker, proxy.mitm),
+            (expected_proxy, expected_broker, expected_broker),
+            "{features}; {requirements}"
+        );
+        if expected_broker {
+            let expected_providers = super::network_proxy_toml_config(configured.features.as_ref())
+                .and_then(|network_proxy| network_proxy.credentials.clone())
+                .unwrap_or_default();
+            assert_eq!(proxy.credential_providers, expected_providers);
+            assert_eq!(
+                proxy.credential_broker_openai_host.as_deref(),
+                Some("api.example.test")
+            );
+        }
+
+        let active_profile = ActivePermissionProfile {
+            id: BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string(),
+            extends: None,
+        };
+        let reloaded = config.network_proxy_spec_for_active_permission_profile(
+            &active_profile,
+            &config.permissions.effective_permission_profile(),
+        )?;
+        assert_eq!(
+            reloaded, config.permissions.network,
+            "{features}; {requirements}"
+        );
+        if requirements.is_empty() {
+            assert_eq!(
+                config.network_proxy_spec_for_active_permission_profile(
+                    &active_profile,
+                    &PermissionProfile::read_only(),
+                )?,
+                None,
+                "profile change should leave masking inactive when the proxy is disabled"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn credential_broker_ambiguity_guard_survives_permission_profile_selection()
 -> anyhow::Result<()> {
-    for (key, other_key, other_value, ambiguous) in [
-        ("GH_HOST", "gh_host", "second.example", true),
-        ("VENDOR_HOST", "vendor_host", "second.example", true),
-        ("VENDOR_PASSWORD", "vendor_password", "second.example", true),
-        ("VENDOR_HOST", "vendor_host", "first.example", false),
-        ("FOO", "foo", "second.example", false),
+    for (key, other_key, other_value, ambiguous, credential_masking) in [
+        ("GH_HOST", "gh_host", "second.example", true, false),
+        ("VENDOR_HOST", "vendor_host", "second.example", true, false),
+        (
+            "VENDOR_PASSWORD",
+            "vendor_password",
+            "second.example",
+            true,
+            false,
+        ),
+        ("VENDOR_HOST", "vendor_host", "first.example", false, false),
+        ("FOO", "foo", "second.example", false, false),
+        ("GH_HOST", "gh_host", "second.example", true, true),
     ] {
         let home = tempdir()?;
         tokio::fs::write(
@@ -2007,6 +2136,8 @@ async fn credential_broker_ambiguity_guard_survives_permission_profile_selection
             format!(
                 r#"
 default_permissions = "first"
+[features]
+credential_masking = {credential_masking}
 [features.network_proxy]
 enabled = true
 credential_broker = true
@@ -2036,6 +2167,11 @@ extends = "first"
             .build()
             .await?;
         let expected_enabled = !(cfg!(windows) && ambiguous);
+        if credential_masking && !expected_enabled {
+            insta::assert_snapshot!(config.startup_warnings.join("\n"), @r"Credential masking is inactive because shell environment overrides contain conflicting case-insensitive provider keys. Commands will receive unmasked credentials. Remove the conflicting entries from `shell_environment_policy.set`.");
+        } else {
+            assert_eq!(config.startup_warnings, Vec::<String>::new());
+        }
         assert_eq!(
             config.permissions.shell_environment_policy.r#set,
             HashMap::from([
@@ -4750,5 +4886,57 @@ prefix_rules = []
         );
 
         Ok(())
+    }
+}
+
+#[tokio::test]
+async fn async_compaction_config() {
+    use std::io::ErrorKind::InvalidInput;
+
+    for (settings, expected) in [
+        ("[features]\nasync_compaction = true", Ok((true, 65))),
+        ("[features]\nasync_compaction = false", Ok((false, 65))),
+        ("[features.async_compaction]", Ok((false, 65))),
+        (
+            "[features.async_compaction]\nenabled = true",
+            Ok((true, 65)),
+        ),
+        (
+            "[features.async_compaction]\nmodel_async_compact_threshold_percent = 80",
+            Ok((false, 80)),
+        ),
+        (
+            "[features.async_compaction]\nenabled = false\nmodel_async_compact_threshold_percent = 80",
+            Ok((false, 80)),
+        ),
+        (
+            "[features.async_compaction]\nenabled = true\nmodel_async_compact_threshold_percent = 75",
+            Ok((true, 75)),
+        ),
+        (
+            "[features.async_compaction]\nmodel_async_compact_threshold_percent = 0",
+            Err(InvalidInput),
+        ),
+        (
+            "[features.async_compaction]\nmodel_async_compact_threshold_percent = 101",
+            Err(InvalidInput),
+        ),
+    ] {
+        let tmp = tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(CONFIG_TOML_FILE), settings).expect("write config");
+        let actual = ConfigBuilder::default()
+            .codex_home(tmp.path().to_path_buf())
+            .fallback_cwd(Some(tmp.path().to_path_buf()))
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+            .build()
+            .await
+            .map(|config| {
+                (
+                    config.features.enabled(Feature::AsyncCompaction),
+                    config.async_compaction_threshold_percent,
+                )
+            })
+            .map_err(|error| error.kind());
+        assert_eq!(actual, expected, "{settings}");
     }
 }

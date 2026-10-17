@@ -57,6 +57,36 @@ fn composer_mouse_edits_flush_typing_and_reconcile_placeholders() {
 }
 
 #[test]
+fn recovery_keeps_unselected_text_after_a_held_replace_key() {
+    for (text, expected) in [("abcd", "aXd"), ("!abcd", "!aXd")] {
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_text_content(text.into(), Vec::new(), Vec::new());
+        composer.draft.textarea.set_cursor(/*pos*/ 0);
+        composer.set_vim_enabled(/*enabled*/ true);
+        composer.handle_key_event(KeyCode::Char('R').into());
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 4,
+        );
+        composer.render(area, &mut Buffer::empty(area));
+        let (x, y) = composer.cursor_pos(area).unwrap();
+        for (kind, column) in [
+            (Down(Left), x + 1),
+            (MouseEventKind::Drag(Left), x + 3),
+            (Up(Left), x + 3),
+        ] {
+            mouse(&mut composer, area, kind, column, y);
+        }
+        let now = Instant::now();
+        composer.handle_input_basic_with_time(KeyCode::Char('X').into(), now);
+        let before = composer.draft_snapshot();
+        assert_eq!(composer.recovery_snapshot().text, expected);
+        assert_eq!(composer.draft_snapshot(), before);
+        assert!(composer.handle_paste_burst_flush(now + PasteBurst::recommended_flush_delay()));
+        assert_eq!(composer.current_text(), expected);
+    }
+}
+
+#[test]
 fn selected_text_navigation_does_not_recall_history_or_select_images() {
     for (key, remote) in [
         (KeyCode::Up, false),
@@ -173,9 +203,14 @@ fn right_click_copy_uses_the_refreshed_editor_bounds() {
     assert_eq!(composer.draft.textarea.mouse_selection_range(), selection);
     let key = TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     composer.copy_selection(&key, |_| Ok(CopyStatus::Pending(2)));
+    let paste_target = composer.clipboard_paste_target(Some(KeyCode::Insert));
     assert_eq!(
         composer.finish_copy(&(2, Ok(CopyStatus::Confirmed)), /*current*/ true),
         Some(5)
     );
     assert_eq!(composer.draft.textarea.mouse_selection_range(), None);
+    assert_ne!(
+        composer.clipboard_paste_target(Some(KeyCode::Insert)),
+        paste_target
+    );
 }

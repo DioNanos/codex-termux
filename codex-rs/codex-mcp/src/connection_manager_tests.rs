@@ -80,7 +80,7 @@ use rmcp::model::NumberOrString;
 use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ProtocolVersion;
 use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::model::Tool;
 use rmcp::service::RequestContext;
 use std::collections::HashMap;
@@ -290,8 +290,8 @@ struct RefreshTestTransportFactory {
 }
 
 impl ServerHandler for RefreshTestTransportFactory {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn list_tools(
@@ -338,8 +338,8 @@ struct MutableToolsServer {
 }
 
 impl ServerHandler for MutableToolsServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn list_tools(
@@ -2309,7 +2309,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_while_client_is_pending() {
 }
 
 #[tokio::test]
-async fn capture_binding_uses_the_ready_clients_own_tools() {
+async fn capture_binding_preserves_ready_client_catalog_and_shares_prepared_metadata() {
     let codex_home = tempdir().expect("tempdir");
     let cache_context = create_codex_apps_tools_cache_context(
         codex_home.path().to_path_buf(),
@@ -2323,9 +2323,21 @@ async fn capture_binding_uses_the_ready_clients_own_tools() {
             "shared_cached_tool",
         )],
     );
+    let mut visible_collision = create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "collision");
+    visible_collision.connector_id = Some("a-visible".to_string());
+    let mut hidden_collision = create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "collision");
+    hidden_collision.connector_id = Some("z-hidden".to_string());
+    hidden_collision.tool.meta = Some(rmcp::model::MetaObject(
+        serde_json::json!({ "ui": { "visibility": [] } })
+            .as_object()
+            .expect("metadata object")
+            .clone(),
+    ));
     let mut ready_client = create_test_managed_client(vec![
         create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "client_local_tool"),
         create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "client_local_blocked"),
+        visible_collision,
+        hidden_collision,
     ])
     .await;
     let tool_filter = ToolFilter {
@@ -2387,11 +2399,25 @@ async fn capture_binding_uses_the_ready_clients_own_tools() {
             .iter()
             .map(|tool| tool.callable_name.as_str())
             .collect::<Vec<_>>(),
-        vec!["client_local_tool"]
+        vec!["client_local_tool", "collision"]
+    );
+    let prepared = step
+        .prepare_call(CODEX_APPS_MCP_SERVER_NAME, "client_local_tool")
+        .expect("client-local tool should be callable");
+    assert!(std::ptr::eq(
+        step.tools()
+            .first()
+            .expect("binding should advertise the client-local tool first"),
+        prepared.tool_info()
+    ));
+    assert_eq!(
+        step.tool_info(CODEX_APPS_MCP_SERVER_NAME, "collision")
+            .and_then(|tool| tool.connector_id.as_deref()),
+        Some("z-hidden")
     );
     assert!(
-        step.prepare_call(CODEX_APPS_MCP_SERVER_NAME, "client_local_tool")
-            .is_some()
+        step.prepare_call(CODEX_APPS_MCP_SERVER_NAME, "collision")
+            .is_none()
     );
     assert!(
         step.prepare_call(CODEX_APPS_MCP_SERVER_NAME, "shared_cached_tool")
@@ -4156,13 +4182,13 @@ async fn later_tool_list_retries_after_failed_reconnect_and_keeps_cached_tools()
         .boxed()
         .shared()
     });
-    let manager = create_test_manager_with_failed_apps_startup(
+    let manager = Arc::new(create_test_manager_with_failed_apps_startup(
         vec![create_test_tool(
             CODEX_APPS_MCP_SERVER_NAME,
             "cached_drive_search",
         )],
         reconnect_factory,
-    );
+    ));
 
     let first_reconnect_finished = reconnect_finished.notified();
     let tools = manager.list_all_tools().await;
@@ -4175,6 +4201,19 @@ async fn later_tool_list_retries_after_failed_reconnect_and_keeps_cached_tools()
     );
     first_reconnect_finished.await;
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let failed_binding = capture_binding(&manager).await;
+    assert_eq!(failed_binding.tools(), tools);
+    assert!(
+        manager
+            .prepare_call_for_tool(
+                Arc::clone(failed_binding.config()),
+                &failed_binding.tools()[0],
+            )
+            .await
+            .is_none()
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
     let tools = manager.list_all_tools().await;
     assert_eq!(
@@ -4261,10 +4300,7 @@ async fn tool_lists_do_not_block_and_share_codex_apps_startup_reconnect() {
         .shared()
     });
     let mut manager = create_test_manager_with_failed_apps_startup(
-        vec![create_test_tool(
-            CODEX_APPS_MCP_SERVER_NAME,
-            "cached_drive_search",
-        )],
+        vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "drive_search")],
         reconnect_factory,
     );
     manager.set_test_server_metadata(
@@ -4294,25 +4330,32 @@ async fn tool_lists_do_not_block_and_share_codex_apps_startup_reconnect() {
             .iter()
             .map(|tool| tool.callable_name.as_str())
             .collect::<Vec<_>>(),
-        vec!["cached_drive_search"]
+        vec!["drive_search"]
     );
     assert_eq!(
         second_tools
             .iter()
             .map(|tool| tool.callable_name.as_str())
             .collect::<Vec<_>>(),
-        vec!["cached_drive_search"]
+        vec!["drive_search"]
     );
     let pending_step = tokio::time::timeout(Duration::from_millis(10), capture_binding(&manager))
         .await
         .expect("step capture should not wait for reconnect");
-    assert!(
-        pending_step.tools().is_empty(),
-        "a model step must not advertise cached tools without an exact ready client"
-    );
+    assert_eq!(pending_step.tools(), first_tools);
+    // Readiness joins the retry that discovery started before call preparation.
+    let mut ready = Box::pin(manager.wait_for_server_startup(CODEX_APPS_MCP_SERVER_NAME));
+    assert!(futures::poll!(&mut ready).is_pending());
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
     release_reconnect.notify_one();
-    tokio::task::yield_now().await;
+    assert!(ready.await);
+    assert!(
+        manager
+            .prepare_call_for_tool(Arc::clone(pending_step.config()), &pending_step.tools()[0])
+            .await
+            .is_some()
+    );
     let tools = manager.list_all_tools().await;
     assert_eq!(
         tools
@@ -4439,6 +4482,63 @@ fn hosted_actor_credentials_are_only_available_to_host_owned_mcp_servers() {
         chatgpt_auth_provider_for_server(&remote_server, Some(provider)).is_none(),
         "customer-owned executors must never receive hosted actor credentials"
     );
+}
+
+#[test]
+fn gov_codex_apps_retain_local_chatgpt_auth_provider() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    let provider = codex_model_provider::auth_provider_from_auth(&auth);
+    let mut config = crate::mcp::tests::test_mcp_config(codex_home.path().to_path_buf());
+    config.chatgpt_base_url = "https://gov.chatgpt.com/backend-api/".to_string();
+    config.apps_enabled = true;
+
+    let local_config = crate::codex_apps_mcp_server_config(
+        &config.chatgpt_base_url,
+        /*apps_mcp_product_sku*/ None,
+        /*originator*/ None,
+    );
+    let mut remote_config = local_config.clone();
+    remote_config.environment_id = "customer-executor".to_string();
+    let mut custom_oauth = local_config.clone();
+    custom_oauth.auth = McpServerAuth::OAuth;
+
+    let mut catalog = crate::ResolvedMcpCatalog::builder();
+    catalog.register(crate::McpServerRegistration::from_hosted_apps(
+        "test-host",
+        /*contribution_order*/ 0,
+        local_config,
+    ));
+    catalog.register(crate::McpServerRegistration::from_config(
+        "custom-oauth".to_string(),
+        custom_oauth,
+    ));
+    catalog.register(crate::McpServerRegistration::from_config(
+        "remote-gov".to_string(),
+        remote_config,
+    ));
+    config.mcp_server_catalog = catalog.build();
+
+    let servers = crate::effective_mcp_servers(&config, Some(&auth));
+    let local = &servers[CODEX_APPS_MCP_SERVER_NAME];
+    assert_eq!(local.config().auth, McpServerAuth::ChatGpt);
+    let retained = chatgpt_auth_provider_for_server(local, Some(Arc::clone(&provider)))
+        .expect("local Gov Apps must retain ChatGPT authentication");
+    assert!(
+        Arc::ptr_eq(&provider, &retained),
+        "server selection must preserve the supplied provider"
+    );
+
+    assert_eq!(servers["custom-oauth"].config().auth, McpServerAuth::OAuth);
+    assert_eq!(servers["remote-gov"].config().auth, McpServerAuth::ChatGpt);
+    for name in ["custom-oauth", "remote-gov"] {
+        assert!(
+            chatgpt_auth_provider_for_server(&servers[name], Some(Arc::clone(&provider))).is_none(),
+            "{name} must not receive the host ChatGPT provider"
+        );
+    }
+
+    Ok(())
 }
 
 #[tokio::test]

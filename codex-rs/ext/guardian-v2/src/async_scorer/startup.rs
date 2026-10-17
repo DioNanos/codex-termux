@@ -5,30 +5,32 @@ use std::sync::Arc;
 
 use codex_core::ThreadManager;
 use codex_core::config::Config;
+use codex_core::cyber_access_program::ApiKeyCyberAccessPrograms;
 use codex_extension_api::ThreadOriginator;
 use codex_extension_api::ThreadStartInput;
 use codex_features::Feature;
 use codex_login::AgentIdentityAuthPolicy;
 use codex_login::AuthManager;
+use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
 
+use super::decisions::DecisionsError;
+use super::decisions::DecisionsSampler;
+use super::decisions::URL;
 use super::sampler::LunaSamplerConfig;
 use super::sampler::MODEL;
 
 // Decisions setup failures are telemetry only; they never affect the baseline sampler.
 pub(super) fn decisions_sampler(
     input: &ThreadStartInput<'_, Config>,
-) -> Option<super::decisions::DecisionsSampler> {
-    use super::decisions::DecisionsError;
-    use super::decisions::DecisionsSampler;
-    use super::decisions::URL;
+    auth_manager: &AuthManager,
+) -> Option<DecisionsSampler> {
     use codex_http_client::ClientRouteClass;
     let result = decisions_api_key(
         &input.config.model_provider_id,
         input.config.model_provider.base_url.as_deref(),
-        |name| std::env::var(name),
+        auth_manager,
     )
-    .map_err(|_| DecisionsError::Credentials)
     .and_then(|key| {
         let client = input
             .config
@@ -52,17 +54,26 @@ pub(super) fn decisions_sampler(
     }
 }
 
-fn decisions_api_key(
+pub(super) fn decisions_api_key(
     provider_id: &str,
     base_url: Option<&str>,
-    read_env: impl Fn(&str) -> Result<String, std::env::VarError>,
-) -> Result<String, std::env::VarError> {
-    read_env("CODEX_GUARDIAN_DECISIONS_API_KEY").or_else(|error| match error {
-        std::env::VarError::NotPresent if provider_id == "openai" && base_url.is_none() => {
-            read_env("OPENAI_API_KEY")
+    auth_manager: &AuthManager,
+) -> Result<String, DecisionsError> {
+    match std::env::var("CODEX_GUARDIAN_DECISIONS_API_KEY") {
+        Ok(key) => Ok(key),
+        Err(std::env::VarError::NotPresent) if provider_id == "openai" && base_url.is_none() => {
+            auth_manager
+                .auth_cached()
+                .as_ref()
+                .and_then(CodexAuth::api_key)
+                .map(str::to_owned)
+                .or_else(codex_login::read_openai_api_key_from_env)
+                .ok_or(DecisionsError::Credentials)
         }
-        std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_) => Err(error),
-    })
+        Err(std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_)) => {
+            Err(DecisionsError::Credentials)
+        }
+    }
 }
 
 pub(super) async fn sampler_config(
@@ -92,6 +103,7 @@ pub(super) async fn sampler_config(
             });
     let luna_compaction_hash = luna_model.and_then(|model| model.comp_hash);
     LunaSamplerConfig {
+        api_key_cyber_access_programs: ApiKeyCyberAccessPrograms::from_config(input.config),
         workspace_routing: input
             .thread_store
             .get_or_init(|| input.config.workspace_routing_context())
@@ -117,7 +129,3 @@ pub(super) async fn sampler_config(
         metrics: input.extension_metrics.clone(),
     }
 }
-
-#[cfg(test)]
-#[path = "startup_tests.rs"]
-mod tests;

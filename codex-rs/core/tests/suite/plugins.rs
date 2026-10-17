@@ -68,8 +68,6 @@ use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use core_test_support::wait_for_mcp_server;
-use core_test_support::zsh_fork::zsh_fork_runtime;
-use core_test_support::zsh_fork::zsh_fork_test_builder;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use test_case::test_case;
@@ -466,12 +464,8 @@ async fn shared_analytics_client_preserves_session_products() -> Result<()> {
     Ok(())
 }
 
-#[test_case(false; "classic shell")]
-#[test_case(true; "zsh-fork shell")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn persisted_remote_plugin_command_attribution_flows_through_turn_context(
-    zsh_fork: bool,
-) -> Result<()> {
+async fn persisted_remote_plugin_command_attribution_flows_through_turn_context() -> Result<()> {
     skip_if_target_windows!(Ok(()), "executes a POSIX shell script");
     skip_if_no_network!(Ok(()));
     skip_if_remote!(
@@ -495,14 +489,7 @@ async fn persisted_remote_plugin_command_attribution_flows_through_turn_context(
         plugin_root.join("analytics.yaml"),
         "version: 1\noperations: {scan: {path: ./scripts/run.sh, measurements: {files_scanned: {}}}}\n",
     )?;
-    let builder = if zsh_fork {
-        let Some(runtime) = zsh_fork_runtime("zsh-fork plugin measurement test")? else {
-            return Ok(());
-        };
-        zsh_fork_test_builder(runtime, AskForApproval::Never)
-    } else {
-        test_codex()
-    };
+    let builder = test_codex();
     let command = shlex::try_join(["/bin/sh", script_path.to_string_lossy().as_ref()])?;
     let call_id = "remote-plugin-command";
     let arguments = serde_json::to_string(&serde_json::json!({
@@ -687,7 +674,7 @@ printf 'STDIN_OK\n'
         });
     // Exercise both native and executor-managed sandboxes with the same plugin fixture.
     let _executor = if environment_id == codex_exec_server::REMOTE_ENVIRONMENT_ID {
-        let executor = super::multi_exec_server_sandbox::ExecServerProcess::start().await?;
+        let executor = core_test_support::exec_server::ExecServerProcess::start().await?;
         builder = builder.with_exec_server_url(executor.websocket_url.clone());
         Some(executor)
     } else {
@@ -745,7 +732,7 @@ async fn remote_plugin_measurements_require_the_frontend_version() -> Result<()>
     skip_if_no_network!(Ok(()));
     // This fixture needs a real remote transport with separately controlled frontend
     // and executor caches, rather than the runner's automatic executor selection.
-    let executor = super::multi_exec_server_sandbox::ExecServerProcess::start().await?;
+    let executor = core_test_support::exec_server::ExecServerProcess::start().await?;
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
     let frontend_script = write_remote_plugin_script_and_config(home.as_ref());

@@ -233,10 +233,10 @@ async fn load_file(cache_path: &PathBuf) -> io::Result<Option<ModelsCacheEntry>>
         Ok(contents) => {
             let cache: ModelsCacheEntry = serde_json::from_slice(&contents)
                 .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
-            // Stessa regola della risposta remota: una voce fuori misura esce, le
-            // altre si caricano. Prima una sola voce rendeva illeggibile l'intera
-            // cache, che e' il ripiego di quando la rete non risponde — cioe' il
-            // caso in cui serve di piu'.
+            // Same rule as the remote response: an oversized entry goes, the
+            // others load. Before, one single entry made the whole cache
+            // unreadable, and the cache is the fallback for when the network
+            // does not answer — that is, the case where it matters most.
             let (models, invalid) = partition_model_infos(cache.models);
             for error in &invalid {
                 warn!("discarding cached model with an oversized message: {error}");
@@ -317,7 +317,7 @@ mod tests {
             "fetched_at": Utc::now(),
             "client_version": "0.153.3",
             "models": [
-                model_json_with_slug_and_instructions("cache-ok-1", /*len*/ 0),
+                model_json_with_slug_and_instructions("cache-ok-1", 0),
                 model_json_with_slug_and_instructions("cache-too-long", 8 * 1024 + 1),
                 model_json_with_slug_and_instructions("cache-ok-2", 8 * 1024),
             ]

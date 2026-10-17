@@ -20,7 +20,6 @@ static COLON_LOCATION_SUFFIX_RE: LazyLock<Regex> =
         },
     );
 
-// Covered by load_location_suffix_regexes.
 static HASH_LOCATION_SUFFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| match Regex::new(r"^L\d+(?:C\d+)?(?:-L\d+(?:C\d+)?)?$") {
         Ok(regex) => regex,

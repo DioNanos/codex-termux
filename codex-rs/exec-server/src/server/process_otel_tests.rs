@@ -40,6 +40,7 @@ use super::session_registry::SessionRegistry;
 use crate::ExecServerRuntimeOptions;
 use crate::ExecServerTelemetry;
 use crate::connection::JsonRpcConnectionEvent;
+use crate::discover_v2::capability_manager::CapabilityManager;
 use crate::protocol::EXEC_METHOD;
 use crate::protocol::EXEC_READ_METHOD;
 use crate::protocol::EXEC_TERMINATE_METHOD;
@@ -738,6 +739,7 @@ fn new_handler(
 ) -> Arc<ExecServerHandler> {
     let mut handler = ExecServerHandler::new(
         Arc::clone(sessions),
+        CapabilityManager::new(crate::LocalFileSystem::default()),
         RpcNotificationSender::new(outgoing),
         ExecServerRuntimeOptions::new(
             std::env::current_exe().expect("test executable"),

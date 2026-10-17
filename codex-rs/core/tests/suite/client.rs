@@ -692,6 +692,8 @@ async fn synthetic_call_output_id_is_stable_across_resumes() -> anyhow::Result<(
             timestamp: "2024-01-01T00:00:01.000Z".to_string(),
             ordinal: None,
             item: rollout_response_item(ResponseItem::FunctionCall {
+                status: None,
+                encrypted_content: None,
                 id: Some(ResponseItemId::with_suffix("fc", "existing")),
                 name: "do_it".to_string(),
                 namespace: None,
@@ -988,6 +990,8 @@ async fn resume_sends_prior_items() {
 
     // Prior item: user message (should be delivered)
     let prior_user = codex_protocol::models::ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![codex_protocol::models::ContentItem::InputText {
@@ -1010,9 +1014,13 @@ async fn resume_sends_prior_items() {
 
     // Prior item: system message (excluded from API history)
     let prior_system = codex_protocol::models::ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "system".to_string(),
         content: vec![codex_protocol::models::ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "resumed system instruction".to_string(),
         }],
         phase: None,
@@ -1032,9 +1040,13 @@ async fn resume_sends_prior_items() {
 
     // Prior item: assistant message
     let prior_item = codex_protocol::models::ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![codex_protocol::models::ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "resumed assistant message".to_string(),
         }],
         phase: Some(MessagePhase::Commentary),
@@ -1160,6 +1172,7 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
     // Current image tests cover today's shapes; this keeps resume compatibility for that
     // legacy rollout representation.
     let legacy_custom_tool_call = ResponseItem::CustomToolCall {
+        encrypted_content: None,
         id: None,
         status: None,
         call_id: "legacy-js-call".to_string(),
@@ -1209,6 +1222,8 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
             timestamp: "2024-01-01T00:00:03.000Z".to_string(),
             ordinal: None,
             item: rollout_response_item(ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputImage {
@@ -1335,6 +1350,8 @@ async fn resume_replays_image_tool_outputs_with_detail() {
             timestamp: "2024-01-01T00:00:01.000Z".to_string(),
             ordinal: None,
             item: rollout_response_item(ResponseItem::FunctionCall {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 name: "view_image".to_string(),
                 namespace: None,
@@ -1367,6 +1384,7 @@ async fn resume_replays_image_tool_outputs_with_detail() {
             timestamp: "2024-01-01T00:00:02.000Z".to_string(),
             ordinal: None,
             item: rollout_response_item(ResponseItem::CustomToolCall {
+                encrypted_content: None,
                 id: None,
                 status: Some("completed".to_string()),
                 call_id: custom_call_id.to_string(),
@@ -1752,6 +1770,7 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
         config
             .features
             .enabled(Feature::ConcurrentReasoningSummaries),
+        /*output_token_replay_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
         config.workspace_routing_context(),
@@ -1772,6 +1791,8 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
     }
     let mut prompt = Prompt::default();
     prompt.input.push(ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -3247,6 +3268,7 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*concurrent_reasoning_summaries_enabled*/ false,
+        /*output_token_replay_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
         config.workspace_routing_context(),
@@ -3268,15 +3290,20 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: Some(ResponseItemId::with_suffix("msg", "message-id")),
         role: "assistant".into(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "message".into(),
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::WebSearchCall {
+        encrypted_content: None,
         id: Some(ResponseItemId::with_suffix("ws", "web-search-id")),
         status: Some("completed".into()),
         action: Some(WebSearchAction::Search {
@@ -3286,6 +3313,8 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
         id: Some(ResponseItemId::with_suffix("fc", "function-id")),
         name: "do_thing".into(),
         namespace: None,
@@ -3303,6 +3332,7 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::LocalShellCall {
+        encrypted_content: None,
         id: Some(ResponseItemId::with_suffix("lsh", "local-shell-id")),
         call_id: Some("local-shell-call-id".into()),
         status: LocalShellStatus::Completed,
@@ -3316,6 +3346,7 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::CustomToolCall {
+        encrypted_content: None,
         id: Some(ResponseItemId::with_suffix("ctc", "custom-tool-id")),
         status: Some("completed".into()),
         call_id: "custom-tool-call-id".into(),
@@ -3765,6 +3796,208 @@ async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Res
     assert_eq!(responses_mock.requests().len(), 1);
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    Ok(())
+}
+
+#[test_case::test_case(false, json!({"input_tokens": 120, "output_tokens": 30, "total_tokens": 150}); "sse_usage")]
+#[test_case::test_case(true, json!({"input_tokens": 120, "output_tokens": 30, "total_tokens": 150}); "websocket_usage")]
+#[test_case::test_case(false, serde_json::Value::Null; "sse_missing_usage")]
+#[test_case::test_case(true, serde_json::Value::Null; "websocket_missing_usage")]
+#[test_case::test_case(false, json!({"malformed": true}); "sse_malformed_usage")]
+#[test_case::test_case(true, json!({"malformed": true}); "websocket_malformed_usage")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_response_is_terminal(
+    use_websocket: bool,
+    reported_usage: serde_json::Value,
+) -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let incomplete = vec![
+        ev_response_created("resp-incomplete"),
+        ev_assistant_message("partial", "Partial reply."),
+        json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp-incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": reported_usage
+            }
+        }),
+    ];
+    let server = MockServer::start().await;
+    let response_mock = if use_websocket {
+        None
+    } else {
+        Some(mount_sse_once(&server, sse(incomplete.clone())).await)
+    };
+    let websocket_server = if use_websocket {
+        Some(
+            core_test_support::responses::start_websocket_server(vec![vec![
+                vec![ev_response_created("prewarm"), ev_completed("prewarm")],
+                incomplete,
+            ]])
+            .await,
+        )
+    } else {
+        None
+    };
+    let mut builder = test_codex().with_config(|config| {
+        config.model_provider.stream_max_retries = Some(2);
+        config.model_provider.request_max_retries = Some(0);
+    });
+    let test = if let Some(server) = &websocket_server {
+        builder.build_with_websocket_server(server).await?
+    } else {
+        builder.build_with_auto_env(&server).await?
+    };
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "trigger output limit".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let mut errors = Vec::new();
+    wait_for_event(&test.codex, |event| {
+        match event {
+            EventMsg::Error(error) => errors.push(error.message.clone()),
+            EventMsg::StreamError(_) | EventMsg::Warning(_) | EventMsg::RawResponseCompleted(_) => {
+                panic!("unexpected incomplete-response event: {event:?}")
+            }
+            _ => {}
+        }
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    insta::allow_duplicates! {
+        insta::assert_snapshot!(errors.join("\n"), @"Incomplete response returned, reason: max_output_tokens");
+    }
+    let expected_usage = if reported_usage.get("input_tokens").is_some() {
+        codex_protocol::protocol::TokenUsage {
+            input_tokens: 120,
+            output_tokens: 30,
+            total_tokens: 150,
+            ..Default::default()
+        }
+    } else {
+        codex_protocol::protocol::TokenUsage::default()
+    };
+    assert_eq!(
+        test.codex
+            .token_usage_info()
+            .await
+            .map(|info| info.total_token_usage)
+            .unwrap_or_default(),
+        expected_usage
+    );
+    test.codex.flush_rollout().await?;
+    let records = std::fs::read_to_string(test.codex.rollout_path().expect("rollout path"))?
+        .lines()
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
+        .filter_map(|line| match line.item {
+            RolloutItem::TokenUsageRecord(record) => Some(record.usage),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records,
+        if reported_usage.get("input_tokens").is_some() {
+            vec![expected_usage]
+        } else {
+            vec![]
+        }
+    );
+    if let Some(server) = websocket_server {
+        assert_eq!(
+            server
+                .connections()
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![2],
+        );
+        server.shutdown().await;
+    } else {
+        response_mock.expect("SSE response mock").single_request();
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_response_without_output_does_not_compact_the_next_turn() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_auto_compact_token_limit = Some(128_000);
+            config.model_post_turn_compact_threshold_percent = 0;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    let initial = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("initial", "Initial reply."),
+            ev_completed_with_tokens("initial", /*total_tokens*/ 40_000),
+        ]),
+    )
+    .await;
+    test.submit_turn("hello").await?;
+    initial.single_request();
+
+    // An unfinished parallel call can report usage without emitting an output item.
+    // This input fits the window, but counting it again on top of reported usage does not.
+    let incomplete = mount_sse_once(
+        &server,
+        sse(vec![json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"input_tokens": 100_000, "output_tokens": 16, "total_tokens": 100_016}
+            }
+        })]),
+    )
+    .await;
+    test.submit_turn(&"x".repeat(240_000)).await?;
+    incomplete.single_request();
+    assert_eq!(
+        test.codex
+            .token_usage_info()
+            .await
+            .unwrap()
+            .total_token_usage
+            .total_tokens,
+        140_016,
+    );
+
+    let continuation = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("continued", "Continued."),
+            ev_completed("continued"),
+        ]),
+    )
+    .await;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "continue".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        assert!(
+            !matches!(event, EventMsg::Error(_) | EventMsg::StreamError(_)),
+            "continuation failed: {event:?}"
+        );
+        assert!(
+            !matches!(event, EventMsg::ItemStarted(event)
+            if matches!(&event.item, codex_protocol::items::TurnItem::ContextCompaction(_))),
+            "the incomplete request's input must only count once toward compaction"
+        );
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    continuation.single_request();
     Ok(())
 }
 

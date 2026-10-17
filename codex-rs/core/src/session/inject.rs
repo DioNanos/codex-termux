@@ -19,7 +19,7 @@ impl Session {
         input: Vec<T>,
     ) -> Result<(), Vec<T>> {
         let mut active = self.active_turn.lock().await;
-        match active.as_mut() {
+        match active.as_mut().filter(|turn| turn.finishing.is_none()) {
             Some(active_turn) => {
                 self.input_queue
                     .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
@@ -81,7 +81,7 @@ impl Session {
             .map(|item| self.annotate_client_response_item(item))
             .collect::<Vec<_>>();
         let mut active = self.active_turn.lock().await;
-        if let Some(active_turn) = active.as_mut() {
+        if let Some(active_turn) = active.as_mut().filter(|turn| turn.finishing.is_none()) {
             self.input_queue
                 .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                     active_turn.turn_state.as_ref(),
@@ -93,7 +93,11 @@ impl Session {
                 .await;
             return;
         }
+        let finishing = active.as_ref().and_then(|turn| turn.finishing.clone());
         drop(active);
+        if let Some(finishing) = finishing {
+            finishing.cancelled().await;
+        }
         self.record_annotated_conversation_items(turn_context, turn_context.model_info(), items)
             .await;
     }
@@ -175,6 +179,15 @@ impl Session {
         let Err(items) = self.inject_if_running(items).await else {
             return;
         };
+        let finishing = self
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|turn| turn.finishing.clone());
+        if let Some(finishing) = finishing {
+            finishing.cancelled().await;
+        }
         let default_turn_context;
         let turn_context = match current_turn_context {
             Some(turn_context) => turn_context,

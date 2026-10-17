@@ -32,6 +32,8 @@ use crate::sandbox_bin_dir;
 use crate::sandbox_dir;
 use crate::sandbox_secrets_dir;
 use crate::set_local_user_flags;
+use crate::setup_acl_error::WriteAclOperation;
+use crate::setup_acl_error::record_acl_failure;
 use crate::setup_error_path;
 use crate::setup_log_writer;
 use crate::string_from_sid_bytes;
@@ -900,7 +902,7 @@ fn lock_sandbox_bin_dir(payload: &Payload, sandbox_group_sid: &[u8]) -> Result<(
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperSandboxLockFailed,
             format!(
-                "lock sandbox bin dir {} failed: {err}",
+                "lock sandbox bin dir {} failed: {err:#}",
                 sandbox_bin_dir(&payload.codex_home).display()
             ),
         ))
@@ -1074,18 +1076,12 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             match path_write_aces_need_refresh(root, &[sandbox_group_psid, root_cap_psid]) {
                 Ok(needs_refresh) => needs_refresh,
                 Err(e) => {
-                    refresh_errors.push(format!(
-                        "write ACE check failed on {}: {}",
-                        root.display(),
-                        e
-                    ));
-                    log_line(
-                        log,
-                        &format!(
-                            "write ACE check failed on {}: {}; continuing",
-                            root.display(),
-                            e
-                        ),
+                    record_acl_failure(
+                        &mut refresh_errors,
+                        WriteAclOperation::Check,
+                        root,
+                        &e,
+                        |message| log_line(log, message),
                     )?;
                     true
                 }
@@ -1137,10 +1133,12 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             match res {
                 Ok(_) => {}
                 Err(e) => {
-                    refresh_errors.push(format!("write ACE failed on {}: {}", root.display(), e));
-                    if log_line(
-                        log,
-                        &format!("write ACE grant failed on {}: {}", root.display(), e),
+                    if record_acl_failure(
+                        &mut refresh_errors,
+                        WriteAclOperation::Grant,
+                        &root,
+                        &e,
+                        |message| log_line(log, message),
                     )
                     .is_err()
                     {
@@ -1191,10 +1189,12 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                 }
                 Ok(false) => {}
                 Err(err) => {
-                    refresh_errors.push(format!("deny ACE failed on {}: {err}", path.display()));
-                    log_line(
-                        log,
-                        &format!("deny ACE failed on {}: {err}", path.display()),
+                    record_acl_failure(
+                        &mut refresh_errors,
+                        WriteAclOperation::Deny,
+                        path,
+                        &err,
+                        |message| log_line(log, message),
                     )?;
                 }
             }

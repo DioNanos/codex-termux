@@ -1,6 +1,12 @@
 use pretty_assertions::assert_eq;
 
+// Upstream test for the standalone/dedicated ownership heuristics: it flips
+// `package_root` between `packages/standalone` and `packages/app-server-daemon`
+// based on state-directory signals. This fork owns one fixed dedicated root
+// (`packages/app-server-daemon-termux`) and never adopts or migrates either
+// upstream layout, so the heuristics under test do not exist here.
 #[test]
+#[ignore = "termux fork: dedicated packages root, no standalone ownership heuristics"]
 fn discovers_package_and_legacy_installs() {
     let home = tempfile::TempDir::new().expect("home");
     let current = home.path().join("packages/standalone/current");
@@ -66,10 +72,8 @@ fn discovers_package_and_legacy_installs() {
 #[test]
 fn updater_only_runs_for_stable_installer_owned_releases() {
     let home = tempfile::TempDir::new().expect("home");
-    let state = home.path().join("app-server-daemon");
-    std::fs::create_dir(&state).unwrap();
-    std::fs::write(state.join("app-server.stderr.log"), b"").unwrap();
-    let standalone = home.path().join("packages/standalone");
+    // The updater eligibility scan runs against the fork's own packages root.
+    let standalone = super::package_root(home.path());
     let current = standalone.join("current");
     let release = standalone.join("releases/0.150.0-aarch64-apple-darwin");
     let managed = release.join("bin/codex");

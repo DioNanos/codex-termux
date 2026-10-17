@@ -11,6 +11,7 @@ use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -60,7 +61,7 @@ const CALENDAR_LIST_EVENTS_RESOURCE_URI: &str = "connector://calendar/tools/cale
 pub const DOCUMENT_EXTRACT_TEXT_RESOURCE_URI: &str =
     "connector://calendar/tools/calendar_extract_text";
 
-type AppsStartupInitializeGate = Arc<Mutex<Option<mpsc::Receiver<()>>>>;
+type AppsStartupInitializeGate = Arc<Mutex<VecDeque<mpsc::Receiver<()>>>>;
 
 pub struct HostedMessagingServer(pub String);
 
@@ -112,12 +113,13 @@ impl AppsTestServerStartupControl {
     }
 
     /// Holds one successful startup without turning recovery into a fresh runtime refresh.
+    /// Multiple holds are consumed in order, so tests can gate startup and recovery in advance.
     pub fn hold_next_successful_initialize(&self) -> mpsc::Sender<()> {
         let (release, gate) = mpsc::channel();
-        *self
-            .successful_initialize_gate
+        self.successful_initialize_gate
             .lock()
-            .expect("Apps initialization gate lock should not be poisoned") = Some(gate);
+            .expect("Apps initialization gate lock should not be poisoned")
+            .push_back(gate);
         release
     }
 }
@@ -224,7 +226,7 @@ impl AppsTestServer {
         let control = AppsTestServerStartupControl {
             initialize_attempts: Arc::new(AtomicUsize::new(0)),
             remaining_initialize_failures: Arc::new(AtomicUsize::new(0)),
-            successful_initialize_gate: Arc::new(Mutex::new(None)),
+            successful_initialize_gate: Arc::new(Mutex::new(VecDeque::new())),
         };
         mount_streamable_http_json_rpc_with_startup_control(
             server,
@@ -554,7 +556,7 @@ impl Respond for CodexAppsJsonRpcResponder {
                 let gate = self.successful_initialize_gate.as_ref().and_then(|gate| {
                     gate.lock()
                         .expect("Apps initialization gate lock should not be poisoned")
-                        .take()
+                        .pop_front()
                 });
                 // This responder's dedicated mock server stays paused while the test controls
                 // when this existing client's background retry may finish.

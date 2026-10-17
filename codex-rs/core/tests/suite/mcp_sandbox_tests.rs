@@ -7,6 +7,8 @@ use std::process::Stdio;
 use anyhow::Context;
 use anyhow::Result;
 use codex_config::McpServerConfig;
+use codex_mcp::MCP_SANDBOX_LAUNCHER_META_KEY;
+use codex_mcp::MCP_SANDBOX_STATE_CAPABILITY;
 use codex_mcp::MCP_SANDBOX_STATE_META_CAPABILITY;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
@@ -172,6 +174,15 @@ impl Respond for SandboxMcpServer {
                 let state = body["params"]["_meta"]
                     .get(MCP_SANDBOX_STATE_META_CAPABILITY)
                     .expect("Codex must supply sandbox state in request metadata");
+                // A legacy capability still receives both identical state names.
+                // HTTP does not establish a shared executable filesystem.
+                assert_eq!(
+                    (
+                        body["params"]["_meta"].get(MCP_SANDBOX_STATE_CAPABILITY),
+                        body["params"]["_meta"].get(MCP_SANDBOX_LAUNCHER_META_KEY),
+                    ),
+                    (Some(state), None),
+                );
                 let target_path = body["params"]["arguments"]["path"]
                     .as_str()
                     .expect("write_file path argument");

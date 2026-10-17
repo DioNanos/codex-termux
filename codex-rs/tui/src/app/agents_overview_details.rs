@@ -230,7 +230,11 @@ impl App {
         self.agents_overview
             .dispatched_requests
             .get(&thread_id)
-            .and_then(|requests| requests.iter().find_map(request_preview))
+            .and_then(|requests| {
+                requests
+                    .iter()
+                    .find_map(|request| request_preview(&request.request))
+            })
             .or_else(|| {
                 let channel = self
                     .thread_event_channels

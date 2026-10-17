@@ -1,10 +1,11 @@
-//! Installs caller-bound tools using persistent host identities.
+//! Installs caller-bound tools using host identities and optional local connections.
 //!
 //! Backend selection is a host concern. Startup failures leave tools unavailable
 //! and emit a warning; a disabled factory does not open storage.
 //! Tool namespaces follow the host's configuration at runtime startup.
 
 use crate::AgentMessageBoard;
+use crate::LocalBoardConnection;
 use crate::tools::message_board_tools_with_descriptions;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
@@ -60,7 +61,11 @@ impl<C: Sync> ThreadLifecycleContributor<C> for BoardExtension<C> {
                         CodexErr::InvalidRequest("invalid board caller identity".into())
                     })?;
                 if let Some(board) = (self.open)(&input, tree, caller).await? {
-                    if board.identity() != tree {
+                    let connection = input.thread_store.get::<LocalBoardConnection>();
+                    let expected = connection
+                        .as_ref()
+                        .map_or(tree, |connection| connection.identity());
+                    if board.identity() != expected {
                         return Err(CodexErr::InvalidRequest(
                             "message-board factory returned another tree".into(),
                         ));
@@ -69,10 +74,13 @@ impl<C: Sync> ThreadLifecycleContributor<C> for BoardExtension<C> {
                         board,
                         caller,
                         namespace: (self.tool_namespace)(input.config),
-                        path: input
-                            .session_source
-                            .get_agent_path()
-                            .unwrap_or_else(AgentPath::root),
+                        path: match connection {
+                            Some(connection) => connection.caller_path(caller)?,
+                            None => input
+                                .session_source
+                                .get_agent_path()
+                                .unwrap_or_else(AgentPath::root),
+                        },
                     });
                 }
                 Ok::<(), CodexErr>(())

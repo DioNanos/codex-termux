@@ -29,6 +29,109 @@ use super::should_print_final_message_to_tty;
 use crate::event_processor::EventProcessor;
 
 #[test]
+fn turn_diff_notifications_render_only_changes() -> anyhow::Result<()> {
+    const CHILD: &str = "CODEX_EXEC_TURN_DIFF_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Capture stderr in a child so other tests cannot interfere with rendering.
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "event_processor_with_human_output::tests::turn_diff_notifications_render_only_changes",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        insta::assert_snapshot!(String::from_utf8(output.stderr)?, @r"
+        turn-1
+        @@ -1 +1 @@
+        -value=1
+        +value=2
+        @@ -1 +1 @@
+        -value=1
+        +value=3
+        @@ -1 +1 @@
+        -value=1
+        +value=2
+        @@ -1 +1 @@
+        -value=1
+        +value=2
+        @@ -1 +1 @@
+        -value=1
+        +value=2
+        turn-2
+        @@ -1 +1 @@
+        -value=1
+        +value=2
+        ");
+        return Ok(());
+    }
+
+    let mut processor = EventProcessorWithHumanOutput {
+        bold: Style::new(),
+        cyan: Style::new(),
+        dimmed: Style::new(),
+        green: Style::new(),
+        italic: Style::new(),
+        magenta: Style::new(),
+        red: Style::new(),
+        yellow: Style::new(),
+        show_agent_reasoning: true,
+        show_raw_agent_reasoning: false,
+        last_message_path: None,
+        final_message: None,
+        final_message_rendered: false,
+        emit_final_message_on_shutdown: false,
+        last_total_token_usage: None,
+        last_turn_diff: String::new(),
+    };
+    let first = "@@ -1 +1 @@\n-value=1\n+value=2";
+    let changed = "@@ -1 +1 @@\n-value=1\n+value=3";
+    for (turn_id, diffs) in [
+        // Repeated updates are quiet, but changed and restored diffs still print.
+        (
+            "turn-1",
+            vec![
+                "", " \n", first, first, changed, changed, first, "", first, " \n", first,
+            ],
+        ),
+        ("turn-2", vec![first, first]),
+    ] {
+        processor.process_server_notification(ServerNotification::TurnStarted(
+            codex_app_server_protocol::TurnStartedNotification {
+                thread_id: "thread-1".to_string(),
+                turn: Turn {
+                    id: turn_id.to_string(),
+                    root_turn_id: None,
+                    items_view: codex_app_server_protocol::TurnItemsView::Full,
+                    items: Vec::new(),
+                    status: TurnStatus::InProgress,
+                    error: None,
+                    started_at: None,
+                    completed_at: None,
+                    duration_ms: None,
+                },
+            },
+        ));
+        eprintln!("{turn_id}");
+        for diff in diffs {
+            assert_eq!(
+                processor.process_server_notification(ServerNotification::TurnDiffUpdated(
+                    codex_app_server_protocol::TurnDiffUpdatedNotification {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: turn_id.to_string(),
+                        diff: diff.to_string(),
+                    },
+                )),
+                crate::event_processor::CodexStatus::Running
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn suppresses_final_stdout_message_when_both_streams_are_terminals() {
     assert!(!should_print_final_message_to_stdout(
         Some("hello"),
@@ -313,6 +416,7 @@ fn turn_completed_recovers_final_message_from_turn_items() {
         final_message_rendered: false,
         emit_final_message_on_shutdown: false,
         last_total_token_usage: None,
+        last_turn_diff: String::new(),
     };
 
     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
@@ -364,6 +468,7 @@ fn turn_completed_overwrites_stale_final_message_from_turn_items() {
         final_message_rendered: true,
         emit_final_message_on_shutdown: false,
         last_total_token_usage: None,
+        last_turn_diff: String::new(),
     };
 
     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
@@ -416,6 +521,7 @@ fn turn_completed_preserves_streamed_final_message_when_turn_items_are_empty() {
         final_message_rendered: false,
         emit_final_message_on_shutdown: false,
         last_total_token_usage: None,
+        last_turn_diff: String::new(),
     };
 
     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
@@ -461,6 +567,7 @@ fn turn_failed_clears_stale_final_message() {
         final_message_rendered: true,
         emit_final_message_on_shutdown: true,
         last_total_token_usage: None,
+        last_turn_diff: String::new(),
     };
 
     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
@@ -507,6 +614,7 @@ fn turn_interrupted_clears_stale_final_message() {
         final_message_rendered: true,
         emit_final_message_on_shutdown: true,
         last_total_token_usage: None,
+        last_turn_diff: String::new(),
     };
 
     let status = processor.process_server_notification(ServerNotification::TurnCompleted(

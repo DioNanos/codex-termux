@@ -34,12 +34,45 @@ pub(super) async fn request<T>(
 
     match result {
         Ok(value) => Ok(value),
-        Err(RequestError::Failed(error)) => Err(failure(operation, error)),
+        Err(RequestError::Failed(error)) => {
+            let reason = failure(operation, &error);
+            // Only the proxy can declare a pinned route lost. Ordinary RPC and
+            // connection failures must not discard a potentially live session.
+            if session.route.is_some()
+                && error.code() == tonic::Code::Unavailable
+                && error
+                    .metadata()
+                    .get("x-code-mode-route-lost")
+                    .is_some_and(|value| value == "true")
+            {
+                session.fail(reason.clone());
+            }
+            Err(reason)
+        }
         Err(RequestError::TimedOut(reason)) => {
             session.fail(reason.clone());
             Err(reason)
         }
     }
+}
+
+/// Invalidates the session on RPCs where `NotFound` means the session is missing.
+pub(super) async fn session_request<T>(
+    session: &SessionInner,
+    operation: &str,
+    runtime_timeout: Duration,
+    rpc: impl Future<Output = Result<T, tonic::Status>>,
+) -> Result<T, String> {
+    request(session, operation, runtime_timeout, async {
+        let result = rpc.await;
+        if let Err(error) = &result
+            && error.code() == tonic::Code::NotFound
+        {
+            session.fail(failure(operation, error));
+        }
+        result
+    })
+    .await
 }
 
 pub(super) fn failure(operation: &str, error: impl Display) -> String {

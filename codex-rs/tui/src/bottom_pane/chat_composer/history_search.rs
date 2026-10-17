@@ -68,7 +68,7 @@ pub(super) struct HistorySearchSession {
     /// Active and completed Vim commands suspended during temporary draft replacement.
     original_vim_state: VimPersistentState,
     /// Footer-owned query text typed or pasted while Ctrl+R search is active.
-    query: String,
+    pub(super) query: String,
     /// User-visible search status used to choose footer hints and composer preview behavior.
     status: HistorySearchStatus,
 }

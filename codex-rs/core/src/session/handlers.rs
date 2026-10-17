@@ -299,6 +299,7 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
     }
     let _ = sess.conversation.shutdown().await;
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    super::async_compaction::shutdown(sess).await;
     let shell_snapshot_prewarm = sess.state.lock().await.shell_snapshot_prewarm.take();
     if let Some(shell_snapshot_prewarm) = shell_snapshot_prewarm {
         shell_snapshot_prewarm.abort();
@@ -516,6 +517,25 @@ pub(super) async fn submission_loop(
                         })
                         .await;
                     }
+                    false
+                }
+                Op::RealtimeConversationAttach { params, reply } => {
+                    let result =
+                        crate::realtime_conversation::handle_attach(&sess, sub.id, params).await;
+                    let _ = reply.send(result);
+                    false
+                }
+                Op::RealtimeConversationDetach {
+                    realtime_session_id,
+                    reply,
+                } => {
+                    crate::realtime_conversation::handle_detach(
+                        &sess,
+                        Some(&realtime_session_id),
+                        &sub.id,
+                    )
+                    .await;
+                    let _ = reply.send(Ok(()));
                     false
                 }
                 Op::RealtimeConversationAudio(params) => {

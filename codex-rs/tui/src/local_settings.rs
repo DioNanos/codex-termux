@@ -28,6 +28,7 @@ pub(crate) struct LocalSettings {
     pub(crate) transcript_mode: TranscriptMode,
     pub(crate) history: History,
     pub(crate) notices: Notice,
+    pub(crate) custom_notification_filters: bool,
     pub(crate) codex_home: AbsolutePathBuf,
     pub(crate) user_config_path: AbsolutePathBuf,
 }
@@ -70,6 +71,7 @@ impl LocalSettings {
                 fullscreen_transcript: config.tui_fullscreen_transcript,
                 mouse_scroll_speed: config.tui_mouse_scroll_speed,
                 copy_on_select: config.tui_copy_on_select,
+                copy_on_select_clear_selection: config.tui_copy_on_select_clear_selection,
                 right_click_paste: config.tui_right_click_paste,
                 alternate_screen: config.tui_alternate_screen,
                 status_line: config.tui_status_line.clone(),
@@ -91,6 +93,7 @@ impl LocalSettings {
             },
             history: config.history.clone(),
             notices: config.notices.clone(),
+            custom_notification_filters: custom_notification_filters(&config.config_layer_stack),
             codex_home: config.codex_home.clone(),
             user_config_path: config
                 .config_layer_stack
@@ -132,6 +135,7 @@ impl LocalSettings {
             tui,
             history: config.history.clone().unwrap_or_default(),
             notices: config.notice.clone().unwrap_or_default(),
+            custom_notification_filters: custom_notification_filters(&bootstrap.config_layer_stack),
             user_config_path: bootstrap
                 .config_layer_stack
                 .get_user_config_file()
@@ -176,6 +180,15 @@ impl LocalSettings {
     }
 }
 
+fn custom_notification_filters(layers: &ConfigLayerStack) -> bool {
+    layers.effective_user_config().is_some_and(|config| {
+        config
+            .get("tui")
+            .and_then(|tui| tui.get("notifications"))
+            .is_some_and(toml::Value::is_array)
+    })
+}
+
 impl LocalSettings {
     /// Adopt the screen selected before first paint, including command-line restrictions.
     pub(crate) fn for_tui(config: &Config, tui: &crate::tui::Tui) -> Self {
@@ -194,6 +207,13 @@ impl LocalSettings {
         let mut settings = Self::from(config);
         settings.transcript_mode = self.transcript_mode;
         settings.tui.alternate_screen = self.tui.alternate_screen;
+        // Generic reloads do not update these values in the live UI. The config panel updates
+        // both copies when the user changes one.
+        settings.tui.animations = self.tui.animations;
+        settings.tui.auto_recap = self.tui.auto_recap;
+        settings.tui.effects.starfield = self.tui.effects.starfield;
+        settings.tui.disable_paste_burst = self.tui.disable_paste_burst;
+        settings.tui.show_tooltips = self.tui.show_tooltips;
         settings
     }
 

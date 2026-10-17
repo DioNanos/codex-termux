@@ -235,8 +235,12 @@ fn ev_rate_limits() -> Value {
     })
 }
 
+#[test_case::test_case("response.completed"; "completed")]
+#[test_case::test_case("response.incomplete"; "incomplete")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_interrupt_emits_deferred_token_count() -> anyhow::Result<()> {
+async fn request_user_input_interrupt_emits_deferred_token_count(
+    terminal_type: &str,
+) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -264,10 +268,13 @@ async fn request_user_input_interrupt_emits_deferred_token_count() -> anyhow::Re
     })
     .to_string();
 
+    let mut terminal = ev_completed_with_tokens("resp-interrupt", /*total_tokens*/ 77);
+    terminal["type"] = json!(terminal_type);
+    terminal["response"]["incomplete_details"] = json!({"reason": "max_output_tokens"});
     let response = sse(vec![
         ev_response_created("resp-interrupt"),
         ev_function_call(call_id, "request_user_input", &request_args),
-        ev_completed_with_tokens("resp-interrupt", /*total_tokens*/ 77),
+        terminal,
     ]);
     responses::mount_sse_once(&server, response).await;
 

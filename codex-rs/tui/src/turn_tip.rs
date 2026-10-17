@@ -14,15 +14,16 @@ use crate::terminal_hyperlinks::HyperlinkParagraph;
 
 pub(crate) struct TurnTip {
     pub(crate) line: HyperlinkLine,
-    pub(crate) rendered: Cell<bool>,
+    pub(crate) rendered: Cell<Option<Rect>>,
 }
 
 impl Renderable for TurnTip {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         if !area.is_empty() && self.line.width() <= usize::from(area.width) {
+            let area = Rect { height: 1, ..area }.intersection(buf.area);
             HyperlinkParagraph::new(std::slice::from_ref(&self.line), Style::default())
-                .render(Rect { height: 1, ..area }, buf);
-            self.rendered.set(/*val*/ true);
+                .render(area, buf);
+            self.rendered.set(Some(area));
         }
     }
 

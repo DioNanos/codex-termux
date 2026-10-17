@@ -34,6 +34,7 @@ use codex_utils_path_uri::PathUri;
 
 mod configuration_update;
 mod executed_tool_calls;
+
 mod item_metadata;
 
 pub use crate::local_media::MAX_PROMPT_AUDIO_INPUT_BYTES;
@@ -50,7 +51,7 @@ pub use executed_tool_calls::ToolResultSource;
 pub use executed_tool_calls::ToolResultSources;
 pub use executed_tool_calls::bound_executed_tool_calls_for_message;
 pub use executed_tool_calls::executed_tool_call_metadata_bytes;
-pub use executed_tool_calls::normalize_executed_tool_call_arguments;
+pub use executed_tool_calls::normalize_executed_tool_call_completeness;
 pub use item_metadata::ContentItemKind;
 
 /// Controls the per-command sandbox override requested by a shell-like tool call.
@@ -892,6 +893,17 @@ pub enum ContentItem {
     },
     OutputText {
         text: String,
+        // Preserve provider metadata, including empty arrays, for sampled-output replay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        #[ts(type = "unknown[]")]
+        #[debug(skip)]
+        annotations: Option<Vec<serde_json::Value>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        #[ts(type = "unknown[]")]
+        #[debug(skip)]
+        logprobs: Option<Vec<serde_json::Value>>,
     },
 }
 
@@ -986,7 +998,8 @@ pub struct InternalChatMessageMetadataPassthrough {
     #[schemars(skip)]
     #[ts(skip)]
     pub executed_tool_calls: Option<Vec<ExecutedToolCall>>,
-    /// Whether the host recorded the complete call inventory without losing calls or arguments.
+    /// Whether the host recorded the complete ordered call inventory without losing calls or names.
+    /// Recorded arguments may be truncated independently of this claim.
     /// For a direct tool output this covers its single invocation; with `cell_id`, it covers
     /// the Code Mode cell across its outputs. Neither case describes tool success.
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
@@ -1021,6 +1034,12 @@ pub enum ResponseItem {
         tools: Vec<serde_json::Value>,
     },
     Message {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        status: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         id: Option<ResponseItemId>,
@@ -1061,6 +1080,9 @@ pub enum ResponseItem {
         internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
     },
     LocalShellCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_content: Option<String>,
         /// Legacy id field retained for compatibility with older payloads.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -1074,6 +1096,12 @@ pub enum ResponseItem {
         internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
     },
     FunctionCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        status: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         id: Option<ResponseItemId>,
@@ -1094,6 +1122,9 @@ pub enum ResponseItem {
         internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
     },
     ToolSearchCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_content: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         id: Option<ResponseItemId>,
@@ -1134,6 +1165,9 @@ pub enum ResponseItem {
         internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
     },
     CustomToolCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_content: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         id: Option<ResponseItemId>,
@@ -1193,6 +1227,9 @@ pub enum ResponseItem {
     WebSearchCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        encrypted_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         id: Option<ResponseItemId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -1214,6 +1251,9 @@ pub enum ResponseItem {
     //   "result":"..."
     // }
     ImageGenerationCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_content: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         id: Option<ResponseItemId>,
@@ -1258,6 +1298,74 @@ pub enum ResponseItem {
 }
 
 impl ResponseItem {
+    /// Clears the top-level `encrypted_content` fields.
+    pub fn clear_encrypted_content(&mut self) {
+        match self {
+            Self::Message {
+                encrypted_content, ..
+            }
+            | Self::Reasoning {
+                encrypted_content, ..
+            }
+            | Self::LocalShellCall {
+                encrypted_content, ..
+            }
+            | Self::FunctionCall {
+                encrypted_content, ..
+            }
+            | Self::ToolSearchCall {
+                encrypted_content, ..
+            }
+            | Self::CustomToolCall {
+                encrypted_content, ..
+            }
+            | Self::WebSearchCall {
+                encrypted_content, ..
+            }
+            | Self::ImageGenerationCall {
+                encrypted_content, ..
+            }
+            | Self::ContextCompaction {
+                encrypted_content, ..
+            } => *encrypted_content = None,
+            Self::Compaction {
+                encrypted_content, ..
+            } => encrypted_content.clear(),
+            Self::AdditionalTools { .. }
+            | Self::AgentMessage { .. }
+            | Self::FunctionCallOutput { .. }
+            | Self::CustomToolCallOutput { .. }
+            | Self::ToolSearchOutput { .. }
+            | Self::ConfigurationUpdate { .. }
+            | Self::CompactionTrigger { .. }
+            | Self::Other => {}
+        }
+    }
+
+    /// Returns the wire type name for this response item.
+    pub fn item_type(&self) -> &'static str {
+        match self {
+            Self::AdditionalTools { .. } => "additional_tools",
+            Self::Message { .. } => "message",
+            Self::AgentMessage { .. } => "agent_message",
+            Self::Reasoning { .. } => "reasoning",
+            Self::LocalShellCall { .. } => "local_shell_call",
+            Self::FunctionCall { .. } => "function_call",
+            Self::ToolSearchCall { .. } => "tool_search_call",
+            Self::FunctionCallOutput { .. } => "function_call_output",
+            Self::CustomToolCall { .. } => "custom_tool_call",
+            Self::CustomToolCallOutput { .. } => "custom_tool_call_output",
+            Self::ToolSearchOutput { .. } => "tool_search_output",
+            Self::WebSearchCall { .. } => "web_search_call",
+            Self::ImageGenerationCall { .. } => "image_generation_call",
+            Self::Compaction { .. } => "compaction",
+            Self::ConfigurationUpdate { .. } => "configuration_update",
+            Self::CompactionTrigger { .. } => "compaction_trigger",
+            Self::ContextCompaction { .. } => "context_compaction",
+            Self::Other => "other",
+        }
+    }
+
     /// Returns whether this item is an ordinary user-role message.
     pub fn is_user_message(&self) -> bool {
         matches!(self, Self::Message { role, .. } if role == "user")
@@ -1875,6 +1983,8 @@ impl From<ResponseInputItem> for ResponseItem {
                 content,
                 phase,
             } => Self::Message {
+                status: None,
+                encrypted_content: None,
                 role,
                 content,
                 id: None,
@@ -2530,6 +2640,8 @@ mod tests {
             let input = ResponseInputItem::Message {
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: "answer text".to_string(),
                 }],
                 phase: phase.clone(),
@@ -2537,9 +2649,13 @@ mod tests {
             let wire = serde_json::to_value(input)?;
             let item = ResponseItem::from(serde_json::from_value::<ResponseInputItem>(wire)?);
             let expected = ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: "answer text".to_string(),
                 }],
                 phase,
@@ -2653,6 +2769,8 @@ mod tests {
         internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
     ) -> ResponseItem {
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -2771,6 +2889,7 @@ mod tests {
         assert_eq!(
             item,
             ResponseItem::ImageGenerationCall {
+                encrypted_content: None,
                 id: Some(ResponseItemId::with_suffix("ig", "123")),
                 status: "completed".to_string(),
                 revised_prompt: Some("A small blue square".to_string()),
@@ -2793,6 +2912,7 @@ mod tests {
         assert_eq!(
             item,
             ResponseItem::ImageGenerationCall {
+                encrypted_content: None,
                 id: Some(ResponseItemId::with_suffix("ig", "123")),
                 status: "completed".to_string(),
                 revised_prompt: None,
@@ -3219,6 +3339,8 @@ mod tests {
         assert_eq!(
             item,
             ResponseItem::FunctionCall {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 name: "mcp__codex_apps__gmail_get_recent_emails".to_string(),
                 namespace: Some("mcp__codex_apps__gmail".to_string()),
@@ -3892,6 +4014,7 @@ mod tests {
         for (json_literal, expected_id, expected_action, expected_status) in cases {
             let parsed: ResponseItem = serde_json::from_str(json_literal)?;
             let expected = ResponseItem::WebSearchCall {
+                encrypted_content: None,
                 id: expected_id.clone(),
                 status: expected_status.clone(),
                 action: expected_action.clone(),
@@ -4134,6 +4257,7 @@ mod tests {
         assert_eq!(
             parsed,
             ResponseItem::ToolSearchCall {
+                encrypted_content: None,
                 id: None,
                 call_id: Some("search-1".to_string()),
                 status: None,
@@ -4251,6 +4375,7 @@ mod tests {
         assert_eq!(
             parsed_call,
             ResponseItem::ToolSearchCall {
+                encrypted_content: None,
                 id: None,
                 call_id: None,
                 status: Some("completed".to_string()),

@@ -1,4 +1,4 @@
-//! Owns a spawned child until its initial input is accepted.
+//! Owns a provisional child until the spawn result can be returned without yielding.
 
 use super::AgentTreeMembership;
 use crate::thread_manager::ThreadManagerState;

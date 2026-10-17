@@ -2218,7 +2218,6 @@ async fn slash_copy_picker_remains_available_from_parent_owned_threads() {
 #[tokio::test]
 async fn slash_daybreak_offers_an_application_when_unavailable() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.set_feature_enabled(Feature::CliDaybreak, /*enabled*/ true);
     chat.has_chatgpt_account = true;
     chat.config.model_provider_id = "openai".into();
     let mut model = crate::test_support::TEST_MODEL_PRESETS[0].clone();
@@ -2272,7 +2271,10 @@ async fn slash_daybreak_offers_an_application_when_unavailable() {
     chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![model]));
     chat.has_chatgpt_account = false;
     chat.status_account_display = Some(StatusAccountDisplay::ApiKey);
+    chat.set_feature_enabled(Feature::ApiKeyCyberAccessPrograms, /*enabled*/ true);
     chat.set_daybreak_enabled(/*enabled*/ false);
+    chat.bottom_pane
+        .set_composer_text(String::new(), Vec::new(), Vec::new());
     chat.bottom_pane
         .set_composer_text("/daybreak".to_string(), Vec::new(), Vec::new());
     assert_chatwidget_snapshot!(
@@ -2281,6 +2283,20 @@ async fn slash_daybreak_offers_an_application_when_unavailable() {
             .lines()
             .next()
             .unwrap()
+    );
+    chat.set_daybreak_enabled(/*enabled*/ true);
+    chat.set_feature_enabled(Feature::ApiKeyCyberAccessPrograms, /*enabled*/ false);
+    chat.bottom_pane
+        .set_composer_text(String::new(), Vec::new(), Vec::new());
+    chat.bottom_pane
+        .set_composer_text("/daybreak".to_string(), Vec::new(), Vec::new());
+    insta::assert_snapshot!(
+        render_bottom_popup(&chat, /*width*/ 80)
+            .lines()
+            .filter(|line| line.contains("broader access"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        @""
     );
     chat.has_chatgpt_account = true;
     chat.status_account_display = None;
@@ -2510,16 +2526,46 @@ async fn slash_keymap_invalid_args_show_usage() {
 #[tokio::test]
 async fn copy_shortcut_can_be_remapped() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
-        let paste = KeyEvent::new(KeyCode::Char('v'), modifiers);
+    for (code, modifiers) in [
+        (KeyCode::Char('v'), KeyModifiers::CONTROL),
+        (KeyCode::Char('V'), KeyModifiers::CONTROL),
+        (
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ),
+        (KeyCode::Char('v'), KeyModifiers::ALT),
+    ] {
+        let paste = KeyEvent::new(code, modifiers);
         assert_matches!(
             chat.handle_key_event(paste),
-            crate::chatwidget::KeyEventAction::PasteImage
+            crate::chatwidget::KeyEventAction::PasteImage { text_fallback }
+                if text_fallback == (cfg!(windows) && modifiers == KeyModifiers::CONTROL)
+                    .then_some(code)
         );
         chat.handle_key_event(KeyEvent {
             kind: KeyEventKind::Release,
             ..paste
         });
+    }
+    // Crossterm maps VK_INSERT + SHIFT_PRESSED directly to Insert + Shift on Windows.
+    let shift_insert = KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT);
+    if cfg!(windows) {
+        chat.bottom_pane.set_disable_paste_burst(/*disabled*/ false);
+        chat.handle_key_event(KeyEvent::from(KeyCode::Char('q')));
+        assert_matches!(
+            chat.handle_key_event(shift_insert),
+            KeyEventAction::PasteImage {
+                text_fallback: Some(KeyCode::Insert)
+            }
+        );
+        assert_eq!(chat.bottom_pane.composer_text(), "q");
+        assert_matches!(chat.handle_key_event(shift_insert), KeyEventAction::None);
+        chat.handle_key_event(KeyEvent {
+            kind: KeyEventKind::Release,
+            ..shift_insert
+        });
+        chat.bottom_pane
+            .set_composer_text(String::new(), Vec::new(), Vec::new());
     }
     let mut keymap_config = chat.config_ref().tui_keymap.clone();
     keymap_config.global.copy = Some(codex_config::types::KeybindingsSpec::One(
@@ -2553,22 +2599,34 @@ async fn legacy_image_paste_ignores_buffered_press_until_other_input() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let paste = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
 
-    assert_matches!(chat.handle_key_event(paste), KeyEventAction::PasteImage);
+    assert_matches!(
+        chat.handle_key_event(paste),
+        KeyEventAction::PasteImage { .. }
+    );
     assert_matches!(chat.handle_key_event(paste), KeyEventAction::None);
 
     chat.suppress_image_paste_until = Instant::now() - Duration::from_secs(/*secs*/ 1);
-    assert_matches!(chat.handle_key_event(paste), KeyEventAction::PasteImage);
+    assert_matches!(
+        chat.handle_key_event(paste),
+        KeyEventAction::PasteImage { .. }
+    );
 
     chat.suppress_image_paste_until = Instant::now() + Duration::from_secs(/*secs*/ 1);
     chat.handle_key_event(KeyEvent::from(KeyCode::Char('x')));
-    assert_matches!(chat.handle_key_event(paste), KeyEventAction::PasteImage);
+    assert_matches!(
+        chat.handle_key_event(paste),
+        KeyEventAction::PasteImage { .. }
+    );
 
     chat.suppress_image_paste_until = Instant::now() + Duration::from_secs(/*secs*/ 1);
     chat.handle_key_event(KeyEvent {
         kind: KeyEventKind::Release,
         ..paste
     });
-    assert_matches!(chat.handle_key_event(paste), KeyEventAction::PasteImage);
+    assert_matches!(
+        chat.handle_key_event(paste),
+        KeyEventAction::PasteImage { .. }
+    );
 }
 
 #[tokio::test]

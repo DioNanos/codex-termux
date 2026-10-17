@@ -116,7 +116,7 @@ async fn seeds_full_package() {
     .await
     .expect("seed");
 
-    let standalone = home.join("packages/app-server-daemon");
+    let standalone = crate::managed_install::package_root(&home);
     let selected = std::fs::canonicalize(standalone.join("current")).expect("selected");
     assert_eq!(
         std::fs::read(selected.join("codex-resources/nested/runtime")).expect("runtime"),
@@ -186,7 +186,12 @@ async fn provisioned_macos_bundle_seeds_from_its_running_executable() {
     );
 }
 
+// Upstream test: a legacy `packages/standalone` selection must stay selected and
+// must not be migrated by a missing-install seed. This fork always selects its
+// own dedicated root (`packages/app-server-daemon-termux`) and seeds there, so
+// the upstream legacy-selection semantics do not apply.
 #[tokio::test]
+#[ignore = "termux fork: dedicated packages root, no legacy standalone selection"]
 async fn legacy_selection_is_not_migrated_or_refreshed() {
     let temp = tempfile::TempDir::new().unwrap();
     let home = temp.path().join("home");
@@ -243,7 +248,7 @@ async fn standalone_seed_preserves_explicit_pin_or_latest_channel() {
         )
         .await
         .unwrap();
-        let root = home.join("packages/app-server-daemon");
+        let root = crate::managed_install::package_root(&home);
         let selected = root.join("current").canonicalize().unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("auto-update-version")).ok(),
@@ -252,142 +257,119 @@ async fn standalone_seed_preserves_explicit_pin_or_latest_channel() {
     }
 }
 
+// Upstream also runs every scenario against a "legacy standalone selection"
+// that renames the dedicated root into `packages/standalone`. This fork owns
+// one fixed dedicated root and never adopts that layout, so only the dedicated
+// variant runs here.
 #[tokio::test]
 async fn explicit_selection_requires_unchanged_cli_and_pins_all_versions() {
-    for legacy in [false, true] {
-        let temp = tempfile::TempDir::new().unwrap();
-        let home = temp.path().join("home");
-        let source = temp.path().join("source");
-        let bin = package(&source, "0.152.0");
-        let settings = DaemonSettings::default();
-        let initial = daemon(&home);
+    let temp = tempfile::TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let source = temp.path().join("source");
+    let bin = package(&source, "0.152.0");
+    let settings = DaemonSettings::default();
+    let initial = daemon(&home);
+    prepare_from_package(
+        &initial,
+        &settings,
+        InstallMode::Missing,
+        Some(&source),
+        &bin,
+        |_| Ok(true),
+    )
+    .await
+    .unwrap();
+    let initial_root = crate::managed_install::package_root(&home);
+    let initial_release = initial_root.join("current").canonicalize().unwrap();
+    let initial_marker = std::fs::read(initial_root.join("auto-update-version")).unwrap();
+    let error = prepare_from_package(
+        &daemon(&home),
+        &settings,
+        InstallMode::Replace,
+        Some(&source),
+        &bin,
+        |_| {
+            let mut rebuilt = std::fs::read(&bin)?;
+            rebuilt.extend_from_slice(b"# rebuilt during confirmation\n");
+            std::fs::write(&bin, rebuilt)?;
+            Ok(true)
+        },
+    )
+    .await
+    .expect_err("reject a CLI rebuilt during confirmation");
+    assert!(
+        error
+            .to_string()
+            .contains("differs from the running executable")
+    );
+    assert_eq!(
+        initial_root.join("current").canonicalize().unwrap(),
+        initial_release
+    );
+    assert_eq!(
+        std::fs::read(initial_root.join("auto-update-version")).unwrap(),
+        initial_marker
+    );
+    let root = crate::managed_install::package_root(&home);
+    let mut previous = initial_release.clone();
+    for version in [
+        "0.153.0",
+        "0.151.0",
+        "0.151.0",
+        "0.154.0-alpha.1",
+        "0.0.0",
+        "0.0.0",
+    ] {
+        let daemon = daemon(&home);
+        let previous_root = crate::managed_install::package_root(&home);
+        package(&source, version);
+        std::fs::write(
+            source.join("codex-resources/nested/runtime"),
+            previous.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let before = std::fs::read(previous.join("bin/codex")).unwrap();
+        assert!(
+            !prepare_from_package(
+                &daemon,
+                &settings,
+                InstallMode::Replace,
+                Some(&source),
+                &bin,
+                |request| {
+                    assert_eq!(request.destination, root);
+                    Ok(false)
+                }
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(crate::managed_install::package_root(&home), previous_root);
+        assert_eq!(
+            previous_root.join("current").canonicalize().unwrap(),
+            previous
+        );
         prepare_from_package(
-            &initial,
+            &daemon,
             &settings,
-            InstallMode::Missing,
+            InstallMode::Replace,
             Some(&source),
             &bin,
             |_| Ok(true),
         )
         .await
         .unwrap();
-        if legacy {
-            std::fs::rename(
-                home.join("packages/app-server-daemon"),
-                home.join("packages/standalone"),
-            )
-            .unwrap();
-            let root = home.join("packages/standalone");
-            let name = std::fs::read_to_string(root.join("auto-update-version")).unwrap();
-            std::fs::remove_file(root.join("current")).unwrap();
-            std::os::unix::fs::symlink(root.join("releases").join(name), root.join("current"))
-                .unwrap();
-            let state = home.join("app-server-daemon");
-            std::fs::create_dir_all(&state).unwrap();
-            std::fs::write(state.join("app-server.stderr.log"), b"").unwrap();
-        }
-        let initial_root = crate::managed_install::package_root(&home);
-        let legacy_release = initial_root.join("current").canonicalize().unwrap();
-        let legacy_marker = std::fs::read(initial_root.join("auto-update-version")).unwrap();
-        let error = prepare_from_package(
-            &daemon(&home),
-            &settings,
-            InstallMode::Replace,
-            Some(&source),
-            &bin,
-            |_| {
-                let mut rebuilt = std::fs::read(&bin)?;
-                rebuilt.extend_from_slice(b"# rebuilt during confirmation\n");
-                std::fs::write(&bin, rebuilt)?;
-                Ok(true)
-            },
-        )
-        .await
-        .expect_err("reject a CLI rebuilt during confirmation");
-        assert!(
-            error
-                .to_string()
-                .contains("differs from the running executable")
-        );
+        let selected = root.join("current").canonicalize().unwrap();
+        assert_eq!(crate::managed_install::package_root(&home), root);
+        assert_ne!(selected, previous);
         assert_eq!(
-            initial_root.join("current").canonicalize().unwrap(),
-            legacy_release
+            std::fs::read(selected.join("bin/codex")).unwrap(),
+            std::fs::read(&bin).unwrap()
         );
-        assert_eq!(
-            std::fs::read(initial_root.join("auto-update-version")).unwrap(),
-            legacy_marker
-        );
-        let root = home.join("packages/app-server-daemon");
-        let mut previous = legacy_release.clone();
-        for version in [
-            "0.153.0",
-            "0.151.0",
-            "0.151.0",
-            "0.154.0-alpha.1",
-            "0.0.0",
-            "0.0.0",
-        ] {
-            let daemon = daemon(&home);
-            let previous_root = crate::managed_install::package_root(&home);
-            package(&source, version);
-            std::fs::write(
-                source.join("codex-resources/nested/runtime"),
-                previous.to_string_lossy().as_bytes(),
-            )
-            .unwrap();
-            let before = std::fs::read(previous.join("bin/codex")).unwrap();
-            assert!(
-                !prepare_from_package(
-                    &daemon,
-                    &settings,
-                    InstallMode::Replace,
-                    Some(&source),
-                    &bin,
-                    |request| {
-                        assert_eq!(request.destination, root);
-                        Ok(false)
-                    }
-                )
-                .await
-                .unwrap()
-            );
-            assert_eq!(crate::managed_install::package_root(&home), previous_root);
-            assert_eq!(
-                previous_root.join("current").canonicalize().unwrap(),
-                previous
-            );
-            prepare_from_package(
-                &daemon,
-                &settings,
-                InstallMode::Replace,
-                Some(&source),
-                &bin,
-                |_| Ok(true),
-            )
-            .await
-            .unwrap();
-            let selected = root.join("current").canonicalize().unwrap();
-            assert_eq!(crate::managed_install::package_root(&home), root);
-            if legacy {
-                assert_eq!(
-                    initial_root.join("current").canonicalize().unwrap(),
-                    legacy_release
-                );
-                assert_eq!(
-                    std::fs::read(initial_root.join("auto-update-version")).unwrap(),
-                    legacy_marker
-                );
-            }
-            assert_ne!(selected, previous);
-            assert_eq!(
-                std::fs::read(selected.join("bin/codex")).unwrap(),
-                std::fs::read(&bin).unwrap()
-            );
-            assert_eq!(std::fs::read(previous.join("bin/codex")).unwrap(), before);
-            assert!(!root.join("auto-update-version").exists());
-            assert!(daemon.running_backend(&settings).await.unwrap().is_none());
-            previous = selected;
-        }
+        assert_eq!(std::fs::read(previous.join("bin/codex")).unwrap(), before);
+        assert!(!root.join("auto-update-version").exists());
+        assert!(daemon.running_backend(&settings).await.unwrap().is_none());
+        previous = selected;
     }
 }
 
@@ -398,7 +380,7 @@ async fn broken_selection_is_not_a_missing_installation() {
     let source = temp.path().join("source");
     let bin = package(&source, "0.152.0");
     let daemon = daemon(&home);
-    let current = home.join("packages/app-server-daemon/current");
+    let current = crate::managed_install::package_root(&home).join("current");
     std::fs::create_dir_all(current.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink("missing-release", &current).unwrap();
     let error = prepare_from_package(

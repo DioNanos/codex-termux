@@ -38,13 +38,12 @@ async fn watch_events_invalidate_discovery_and_no_subscription_disables_caching(
     let request = request(&root)?;
     let demo_skill = request.codex_home.join("skills/demo/SKILL.md")?;
     let manager = CapabilityManager::new(LocalFileSystem::unsandboxed());
+    manager.seed_prewarmed_locations(request.clone()).await?;
     let params = DiscoverV2CapabilitiesRequest {
         cwd: PathUri::from_host_native_path(&root)?,
         sandbox: None,
     };
-    let original = manager
-        .get_or_refresh_discovery(request.clone(), params.clone())
-        .await?;
+    let original = manager.get_or_refresh_discovery(params.clone()).await?;
     assert!(
         original
             .skills
@@ -121,9 +120,7 @@ async fn watch_events_invalidate_discovery_and_no_subscription_disables_caching(
     .context("native watcher missed creation of a global root")??;
     // Drive subsequent refreshes explicitly so native delivery cannot race cache assertions.
     stop_listener(&manager).await?;
-    let refreshed = manager
-        .get_or_refresh_discovery(request.clone(), params.clone())
-        .await?;
+    let refreshed = manager.get_or_refresh_discovery(params.clone()).await?;
     let added_skill = home_skills.join("added/SKILL.md")?;
     assert!(
         refreshed
@@ -145,9 +142,7 @@ async fn watch_events_invalidate_discovery_and_no_subscription_disables_caching(
         )?),
         ..params.clone()
     };
-    manager
-        .get_or_refresh_discovery(request.clone(), sandbox_params)
-        .await?;
+    manager.get_or_refresh_discovery(sandbox_params).await?;
     let retained = manager
         .location_snapshot()
         .await
@@ -189,9 +184,7 @@ async fn watch_events_invalidate_discovery_and_no_subscription_disables_caching(
             .map(|plugin| plugin.version.as_str()),
         Some("1.0.0")
     );
-    let after = manager
-        .get_or_refresh_discovery(request.clone(), params.clone())
-        .await?;
+    let after = manager.get_or_refresh_discovery(params.clone()).await?;
     assert!(
         after
             .skills
@@ -202,9 +195,7 @@ async fn watch_events_invalidate_discovery_and_no_subscription_disables_caching(
     assert_eq!(next.sandbox_discoveries.lock().await.len(), 1);
     assert!(Arc::ptr_eq(
         &after,
-        &manager
-            .get_or_refresh_discovery(request.clone(), params.clone())
-            .await?
+        &manager.get_or_refresh_discovery(params.clone()).await?
     ));
 
     #[cfg(unix)]
@@ -215,9 +206,7 @@ async fn watch_events_invalidate_discovery_and_no_subscription_disables_caching(
         std::fs::rename(&cache, &saved_cache)?;
         std::os::unix::fs::symlink(&cache, &cache)?;
         manager.refresh_locations().await;
-        let fallback = manager
-            .get_or_refresh_discovery(request.clone(), params.clone())
-            .await?;
+        let fallback = manager.get_or_refresh_discovery(params.clone()).await?;
         assert!(Arc::ptr_eq(&after, &fallback));
         std::fs::remove_file(&cache)?;
         std::fs::rename(&saved_cache, &cache)?;
@@ -226,9 +215,7 @@ async fn watch_events_invalidate_discovery_and_no_subscription_disables_caching(
             "codex/skills/recovered/SKILL.md",
             "---\nname: recovered\ndescription: recovered after failed refresh\n---\n",
         )?;
-        let recovered = manager
-            .get_or_refresh_discovery(request.clone(), params.clone())
-            .await?;
+        let recovered = manager.get_or_refresh_discovery(params.clone()).await?;
         assert!(
             recovered
                 .skills
@@ -238,9 +225,7 @@ async fn watch_events_invalidate_discovery_and_no_subscription_disables_caching(
         assert!(!Arc::ptr_eq(&fallback, &recovered));
         assert!(Arc::ptr_eq(
             &recovered,
-            &manager
-                .get_or_refresh_discovery(request.clone(), params.clone())
-                .await?
+            &manager.get_or_refresh_discovery(params.clone()).await?
         ));
     }
 
@@ -250,9 +235,8 @@ async fn watch_events_invalidate_discovery_and_no_subscription_disables_caching(
         .context("new manager unexpectedly shared")?
         .watchers
         .file_watcher = None;
-    let before = uncached
-        .get_or_refresh_discovery(request.clone(), params.clone())
-        .await?;
+    uncached.seed_prewarmed_locations(request.clone()).await?;
+    let before = uncached.get_or_refresh_discovery(params.clone()).await?;
     assert!(uncached.watchers.subscription.get().is_none());
     write(
         &root,
@@ -264,9 +248,7 @@ async fn watch_events_invalidate_discovery_and_no_subscription_disables_caching(
         "codex/plugins/cache/acme/calendar/1.0.0/.codex-plugin/plugin.json",
         r#"{"name":"calendar"}"#,
     )?;
-    let after = uncached
-        .get_or_refresh_discovery(request.clone(), params.clone())
-        .await?;
+    let after = uncached.get_or_refresh_discovery(params.clone()).await?;
     assert_eq!(after.plugins.len(), before.plugins.len() + 1);
     assert!(
         after
@@ -280,7 +262,72 @@ async fn watch_events_invalidate_discovery_and_no_subscription_disables_caching(
             .iter()
             .any(|skill| skill.path == demo_skill && skill.description == "uncached edit")
     );
-    let repeated = uncached.get_or_refresh_discovery(request, params).await?;
+    let repeated = uncached.get_or_refresh_discovery(params).await?;
+    assert_eq!(after, repeated);
+    assert!(!Arc::ptr_eq(&after, &repeated));
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_watch_registration_reloads_locations_and_contents() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = std::fs::canonicalize(directory.path())?;
+    write(
+        &root,
+        "codex/skills/demo/SKILL.md",
+        "---\nname: demo\ndescription: original\n---\n",
+    )?;
+    let request = request(&root)?;
+    let params = DiscoverV2CapabilitiesRequest {
+        cwd: PathUri::from_host_native_path(&root)?,
+        sandbox: None,
+    };
+    let mut manager = CapabilityManager::new(LocalFileSystem::unsandboxed());
+    // A subscriber exists, but no OS watches can be registered.
+    Arc::get_mut(&mut manager)
+        .context("new manager unexpectedly shared")?
+        .watchers
+        .file_watcher = Some(Arc::new(FileWatcher::noop()));
+    manager.seed_prewarmed_locations(request.clone()).await?;
+    let before = manager.get_or_refresh_discovery(params.clone()).await?;
+    assert_eq!(before.skills.len(), 1);
+    assert!(before.plugins.is_empty());
+    assert!(manager.watchers.subscription.get().is_some());
+    let initial = manager
+        .location_snapshot()
+        .await
+        .context("missing snapshot")?;
+    assert!(!initial.registration.registration_succeeded());
+
+    write(
+        &root,
+        "codex/skills/demo/SKILL.md",
+        "---\nname: demo\ndescription: edited\n---\n",
+    )?;
+    write(
+        &root,
+        "codex/plugins/cache/acme/calendar/1.0.0/.codex-plugin/plugin.json",
+        r#"{"name":"calendar"}"#,
+    )?;
+    let after = manager.get_or_refresh_discovery(params.clone()).await?;
+    assert_eq!(after.skills.len(), 1);
+    assert_eq!(after.skills[0].description, "edited");
+    assert_eq!(after.plugins.len(), 1);
+    assert_eq!(after.plugins[0].id, "calendar@acme");
+    let snapshot = manager
+        .location_snapshot()
+        .await
+        .context("missing refreshed snapshot")?;
+    assert!(!Arc::ptr_eq(&initial, &snapshot));
+    assert!(
+        snapshot
+            .sandbox_discoveries
+            .lock()
+            .await
+            .iter()
+            .all(|discovery| discovery.response.get().is_none())
+    );
+    let repeated = manager.get_or_refresh_discovery(params).await?;
     assert_eq!(after, repeated);
     assert!(!Arc::ptr_eq(&after, &repeated));
     Ok(())

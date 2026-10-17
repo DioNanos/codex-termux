@@ -7,11 +7,23 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 
-async fn setup() -> anyhow::Result<(
-    tempfile::TempDir,
-    CapabilityLocationRequest,
-    Arc<CapabilityManager>,
-)> {
+impl CapabilityManager {
+    // Supply fixture paths through the existing cell, without production override state.
+    pub(crate) async fn seed_prewarmed_locations(
+        self: &Arc<Self>,
+        request: CapabilityLocationRequest,
+    ) -> io::Result<()> {
+        self.prewarmed_locations
+            .get_or_try_init(|| async {
+                let locations = prewarm_locations(&self.file_system, &request).await?;
+                Ok::<_, io::Error>((request, locations))
+            })
+            .await?;
+        self.prewarm_locations().await.map(|_| ())
+    }
+}
+
+async fn setup() -> anyhow::Result<(tempfile::TempDir, Arc<CapabilityManager>)> {
     let directory = tempfile::tempdir()?;
     write(
         directory.path(),
@@ -21,36 +33,34 @@ async fn setup() -> anyhow::Result<(
     let request = request(&std::fs::canonicalize(directory.path())?)?;
     let file_system = LocalFileSystem::unsandboxed();
     let manager = CapabilityManager::new(file_system);
-    manager.prewarm_locations(request.clone()).await?;
+    manager.seed_prewarmed_locations(request).await?;
     capability_watchers::tests::stop_listener(&manager).await?;
-    Ok((directory, request, manager))
+    Ok((directory, manager))
 }
 
 #[tokio::test]
 async fn discovery_responses_are_cached_by_sandbox_context() -> anyhow::Result<()> {
-    let (directory, request, manager) = setup().await?;
+    let (directory, manager) = setup().await?;
+    let (first_locations, second_locations) =
+        tokio::try_join!(manager.prewarm_locations(), manager.prewarm_locations())?;
+    assert!(std::ptr::eq(first_locations, second_locations));
     let cwd = PathUri::from_host_native_path(directory.path().join("project"))?;
     let other_cwd = PathUri::from_host_native_path(directory.path().join("other"))?;
     let params = DiscoverV2CapabilitiesRequest {
         cwd: cwd.clone(),
         sandbox: None,
     };
-    let first = manager
-        .get_or_refresh_discovery(request.clone(), params.clone())
-        .await?;
+    let first = manager.get_or_refresh_discovery(params.clone()).await?;
     assert_eq!(first.skills.len(), 1);
     let snapshot = manager
         .location_snapshot()
         .await
         .ok_or_else(|| anyhow::anyhow!("missing snapshot"))?;
     let other = manager
-        .get_or_refresh_discovery(
-            request.clone(),
-            DiscoverV2CapabilitiesRequest {
-                cwd: other_cwd.clone(),
-                ..params.clone()
-            },
-        )
+        .get_or_refresh_discovery(DiscoverV2CapabilitiesRequest {
+            cwd: other_cwd.clone(),
+            ..params.clone()
+        })
         .await?;
     assert!(Arc::ptr_eq(&first, &other));
 
@@ -65,16 +75,12 @@ async fn discovery_responses_are_cached_by_sandbox_context() -> anyhow::Result<(
             )?),
             ..params.clone()
         };
-        let response = manager
-            .get_or_refresh_discovery(request.clone(), sandbox.clone())
-            .await?;
+        let response = manager.get_or_refresh_discovery(sandbox.clone()).await?;
         assert_eq!(response, previous);
         assert!(!Arc::ptr_eq(&response, &previous));
         assert!(Arc::ptr_eq(
             &response,
-            &manager
-                .get_or_refresh_discovery(request.clone(), sandbox)
-                .await?
+            &manager.get_or_refresh_discovery(sandbox).await?
         ));
         previous = response;
     }
@@ -83,7 +89,7 @@ async fn discovery_responses_are_cached_by_sandbox_context() -> anyhow::Result<(
         MAX_CACHED_SANDBOX_CONTEXTS
     );
     // The oldest context is evicted, but its previously returned response stays valid.
-    let reloaded = manager.get_or_refresh_discovery(request, params).await?;
+    let reloaded = manager.get_or_refresh_discovery(params).await?;
     assert_eq!(reloaded, first);
     assert!(!Arc::ptr_eq(&reloaded, &first));
     assert_eq!(
@@ -100,7 +106,7 @@ fn cancelled_initialization_retries_and_warning_responses_are_cached() -> anyhow
         .max_blocking_threads(1)
         .build()?
         .block_on(async {
-            let (directory, request, manager) = setup().await?;
+            let (directory, manager) = setup().await?;
             let params = DiscoverV2CapabilitiesRequest {
                 cwd: PathUri::from_host_native_path(directory.path().join("project"))?,
                 sandbox: None,
@@ -118,8 +124,7 @@ fn cancelled_initialization_retries_and_warning_responses_are_cached() -> anyhow
                 let _ = wait.recv();
             });
             ready.await?;
-            let mut first =
-                Box::pin(manager.get_or_refresh_discovery(request.clone(), params.clone()));
+            let mut first = Box::pin(manager.get_or_refresh_discovery(params.clone()));
             assert!(futures::poll!(&mut first).is_pending());
             let discovery = snapshot
                 .sandbox_discoveries
@@ -128,8 +133,7 @@ fn cancelled_initialization_retries_and_warning_responses_are_cached() -> anyhow
                 .first()
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("missing sandbox discovery"))?;
-            let mut second =
-                Box::pin(manager.get_or_refresh_discovery(request.clone(), params.clone()));
+            let mut second = Box::pin(manager.get_or_refresh_discovery(params.clone()));
             assert!(futures::poll!(&mut second).is_pending());
             assert!(discovery.response.get().is_none());
             assert!(snapshot.sandbox_discoveries.try_lock().is_ok());
@@ -141,9 +145,7 @@ fn cancelled_initialization_retries_and_warning_responses_are_cached() -> anyhow
             assert_eq!(original.skills.len(), 1);
             assert!(Arc::ptr_eq(
                 &original,
-                &manager
-                    .get_or_refresh_discovery(request.clone(), params.clone())
-                    .await?,
+                &manager.get_or_refresh_discovery(params.clone()).await?,
             ));
 
             write(
@@ -154,17 +156,15 @@ fn cancelled_initialization_retries_and_warning_responses_are_cached() -> anyhow
             // Invalidation drops entries instead of overwriting their initialized responses.
             snapshot.sandbox_discoveries.lock().await.clear();
             let (partial, concurrent) = tokio::try_join!(
-                manager.get_or_refresh_discovery(request.clone(), params.clone()),
-                manager.get_or_refresh_discovery(request.clone(), params.clone()),
+                manager.get_or_refresh_discovery(params.clone()),
+                manager.get_or_refresh_discovery(params.clone()),
             )?;
             assert!(Arc::ptr_eq(&partial, &concurrent));
             assert!(partial.skills.is_empty());
             assert!(!partial.warnings.is_empty());
             assert!(Arc::ptr_eq(
                 &partial,
-                &manager
-                    .get_or_refresh_discovery(request.clone(), params.clone())
-                    .await?
+                &manager.get_or_refresh_discovery(params.clone()).await?
             ));
 
             write(
@@ -174,14 +174,10 @@ fn cancelled_initialization_retries_and_warning_responses_are_cached() -> anyhow
             )?;
             assert!(Arc::ptr_eq(
                 &partial,
-                &manager
-                    .get_or_refresh_discovery(request.clone(), params.clone())
-                    .await?
+                &manager.get_or_refresh_discovery(params.clone()).await?
             ));
             snapshot.sandbox_discoveries.lock().await.clear();
-            let recovered = manager
-                .get_or_refresh_discovery(request.clone(), params.clone())
-                .await?;
+            let recovered = manager.get_or_refresh_discovery(params.clone()).await?;
             assert!(recovered.warnings.is_empty());
             assert_eq!(
                 recovered
@@ -193,9 +189,7 @@ fn cancelled_initialization_retries_and_warning_responses_are_cached() -> anyhow
             );
             assert!(Arc::ptr_eq(
                 &recovered,
-                &manager
-                    .get_or_refresh_discovery(request.clone(), params)
-                    .await?
+                &manager.get_or_refresh_discovery(params).await?
             ));
             Ok(())
         })

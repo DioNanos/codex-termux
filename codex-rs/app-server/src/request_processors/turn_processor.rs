@@ -15,6 +15,8 @@ use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind
 use codex_protocol::protocol::TurnEnvironmentRequests;
 use codex_protocol::protocol::TurnSettingsUpdate;
 use codex_protocol::protocol::TurnSettingsUpdateOutcome;
+use codex_protocol::turn_input::AnnotatedResponseItem;
+use codex_protocol::turn_input::ResponseItemAnnotations;
 use codex_skills::system_cache_root_dir;
 
 use crate::attachment_path_mapper::to_host_path;
@@ -105,7 +107,7 @@ pub(crate) struct TurnRequestProcessor {
     analytics_events_client: AnalyticsEventsClient,
     config: Arc<Config>,
     config_manager: ConfigManager,
-    pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    pending_thread_unloads: PendingThreadUnloads,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
     skills_watcher: Arc<SkillsWatcher>,
@@ -167,7 +169,7 @@ impl TurnRequestProcessor {
         analytics_events_client: AnalyticsEventsClient,
         config: Arc<Config>,
         config_manager: ConfigManager,
-        pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+        pending_thread_unloads: PendingThreadUnloads,
         thread_state_manager: ThreadStateManager,
         thread_watch_manager: ThreadWatchManager,
         skills_watcher: Arc<SkillsWatcher>,
@@ -626,7 +628,14 @@ impl TurnRequestProcessor {
                 internal_chat_message_metadata_passthrough: None,
             };
             validate_response_item_image_urls(std::slice::from_ref(&item))?;
-            TurnInput::ResponseItem(item)
+            if tool_output.retain {
+                TurnInput::AnnotatedResponseItem(AnnotatedResponseItem {
+                    item,
+                    annotations: ResponseItemAnnotations { retain: true },
+                })
+            } else {
+                TurnInput::ResponseItem(item)
+            }
         } else {
             TurnInput::UserInput {
                 content: params

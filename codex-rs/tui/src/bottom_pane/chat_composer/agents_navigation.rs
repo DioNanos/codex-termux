@@ -30,4 +30,15 @@ impl ChatComposer {
             && !self.popup_active()
             && !self.draft.textarea.is_vim_operator_pending()
     }
+
+    pub(super) fn handle_agents_navigation(&mut self, key: KeyEvent) -> bool {
+        if key.kind == KeyEventKind::Press
+            && key_hint::plain(KeyCode::Left).is_press(key)
+            && self.agents_navigation_available()
+        {
+            self.app_event_tx.send(AppEvent::OpenAgentsOverview);
+            return true;
+        }
+        false
+    }
 }

@@ -96,7 +96,7 @@ pub struct SectionCost {
 impl SectionCost {
     fn add_content(mut self, item: &ContentItem) -> Self {
         match item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
                 self.text_bytes = self.text_bytes.saturating_add(text.len());
             }
             ContentItem::InputImage {
@@ -186,15 +186,48 @@ impl ComposedContext {
     }
 }
 
-/// Conservative estimate including roles, framing, metadata and opaque checkpoints.
+/// Coarse estimate including roles, framing, metadata and opaque checkpoints.
 /// Images reserve tokens separately from their wire bytes. This is a budgeting
 /// heuristic, not the model's tokenizer or a measurement of server-side usage.
 pub fn estimate_input_tokens(item: &ResponseItem) -> usize {
+    estimate_input_tokens_from_serialized_len(item, ByteCount::item(item))
+}
+
+/// Estimate input tokens while reusing the length of an existing serialization.
+/// `serialized_len` must be the byte length of the item's `serde_json` encoding.
+pub fn estimate_input_tokens_from_serialized_len(
+    item: &ResponseItem,
+    serialized_len: usize,
+) -> usize {
+    if serialized_len == usize::MAX {
+        return usize::MAX;
+    }
+    if let Some(encrypted_content) = compaction_ciphertext(item) {
+        let framing =
+            TruncationPolicy::Bytes(serialized_len.saturating_sub(encrypted_content.len()))
+                .token_budget();
+        let content =
+            codex_protocol::protocol::estimate_compaction_content_length(encrypted_content.len());
+        return framing.saturating_add(TruncationPolicy::Bytes(content).token_budget());
+    }
     let content = match item {
         ResponseItem::Message { content, .. } => content.as_slice(),
         _ => &[],
     };
-    adjusted_tokens(ByteCount::item(item), content)
+    adjusted_tokens(serialized_len, content)
+}
+
+fn compaction_ciphertext(item: &ResponseItem) -> Option<&str> {
+    match item {
+        ResponseItem::Compaction {
+            encrypted_content, ..
+        }
+        | ResponseItem::ContextCompaction {
+            encrypted_content: Some(encrypted_content),
+            ..
+        } => Some(encrypted_content),
+        _ => None,
+    }
 }
 
 pub(super) fn section_content_tokens(item: &SectionContent) -> usize {

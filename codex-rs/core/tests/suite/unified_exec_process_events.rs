@@ -11,6 +11,7 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -62,6 +63,8 @@ use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
 const CALL_ID: &str = "pushed-remote-process-events";
+const POLL_CALL_ID: &str = "poll-remote-process-events";
+const DRAIN_POLL_CALL_ID: &str = "poll-during-remote-drain";
 const COMPLETE_OUTPUT: &str = "pushed remote output\n";
 const RECOVERED_OUTPUT: &str = "recovered missing output\n";
 const RETAINED_OUTPUT: &str = "retained output\n";
@@ -72,6 +75,14 @@ const REPLAY_RETAINED_OUTPUT_SEQ: u64 = 800;
 #[cfg_attr(windows, allow(dead_code))]
 enum PushedExecScenario {
     Complete,
+    OutputAfterExit,
+    OutputAfterRecoveredExit,
+    OutputOpenAtDeadline,
+    OutputOpenAtFinalPoll,
+    OutputOpenWhenCancelled,
+    OutputOpenWhenResumableCancelled,
+    OutputOpenWhenTerminated,
+    OutputOpenWhenTerminatedBeforeYield,
     CodexPath,
     CodexPathDefaultFeature,
     CodexPathDisabledFeature,
@@ -231,6 +242,8 @@ async fn serve_exec_with_pushed_events(
     listener: TcpListener,
     scenario: PushedExecScenario,
     process_started: Arc<AtomicBool>,
+    output_ready: Arc<tokio::sync::Notify>,
+    drain_read_ready: Arc<tokio::sync::Notify>,
 ) -> PushedExecServerResult {
     let unrestricted_patch = matches!(
         scenario,
@@ -420,7 +433,114 @@ async fn serve_exec_with_pushed_events(
     )
     .await;
 
+    let output_stays_open = matches!(
+        scenario,
+        PushedExecScenario::OutputOpenAtDeadline
+            | PushedExecScenario::OutputOpenAtFinalPoll
+            | PushedExecScenario::OutputOpenWhenCancelled
+            | PushedExecScenario::OutputOpenWhenResumableCancelled
+            | PushedExecScenario::OutputOpenWhenTerminated
+            | PushedExecScenario::OutputOpenWhenTerminatedBeforeYield
+    );
+    if output_stays_open || matches!(scenario, PushedExecScenario::OutputAfterExit) {
+        output_ready.notified().await;
+    }
+    let mut process_read_requests = 0;
     match scenario {
+        PushedExecScenario::OutputAfterExit
+        | PushedExecScenario::OutputAfterRecoveredExit
+        | PushedExecScenario::OutputOpenAtDeadline
+        | PushedExecScenario::OutputOpenAtFinalPoll
+        | PushedExecScenario::OutputOpenWhenCancelled
+        | PushedExecScenario::OutputOpenWhenResumableCancelled
+        | PushedExecScenario::OutputOpenWhenTerminated
+        | PushedExecScenario::OutputOpenWhenTerminatedBeforeYield => {
+            send_exec_server_json(
+                &mut websocket,
+                json!({
+                    "method": "process/output",
+                    "params": {
+                        "processId": &process_id,
+                        "seq": 1,
+                        "stream": "stdout",
+                        "chunk": BASE64_STANDARD.encode("pushed "),
+                    }
+                }),
+            )
+            .await;
+            let mut exit = json!({
+                "method": "process/exited",
+                "params": {
+                    "processId": &process_id,
+                    "seq": 2,
+                    "exitCode": 0,
+                }
+            });
+            if !matches!(scenario, PushedExecScenario::OutputAfterRecoveredExit) {
+                exit["params"]["sandboxDenied"] = json!(false);
+            }
+            send_exec_server_json(&mut websocket, exit).await;
+            if matches!(scenario, PushedExecScenario::OutputAfterRecoveredExit) {
+                let read = read_exec_server_json(&mut websocket, STARTUP_TIMEOUT).await;
+                assert_eq!(read["method"], "process/read");
+                process_read_requests += 1;
+                send_exec_server_json(
+                    &mut websocket,
+                    json!({
+                        "id": read["id"],
+                        "result": {
+                            "chunks": [],
+                            "nextSeq": 3,
+                            "exited": true,
+                            "exitCode": 0,
+                            "closed": false,
+                            "failure": null,
+                            "sandboxDenied": false,
+                        }
+                    }),
+                )
+                .await;
+            }
+            if matches!(scenario, PushedExecScenario::OutputAfterExit) {
+                // Keep the tail in transit until the initial collection yields.
+                output_ready.notified().await;
+            }
+            // Model foreground output delayed in transit beyond the local post-exit grace.
+            // An active final poll must also outlive the five-second background drain.
+            tokio::time::sleep(
+                if matches!(scenario, PushedExecScenario::OutputOpenAtFinalPoll) {
+                    Duration::from_secs(6)
+                } else {
+                    Duration::from_millis(250)
+                },
+            )
+            .await;
+            if !matches!(scenario, PushedExecScenario::OutputOpenAtDeadline) {
+                send_exec_server_json(
+                    &mut websocket,
+                    json!({
+                        "method": "process/output",
+                        "params": {
+                            "processId": &process_id,
+                            "seq": 3,
+                            "stream": "stdout",
+                            "chunk": BASE64_STANDARD.encode("remote output\n"),
+                        }
+                    }),
+                )
+                .await;
+            }
+            if !output_stays_open || matches!(scenario, PushedExecScenario::OutputOpenAtFinalPoll) {
+                send_exec_server_json(
+                    &mut websocket,
+                    json!({
+                        "method": "process/closed",
+                        "params": { "processId": &process_id, "seq": 4 }
+                    }),
+                )
+                .await;
+            }
+        }
         PushedExecScenario::Complete
         | PushedExecScenario::DenyWin
         | PushedExecScenario::DenyWinUnchanged
@@ -506,13 +626,74 @@ async fn serve_exec_with_pushed_events(
         PushedExecScenario::ReplayGap => {}
     }
 
-    let mut process_read_requests = 0;
+    let mut pending_drain_response = None;
     loop {
-        let request = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)).await;
+        let wait = if output_stays_open {
+            STARTUP_TIMEOUT
+        } else {
+            Duration::from_secs(/*secs*/ 5)
+        };
+        let request = tokio::select! {
+            request = read_exec_server_json(&mut websocket, wait) => request,
+            _ = output_ready.notified(), if pending_drain_response.is_some() => {
+                send_exec_server_json(
+                    &mut websocket,
+                    pending_drain_response.take().expect("pending final read"),
+                ).await;
+                continue;
+            }
+        };
         match request["method"].as_str() {
+            Some("fs/getMetadata") => {
+                // Starting the polling turn still needs filesystem metadata while the read waits.
+                send_exec_server_json(
+                    &mut websocket,
+                    json!({
+                        "id": request["id"],
+                        "error": { "code": -32004, "message": "not found" }
+                    }),
+                )
+                .await;
+            }
             Some("process/read") => {
                 process_read_requests += 1;
                 let result = match scenario {
+                    PushedExecScenario::OutputOpenAtDeadline => {
+                        assert_eq!(request["params"]["afterSeq"], 2);
+                        // Hold the final read until a later poll yields its buffered output.
+                        // The tail remains recoverable even after that poll's deadline.
+                        drain_read_ready.notify_one();
+                        json!({
+                            "chunks": [{
+                                "seq": 3,
+                                "stream": "stdout",
+                                "chunk": BASE64_STANDARD.encode("remote output\n"),
+                            }],
+                            "nextSeq": 4,
+                            "exited": true,
+                            "exitCode": 0,
+                            "closed": false,
+                            "failure": null,
+                            "sandboxDenied": false,
+                        })
+                    }
+                    PushedExecScenario::OutputOpenWhenResumableCancelled => json!({
+                        "chunks": [],
+                        "nextSeq": 4,
+                        "exited": true,
+                        "exitCode": 0,
+                        "closed": false,
+                        "failure": null,
+                        "sandboxDenied": false,
+                    }),
+                    PushedExecScenario::OutputAfterExit
+                    | PushedExecScenario::OutputAfterRecoveredExit
+                    | PushedExecScenario::OutputOpenAtFinalPoll
+                    | PushedExecScenario::OutputOpenWhenCancelled
+                    | PushedExecScenario::OutputOpenWhenTerminated
+                    | PushedExecScenario::OutputOpenWhenTerminatedBeforeYield => {
+                        panic!("unexpected read after the delayed-output sequence")
+                    }
                     PushedExecScenario::Complete
                     | PushedExecScenario::CodexPath
                     | PushedExecScenario::CodexPathDefaultFeature
@@ -591,14 +772,12 @@ async fn serve_exec_with_pushed_events(
                         })
                     }
                 };
-                send_exec_server_json(
-                    &mut websocket,
-                    json!({
-                        "id": request["id"],
-                        "result": result,
-                    }),
-                )
-                .await;
+                let response = json!({ "id": request["id"], "result": result });
+                if matches!(scenario, PushedExecScenario::OutputOpenAtDeadline) {
+                    pending_drain_response = Some(response);
+                } else {
+                    send_exec_server_json(&mut websocket, response).await;
+                }
                 if matches!(scenario, PushedExecScenario::ReplayGap) && process_read_requests == 1 {
                     send_exec_server_json(
                         &mut websocket,
@@ -633,6 +812,14 @@ async fn serve_exec_with_pushed_events(
 }
 
 #[test_case(PushedExecScenario::Complete, ManagedNetworkScenario::None, false ; "complete_event_stream")]
+#[test_case(PushedExecScenario::OutputAfterExit, ManagedNetworkScenario::None, false ; "output_after_exit")]
+#[test_case(PushedExecScenario::OutputAfterRecoveredExit, ManagedNetworkScenario::None, false ; "output_after_recovered_exit")]
+#[test_case(PushedExecScenario::OutputOpenAtDeadline, ManagedNetworkScenario::None, /*foreign_cwd*/ false ; "output_open_at_deadline")]
+#[test_case(PushedExecScenario::OutputOpenAtFinalPoll, ManagedNetworkScenario::None, /*foreign_cwd*/ false ; "output_open_at_final_poll")]
+#[test_case(PushedExecScenario::OutputOpenWhenCancelled, ManagedNetworkScenario::None, /*foreign_cwd*/ false ; "output_open_when_cancelled")]
+#[test_case(PushedExecScenario::OutputOpenWhenResumableCancelled, ManagedNetworkScenario::None, /*foreign_cwd*/ false ; "output_open_when_resumable_cancelled")]
+#[test_case(PushedExecScenario::OutputOpenWhenTerminated, ManagedNetworkScenario::None, /*foreign_cwd*/ false ; "output_open_when_terminated")]
+#[test_case(PushedExecScenario::OutputOpenWhenTerminatedBeforeYield, ManagedNetworkScenario::None, /*foreign_cwd*/ false ; "output_open_when_terminated_before_yield")]
 #[test_case(PushedExecScenario::CodexPath, ManagedNetworkScenario::None, false ; "codex_path_is_exported_before_nested_command")]
 #[test_case(PushedExecScenario::CodexPathDefaultFeature, ManagedNetworkScenario::None, false ; "codex_path_is_not_exported_by_default")]
 #[test_case(PushedExecScenario::CodexPathDisabledFeature, ManagedNetworkScenario::None, false ; "disabled_codex_path_preserves_original_login_command")]
@@ -666,6 +853,21 @@ async fn exec_command_consumes_pushed_remote_process_events(
     managed_network: ManagedNetworkScenario,
     foreign_cwd: bool,
 ) -> Result<()> {
+    let finish_at_deadline = matches!(scenario, PushedExecScenario::OutputOpenAtDeadline);
+    let finish_at_final_poll = matches!(scenario, PushedExecScenario::OutputOpenAtFinalPoll);
+    let resumable_cancel = matches!(
+        scenario,
+        PushedExecScenario::OutputOpenWhenResumableCancelled
+    );
+    let cancel_after_exit =
+        resumable_cancel || matches!(scenario, PushedExecScenario::OutputOpenWhenCancelled);
+    let output_after_yield = matches!(scenario, PushedExecScenario::OutputAfterExit);
+    let terminate_initial_collection = matches!(
+        scenario,
+        PushedExecScenario::OutputOpenWhenTerminatedBeforeYield
+    );
+    let terminate_after_exit = terminate_initial_collection
+        || matches!(scenario, PushedExecScenario::OutputOpenWhenTerminated);
     let explicit_path = "/user/configured/bin:/user/other/bin";
     let managed_network_configured = !matches!(managed_network, ManagedNetworkScenario::None);
     let managed_network_enabled = matches!(managed_network, ManagedNetworkScenario::Enabled { .. });
@@ -686,6 +888,9 @@ async fn exec_command_consumes_pushed_remote_process_events(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server = start_mock_server().await;
     let tool_call = match scenario {
+        PushedExecScenario::OutputOpenWhenCancelled => ev_function_call(
+            CALL_ID, "exec_command", &json!({ "cmd": "pwd", "timeout_ms": 30_000 }).to_string(),
+        ),
         _ if deny_read => ev_function_call(
             CALL_ID,
             "exec_command",
@@ -733,33 +938,77 @@ async fn exec_command_consumes_pushed_remote_process_events(
                     | PushedExecScenario::CodexPathDisabledFeature => "sh -c 'command -v rg'".to_string(),
                     _ => "pwd".to_string(),
                 },
-                "yield_time_ms": 1_000,
+                "tty": output_after_yield,
+                "yield_time_ms": if resumable_cancel || terminate_initial_collection { 30_000 } else { 1_000 },
             })
             .to_string(),
         ),
     };
-    let response_mock = mount_sse_sequence(
-        &server,
-        vec![
+    let mut responses = vec![
+        sse(vec![
+            ev_response_created("resp-1"),
+            tool_call,
+            ev_completed("resp-1"),
+        ]),
+        sse(vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "done"),
+            ev_completed("resp-2"),
+        ]),
+    ];
+    if cancel_after_exit {
+        responses.truncate(/*len*/ 1);
+    }
+    if output_after_yield || finish_at_final_poll {
+        responses.insert(
+            /*index*/ 1,
             sse(vec![
-                ev_response_created("resp-1"),
-                tool_call,
-                ev_completed("resp-1"),
+                ev_response_created("resp-poll"),
+                ev_function_call(
+                    POLL_CALL_ID,
+                    "write_stdin",
+                    &json!({
+                        "session_id": 1000,
+                        // Exit is already observed; skip stdin but still collect the tail.
+                        "chars": if output_after_yield { "ignored\n" } else { "" },
+                        // The final poll receives output after the five-second background drain.
+                        "yield_time_ms": if finish_at_final_poll { 10_000 } else { 1_000 },
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp-poll"),
             ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-2", "done"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
+        );
+    }
+    if finish_at_deadline {
+        for call_id in [DRAIN_POLL_CALL_ID, POLL_CALL_ID] {
+            responses.push(sse(vec![
+                ev_response_created(call_id),
+                ev_function_call(
+                    call_id,
+                    "write_stdin",
+                    &json!({ "session_id": 1000, "chars": "", "yield_time_ms": 1_000 }).to_string(),
+                ),
+                ev_completed(call_id),
+            ]));
+        }
+        responses.push(sse(vec![
+            ev_response_created("resp-drained"),
+            ev_assistant_message("msg-drained", "done"),
+            ev_completed("resp-drained"),
+        ]));
+    }
+    let response_mock = mount_sse_sequence(&server, responses).await;
     let exec_server_url = format!("ws://{}", listener.local_addr()?);
     let process_started = Arc::new(AtomicBool::new(false));
+    let output_ready = Arc::new(tokio::sync::Notify::new());
+    let drain_read_ready = Arc::new(tokio::sync::Notify::new());
     let exec_server = tokio::spawn(serve_exec_with_pushed_events(
         listener,
         scenario,
         Arc::clone(&process_started),
+        Arc::clone(&output_ready),
+        Arc::clone(&drain_read_ready),
     ));
     let mut builder = test_codex().with_exec_server_url(exec_server_url);
     if managed_network_configured {
@@ -820,6 +1069,13 @@ timeout = 900
                 )
                 .expect("write managed-network test config");
             });
+    }
+    if matches!(scenario, PushedExecScenario::OutputOpenWhenCancelled) {
+        builder = builder.with_cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                "[features]\nunified_exec = false\nshell_tool = true\n",
+            ),
+        );
     }
     let mut builder = builder.with_config(move |config| {
         config.project_doc_max_bytes = 0;
@@ -996,9 +1252,25 @@ timeout = 900
     let mut saw_exec_command_begin = false;
     let mut exec_command_begin_command = None;
     let mut saw_patch_denial_approval = false;
+    let mut command_end = None;
+    let mut stopped = false;
+    let mut turn_finished = false;
+    let mut drain_poll_started = false;
+    let wait_for_end =
+        finish_at_deadline || finish_at_final_poll || cancel_after_exit || terminate_after_exit;
+    let event_timeout = if finish_at_deadline
+        || finish_at_final_poll
+        || terminate_after_exit
+        || resumable_cancel
+        || output_after_yield
+    {
+        STARTUP_TIMEOUT
+    } else {
+        Duration::from_secs(/*secs*/ 5)
+    };
     if !managed_network_enabled {
         loop {
-            let event = timeout(Duration::from_secs(5), test.codex.next_event())
+            let event = timeout(event_timeout, test.codex.next_event())
                 .await
                 .context("turn should complete")??
                 .msg;
@@ -1006,6 +1278,17 @@ timeout = 900
                 EventMsg::ExecCommandBegin(event) if event.call_id == CALL_ID => {
                     saw_exec_command_begin = true;
                     exec_command_begin_command = Some(event.command);
+                    if cancel_after_exit || output_after_yield || terminate_initial_collection {
+                        // Storage follows the streaming subscription, so the fixture's
+                        // exit and tail cannot race ahead of the cancellation trigger.
+                        timeout(STARTUP_TIMEOUT, async {
+                            while test.codex.list_background_terminals().await.is_empty() {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await?;
+                        output_ready.notify_one();
+                    }
                 }
                 EventMsg::ExecApprovalRequest(approval) if deny_read => {
                     assert_eq!(approval.call_id, CALL_ID);
@@ -1041,10 +1324,70 @@ timeout = 900
                         })
                         .await?;
                 }
-                EventMsg::TurnComplete(_) => break,
+                EventMsg::ExecCommandOutputDelta(event)
+                    if (cancel_after_exit || terminate_after_exit)
+                        && event.call_id == CALL_ID
+                        && !stopped
+                        && String::from_utf8_lossy(&event.chunk).contains("remote output") =>
+                {
+                    // The exit precedes this output in the executor event stream.
+                    if cancel_after_exit {
+                        test.codex.submit(Op::Interrupt).await?;
+                    } else {
+                        assert!(
+                            test.codex
+                                .terminate_background_terminal(/*process_id*/ 1000)
+                                .await
+                        );
+                    }
+                    stopped = true;
+                }
+                EventMsg::RawResponseItem(raw)
+                    if finish_at_deadline
+                        && matches!(&raw.item, ResponseItem::FunctionCallOutput { call_id, .. } if call_id.as_deref() == Some(DRAIN_POLL_CALL_ID)) =>
+                {
+                    output_ready.notify_one();
+                }
+                EventMsg::RawResponseItem(raw)
+                    if ((terminate_after_exit && !terminate_initial_collection)
+                        || finish_at_deadline
+                        || finish_at_final_poll
+                        || output_after_yield)
+                        && matches!(&raw.item, ResponseItem::FunctionCallOutput { call_id, .. } if call_id.as_deref() == Some(CALL_ID)) =>
+                {
+                    // Release exit/output only after the initial exec_command yielded.
+                    output_ready.notify_one();
+                }
+                EventMsg::ExecCommandEnd(event) if event.call_id == CALL_ID => {
+                    command_end = Some(event);
+                }
+                EventMsg::TurnAborted(_) if cancel_after_exit => {
+                    turn_finished = true;
+                }
+                EventMsg::TurnComplete(_) if finish_at_deadline && !drain_poll_started => {
+                    timeout(STARTUP_TIMEOUT, drain_read_ready.notified()).await?;
+                    test.codex
+                        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                            text: "Poll the command.".into(),
+                            text_elements: Vec::new(),
+                        }]))
+                        .await?;
+                    drain_poll_started = true;
+                }
+                EventMsg::TurnComplete(_) if !cancel_after_exit => turn_finished = true,
                 _ => {}
             }
+            if turn_finished && (!wait_for_end || command_end.is_some()) {
+                break;
+            }
         }
+    }
+    if wait_for_end {
+        assert_eq!(
+            command_end.map(|end| (end.exit_code, end.aggregated_output)),
+            Some((0, COMPLETE_OUTPUT.to_string()))
+        );
+        assert!(test.codex.list_background_terminals().await.is_empty());
     }
     if matches!(
         scenario,
@@ -1213,6 +1556,25 @@ timeout = 900
             "toolCallId": CALL_ID,
         }),
     );
+    if resumable_cancel {
+        assert_eq!(exec_server_result.process_read_requests, 1);
+        // The producer is closed without another poll; its unread output stays collectable.
+        assert!(
+            test.codex
+                .terminate_background_terminal(/*process_id*/ 1000)
+                .await
+        );
+    }
+    if cancel_after_exit || terminate_after_exit {
+        assert!(stopped);
+        assert_eq!(
+            exec_server_result.process_read_requests,
+            usize::from(resumable_cancel)
+        );
+        if !terminate_initial_collection {
+            return Ok(());
+        }
+    }
     if foreign_cwd && !managed_network_configured && !deny_read {
         let permissions = response_mock.requests()[0]
             .message_input_texts("developer")
@@ -1362,12 +1724,67 @@ timeout = 900
     let request = response_mock
         .last_request()
         .context("model should receive the exec_command output")?;
+    let output_call_id = if output_after_yield || finish_at_final_poll || finish_at_deadline {
+        let (initial, _) = request
+            .function_call_output_content_and_success(CALL_ID)
+            .context("initial collection")?;
+        let initial = initial.context("initial output")?;
+        assert!(initial.contains("Process running with session ID 1000"));
+        if output_after_yield {
+            assert!(initial.contains("pushed "));
+        }
+        assert!(
+            !test
+                .codex
+                .terminate_background_terminal(/*process_id*/ 1000)
+                .await
+        );
+        POLL_CALL_ID
+    } else {
+        CALL_ID
+    };
+    if finish_at_deadline {
+        let (pending, _) = request
+            .function_call_output_content_and_success(DRAIN_POLL_CALL_ID)
+            .context("poll during the final read should yield")?;
+        let pending = pending.context("poll should contain buffered output")?;
+        assert!(pending.contains("Process running with session ID 1000"));
+        assert!(pending.contains("pushed "));
+    }
     let (output, success) = request
-        .function_call_output_content_and_success(CALL_ID)
+        .function_call_output_content_and_success(output_call_id)
         .context("exec_command output should be model visible")?;
     let output = output.context("exec_command output should contain text")?;
     let process_read_requests = exec_server_result.process_read_requests;
     match scenario {
+        PushedExecScenario::OutputAfterExit
+        | PushedExecScenario::OutputAfterRecoveredExit
+        | PushedExecScenario::OutputOpenAtDeadline
+        | PushedExecScenario::OutputOpenAtFinalPoll
+        | PushedExecScenario::OutputOpenWhenCancelled
+        | PushedExecScenario::OutputOpenWhenResumableCancelled
+        | PushedExecScenario::OutputOpenWhenTerminated
+        | PushedExecScenario::OutputOpenWhenTerminatedBeforeYield => {
+            assert_ne!(success, Some(false));
+            assert!(saw_exec_command_begin);
+            assert!(output.contains("Process exited with code 0"));
+            assert!(
+                output.contains(if output_after_yield || finish_at_deadline {
+                    "remote output\n"
+                } else {
+                    COMPLETE_OUTPUT
+                }),
+                "missing remote output tail: {output}"
+            );
+            assert_eq!(
+                process_read_requests,
+                usize::from(matches!(
+                    scenario,
+                    PushedExecScenario::OutputAfterRecoveredExit
+                        | PushedExecScenario::OutputOpenAtDeadline
+                ))
+            );
+        }
         PushedExecScenario::Complete
         | PushedExecScenario::DenyWin
         | PushedExecScenario::DenyWinUnchanged

@@ -69,7 +69,12 @@ impl SuspendContext {
         }
         let y = self.suspend_cursor_y.load(Ordering::Relaxed);
         let _ = execute!(stdout(), MoveTo(0, y), Show);
-        suspend_process()?;
+        if let Err(err) = crate::terminal_program_status::clear_terminal_program_status() {
+            tracing::debug!(error = %err, "failed to clear terminal program status before suspend");
+        }
+        let suspend_result = suspend_process();
+        crate::terminal_program_status::invalidate_terminal_program_status();
+        suspend_result?;
         super::reapply_raw_mode_after_resume()?;
 
         // The shell writes its job-control status and the resumed command after `fg`, so the

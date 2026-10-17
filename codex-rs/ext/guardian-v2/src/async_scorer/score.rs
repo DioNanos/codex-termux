@@ -1,6 +1,7 @@
 //! Owns cached-score publication, observation coverage, and reuse snapshots.
 //! The cached score, authorization, and coverage are published under one lock;
 //! failures never replace a newer sample.
+//! Pending classifications expire only when no active action can reuse their score.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -19,7 +20,40 @@ use super::wrapper_lag::WrapperLag;
 pub(super) struct GuardianV2ScoreProgress {
     state: Mutex<ScoreState>,
     pub(super) updates: tokio::sync::watch::Sender<()>,
+    observations: tokio::sync::watch::Sender<()>,
     pub(super) metrics: Option<Arc<dyn ExtensionMetrics>>,
+}
+
+#[derive(Clone)]
+pub(super) struct PendingScore {
+    pub(super) progress: Arc<GuardianV2ScoreProgress>,
+    pub(super) index: usize,
+    pub(super) max_lag: usize,
+}
+
+impl PendingScore {
+    pub(super) fn is_expired(&self) -> bool {
+        let state = self
+            .progress
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .latest_tool_call
+            .saturating_sub(self.index)
+            .saturating_sub(state.wrapper_lag.pending_discount(self.index))
+            > self.max_lag
+    }
+
+    pub(super) async fn expired(&self) {
+        // Subscribe before checking so admission cannot race past the expiry check.
+        let mut observations = self.progress.observations.subscribe();
+        while !self.is_expired() {
+            if observations.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -63,6 +97,7 @@ impl GuardianV2ScoreProgress {
         state.latest_tool_call = state.latest_tool_call.saturating_add(/*rhs*/ 1);
         let index = state.latest_tool_call;
         state.wrapper_lag.record(input, index);
+        self.observations.send_replace(());
         index
     }
 
@@ -94,11 +129,13 @@ impl GuardianV2ScoreProgress {
 
     pub(super) fn finish(&self, call_id: &str) {
         // Overflow belongs to each active call even after a newer score succeeds.
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .oversized_tool_calls
-            .remove(call_id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.oversized_tool_calls.remove(call_id);
+        state.wrapper_lag.finish(call_id);
+        self.observations.send_replace(());
     }
 
     pub(super) fn publish(

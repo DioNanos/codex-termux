@@ -406,7 +406,6 @@ fn extract_apply_patch_from_bash(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unified_diff_from_chunks;
     use assert_matches::assert_matches;
     use codex_exec_server::LOCAL_FS;
     use pretty_assertions::assert_eq;
@@ -739,87 +738,6 @@ PATCH"#,
     async fn test_echo_then_cd_and_apply_patch_is_ignored() {
         // Ensure preceding commands before the `cd && apply_patch <<...` sequence do not match.
         assert_not_match(&heredoc_script("echo foo; cd bar && "));
-    }
-
-    #[tokio::test]
-    async fn test_unified_diff_last_line_replacement() {
-        // Replace the very last line of the file.
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("last.txt");
-        fs::write(&path, "foo\nbar\nbaz\n").unwrap();
-
-        let patch = wrap_patch(&format!(
-            r#"*** Update File: {}
-@@
- foo
- bar
--baz
-+BAZ
-"#,
-            path.display()
-        ));
-
-        let patch = parse_patch(&patch).unwrap();
-        let chunks = match patch.hunks.as_slice() {
-            [Hunk::UpdateFile { chunks, .. }] => chunks,
-            _ => panic!("Expected a single UpdateFile hunk"),
-        };
-
-        let path_uri = PathUri::from_host_native_path(&path).expect("absolute test path");
-        let diff =
-            unified_diff_from_chunks(&path_uri, chunks, LOCAL_FS.as_ref(), /*sandbox*/ None)
-                .await
-                .unwrap();
-        let expected_diff = r#"@@ -2,2 +2,2 @@
- bar
--baz
-+BAZ
-"#;
-        let expected = ApplyPatchFileUpdate {
-            unified_diff: expected_diff.to_string(),
-            original_content: "foo\nbar\nbaz\n".to_string(),
-            content: "foo\nbar\nBAZ\n".to_string(),
-        };
-        assert_eq!(expected, diff);
-    }
-
-    #[tokio::test]
-    async fn test_unified_diff_insert_at_eof() {
-        // Insert a new line at end‑of‑file.
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("insert.txt");
-        fs::write(&path, "foo\nbar\nbaz\n").unwrap();
-
-        let patch = wrap_patch(&format!(
-            r#"*** Update File: {}
-@@
-+quux
-*** End of File
-"#,
-            path.display()
-        ));
-
-        let patch = parse_patch(&patch).unwrap();
-        let chunks = match patch.hunks.as_slice() {
-            [Hunk::UpdateFile { chunks, .. }] => chunks,
-            _ => panic!("Expected a single UpdateFile hunk"),
-        };
-
-        let path_uri = PathUri::from_host_native_path(&path).expect("absolute test path");
-        let diff =
-            unified_diff_from_chunks(&path_uri, chunks, LOCAL_FS.as_ref(), /*sandbox*/ None)
-                .await
-                .unwrap();
-        let expected_diff = r#"@@ -3 +3,2 @@
- baz
-+quux
-"#;
-        let expected = ApplyPatchFileUpdate {
-            unified_diff: expected_diff.to_string(),
-            original_content: "foo\nbar\nbaz\n".to_string(),
-            content: "foo\nbar\nbaz\nquux\n".to_string(),
-        };
-        assert_eq!(expected, diff);
     }
 
     #[tokio::test]

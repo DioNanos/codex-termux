@@ -53,6 +53,9 @@ pub trait AgentControl: Send + Sync {
     ) -> BoxFuture<'a, Result<ThreadId>>;
 
     /// Start a child and accept its initial input, returning its effective settings.
+    /// Retain provisional-child ownership until this future returns its acceptance receipt.
+    /// Once returned, caller cancellation does not retract the accepted child. Subsequent
+    /// tool-result or transport publication belongs to the caller, outside this boundary.
     /// V2 snapshots resolve effort against captured startup metadata without changing the
     /// child's configured effort (for example, Ultra still enables proactive behavior).
     fn spawn(

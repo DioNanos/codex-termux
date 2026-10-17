@@ -23,11 +23,12 @@ expression: text
   esc esc  Edit last message
 
   Session
-  tab  Send message
-  ⌥,   Less reasoning
-  ⌥.   More reasoning
-  f4   Inspect activity
-  ⌃c   Quit
+  tab      Send message
+  ⌥,       Less reasoning
+  ⌥.       More reasoning
+  ⌥← / ⌥→  Subagents (empty prompt)
+  f4       Inspect activity
+  ⌃c       Quit
 
   Transcript (open first)
   ⌃t            Open transcript

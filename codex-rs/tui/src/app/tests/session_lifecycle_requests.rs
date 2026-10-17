@@ -1,6 +1,7 @@
 use super::*;
 use crate::app_event::TranscriptExportDestination;
 use crate::bottom_pane::BottomPaneView;
+use crate::test_support::boxed_future;
 use app_test_support::create_fake_paginated_rollout;
 use app_test_support::create_fake_parented_rollout_with_source;
 use app_test_support::create_fake_rollout;
@@ -38,10 +39,25 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 
 pub(super) type RecordedRequests = Arc<Mutex<Vec<JSONRPCRequest>>>;
 pub(super) type RecordingAppServer = (AppServerSession, RecordedRequests, JoinHandle<Result<()>>);
+
+fn is_recording_client_disconnect(error: &WebSocketError) -> bool {
+    match error {
+        WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+        WebSocketError::Io(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+        ),
+        _ => false,
+    }
+}
 
 #[tokio::test]
 async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
@@ -49,9 +65,6 @@ async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
     use codex_protocol::turn_input::CyberAccessProgram;
 
     let (mut app, mut events, mut ops) = make_test_app_with_channels().await;
-    app.config.features.enable(Feature::CliDaybreak)?;
-    app.chat_widget
-        .set_feature_enabled(Feature::CliDaybreak, /*enabled*/ true);
     let (mut server, requests, proxy) = start_recording_app_server(
         &app.config,
         /*blocked_thread_list*/ None,
@@ -190,23 +203,49 @@ async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
     app.chat_widget
         .set_feature_enabled(Feature::CliDaybreak, /*enabled*/ true);
     app.chat_widget.set_daybreak_enabled(/*enabled*/ true);
+    app.chat_widget
+        .set_feature_enabled(Feature::ApiKeyCyberAccessPrograms, /*enabled*/ false);
+    let models = app.chat_widget.model_catalog().models.clone();
     app.chat_widget.update_account_state(
         Some(crate::status::StatusAccountDisplay::ApiKey),
         /*plan_type*/ None,
         /*has_chatgpt_account*/ false,
         /*has_codex_backend_auth*/ false,
     );
-    assert!(
-        !app.chat_widget
-            .set_feature_enabled(Feature::ApiKeyCyberAccessPrograms, /*enabled*/ false,)
-    );
-    app.submit_thread_op(&mut server, thread_id, turn.clone())
-        .await?;
-    app.chat_widget.set_daybreak_enabled(/*enabled*/ false);
-    app.submit_thread_op(&mut server, thread_id, turn).await?;
+    assert!(!app.chat_widget.daybreak_enabled);
+    let request_id = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::FetchModels { request_id } => Some(request_id),
+            _ => None,
+        })
+        .last()
+        .expect("account model refresh");
+    assert!(app.chat_widget.on_models_loaded(request_id, Ok(models)));
+    for (cli_daybreak, api_key_cyber_access_programs, enabled) in [
+        (false, false, true),
+        (false, true, true),
+        (true, false, true),
+        (true, true, true),
+        (true, true, false),
+    ] {
+        app.chat_widget
+            .set_feature_enabled(Feature::CliDaybreak, cli_daybreak);
+        app.chat_widget.set_feature_enabled(
+            Feature::ApiKeyCyberAccessPrograms,
+            api_key_cyber_access_programs,
+        );
+        app.chat_widget.set_daybreak_enabled(enabled);
+        app.submit_thread_op(&mut server, thread_id, turn.clone())
+            .await?;
+    }
     let turns = recorded_params(&requests, "turn/start");
-    assert_eq!(turns[5]["cyberAccessProgram"], "daybreakBlue");
-    assert!(turns[6]["cyberAccessProgram"].is_null());
+    assert_eq!(
+        turns[5..]
+            .iter()
+            .map(|turn| turn["cyberAccessProgram"].as_str())
+            .collect::<Vec<_>>(),
+        vec![None, None, None, Some("daybreakBlue"), Some("standard")]
+    );
     while events.try_recv().is_ok() {}
 
     let missing_thread_id = ThreadId::new();
@@ -334,6 +373,8 @@ pub(super) enum HistoryCapabilities {
     ItemsAndSummaryTurnsFail,
     ThreadListFails,
     ThreadStartFails,
+    ThreadStartWhileShuttingDown,
+    ThreadStartDuringLegacyShutdown,
     ConfigReadUnsupported(i64),
     ConfigReadFails,
     ConfigReadUnknownVoice,
@@ -477,20 +518,19 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                     if let codex_app_server_client::InProcessServerEvent::ServerNotification(notification) = event
                         && matches!(*notification, ServerNotification::ThreadSettingsUpdated(_))
                     {
-                        websocket.send(Message::Text(serde_json::to_string(&notification)?.into())).await?;
+                        let result = websocket.send(Message::Text(serde_json::to_string(&notification)?.into())).await;
+                        if result.as_ref().is_err_and(is_recording_client_disconnect) {
+                            break;
+                        }
+                        result?;
                     }
                     continue;
                 }
             };
             let Some(frame) = frame else { break };
-            // The client can close with an unread settings notification during shutdown.
-            match &frame {
-                Err(tokio_tungstenite::tungstenite::Error::Protocol(
-                    tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
-                )) => break,
-                Err(tokio_tungstenite::tungstenite::Error::Io(error))
-                    if matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset) => break,
-                _ => {}
+            // The client can close with requests or notifications pending during shutdown.
+            if frame.as_ref().is_err_and(is_recording_client_disconnect) {
+                break;
             }
             let Message::Text(text) = frame? else {
                 continue;
@@ -498,7 +538,7 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
             let message = serde_json::from_str::<JSONRPCMessage>(&text)?;
             match message {
                 JSONRPCMessage::Request(request) if request.method == "initialize" => {
-                    websocket
+                    let result = websocket
                         .send(Message::Text(
                             serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
                                 id: request.id,
@@ -509,7 +549,11 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                             }))?
                             .into(),
                         ))
-                        .await?;
+                        .await;
+                    if result.as_ref().is_err_and(is_recording_client_disconnect) {
+                        break;
+                    }
+                    result?;
                 }
                 JSONRPCMessage::Request(request) => {
                     request_sink
@@ -622,15 +666,30 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                                 message: "method not found".to_string(),
                             },
                         })
-                    } else if history_capabilities == HistoryCapabilities::ThreadStartFails
-                        && request.method == "thread/start"
+                    } else if matches!(
+                        history_capabilities,
+                        HistoryCapabilities::ThreadStartFails
+                            | HistoryCapabilities::ThreadStartWhileShuttingDown
+                            | HistoryCapabilities::ThreadStartDuringLegacyShutdown
+                    ) && request.method == "thread/start"
                     {
+                        let (code, message, data) = match history_capabilities {
+                            HistoryCapabilities::ThreadStartWhileShuttingDown => (
+                                -32600,
+                                "not accepting new actions",
+                                Some(serde_json::json!({ "reason": "serverShuttingDown" })),
+                            ),
+                            HistoryCapabilities::ThreadStartDuringLegacyShutdown => {
+                                (-32600, "Server is draining; retry after reconnecting", None)
+                            }
+                            _ => (-32603, "replacement unavailable", None),
+                        };
                         JSONRPCMessage::Error(JSONRPCError {
                             id: request_id,
                             error: JSONRPCErrorError {
-                                code: -32603,
-                                data: None,
-                                message: "replacement unavailable".to_string(),
+                                code,
+                                data,
+                                message: message.to_string(),
                             },
                         })
                     } else if request.method == "thread/list"
@@ -770,9 +829,13 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                             }
                         }
                     };
-                    websocket
+                    let result = websocket
                         .send(Message::Text(serde_json::to_string(&response)?.into()))
-                        .await?;
+                        .await;
+                    if result.as_ref().is_err_and(is_recording_client_disconnect) {
+                        break;
+                    }
+                    result?;
                 }
                 JSONRPCMessage::Notification(notification)
                     if notification.method == "initialized" => {}
@@ -1306,6 +1369,12 @@ async fn archive_current_thread_returns_shared_servers_to_agents() -> Result<()>
 
 #[tokio::test]
 async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() -> Result<()> {
+    boxed_future!(local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_scenario())
+        .await
+}
+
+async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_scenario()
+-> Result<()> {
     let (mut app, events, _ops) = Box::pin(make_test_app_with_channels()).await;
     // Invalid optional worktree settings must preserve both daemon start paths.
     app.config.features.enable(Feature::Worktrees)?;
@@ -1790,11 +1859,44 @@ async fn embedded_server_rejects_unowned_dynamic_tool_calls() -> Result<()> {
 
 #[tokio::test]
 async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespace() -> Result<()> {
-    check_dynamic_tool_requests(/*rollout_enabled*/ true).await?;
-    check_dynamic_tool_requests(/*rollout_enabled*/ false).await
+    use HistoryCapabilities::ConfigReadUnsupported;
+    use HistoryCapabilities::Current;
+    use codex_app_server_protocol::AuthMode::ApiKey;
+    use codex_app_server_protocol::AuthMode::Chatgpt;
+
+    for (
+        rollout_enabled,
+        auth_mode,
+        api_key_cyber_access_programs,
+        history_capabilities,
+        expected_program,
+    ) in [
+        (true, Chatgpt, false, Current, Some("daybreakBlue")),
+        (false, Chatgpt, false, Current, None),
+        (true, ApiKey, false, Current, None),
+        (true, ApiKey, true, Current, Some("daybreakBlue")),
+        (true, Chatgpt, false, ConfigReadUnsupported(-32601), None),
+        (true, Chatgpt, false, ConfigReadUnsupported(-32600), None),
+    ] {
+        boxed_future!(check_dynamic_tool_requests(
+            rollout_enabled,
+            auth_mode,
+            api_key_cyber_access_programs,
+            history_capabilities,
+            expected_program,
+        ))
+        .await?;
+    }
+    Ok(())
 }
 
-async fn check_dynamic_tool_requests(rollout_enabled: bool) -> Result<()> {
+async fn check_dynamic_tool_requests(
+    rollout_enabled: bool,
+    auth_mode: codex_app_server_protocol::AuthMode,
+    api_key_cyber_access_programs: bool,
+    history_capabilities: HistoryCapabilities,
+    expected_program: Option<&str>,
+) -> Result<()> {
     let (mut app, mut events, _ops) = make_test_app_with_channels().await;
     app.config
         .features
@@ -1802,6 +1904,8 @@ async fn check_dynamic_tool_requests(rollout_enabled: bool) -> Result<()> {
     let codex_home = tempdir()?;
     let backend = wiremock::MockServer::start().await;
     let backend_url = format!("{}/backend-api", backend.uri());
+    let api_url = format!("{}/v1", backend.uri());
+    app.config.model_provider.base_url = Some(api_url.clone());
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
     let mut catalog = codex_models_manager::bundled_models_response()?;
@@ -1813,10 +1917,11 @@ async fn check_dynamic_tool_requests(rollout_enabled: bool) -> Result<()> {
     }
     let catalog_path = codex_home.path().join("models.json");
     std::fs::write(&catalog_path, serde_json::to_vec(&catalog)?)?;
+    // The server's target-thread config may differ from the launching TUI's defaults.
     std::fs::write(
         codex_home.path().join("config.toml"),
         format!(
-            "daybreak = true\nmodel_catalog_json = {:?}\nchatgpt_base_url = {backend_url:?}\ncli_auth_credentials_store = \"file\"\n",
+            "daybreak = true\nmodel_catalog_json = {:?}\nchatgpt_base_url = {backend_url:?}\ncli_auth_credentials_store = \"file\"\nopenai_base_url = {api_url:?}\nfeatures.cli_daybreak = {rollout_enabled}\nfeatures.api_key_cyber_access_programs = {api_key_cyber_access_programs}\n",
             catalog_path.display().to_string()
         ),
     )?;
@@ -1831,6 +1936,14 @@ async fn check_dynamic_tool_requests(rollout_enabled: bool) -> Result<()> {
         codex_login::AuthCredentialsStoreMode::File,
     )
     .expect("write fixture auth");
+    if auth_mode == codex_app_server_protocol::AuthMode::ApiKey {
+        codex_login::login_with_api_key(
+            codex_home.path(),
+            "test-key",
+            codex_login::AuthCredentialsStoreMode::File,
+            codex_login::AuthKeyringBackendKind::default(),
+        )?;
+    }
     app.config
         .permissions
         .set_permission_profile(PermissionProfile::workspace_write_with(
@@ -1839,10 +1952,13 @@ async fn check_dynamic_tool_requests(rollout_enabled: bool) -> Result<()> {
             /*exclude_tmpdir_env_var*/ true,
             /*exclude_slash_tmp*/ true,
         ))?;
-    let (mut app_server, requests, proxy) = start_recording_app_server(
+    let (mut app_server, requests, proxy) = start_recording_app_server_with_history(
         &app.config,
+        history_capabilities,
         /*blocked_thread_list*/ None,
         /*failed_thread_name*/ Some("Unavailable name"),
+        crate::app_server_session::ThreadParamsMode::Embedded,
+        LoaderOverrides::without_managed_config_for_tests(),
     )
     .await?;
     let thread_id = app_server
@@ -2111,7 +2227,10 @@ async fn check_dynamic_tool_requests(rollout_enabled: bool) -> Result<()> {
     );
     assert_eq!(
         recorded_params(&requests, "thread/start").last().unwrap()["daybreakEnabled"],
-        serde_json::json!(rollout_enabled.then_some(true))
+        serde_json::json!(
+            (rollout_enabled && history_capabilities == HistoryCapabilities::Current)
+                .then_some(true)
+        )
     );
     assert_eq!(
         recorded_params(&requests, "thread/start")
@@ -2128,7 +2247,7 @@ async fn check_dynamic_tool_requests(rollout_enabled: bool) -> Result<()> {
         .expect("background task turn request");
     assert_eq!(
         turn["cyberAccessProgram"],
-        serde_json::json!(rollout_enabled.then_some("daybreakBlue"))
+        serde_json::json!(expected_program)
     );
     assert_eq!(turn["input"], serde_json::json!([]));
     assert_eq!(
@@ -2213,7 +2332,7 @@ async fn check_dynamic_tool_requests(rollout_enabled: bool) -> Result<()> {
     let turn = &recorded_params(&requests, "turn/start")[1];
     assert_eq!(
         turn["cyberAccessProgram"],
-        serde_json::json!(rollout_enabled.then_some("daybreakBlue"))
+        serde_json::json!(expected_program)
     );
     assert_eq!(turn["input"], serde_json::json!([]));
     assert_eq!(

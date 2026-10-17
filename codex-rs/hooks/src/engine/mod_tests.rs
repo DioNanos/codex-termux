@@ -115,13 +115,13 @@ fn permission_request_timeout_only_counts_synchronous_handlers() {
         ..synchronous_handler.clone()
     };
 
-    engine.handlers = vec![synchronous_handler, asynchronous_handler.clone()];
+    engine.handlers = Arc::new(vec![synchronous_handler, asynchronous_handler.clone()]);
     assert_eq!(
         engine.max_permission_request_timeout(),
         Duration::from_secs(5)
     );
 
-    engine.handlers = vec![asynchronous_handler];
+    engine.handlers = Arc::new(vec![asynchronous_handler]);
     assert_eq!(engine.max_permission_request_timeout(), Duration::ZERO);
 }
 
@@ -1960,7 +1960,7 @@ fn builtin_cleanup_ignores_disablement_but_preserves_managed_only_policy() {
             }),
             mcp_executor(),
         );
-        assert_eq!(feature_disabled.handlers, expected);
+        assert_eq!(feature_disabled.handlers.as_ref(), &expected);
     }
 }
 
@@ -1996,7 +1996,10 @@ fn disabled_hooks_feature_keeps_builtin_cleanup_but_not_trusted_plugin_hooks() {
         }),
         mcp_executor(),
     );
-    assert_eq!(engine.handlers, vec![discovered.handlers[0].clone()]);
+    assert_eq!(
+        engine.handlers.as_slice(),
+        &[discovered.handlers[0].clone()]
+    );
 }
 
 #[tokio::test]
@@ -2310,8 +2313,8 @@ fn executor_stop_hook_fixture() -> (
     };
     engine.set_executor_hooks(vec![source.clone()]);
     assert_eq!(
-        engine.handlers,
-        vec![ConfiguredHandler {
+        engine.handlers.as_slice(),
+        &[ConfiguredHandler {
             builtin: true,
             event_name: HookEventName::Stop,
             matcher: None,
@@ -2400,7 +2403,7 @@ async fn executor_stop_hooks_run_unless_regular_hooks_block_without_stopping() {
         vec![expected_executor_call.clone()]
     );
 
-    engine.handlers.push(ConfiguredHandler {
+    Arc::make_mut(&mut engine.handlers).push(ConfiguredHandler {
         builtin: false,
         event_name: HookEventName::Stop,
         matcher: None,
@@ -2435,7 +2438,7 @@ async fn executor_stop_hooks_run_unless_regular_hooks_block_without_stopping() {
         ]
     );
 
-    engine.handlers.push(ConfiguredHandler {
+    Arc::make_mut(&mut engine.handlers).push(ConfiguredHandler {
         builtin: false,
         event_name: HookEventName::Stop,
         matcher: None,
@@ -2493,7 +2496,8 @@ async fn executor_stop_hooks_run_unless_regular_hooks_block_without_stopping() {
 #[test]
 fn executor_stop_hooks_register_each_target_environment_once() {
     let (mut engine, _, _, _, first_source) = executor_stop_hook_fixture();
-    let mut expected_handlers = engine.handlers.clone();
+    let previous = engine.clone();
+    let mut expected_handlers = engine.handlers.as_ref().clone();
     let mut duplicate_target = first_source.clone();
     duplicate_target.plugin_id = PluginId::parse("chrome@openai-bundled").expect("valid plugin ID");
     let mut second_source = first_source.clone();
@@ -2508,7 +2512,8 @@ fn executor_stop_hooks_register_each_target_environment_once() {
     expected_handlers.push(second_handler);
     engine.set_executor_hooks(vec![first_source, duplicate_target, second_source]);
 
-    assert_eq!(engine.handlers, expected_handlers);
+    assert_eq!(engine.handlers.as_ref(), &expected_handlers);
+    assert_eq!(previous.handlers.as_slice(), &expected_handlers[..1]);
 }
 
 #[tokio::test]
@@ -2558,7 +2563,7 @@ fn executor_hooks_register_events_from_each_environment() {
     let (mut engine, _, _, _, mut first_source) = executor_stop_hook_fixture();
     first_source.hooks.interrupt = std::mem::take(&mut first_source.hooks.stop);
     engine.set_executor_hooks(vec![first_source.clone()]);
-    let mut expected_handlers = engine.handlers.clone();
+    let mut expected_handlers = engine.handlers.as_ref().clone();
     let mut second_source = first_source.clone();
     second_source.environment_id = "executor-b".to_string();
     second_source.hooks.stop = std::mem::take(&mut second_source.hooks.interrupt);
@@ -2574,7 +2579,7 @@ fn executor_hooks_register_events_from_each_environment() {
 
     engine.set_executor_hooks(vec![first_source, second_source]);
 
-    assert_eq!(engine.handlers, expected_handlers);
+    assert_eq!(engine.handlers.as_ref(), &expected_handlers);
 }
 
 #[tokio::test]
@@ -2624,7 +2629,7 @@ async fn memory_consolidation_stop_preserves_policy_and_executor_cleanup() {
             tool: policy_call.tool.clone(),
             input: policy_call.input.clone(),
         };
-        engine.handlers.push(handler);
+        Arc::make_mut(&mut engine.handlers).push(handler);
         assert_eq!(
             engine.preview_stop(&request).len(),
             usize::from(runs_policy)

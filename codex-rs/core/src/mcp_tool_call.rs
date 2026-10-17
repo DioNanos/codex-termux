@@ -875,36 +875,23 @@ async fn augment_mcp_tool_request_meta_with_sandbox_state(
     };
     // TODO(anp): Build this metadata from the server's captured
     // TurnEnvironment::sandbox_context instead of the runtime-wide Landlock value.
-    let sandbox_state = serde_json::to_value(SandboxState {
-        permission_profile: prepared_call.permission_profile().clone(),
-        codex_linux_sandbox_exe: prepared_call.config().codex_linux_sandbox_exe.clone(),
-        sandbox_cwd,
-        use_legacy_landlock: prepared_call.config().use_legacy_landlock,
-        use_mxc: prepared_call
-            .config()
-            .environment_use_mxc
-            .get(server_environment_id)
-            .copied()
-            .unwrap_or(false),
-    })?;
-
-    match meta.as_mut() {
-        Some(serde_json::Value::Object(map)) => {
-            map.insert(
-                codex_mcp::MCP_SANDBOX_STATE_META_CAPABILITY.to_string(),
-                sandbox_state,
-            );
-        }
-        Some(_) => {}
-        None => {
-            let mut map = serde_json::Map::new();
-            map.insert(
-                codex_mcp::MCP_SANDBOX_STATE_META_CAPABILITY.to_string(),
-                sandbox_state,
-            );
-            meta = Some(serde_json::Value::Object(map));
-        }
-    }
+    prepared_call
+        .augment_sandbox_metadata(
+            &mut meta,
+            SandboxState {
+                permission_profile: prepared_call.permission_profile().clone(),
+                codex_linux_sandbox_exe: prepared_call.config().codex_linux_sandbox_exe.clone(),
+                sandbox_cwd,
+                use_legacy_landlock: prepared_call.config().use_legacy_landlock,
+                use_mxc: prepared_call
+                    .config()
+                    .environment_use_mxc
+                    .get(server_environment_id)
+                    .copied()
+                    .unwrap_or(false),
+            },
+        )
+        .await?;
 
     Ok(meta)
 }

@@ -245,6 +245,11 @@ async fn model_switch_program_pair(
                         .features
                         .enable(Feature::ApiKeyCyberAccessPrograms)
                         .expect("enable API-key Cyber access programs");
+                } else if matches!(history, History::ApiKeyResume) {
+                    config
+                        .features
+                        .disable(Feature::ApiKeyCyberAccessPrograms)
+                        .expect("disable API-key Cyber access programs");
                 }
                 if matches!(history, History::ApiKeyCustomProviderResume) {
                     config.model_provider_id = "custom".to_owned();
@@ -258,7 +263,7 @@ async fn model_switch_program_pair(
         }
     };
     if matches!(history, History::ApiKeyResume) {
-        // Resuming a ChatGPT turn does not enable the API-key rollout features.
+        // Resuming a ChatGPT turn cannot bypass an explicit API-key opt-out.
         let error = submit_pair(&thread, next_model, Some(CyberAccessProgram::DaybreakRed))
             .await
             .expect_err("API-key selections require the rollout features");

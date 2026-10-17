@@ -39,6 +39,8 @@ use codex_features::Feature;
 use codex_http_client::HttpClientBuilder;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+use codex_mcp::MCP_SANDBOX_LAUNCHER_META_KEY;
+use codex_mcp::MCP_SANDBOX_STATE_CAPABILITY;
 use codex_mcp::MCP_SANDBOX_STATE_META_CAPABILITY;
 use codex_mcp::McpProtocolMode;
 use codex_mcp::SandboxState;
@@ -92,6 +94,7 @@ use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::turn_input::TurnInput;
 use codex_protocol::user_input::UserInput;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cargo_bin::cargo_bin;
 use codex_utils_path_uri::PathUri;
 use core_test_support::apps_test_server::AppsTestServer;
@@ -2228,6 +2231,14 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
         .with_model("gpt-5.5")
         .with_config(move |config| {
             config.prefer_mxc = prefer_mxc;
+            // The real CLI is explicitly provided; the test harness is not a CLI.
+            config.codex_self_exe = Some(
+                AbsolutePathBuf::from_absolute_path_checked(
+                    cargo_bin("codex").expect("codex binary"),
+                )
+                .expect("absolute codex binary path")
+                .into_path_buf(),
+            );
             insert_mcp_server(
                 config,
                 server_name,
@@ -2411,7 +2422,7 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
     assert_eq!(output_json["callId"], json!(call_id));
 
     let sandbox_meta = meta
-        .get(MCP_SANDBOX_STATE_META_CAPABILITY)
+        .get(MCP_SANDBOX_STATE_CAPABILITY)
         .expect("sandbox state metadata should be present");
     let sandbox_state: SandboxState = serde_json::from_value(sandbox_meta.clone())?;
     if attachment_owned_permissions {
@@ -2429,16 +2440,30 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
             );
         }
     }
+    let expected_state = serde_json::to_value(SandboxState {
+        permission_profile: owner_permission_profile
+            .materialize_project_roots_with_path_uris(&owner_workspace_roots),
+        codex_linux_sandbox_exe: fixture.config.codex_linux_sandbox_exe.clone(),
+        sandbox_cwd: PathUri::from_abs_path(&fixture.config.cwd),
+        use_legacy_landlock: false,
+        use_mxc: prefer_mxc && cfg!(windows) && !attachment_owned_permissions,
+    })?;
+    let expected_launcher = (remote_aware_environment_id()
+        == codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID)
+        .then_some(fixture.config.codex_self_exe.as_ref())
+        .flatten()
+        .map(|executable| json!({"codexExecutable": executable}));
     assert_eq!(
-        sandbox_state,
-        SandboxState {
-            permission_profile: owner_permission_profile
-                .materialize_project_roots_with_path_uris(&owner_workspace_roots),
-            codex_linux_sandbox_exe: fixture.config.codex_linux_sandbox_exe.clone(),
-            sandbox_cwd: PathUri::from_abs_path(&fixture.config.cwd),
-            use_legacy_landlock: false,
-            use_mxc: prefer_mxc && cfg!(windows) && !attachment_owned_permissions,
-        }
+        (
+            meta.get(MCP_SANDBOX_STATE_CAPABILITY),
+            meta.get(MCP_SANDBOX_STATE_META_CAPABILITY),
+            meta.get(MCP_SANDBOX_LAUNCHER_META_KEY),
+        ),
+        (
+            Some(&expected_state),
+            Some(&expected_state),
+            expected_launcher.as_ref()
+        ),
     );
 
     server.verify().await;

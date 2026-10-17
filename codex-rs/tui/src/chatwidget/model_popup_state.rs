@@ -6,6 +6,17 @@ use super::model_popups::MODEL_SELECTION_VIEW_ID;
 use super::*;
 
 impl ChatWidget {
+    pub(super) fn refresh_account_scoped_models(&mut self) {
+        if self.status_account_display == Some(StatusAccountDisplay::ApiKey) {
+            for model in &mut Arc::make_mut(&mut self.model_catalog).models {
+                model.available_access_programs = None;
+            }
+        }
+        let request_id = uuid::Uuid::new_v4();
+        self.model_popup_request_id = Some(request_id);
+        self.app_event_tx.send(AppEvent::FetchModels { request_id });
+    }
+
     fn model_popup_view_id(&self) -> Option<&'static str> {
         [MODEL_SELECTION_VIEW_ID, ALL_MODELS_SELECTION_VIEW_ID]
             .into_iter()

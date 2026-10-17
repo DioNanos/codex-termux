@@ -10,6 +10,8 @@ use super::status_line_setup::StatusLineItem;
 use crate::render::highlight::foreground_style_for_scopes;
 use crate::style::readable_color_on;
 use crate::style::secondary_text_style;
+use crate::terminal_palette::StdoutColorLevel;
+use crate::terminal_palette::effective_stdout_color_level;
 use crate::thread_color::thread_color;
 use codex_protocol::ThreadId;
 
@@ -135,10 +137,14 @@ where
             secondary_text_style()
         };
         let style = if use_theme_colors {
-            style.fg(readable_color_on(
-                style.fg.unwrap_or(Color::Reset),
-                /*background*/ None,
-            ))
+            let foreground = style.fg.unwrap_or(Color::Reset);
+            if effective_stdout_color_level() == StdoutColorLevel::Ansi16
+                && matches!(foreground, Color::Rgb(..) | Color::Indexed(16..))
+            {
+                style.patch(StatusLineAccent::for_item(item).fallback_style())
+            } else {
+                style.fg(readable_color_on(foreground, /*background*/ None))
+            }
         } else {
             style
         };
@@ -286,22 +292,28 @@ mod tests {
     #[test]
     #[allow(clippy::disallowed_methods)]
     fn status_line_segments_soften_rgb_theme_styles_without_dimming_text() {
-        let line = status_line_from_segments_with_resolver(
-            [(StatusLineItem::ModelName, "gpt-5".to_string())],
-            /*use_theme_colors*/ true,
-            /*thread_id*/ None,
-            |_| Some(Style::default().fg(Color::Rgb(255, 0, 0))),
-        )
-        .expect("status line");
+        let colors = crate::terminal_probe::DefaultColors {
+            fg: (255, 255, 255),
+            bg: (0, 0, 0),
+        };
+        crate::terminal_palette::with_test_default_colors(colors, || {
+            let line = status_line_from_segments_with_resolver(
+                [(StatusLineItem::ModelName, "gpt-5".to_string())],
+                /*use_theme_colors*/ true,
+                /*thread_id*/ None,
+                |_| Some(Style::default().fg(Color::Rgb(255, 0, 0))),
+            )
+            .expect("status line");
 
-        assert_eq!(
-            line.spans[0].style.fg,
-            Some(readable_color_on(
-                Color::Rgb(228, 11, 11),
-                /*background*/ None
-            ))
-        );
-        assert!(!line.spans[0].style.add_modifier.contains(Modifier::DIM));
+            assert_eq!(
+                line.spans[0].style.fg,
+                Some(readable_color_on(
+                    Color::Rgb(228, 11, 11),
+                    /*background*/ None
+                ))
+            );
+            assert!(!line.spans[0].style.add_modifier.contains(Modifier::DIM));
+        });
     }
 
     #[test]
@@ -388,5 +400,81 @@ mod tests {
             line.render(area, &mut buffer);
             insta::assert_snapshot!(format!("{buffer:?}"));
         });
+    }
+
+    #[test]
+    fn status_line_theme_colors_at_limited_color_depths() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+
+        const CHILD: &str = "CODEX_STATUS_LINE_COLOR_TEST_CHILD";
+        let Ok(level) = std::env::var(CHILD) else {
+            for level in ["0", "1"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "bottom_pane::status_line_style::tests::status_line_theme_colors_at_limited_color_depths",
+                    ])
+                    .env(CHILD, level)
+                    .env("FORCE_COLOR", level)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "level {level}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let theme = crate::render::highlight::resolve_theme_by_name(
+            "coldark-dark",
+            /*codex_home*/ None,
+        )
+        .unwrap();
+        crate::render::highlight::set_syntax_theme(theme);
+        let line = status_line_from_segments(
+            [
+                (StatusLineItem::ModelName, "gpt-5".to_string()),
+                (StatusLineItem::CurrentDir, "~/code".to_string()),
+                (StatusLineItem::UsedTokens, "12k tokens".to_string()),
+            ],
+            /*use_theme_colors*/ true,
+            /*thread_id*/ None,
+        )
+        .expect("status line");
+        if level == "0" {
+            assert_eq!(
+                line.spans
+                    .iter()
+                    .map(|span| span.style.fg)
+                    .collect::<Vec<_>>(),
+                vec![Some(Color::Reset); line.spans.len()]
+            );
+        } else {
+            let area = Rect::new(
+                /*x*/ 0, /*y*/ 0, /*width*/ 30, /*height*/ 1,
+            );
+            let mut buffer = Buffer::empty(area);
+            line.render(area, &mut buffer);
+            insta::assert_snapshot!(format!("{buffer:?}"), @r###"
+            Buffer {
+                area: Rect { x: 0, y: 0, width: 30, height: 1 },
+                content: [
+                    "gpt-5 · ~/code · 12k tokens   ",
+                ],
+                styles: [
+                    x: 0, y: 0, fg: Cyan, bg: Reset, underline: Reset, modifier: NONE,
+                    x: 5, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+                    x: 8, y: 0, fg: Green, bg: Reset, underline: Reset, modifier: NONE,
+                    x: 14, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+                    x: 17, y: 0, fg: Green, bg: Reset, underline: Reset, modifier: NONE,
+                    x: 27, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+                ]
+            }
+            "###);
+        }
     }
 }

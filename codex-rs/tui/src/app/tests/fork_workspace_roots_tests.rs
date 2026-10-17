@@ -93,8 +93,11 @@ async fn check_fork_dispatch(mode: ThreadParamsMode) -> Result<()> {
             "command",
             /*approval_id*/ None,
         );
-        app.enqueue_thread_request(source_thread_id, approval.clone())
-            .await?;
+        app.handle_app_server_event(
+            &server,
+            AppServerEvent::ServerRequest(Box::new(approval.clone())),
+        )
+        .await;
         app.drain_active_thread_events(&mut tui).await?;
         vec![approval]
     } else {
@@ -121,8 +124,11 @@ async fn check_fork_dispatch(mode: ThreadParamsMode) -> Result<()> {
     assert!(recorded_params(&requests, "thread/unsubscribe").is_empty());
     assert!(!app.thread_event_listener_tasks[&source_thread_id].is_finished());
     assert_eq!(
-        app.agents_overview.dispatched_requests[&source_thread_id],
-        pending
+        app.agents_overview.dispatched_requests[&source_thread_id]
+            .iter()
+            .map(|pending| &pending.request)
+            .collect::<Vec<_>>(),
+        pending.iter().collect::<Vec<_>>()
     );
     assert!(app.agents_overview.dispatched_requests[&child_id].is_empty());
     let question = request_user_input_request(source_thread_id, "source-turn", "question");
@@ -132,7 +138,9 @@ async fn check_fork_dispatch(mode: ThreadParamsMode) -> Result<()> {
     )
     .await;
     assert_eq!(
-        app.agents_overview.dispatched_requests[&source_thread_id].last(),
+        app.agents_overview.dispatched_requests[&source_thread_id]
+            .last()
+            .map(|pending| &pending.request),
         Some(&question)
     );
     assert!(!app.chat_widget.has_active_view());

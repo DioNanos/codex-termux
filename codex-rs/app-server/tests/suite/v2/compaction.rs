@@ -10,6 +10,7 @@ use app_test_support::ChatGptAuthFixture;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::write_chatgpt_auth;
+use codex_app_server_protocol::CodexErrorInfo;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
@@ -18,6 +19,8 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ResponseUsageMetadata;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
+use codex_app_server_protocol::ThreadForkParams;
+use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadResumeParams;
@@ -28,13 +31,16 @@ use codex_app_server_protocol::TokenUsageBreakdown;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_features::Feature;
 use codex_utils_absolute_path::test_support::PathExt;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::collections::BTreeMap;
 use tempfile::TempDir;
 use test_case::test_case;
 use tokio::time::timeout;
@@ -57,6 +63,215 @@ const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 enum CompactionRoute {
     Local,
     Remote,
+}
+
+/// Prediction forks retain their prompt through pre-, mid-, and post-turn thresholds,
+/// while their parent still compacts normally and keeps the same skill and tool inputs.
+#[test_case(ThreadHistoryMode::Legacy, 0; "legacy pre-turn")]
+#[test_case(ThreadHistoryMode::Paginated, 0; "paginated pre-turn")]
+#[test_case(ThreadHistoryMode::Legacy, 95; "legacy post-turn")]
+#[test_case(ThreadHistoryMode::Paginated, 95; "paginated post-turn")]
+#[tokio::test]
+async fn prediction_forks_do_not_auto_compact(
+    history_mode: ThreadHistoryMode,
+    post_turn_percent: u8,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_assistant_message("seed", "Remember the original context."),
+                responses::ev_completed_with_tokens("seed", /*total_tokens*/ 70_000),
+            ]),
+            responses::sse(vec![
+                responses::ev_function_call("call", "unknown_test_tool", "{}"),
+                responses::ev_completed_with_tokens("tool", /*total_tokens*/ 330_000),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("prediction", "Prediction complete."),
+                responses::ev_completed_with_tokens("prediction", /*total_tokens*/ 330_000),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("next-prediction", "Still the original context."),
+                responses::ev_completed_with_tokens(
+                    "next-prediction",
+                    /*total_tokens*/ 330_000,
+                ),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("parent", "Parent complete."),
+                responses::ev_completed_with_tokens("parent", /*total_tokens*/ 330_000),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("summary", "Compacted parent context."),
+                responses::ev_completed_with_tokens("summary", /*total_tokens*/ 200),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("after", "Parent after compaction."),
+                responses::ev_completed_with_tokens("after", /*total_tokens*/ 120),
+            ]),
+        ],
+    )
+    .await;
+    let codex_home = TempDir::new()?;
+    compaction_config(&server.uri(), /*auto_compact_limit*/ 200_000)
+        .with_root_config(&format!(
+            "model_post_turn_compact_threshold_percent = {post_turn_percent}"
+        ))
+        .write(codex_home.path())?;
+    let skill_dir = codex_home.path().join("skills/cache-test");
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: cache-test\ndescription: Retain this skill metadata across prediction forks.\n---\nUse the original context.\n",
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let parent = mcp
+        .start_thread(ThreadStartParams {
+            history_mode: Some(history_mode),
+            ..Default::default()
+        })
+        .await?;
+    send_turn_and_wait(&mut mcp, &parent.thread.id, "Seed").await?;
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: parent.thread.id.clone(),
+            experimental_prediction_mode: true,
+            ephemeral: true,
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let child: ThreadForkResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+    for (thread_id, expected_requests) in [
+        (&child.thread.id, 3),
+        (&child.thread.id, 4),
+        (&parent.thread.id, if post_turn_percent > 0 { 6 } else { 5 }),
+        (&parent.thread.id, 7),
+    ] {
+        let completed = mcp
+            .start_turn_and_wait_for_completion(TurnStartParams {
+                thread_id: thread_id.clone(),
+                input: vec![V2UserInput::Text {
+                    text: "Continue".into(),
+                    text_elements: vec![],
+                }],
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(completed.turn.status, TurnStatus::Completed);
+        assert_eq!(mock.requests().len(), expected_requests);
+    }
+    let requests = mock.requests();
+    let comparable = |index: usize| {
+        let body = requests[index].body_json();
+        responses::strip_response_item_ids_from_json(responses::strip_metadata_from_json(json!({
+            "input": body["input"],
+            "instructions": body["instructions"],
+            "tools": body["tools"],
+        })))
+    };
+    assert_eq!(comparable(1), comparable(4));
+    assert!(requests[1].body_contains_text("Retain this skill metadata"));
+    assert!(requests[2].body_contains_text("Remember the original context."));
+    assert!(requests[3].body_contains_text("Remember the original context."));
+    assert!(requests[5].body_contains_text(COMPACT_PROMPT));
+    assert!(requests[6].body_contains_text("Compacted parent context."));
+    Ok(())
+}
+
+/// Predictions preserve history on context-limit failures and reject model-requested resets.
+#[test_case(false; "context limit")]
+#[test_case(true; "context reset")]
+#[tokio::test]
+async fn prediction_context_failure_does_not_compact(reset_context: bool) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let mut mock_responses = vec![
+        responses::sse(vec![responses::ev_completed_with_tokens(
+            "seed", /*total_tokens*/ 330_000,
+        )]),
+        if reset_context {
+            responses::sse(vec![
+                responses::ev_function_call("reset", "new_context", "{}"),
+                responses::ev_completed("prediction"),
+            ])
+        } else {
+            responses::sse_failed(
+                "prediction",
+                "context_length_exceeded",
+                "Context limit exceeded",
+            )
+        },
+    ];
+    if reset_context {
+        mock_responses.push(responses::sse(vec![
+            responses::ev_assistant_message("answer", "Prediction without resetting context."),
+            responses::ev_completed("answer"),
+        ]));
+    }
+    let mock = responses::mount_sse_sequence(&server, mock_responses).await;
+    let codex_home = TempDir::new()?;
+    compaction_config(&server.uri(), /*auto_compact_limit*/ 200_000)
+        .with_root_config("model_post_turn_compact_threshold_percent = 0")
+        .with_features(&BTreeMap::from([(Feature::TokenBudget, reset_context)]))
+        .write(codex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let parent = mcp.start_thread(ThreadStartParams::default()).await?;
+    send_turn_and_wait(&mut mcp, &parent.thread.id, "Seed").await?;
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: parent.thread.id,
+            experimental_prediction_mode: true,
+            ephemeral: true,
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let child: ThreadForkResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+    let completed = mcp
+        .start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: child.thread.id,
+            input: vec![V2UserInput::Text {
+                text: "Predict".into(),
+                text_elements: vec![],
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let requests = mock.requests();
+    if reset_context {
+        assert_eq!(completed.turn.status, TurnStatus::Completed);
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].body_contains_text("Context resets are disabled for this thread."));
+        assert!(requests[2].body_contains_text("Seed"));
+    } else {
+        assert_eq!(completed.turn.status, TurnStatus::Failed);
+        let error = completed.turn.error.expect("prediction should fail");
+        assert_eq!(
+            error.codex_error_info,
+            Some(CodexErrorInfo::ContextWindowExceeded)
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1]
+                .message_input_texts("user")
+                .last()
+                .map(String::as_str),
+            Some("Predict")
+        );
+    }
+    Ok(())
 }
 
 #[test_case(CompactionRoute::Local, Some(300), 429, "usage_limit_reached"; "local five hour")]

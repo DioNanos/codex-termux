@@ -30,7 +30,7 @@ use rmcp::model::Resource;
 use rmcp::model::ResourceContents;
 use rmcp::model::ResourceTemplate;
 use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::model::Tool;
 use rmcp::model::ToolAnnotations;
 use serde::Deserialize;
@@ -49,7 +49,7 @@ struct TestToolServer {
 
 const MEMO_URI: &str = "memo://codex/example-note";
 const MEMO_CONTENT: &str = "This is a sample MCP resource served by the rmcp test server.";
-const SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
+const SANDBOX_STATE_CAPABILITY: &str = "codex/sandbox-state";
 const SMALL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 const APP_ONLY_CWD_MARKER_FILE_ENV: &str = "MCP_TEST_APP_ONLY_CWD_MARKER_FILE";
 const DYNAMIC_SERVER_METADATA_ENV: &str = "MCP_TEST_DYNAMIC_SERVER_METADATA";
@@ -529,18 +529,18 @@ impl ServerHandler for TestToolServer {
         Ok(self.get_info())
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_tool_list_changed()
             .enable_resources()
             .build();
         capabilities.experimental = Some(BTreeMap::from([(
-            SANDBOX_STATE_META_CAPABILITY.to_string(),
+            SANDBOX_STATE_CAPABILITY.to_string(),
             JsonObject::new(),
         )]));
 
-        let server_info = ServerInfo::new(capabilities);
+        let server_info = ServerConfig::new(capabilities);
         let server_info = match dynamic_server_process_label() {
             Some(process_label) => server_info
                 .with_server_info(

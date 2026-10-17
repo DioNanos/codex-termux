@@ -34,18 +34,14 @@ use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::McpResourceOriginCheckpoint;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rmcp_client::with_http_headers_helper;
-use codex_utils_path_uri::PathUri;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
 use rmcp::model::RequestId;
-use serde::Deserialize;
-use serde::Serialize;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -83,6 +79,7 @@ pub struct McpRuntimeInput {
     pub ready_selected_capability_roots: Vec<SelectedCapabilityRoot>,
     pub mcp_servers: HashMap<String, EffectiveMcpServer>,
     pub submit_id: String,
+    /// Unbounded sources receive abandonment notifications; bounded sources retain request-only behavior.
     pub tx_event: Option<Sender<Event>>,
     pub startup_cancellation_token: CancellationToken,
     pub runtime_context: McpRuntimeContext,
@@ -778,20 +775,9 @@ impl McpRuntime {
     }
 
     pub async fn shutdown(&self) {
+        self.elicitation_router.close().await;
         self.latest_connections().shutdown().await;
     }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SandboxState {
-    pub permission_profile: PermissionProfile,
-    pub codex_linux_sandbox_exe: Option<PathBuf>,
-    pub sandbox_cwd: PathUri,
-    #[serde(default)]
-    pub use_legacy_landlock: bool,
-    #[serde(default)]
-    pub use_mxc: bool,
 }
 
 /// Runtime context used when resolving per-server MCP environments.
@@ -938,6 +924,8 @@ pub(crate) fn emit_duration(metric: &str, duration: Duration, tags: &[(&str, &st
 
 #[cfg(test)]
 mod tests {
+    use codex_protocol::models::PermissionProfile;
+    use codex_utils_path_uri::PathUri;
     use std::collections::HashMap;
 
     use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
@@ -947,7 +935,6 @@ mod tests {
     use codex_exec_server_test_support::environment_manager_without_environments;
     use codex_utils_path_uri::LegacyAppPathString;
     use pretty_assertions::assert_eq;
-    use serde_json::Value;
 
     use super::*;
 
@@ -1150,63 +1137,6 @@ mod tests {
             environment_id: environment_id.to_string(),
             ..stdio_server(environment_id)
         }
-    }
-
-    #[test]
-    fn sandbox_state_serializes_skip_missing_entries_as_missing_path_behavior() {
-        let sandbox_cwd = PathUri::from_host_native_path(
-            std::env::current_dir().expect("current directory should be available"),
-        )
-        .expect("current directory should convert to a URI");
-        let sandbox_state = SandboxState {
-            permission_profile: PermissionProfile::workspace_write(),
-            codex_linux_sandbox_exe: None,
-            sandbox_cwd,
-            use_legacy_landlock: false,
-            use_mxc: false,
-        };
-
-        let serialized = serde_json::to_value(&sandbox_state).expect("serialize sandbox state");
-        let serialized_text = serde_json::to_string(&serialized).expect("serialize JSON text");
-        assert!(
-            !serialized_text.contains("generated_default_path"),
-            "MCP sandbox metadata must preserve FileSystemPath's stable wire variants"
-        );
-        assert!(
-            !serialized_text.contains("generated_default_special"),
-            "MCP sandbox metadata must preserve FileSystemPath's stable wire variants"
-        );
-
-        let entries = serialized
-            .pointer("/permissionProfile/file_system/entries")
-            .and_then(Value::as_array)
-            .expect("workspace-write profile should contain filesystem entries");
-        let skip_missing_entries = entries
-            .iter()
-            .filter(|entry| {
-                entry.get("missing_path_behavior").and_then(Value::as_str) == Some("skip")
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            !skip_missing_entries.is_empty(),
-            "skip-missing entries should be represented as optional missing_path_behavior"
-        );
-        assert!(
-            skip_missing_entries.iter().all(|entry| {
-                matches!(
-                    entry.pointer("/path/type").and_then(Value::as_str),
-                    Some("path" | "special")
-                )
-            }),
-            "skip-missing entries should use the stable path/special variants"
-        );
-
-        let deserialized: SandboxState =
-            serde_json::from_value(serialized).expect("deserialize sandbox state");
-        assert_eq!(
-            deserialized.permission_profile,
-            sandbox_state.permission_profile
-        );
     }
 
     #[test]

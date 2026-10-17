@@ -11,13 +11,38 @@ use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
 
+/// The input that will receive clipboard text, independent of a search preview.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ClipboardPasteTarget {
+    Draft(String, super::super::textarea::EditTarget),
+    HistorySearch(String),
+    VimSearch(String, super::super::textarea::EditTarget),
+}
+
 impl ChatComposer {
-    pub(crate) fn can_paste_on_right_click(&self) -> bool {
-        self.draft.input_enabled
+    pub(crate) fn clipboard_paste_target(
+        &self,
+        shortcut: Option<KeyCode>,
+    ) -> Option<ClipboardPasteTarget> {
+        let allowed = self.draft.input_enabled
             && !self.blocks_direct_input
-            && self.history_search.is_none()
-            && self.draft.textarea.vim_query().is_none()
-            && self.draft.textarea.mouse_selection_range().is_none()
+            && (shortcut.is_some()
+                || (self.history_search.is_none()
+                    && self.draft.textarea.vim_query().is_none()
+                    && self.draft.textarea.mouse_selection_range().is_none()));
+        if !allowed {
+            return None;
+        }
+        Some(if let Some(search) = &self.history_search {
+            ClipboardPasteTarget::HistorySearch(search.query.clone())
+        } else if let Some(search) = self.draft.textarea.vim_query() {
+            ClipboardPasteTarget::VimSearch(
+                search.editor.text().to_string(),
+                search.editor.edit_target(),
+            )
+        } else {
+            ClipboardPasteTarget::Draft(self.current_text(), self.draft.textarea.edit_target())
+        })
     }
 
     pub(in crate::bottom_pane) fn finish_copy(
@@ -60,6 +85,10 @@ impl ChatComposer {
             self.draft.textarea.set_cursor(self.draft.textarea.cursor());
         }
         Some((char_count, result))
+    }
+
+    pub(crate) fn clear_mouse_selection(&mut self) {
+        self.draft.textarea.set_cursor(self.draft.textarea.cursor());
     }
 
     pub(crate) fn end_mouse_drag(&mut self) {

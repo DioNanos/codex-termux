@@ -7,6 +7,7 @@ use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableItem;
 use crossterm::cursor::SetCursorStyle;
 use ratatui::buffer::Buffer;
+use ratatui::buffer::CellDiffOption;
 use ratatui::layout::Rect;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Widget;
@@ -75,6 +76,13 @@ impl Renderable for CenteredView<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let dialog = dialog_area(self.0, area);
         Clear.render(dialog, buf);
+        // A dialog can cover cached blank cells whose color the terminal did not retain.
+        // Paint its whole surface; let wide text rendering still reset continuation cells.
+        for y in dialog.top()..dialog.bottom() {
+            for x in dialog.left()..dialog.right() {
+                buf[(x, y)].set_diff_option(CellDiffOption::AlwaysUpdate);
+            }
+        }
         self.0.render(dialog, buf);
     }
 

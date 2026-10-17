@@ -79,7 +79,7 @@ printf "Patch #2 (Release Profile): "
 # The fork's size-sensitive Termux package overrides live on the packaging job,
 # where they cannot affect upstream release artifacts.
 if grep -q 'lto = "thin"' codex-rs/Cargo.toml \
-  && grep -q 'zip = "2.4.2"' codex-rs/Cargo.toml \
+  && grep -Eq '^zip = \{ version = "9\.[0-9]+\.[0-9]+", default-features = false' codex-rs/Cargo.toml \
   && grep -q 'CARGO_PROFILE_RELEASE_LTO: "thin"' .github/workflows/termux-npm-build-publish.yml \
   && grep -q 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "4"' .github/workflows/termux-npm-build-publish.yml \
   && grep -q 'CARGO_PROFILE_RELEASE_PANIC: "abort"' .github/workflows/termux-npm-build-publish.yml \

@@ -7,6 +7,7 @@ small and focused and reuses the orchestrator for approvals + sandbox + retry.
 use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
 use crate::exec_env::CODEX_SESSION_ID_ENV_VAR;
 use crate::exec_env::CODEX_THREAD_ID_ENV_VAR;
+use crate::exec_env::CODEX_TOOL_CALL_ID_ENV_VAR;
 use crate::exec_env::CODEX_VERSION_ENV_VAR;
 use crate::sandboxing::SandboxPermissions;
 use crate::shell::Shell;
@@ -34,7 +35,6 @@ use std::path::Path;
 
 pub(crate) mod apply_patch;
 pub(crate) mod unified_exec;
-pub(crate) mod zsh_fork;
 
 const SNAPSHOT_ORIGINAL_BASH_ENV_ENV_KEY: &str = "CODEX_NETWORK_PROXY_SNAPSHOT_ORIGINAL_BASH_ENV";
 const SNAPSHOT_ORIGINAL_POSIX_ENV_ENV_KEY: &str = "CODEX_NETWORK_PROXY_SNAPSHOT_ORIGINAL_POSIX_ENV";
@@ -138,18 +138,6 @@ pub(crate) fn apply_package_path_prepend(
     };
 
     runtime_path_prepends.prepend(env, path_dir.as_path());
-}
-
-#[cfg(unix)]
-pub(crate) fn apply_zsh_fork_path_prepend(
-    env: &mut HashMap<String, String>,
-    runtime_path_prepends: &mut RuntimePathPrepends,
-    shell_zsh_path: &Path,
-) {
-    let Some(zsh_bin_dir) = shell_zsh_path.parent() else {
-        return;
-    };
-    runtime_path_prepends.prepend(env, zsh_bin_dir);
 }
 
 pub(crate) fn prepare_powershell_command_for_windows_sandbox(
@@ -352,6 +340,7 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
     for key in [
         CODEX_SESSION_ID_ENV_VAR,
         CODEX_THREAD_ID_ENV_VAR,
+        CODEX_TOOL_CALL_ID_ENV_VAR,
         CODEX_VERSION_ENV_VAR,
         CODEX_PERMISSION_PROFILE_ENV_VAR,
         CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR,
@@ -368,6 +357,7 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
             CODEX_PERMISSION_PROFILE_ENV_VAR,
             CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR,
             PLUGIN_METRICS_OUTPUT_ENV_VAR,
+            CODEX_TOOL_CALL_ID_ENV_VAR,
         ],
     );
     let (proxy_captures, proxy_exports) = build_proxy_env_exports(env);

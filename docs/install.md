@@ -4,12 +4,12 @@ This package is for Android Termux on ARM64 devices.
 
 ### Requirements
 
-| Requirement | Details                                |
-| ----------- | -------------------------------------- |
-| Android     | Android 10+ / API 29+ (release target) |
-| CPU         | ARM64                                  |
-| Shell       | Termux                                 |
-| Node.js     | 18+                                    |
+| Requirement | Details |
+| --- | --- |
+| Android | Android 10+ / API 29+ (release target) |
+| CPU | ARM64 |
+| Shell | Termux |
+| Node.js | 18+ |
 
 ### Install from npm
 

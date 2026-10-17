@@ -213,6 +213,7 @@ impl SharedConversationHistory {
         self.items
             .iter()
             .filter(|envelope| !is_guardian_context_message(&envelope.item))
+            .filter(|envelope| !codex_guardian_context::is_inherited_manual_approval(envelope))
             .map(|envelope| {
                 (
                     &envelope.item,
@@ -355,7 +356,9 @@ impl ContextManager {
                                     .iter()
                                     .filter_map(|content| match content {
                                         ContentItem::InputText { text }
-                                        | ContentItem::OutputText { text } => Some(text.as_str()),
+                                        | ContentItem::OutputText { text, .. } => {
+                                            Some(text.as_str())
+                                        }
                                         _ => None,
                                     })
                                     .collect::<Vec<_>>()
@@ -1099,7 +1102,7 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
         ResponseItem::Message { content, .. } => content
             .iter()
             .map(|part| match part {
-                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
                     text_bytes(text)
                 }
                 ContentItem::InputImage { image, detail } => {
@@ -1129,15 +1132,18 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
         ResponseItem::Reasoning {
             encrypted_content: Some(content),
             ..
-        }
-        | ResponseItem::Compaction {
+        } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
+        ResponseItem::Compaction {
             encrypted_content: content,
             ..
         }
         | ResponseItem::ContextCompaction {
             encrypted_content: Some(content),
             ..
-        } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
+        } => i64::try_from(
+            codex_protocol::protocol::estimate_compaction_content_length(content.len()),
+        )
+        .unwrap_or(i64::MAX),
         ResponseItem::FunctionCall {
             name,
             namespace,

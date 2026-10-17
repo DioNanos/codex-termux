@@ -486,7 +486,8 @@ impl App {
             | AppCommand::RealtimeConversationStop { thread_id } = &op
                 && self.chat_widget.thread_id() == Some(*thread_id)
             {
-                self.chat_widget.record_realtime_failure();
+                self.chat_widget
+                    .record_realtime_failure(crate::chatwidget::RealtimeFailureCause::LocalRequest);
                 self.chat_widget.reset_realtime_conversation();
             }
             self.chat_widget
@@ -512,7 +513,8 @@ impl App {
             | AppCommand::RealtimeConversationStop { thread_id } = &op
                 && self.chat_widget.thread_id() == Some(*thread_id)
             {
-                self.chat_widget.record_realtime_failure();
+                self.chat_widget
+                    .record_realtime_failure(crate::chatwidget::RealtimeFailureCause::LocalRequest);
                 self.chat_widget.reset_realtime_conversation();
             }
             self.chat_widget.add_error_message(
@@ -530,10 +532,7 @@ impl App {
 
         crate::session_log::log_outbound_op(&op);
 
-        if self
-            .try_resolve_app_server_request(app_server, thread_id, &op)
-            .await?
-        {
+        if self.try_resolve_app_server_request(thread_id, &op).await? {
             return Ok(());
         }
 
@@ -828,7 +827,7 @@ impl App {
                     let enabled = self.chat_widget.daybreak_enabled
                         && !self.chat_widget.side_conversation_active()
                         && !self.side_threads.contains_key(&thread_id);
-                    let eligible_account = self.chat_widget.daybreak_turn_eligible(enabled);
+                    let eligible_account = self.chat_widget.daybreak_account_eligible();
                     let cyber_access_program = match crate::daybreak::program_for_turn(
                         &self.chat_widget.model_catalog().models,
                         model,
@@ -1088,37 +1087,33 @@ impl App {
 
     pub(super) async fn try_resolve_app_server_request(
         &mut self,
-        app_server: &AppServerSession,
         thread_id: ThreadId,
         op: &AppCommand,
     ) -> Result<bool> {
         let Some(resolution) = self
             .pending_app_server_requests
-            .take_resolution(&thread_id.to_string(), op)
+            .take_resolution_record(&thread_id.to_string(), op)
             .map_err(|err| color_eyre::eyre::eyre!(err))?
         else {
             return Ok(false);
         };
+        let Some(reply) = resolution.request.reply else {
+            return Err(color_eyre::eyre::eyre!(
+                "Missing original app-server connection for pending request"
+            ));
+        };
 
-        match app_server
-            .resolve_server_request(resolution.request_id, resolution.result)
-            .await
-        {
-            Ok(()) => {
-                if ThreadEventStore::op_can_change_pending_replay_state(op) {
-                    self.note_thread_outbound_op(thread_id, op).await;
-                    self.refresh_pending_thread_approvals().await;
-                    self.refresh_side_parent_status_from_store(thread_id).await;
-                }
-                Ok(true)
-            }
-            Err(err) => {
-                self.chat_widget.add_error_message(format!(
-                    "Failed to resolve app-server request for thread {thread_id}: {err}"
-                ));
-                Ok(false)
-            }
+        if let Err(err) = reply.resolve(resolution.result).await {
+            self.chat_widget.add_error_message(format!(
+                "Failed to resolve app-server request for thread {thread_id}: {err}"
+            ));
         }
+        if ThreadEventStore::op_can_change_pending_replay_state(op) {
+            self.note_thread_outbound_op(thread_id, op).await;
+            self.refresh_pending_thread_approvals().await;
+            self.refresh_side_parent_status_from_store(thread_id).await;
+        }
+        Ok(true)
     }
 
     pub(super) async fn refresh_pending_thread_approvals(&mut self) {
@@ -2175,12 +2170,9 @@ impl App {
             self.mark_agent_picker_thread_closed(closed_thread_id);
             if self.side_threads.contains_key(&closed_thread_id) {
                 self.discard_closed_side_thread(closed_thread_id).await;
-                self.select_agent_thread(tui, app_server, primary_thread_id)
-                    .await?;
-            } else {
-                self.select_agent_thread_and_discard_side(tui, app_server, primary_thread_id)
-                    .await?;
             }
+            self.select_agent_thread(tui, app_server, primary_thread_id)
+                .await?;
             if self.active_thread_id == Some(primary_thread_id) {
                 self.chat_widget.add_info_message(
                     format!(
@@ -2242,8 +2234,7 @@ impl App {
         {
             self.chat_widget.pre_draw_tick();
             self.render_chat_widget_frame(tui, tui.terminal.last_known_screen_size)?;
-            tui.discard_pending_input_before_interactive_screen()?;
-            self.startup_pending_protected_request = false;
+            self.discard_startup_modal_input(tui)?;
         }
         if self.backtrack_render_pending {
             tui.frame_requester().schedule_frame();

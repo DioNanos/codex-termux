@@ -93,6 +93,12 @@ impl ChatWidget {
         self.bottom_pane
             .set_queue_submissions(/*queue_submissions*/ false);
         if previous_thread_id != self.thread_id {
+            if (previous_thread_id.is_some()
+                || (self.remote_connection.is_some() && self.config.cwd != session.cwd))
+                && self.status_account_display == Some(StatusAccountDisplay::ApiKey)
+            {
+                self.refresh_account_scoped_models();
+            }
             self.backend_banner_notice_model = None;
             self.automatic_model_switch_state =
                 backend_banners::AutomaticModelSwitchState::default();

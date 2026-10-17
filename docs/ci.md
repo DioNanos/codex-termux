@@ -9,8 +9,7 @@ disabled, and why:
   package checks (`repo-checks`, including the V8 sandbox-archive guard
   for the package builder), and the cargo gates (format, cargo shear,
   cargo-deny, sdk, blob size). Bazel does not run. The Android release
-  build and the npm payload checks run in `termux-npm-build-publish` and
-  stay green on main.
+  build and the npm payload checks run in `termux-npm-build-publish`.
 - **postmerge-ci** (pushes to main): calls the `rust-ci-full.yml` and
   `v8-canary.yml` reusable workflows. On this fork only their Linux legs
   run (see "What is disabled, and why"); codespell runs in `blocking-ci`,
@@ -46,13 +45,14 @@ Per workflow:
   Remove the `if` to restore it. `CI results` does not require that job.
   The cargo package job and the cargo general and shear checks stay
   strict. The macOS and Windows legs stay commented out.
-- **`rust-ci-full.yml`** (called by postmerge-ci): `lint_build` and the
-  Linux x64 and arm64 test jobs ask for the private runner group
-  `<repo>-runners`, which is upstream's and does not exist on this fork.
-  They are turned off with `if: false`. The macOS and Windows test jobs
-  stay off too. The results gate accepts `skipped` for those jobs and
-  still requires success from general, cargo shear, and both
-  argument-comment lint jobs. Remove the `if` to restore a job.
+- **`rust-ci-full.yml`** (called by postmerge-ci): the Linux x64 (remote)
+  and arm64 test jobs stay strict in the `results` gate. The macOS test
+  job (paid runners) and the two Windows test jobs (`codex-termux-runners`)
+  are turned off with `if: false`, and the gate accepts `skipped` only for
+  those three; the macOS and Windows legs of the prebuilt
+  argument-comment lint and of the `lint_build` job are commented out of
+  the `matrix: include:` lists — `lint_build` keeps running on its Linux
+  legs, so the `results` gate keeps requiring it.
 - **`v8-canary.yml`** (called by postmerge-ci): only the Linux legs (x64
   and arm64, release and ptrcomp-sandbox variants) run; the four macOS
   legs (paid GitHub runners) are commented out of the `matrix: include:`
@@ -63,8 +63,9 @@ Per workflow:
   `if: false` at the job level; they show up as skipped checks, together
   with the test, clippy, and verify-release-build jobs above.
 
-## Known postmerge limitation
+## Scope
 
-`postmerge-ci` starts and creates jobs. `v8-canary` uses GitHub-hosted
-Linux runners. The `rust-ci-full` jobs that need the private runner group
-are disabled, as listed above.
+This page describes the GitHub Actions configuration kept on this branch. It does not
+report run results: the state of any particular run is not asserted here. A later fix
+on the public line also skips the remaining postmerge jobs that need the private
+runner group; that fix is not part of this branch.

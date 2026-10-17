@@ -1,6 +1,7 @@
 use anyhow::Result;
 use codex_api::ApiError;
 use codex_context_fragments::RenderedFragment;
+use codex_core::cyber_access_program::ApiKeyCyberAccessPrograms;
 use codex_extension_api::ContextualUserFragment;
 use codex_extension_api::ExtensionMetrics;
 use codex_guardian_context::PreviousReviews;
@@ -22,6 +23,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::turn_input::CyberAccessProgram;
 use core_test_support::responses;
 use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::ev_assistant_message;
@@ -140,7 +142,9 @@ pub(in crate::async_scorer) enum ProxyPrewarmLimit {
     StopAfter { ready_connections: usize },
 }
 
-async fn proxy_websocket_servers(servers: &[&responses::WebSocketTestServer]) -> Result<String> {
+pub(super) async fn proxy_websocket_servers(
+    servers: &[&responses::WebSocketTestServer],
+) -> Result<String> {
     proxy_websocket_servers_with_prewarm_limit(servers, ProxyPrewarmLimit::AllConnections).await
 }
 
@@ -204,6 +208,7 @@ pub(in crate::async_scorer) async fn proxy_websocket_servers_with_http(
 
 pub(in crate::async_scorer) fn sampler_config(base_url: String) -> LunaSamplerConfig {
     LunaSamplerConfig {
+        api_key_cyber_access_programs: ApiKeyCyberAccessPrograms::Disabled,
         workspace_routing: codex_model_provider::WorkspaceRoutingContext::new(
             "https://chatgpt.com/backend-api".into(),
         ),
@@ -227,7 +232,7 @@ pub(in crate::async_scorer) fn sampler_config(base_url: String) -> LunaSamplerCo
     }
 }
 
-async fn connect_sampler(config: LunaSamplerConfig) -> Result<LunaSampler> {
+pub(super) async fn connect_sampler(config: LunaSamplerConfig) -> Result<LunaSampler> {
     let sampler = LunaSampler::new(config);
     sampler.prewarm().await;
     Ok(sampler)
@@ -265,6 +270,7 @@ fn assert_classifier_instructions(request: &serde_json::Value) {
 
 pub(in crate::async_scorer) fn sample_request(parent_turn_id: &str) -> LunaSamplingRequest {
     LunaSamplingRequest {
+        cyber_access_program: None,
         parent_response_id: None,
         instructions: classifier_instructions(),
         input: vec![responses::user_message_item(
@@ -275,13 +281,68 @@ pub(in crate::async_scorer) fn sample_request(parent_turn_id: &str) -> LunaSampl
         reasoning_effort: ReasoningEffort::None,
         parent_turn_id: parent_turn_id.to_owned(),
         root_turn_id: None,
+        pending_score: None,
     }
+}
+
+#[tokio::test]
+async fn classifier_preserves_api_key_cyber_program_policy() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    for policy in [
+        ApiKeyCyberAccessPrograms::Enabled,
+        ApiKeyCyberAccessPrograms::Disabled,
+        ApiKeyCyberAccessPrograms::UnsupportedProvider,
+    ] {
+        let server = responses::start_mock_server().await;
+        let response = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                ev_assistant_message("score", "low"),
+                ev_completed("score"),
+            ]),
+        )
+        .await;
+        let mut config = sampler_config(server.uri());
+        config.api_key_cyber_access_programs = policy;
+        let sampler = LunaSampler::new(config);
+        let mut request = sample_request("parent");
+        request.cyber_access_program = Some(CyberAccessProgram::DaybreakRed);
+        let result = sampler.sample(request).await;
+        match policy {
+            ApiKeyCyberAccessPrograms::Disabled => {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Cyber access programs are disabled for this API-key session.")
+                );
+                assert!(response.requests().is_empty());
+            }
+            ApiKeyCyberAccessPrograms::Enabled | ApiKeyCyberAccessPrograms::UnsupportedProvider => {
+                assert_eq!(result?, "low");
+                let expected = match policy {
+                    ApiKeyCyberAccessPrograms::Enabled => Some(json!({"cyber": "daybreak_blue"})),
+                    ApiKeyCyberAccessPrograms::UnsupportedProvider => None,
+                    ApiKeyCyberAccessPrograms::Disabled => unreachable!(),
+                };
+                assert_eq!(
+                    response
+                        .single_request()
+                        .body_json()
+                        .get("access_programs")
+                        .cloned(),
+                    expected,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 type RecordedMetric = (String, i64, Vec<(String, String)>);
 
 #[derive(Default)]
-struct RecordingMetrics(Mutex<Vec<RecordedMetric>>);
+pub(super) struct RecordingMetrics(pub(super) Mutex<Vec<RecordedMetric>>);
 
 impl ExtensionMetrics for RecordingMetrics {
     fn histogram_with_boundaries(
@@ -518,6 +579,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
     );
 
     let sampler = connect_sampler(LunaSamplerConfig {
+        api_key_cyber_access_programs: ApiKeyCyberAccessPrograms::Disabled,
         workspace_routing: codex_model_provider::WorkspaceRoutingContext::new(
             "https://chatgpt.com/backend-api".into(),
         ),
@@ -564,9 +626,12 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
 
     let first = sampler
         .sample(LunaSamplingRequest {
+            cyber_access_program: None,
             parent_response_id: None,
             instructions: classifier_instructions(),
             input: vec![ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_owned(),
                 content: vec![
@@ -585,6 +650,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
             reasoning_effort: ReasoningEffort::None,
             parent_turn_id: "turn-1".to_owned(),
             root_turn_id: Some("turn-1".to_owned()),
+            pending_score: None,
         })
         .await?;
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -607,6 +673,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
     sampler.prewarm().await;
     let second = sampler
         .sample(LunaSamplingRequest {
+            cyber_access_program: None,
             parent_response_id: None,
             instructions: classifier_instructions(),
             input: vec![responses::user_message_item(
@@ -617,6 +684,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
             reasoning_effort: ReasoningEffort::Medium,
             parent_turn_id: "turn-2".to_owned(),
             root_turn_id: Some("root-2".to_owned()),
+            pending_score: None,
         })
         .await?;
 
@@ -779,6 +847,7 @@ async fn sampler_returns_classification_token_before_terminal_response_events() 
         ))),
     );
     let sampler = connect_sampler(LunaSamplerConfig {
+        api_key_cyber_access_programs: ApiKeyCyberAccessPrograms::Disabled,
         workspace_routing: codex_model_provider::WorkspaceRoutingContext::new(
             "https://chatgpt.com/backend-api".into(),
         ),
@@ -800,6 +869,7 @@ async fn sampler_returns_classification_token_before_terminal_response_events() 
     let output = tokio::time::timeout(
         Duration::from_secs(2),
         sampler.sample(LunaSamplingRequest {
+            cyber_access_program: None,
             parent_response_id: None,
             instructions: classifier_instructions(),
             input: vec![responses::user_message_item(
@@ -810,6 +880,7 @@ async fn sampler_returns_classification_token_before_terminal_response_events() 
             reasoning_effort: ReasoningEffort::None,
             parent_turn_id: "turn-1".to_owned(),
             root_turn_id: Some("turn-1".to_owned()),
+            pending_score: None,
         }),
     )
     .await??;
@@ -1089,8 +1160,9 @@ async fn sampler_uses_http_with_a_fresh_identity_when_warm_connections_expire() 
         ev_assistant_message("response-1", "low"),
         ev_completed("response-1"),
     ];
-    let first = responses::start_websocket_server(vec![vec![response.clone()]]).await;
-    let second = responses::start_websocket_server(vec![vec![response.clone()]]).await;
+    // Keep the sockets open until the test expires their pooled connections.
+    let first = responses::start_websocket_server(vec![vec![response.clone(), Vec::new()]]).await;
+    let second = responses::start_websocket_server(vec![vec![response.clone(), Vec::new()]]).await;
     let http = responses::start_mock_server().await;
     let http_mock = responses::mount_sse_once(&http, responses::sse(response)).await;
     let sampler = connect_sampler(sampler_config(

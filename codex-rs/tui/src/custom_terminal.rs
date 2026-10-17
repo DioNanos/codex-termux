@@ -328,25 +328,8 @@ where
         self.visible_history_rows = self.visible_history_rows.min(area.top());
     }
 
-    /// Queries the backend for size and resizes if it doesn't match the previous size.
-    pub fn autoresize(&mut self) -> io::Result<()> {
-        let screen_size = self.size()?;
-        if screen_size != self.last_known_screen_size {
-            self.resize(screen_size)?;
-        }
-        Ok(())
-    }
-
     /// Draws a single frame to the terminal.
-    ///
-    /// Returns a [`CompletedFrame`] if successful, otherwise a [`std::io::Error`].
-    ///
-    /// If the render callback passed to this method can fail, use [`try_draw`] instead.
-    ///
-    /// Applications should call `draw` or [`try_draw`] in a loop to continuously render the
-    /// terminal. These methods are the main entry points for drawing to the terminal.
-    ///
-    /// [`try_draw`]: Terminal::try_draw
+    /// Applications should call `draw` in a loop to continuously render the terminal.
     ///
     /// This method will:
     ///
@@ -369,71 +352,20 @@ where
     }
 
     /// Draws a single frame using a screen size already obtained by the caller.
-    pub(crate) fn draw_with_size<F>(&mut self, screen_size: Size, render: F) -> io::Result<()>
+    pub(crate) fn draw_with_size<F>(
+        &mut self,
+        screen_size: Size,
+        render_callback: F,
+    ) -> io::Result<()>
     where
         F: FnOnce(&mut Frame),
-    {
-        self.try_draw_with_size(screen_size, |frame| {
-            render(frame);
-            io::Result::Ok(())
-        })
-    }
-
-    /// Tries to draw a single frame to the terminal.
-    ///
-    /// Returns [`Result::Ok`] containing a [`CompletedFrame`] if successful, otherwise
-    /// [`Result::Err`] containing the [`std::io::Error`] that caused the failure.
-    ///
-    /// This is the equivalent of [`Terminal::draw`] but the render callback is a function or
-    /// closure that returns a `Result` instead of nothing.
-    ///
-    /// Applications should call `try_draw` or [`draw`] in a loop to continuously render the
-    /// terminal. These methods are the main entry points for drawing to the terminal.
-    ///
-    /// [`draw`]: Terminal::draw
-    ///
-    /// This method will:
-    ///
-    /// - autoresize the terminal if necessary
-    /// - call the render callback, passing it a [`Frame`] reference to render to
-    /// - flush the current internal state by copying the current buffer to the backend
-    /// - move the cursor to the last known position if it was set during the rendering closure
-    /// - return a [`CompletedFrame`] with the current buffer and the area of the terminal
-    ///
-    /// The render callback passed to `try_draw` can return any [`Result`] with an error type that
-    /// can be converted into an [`std::io::Error`] using the [`Into`] trait. This makes it possible
-    /// to use the `?` operator to propagate errors that occur during rendering. If the render
-    /// callback returns an error, the error will be returned from `try_draw` as an
-    /// [`std::io::Error`] and the terminal will not be updated.
-    ///
-    /// The [`CompletedFrame`] returned by this method can be useful for debugging or testing
-    /// purposes, but it is often not used in regular applicationss.
-    ///
-    /// The render callback should fully render the entire frame when called, including areas that
-    /// are unchanged from the previous frame. This is because each frame is compared to the
-    /// previous frame to determine what has changed, and only the changes are written to the
-    /// terminal. If the render function does not fully render the frame, the terminal will not be
-    /// in a consistent state.
-    pub fn try_draw<F, E>(&mut self, render_callback: F) -> io::Result<()>
-    where
-        F: FnOnce(&mut Frame) -> Result<(), E>,
-        E: Into<io::Error>,
-    {
-        let screen_size = self.size()?;
-        self.try_draw_with_size(screen_size, render_callback)
-    }
-
-    fn try_draw_with_size<F, E>(&mut self, screen_size: Size, render_callback: F) -> io::Result<()>
-    where
-        F: FnOnce(&mut Frame) -> Result<(), E>,
-        E: Into<io::Error>,
     {
         if screen_size != self.last_known_screen_size {
             self.resize(screen_size)?;
         }
         let mut frame = self.get_frame();
 
-        render_callback(&mut frame).map_err(Into::into)?;
+        render_callback(&mut frame);
 
         // We can't change the cursor position right away because we have to flush the frame to
         // stdout first. But we also can't keep the frame around, since it holds a &mut to
@@ -800,13 +732,13 @@ where
 /// The `ModifierDiff` struct is used to calculate the difference between two `Modifier`
 /// values. This is useful when updating the terminal display, as it allows for more
 /// efficient updates by only sending the necessary changes.
-struct ModifierDiff {
+pub(crate) struct ModifierDiff {
     pub from: Modifier,
     pub to: Modifier,
 }
 
 impl ModifierDiff {
-    fn queue<W: io::Write>(self, w: &mut W) -> io::Result<()> {
+    pub(crate) fn queue<W: io::Write>(self, w: &mut W) -> io::Result<()> {
         use crossterm::style::Attribute as CAttribute;
         let removed = self.from - self.to;
         if removed.contains(Modifier::REVERSED) {
@@ -1350,10 +1282,7 @@ mod tests {
         ));
 
         terminal
-            .try_draw(|frame| {
-                frame.set_cursor_position(cursor_position);
-                io::Result::Ok(())
-            })
+            .draw(|frame| frame.set_cursor_position(cursor_position))
             .expect("draw");
 
         let mut expected_move = Vec::new();

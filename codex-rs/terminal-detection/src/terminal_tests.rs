@@ -153,14 +153,17 @@ fn detects_iterm2() {
 
 #[test]
 fn detects_apple_terminal() {
-    let env = FakeEnvironment::new().with_var("TERM_PROGRAM", "Apple_Terminal");
+    let env = FakeEnvironment::new()
+        .with_var("TERM_PROGRAM", "Apple_Terminal")
+        .with_var("TERM_PROGRAM_VERSION", "455")
+        .with_var("TERM_SESSION_ID", "A1B2C3");
     let terminal = detect_terminal_info_from_env(&env);
     assert_eq!(
         terminal,
         terminal_info(
             TerminalName::AppleTerminal,
             Some("Apple_Terminal"),
-            /*version*/ None,
+            Some("455"),
             /*term*/ None,
             /*multiplexer*/ None,
         ),
@@ -168,27 +171,8 @@ fn detects_apple_terminal() {
     );
     assert_eq!(
         terminal.user_agent_token(),
-        "Apple_Terminal",
+        "Apple_Terminal/455",
         "apple_term_program_user_agent"
-    );
-
-    let env = FakeEnvironment::new().with_var("TERM_SESSION_ID", "A1B2C3");
-    let terminal = detect_terminal_info_from_env(&env);
-    assert_eq!(
-        terminal,
-        terminal_info(
-            TerminalName::AppleTerminal,
-            /*term_program*/ None,
-            /*version*/ None,
-            /*term*/ None,
-            /*multiplexer*/ None
-        ),
-        "apple_term_session_id_info"
-    );
-    assert_eq!(
-        terminal.user_agent_token(),
-        "Apple_Terminal",
-        "apple_term_session_id_user_agent"
     );
 }
 
@@ -735,7 +719,9 @@ fn detects_vte() {
 
 #[test]
 fn detects_windows_terminal() {
-    let env = FakeEnvironment::new().with_var("WT_SESSION", "1");
+    let env = FakeEnvironment::new()
+        .with_var("WT_SESSION", "1")
+        .with_var("TERM_SESSION_ID", "A1B2C3");
     let terminal = detect_terminal_info_from_env(&env);
     assert_eq!(
         terminal,
@@ -778,7 +764,9 @@ fn detects_windows_terminal() {
 
 #[test]
 fn detects_term_fallbacks() {
-    let env = FakeEnvironment::new().with_var("TERM", "xterm-256color");
+    let env = FakeEnvironment::new()
+        .with_var("TERM", "xterm-256color")
+        .with_var("TERM_SESSION_ID", "A1B2C3");
     let terminal = detect_terminal_info_from_env(&env);
     assert_eq!(
         terminal,

@@ -1,7 +1,6 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::PoisonError;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use codex_code_mode_protocol::CellId;
@@ -55,15 +54,11 @@ impl SessionInner {
                         }
                     }
                     Ok(None) => {
-                        if !inner.shutdown_requested.load(Ordering::Acquire) {
-                            inner.fail(format!("gRPC code-mode {stream_name} closed unexpectedly"));
-                        }
+                        inner.fail(format!("gRPC code-mode {stream_name} closed unexpectedly"));
                         return;
                     }
                     Err(error) => {
-                        if !inner.shutdown_requested.load(Ordering::Acquire) {
-                            inner.fail(deadline::failure(stream_name, error));
-                        }
+                        inner.fail(deadline::failure(stream_name, error));
                         return;
                     }
                 }
@@ -193,11 +188,13 @@ impl SessionInner {
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => {}
+            // NotFound can mean an invocation in a live session was canceled.
+            // Check cancellation before treating a completion error as fatal.
             result = deadline::request(
                 self,
                 "tool invocation completion",
                 Duration::ZERO,
-                client.complete_tool_call(request),
+                client.complete_tool_call(self.request(request)),
             ) => {
                 if let Err(error) = result
                     && !cancellation.is_cancelled()
@@ -266,3 +263,7 @@ impl SessionInner {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "callbacks_tests.rs"]
+mod tests;

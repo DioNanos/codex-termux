@@ -5,10 +5,141 @@ use codex_guardian_context::ContextPresentation;
 use codex_guardian_context::ContextProfile;
 use codex_guardian_context::PlannedAction;
 use codex_guardian_context::PlannedActionKind;
+use codex_guardian_context::TruncationObservation;
+use codex_otel::MetricsClient;
+use codex_otel::MetricsConfig;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnAbortReason;
+use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+use opentelemetry_sdk::metrics::data::MetricData;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
+use test_case::test_case;
+
+#[tokio::test]
+#[test_case(128_000; "accepted_input")]
+#[test_case(1; "rejected_input")]
+async fn finalization_exports_loss_totals_only_for_accepted_input(window: i64) {
+    let metrics = MetricsClient::new(
+        MetricsConfig::in_memory(
+            "test",
+            "codex-core",
+            env!("CARGO_PKG_VERSION"),
+            InMemoryMetricExporter::default(),
+        )
+        .with_runtime_reader(),
+    )
+    .unwrap();
+    let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
+    session.services.session_telemetry = session
+        .services
+        .session_telemetry
+        .clone()
+        .with_metrics(metrics.clone());
+    Arc::make_mut(&mut turn.config).model_context_window = Some(window);
+    let session = Arc::new(session);
+    let step = session
+        .capture_step_context(Arc::new(turn), &tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    let mut context = required_context("required action".to_owned());
+    // Composition and final selection can reduce the same component multiple times.
+    context.truncations = [(256, 100), (64, 40), (16, 0)]
+        .into_iter()
+        .map(|(original_bytes, retained_bytes)| TruncationObservation {
+            component: "conversation_transcript",
+            original_bytes,
+            retained_bytes,
+        })
+        .collect();
+    let mut input = vec![TurnInput::UserInput {
+        metadata: Default::default(),
+        content: context.clone().into_user_inputs().unwrap(),
+        client_id: None,
+    }];
+    session
+        .services
+        .thread_extension_data
+        .insert(PendingReviewContext(context));
+    assert_eq!(
+        finalize(&session, &step, &mut input, HistoryTruncation::Preserve)
+            .await
+            .is_ok(),
+        window > 1,
+    );
+    // A second finalization has no pending input and must not emit the loss twice.
+    if window > 1 {
+        finalize(&session, &step, &mut input, HistoryTruncation::Preserve)
+            .await
+            .unwrap();
+    }
+    let snapshot = metrics.snapshot().unwrap();
+    let mut counts = BTreeMap::new();
+    let mut bytes = BTreeMap::new();
+    for metric in snapshot
+        .scope_metrics()
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+    {
+        match metric.name() {
+            codex_otel::GUARDIAN_REVIEW_TRUNCATION_METRIC => {
+                let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                    panic!("expected loss counter");
+                };
+                for point in sum.data_points() {
+                    let tags = point
+                        .attributes()
+                        .filter(|attr| matches!(attr.key.as_str(), "component" | "disposition"))
+                        .map(|attr| (attr.key.as_str().to_owned(), attr.value.to_string()))
+                        .collect::<BTreeMap<_, _>>();
+                    counts.insert(tags, point.value());
+                }
+            }
+            codex_otel::GUARDIAN_REVIEW_TRUNCATION_BYTES_METRIC => {
+                let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+                    panic!("expected loss histogram");
+                };
+                for point in histogram.data_points() {
+                    let tags = point
+                        .attributes()
+                        .filter(|attr| {
+                            matches!(
+                                attr.key.as_str(),
+                                "component" | "disposition" | "measurement"
+                            )
+                        })
+                        .map(|attr| (attr.key.as_str().to_owned(), attr.value.to_string()))
+                        .collect::<BTreeMap<_, _>>();
+                    bytes.insert(tags, (point.count(), point.sum()));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut expected_counts = BTreeMap::new();
+    let mut expected_bytes = BTreeMap::new();
+    if window > 1 {
+        for (disposition, original, retained) in
+            [("omitted", 16.0, 0.0), ("truncated", 320.0, 140.0)]
+        {
+            let tags = BTreeMap::from([
+                ("component".to_owned(), "conversation_transcript".to_owned()),
+                ("disposition".to_owned(), disposition.to_owned()),
+            ]);
+            expected_counts.insert(tags.clone(), 1);
+            for (measurement, value) in [
+                ("original", original),
+                ("retained", retained),
+                ("omitted", original - retained),
+            ] {
+                let mut tags = tags.clone();
+                tags.insert("measurement".to_owned(), measurement.to_owned());
+                expected_bytes.insert(tags, (1, value));
+            }
+        }
+    }
+    assert_eq!((counts, bytes), (expected_counts, expected_bytes));
+}
 
 fn required_context(text: String) -> ComposedContext {
     let action = PlannedAction {

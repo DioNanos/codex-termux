@@ -1,6 +1,7 @@
 //! Pasted text edits the active history query while preserving the original draft.
 
 use super::super::super::chat_composer_history::HistoryEntry;
+use super::super::super::chat_composer_history::HistorySearchResult;
 use super::super::ChatComposer;
 use super::super::ComposerRenderOptions;
 use super::super::InputResult;
@@ -49,7 +50,20 @@ fn history_search_paste_appends_query_and_accepts_match() {
     assert_eq!(composer.draft.textarea.text(), "git log");
 
     composer.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    let paste_target = composer.clipboard_paste_target(Some(KeyCode::Insert));
+    // A background history lookup changes the preview, not the query being edited.
+    composer.apply_history_search_result(HistorySearchResult::Found(HistoryEntry::new(
+        "git diff".into(),
+    )));
+    assert_eq!(
+        composer.clipboard_paste_target(Some(KeyCode::Insert)),
+        paste_target
+    );
     assert!(composer.handle_paste("status".to_string()));
+    assert_ne!(
+        composer.clipboard_paste_target(Some(KeyCode::Insert)),
+        paste_target
+    );
     assert_eq!(
         composer.history_search.as_ref().unwrap().query,
         "git status"

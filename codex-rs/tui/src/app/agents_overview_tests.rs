@@ -1,6 +1,7 @@
 #[path = "agents_overview_discovery_tests.rs"]
 mod discovery;
 
+use crate::app::app_server_requests::BufferedServerRequest;
 #[path = "agent_center_tests.rs"]
 mod command_center;
 
@@ -837,7 +838,10 @@ async fn agents_overview_details_show_available_attention_without_expanding_rows
                 is_blocking: true,
                 auto_resolution_ms: None,
             },
-        }],
+        }]
+        .into_iter()
+        .map(|request| BufferedServerRequest::new(request, &app_server.request_handle()))
+        .collect(),
     );
     let view = app.agents_overview_view(threads.clone(), Some(root));
     app.agents_overview.visible_thread_ids = view.thread_ids();
@@ -2547,7 +2551,10 @@ async fn command_center_attach_conflict_opens_read_only_and_retries() -> Result<
                 is_blocking: true,
                 auto_resolution_ms: None,
             },
-        }],
+        }]
+        .into_iter()
+        .map(|request| BufferedServerRequest::new(request, &server.request_handle()))
+        .collect(),
     );
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     app.app_event_tx = AppEventSender::new(tx);

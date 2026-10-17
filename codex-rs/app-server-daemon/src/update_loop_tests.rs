@@ -194,8 +194,13 @@ struct FakeInstallerHttp {
     requested_urls: Mutex<Vec<String>>,
 }
 
+// Upstream test: a scheduled tick fetches the standalone installer and a
+// migration moves the selection into the upstream dedicated root. This fork
+// refuses the standalone installer on every trigger and owns a fixed
+// `packages/app-server-daemon-termux` root, so neither flow can run here.
 #[cfg(unix)]
 #[tokio::test]
+#[ignore = "termux fork: no standalone installer; dedicated packages root"]
 async fn explicit_update_migrates_running_and_stopped_installations() {
     for (running, local) in [(false, false), (true, false), (false, true), (true, true)] {
         let home = TempDir::new().unwrap();
@@ -437,6 +442,17 @@ fn manual_update_daemon(home: &TempDir) -> (Daemon, String) {
         "#!/bin/sh\nif [ \"$1\" = '--version' ]; then echo codex 1.0.0; else exec sleep 30; fi\n",
     )
     .expect("managed binary");
+    // The fork refuses to execute a selected binary whose package carries no
+    // fork manifest, so the fake release must ship one like a real package.
+    std::fs::write(
+        bin.parent()
+            .expect("bin directory")
+            .parent()
+            .expect("release directory")
+            .join("codex-package.json"),
+        r#"{"variant":"codex-termux"}"#,
+    )
+    .expect("package manifest");
     std::os::unix::fs::symlink(format!("releases/{release}"), standalone.join("current"))
         .expect("current release");
     std::fs::write(standalone.join("auto-update-version"), &release).expect("latest marker");
@@ -816,10 +832,14 @@ async fn scheduled_resource_only_update_restarts_daemon() {
     server.abort();
 }
 
+// Upstream test: a manual update runs the standalone installer script. The
+// fork refuses that installer before any HTTP or script work, so the installer
+// never starts and these restart flows cannot be exercised.
 #[cfg(unix)]
 #[tokio::test]
+#[ignore = "termux fork: no standalone installer"]
 async fn manual_update_restarts_managed_daemon_with_automatic_updates_disabled() {
-    check_manual_update_restart(/*local_package*/ false).await;
+    check_manual_update_restart(false).await;
 }
 
 #[cfg(unix)]
@@ -931,7 +951,9 @@ async fn confirmed_feature_restart_preserves_ownership_and_skips_matching_settin
                 .unwrap_err();
             std::fs::rename(saved_package, selected_package).unwrap();
             assert!(
-                error.to_string().contains("daemon executable not found"),
+                error
+                    .to_string()
+                    .contains("managed Codex Termux install not found"),
                 "{error:#}"
             );
             assert_eq!(daemon.load_settings().await.unwrap(), original);
@@ -966,10 +988,14 @@ async fn confirmed_feature_restart_preserves_ownership_and_skips_matching_settin
     }
 }
 
+// Upstream test: a manual update runs the standalone installer script. The
+// fork refuses that installer before any HTTP or script work, so the installer
+// never starts and these restart flows cannot be exercised.
 #[cfg(unix)]
 #[tokio::test]
+#[ignore = "termux fork: no standalone installer"]
 async fn manual_update_restarts_local_daemon_with_automatic_updates_disabled() {
-    check_manual_update_restart(/*local_package*/ true).await;
+    check_manual_update_restart(true).await;
 }
 
 #[cfg(unix)]
@@ -1219,8 +1245,12 @@ async fn installer_failure_preserves_stderr_before_drain_timeout() {
     assert!(error.to_string().contains("installer failed"));
 }
 
+// Upstream test: while the installer downloads, the selection flips between
+// `packages/standalone` and the dedicated root and the update must abort. The
+// fork's dedicated root is fixed, so that change cannot occur by design.
 #[cfg(unix)]
 #[tokio::test]
+#[ignore = "termux fork: dedicated packages root cannot change mid-download"]
 async fn update_rejects_a_package_root_change_during_download() {
     struct ChangingRoot<'a>(&'a std::path::Path);
     impl InstallerHttp for ChangingRoot<'_> {
@@ -1251,8 +1281,12 @@ async fn update_rejects_a_package_root_change_during_download() {
     assert!(error.to_string().contains("package root changed"));
 }
 
+// Upstream test: a selection renamed into `packages/app-server-daemon` must be
+// updated only by an installer advertising CODEX_INSTALL_DAEMON_ONLY. This fork
+// keeps its own `-termux` root and never enables that daemon-only channel.
 #[cfg(unix)]
 #[tokio::test]
+#[ignore = "termux fork: dedicated packages root, no daemon-only installer channel"]
 async fn daemon_owned_updates_require_and_request_an_isolated_installer() {
     let home = TempDir::new().unwrap();
     let (mut daemon, release) = manual_update_daemon(&home);

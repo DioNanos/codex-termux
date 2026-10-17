@@ -409,12 +409,23 @@ pub fn create_text_param_for_request(
     })
 }
 
+/// Distinguishes draining a live response from abandoning obsolete work.
+#[derive(Clone, Copy)]
+pub enum ResponseInterrupt {
+    /// Drain normally, without validating or waiting for interruption acknowledgements.
+    Drain,
+    /// Skip undispatched work or retire its transport at the cleanup deadline.
+    /// Undispatched work ends without a completion event and leaves the socket reusable.
+    Cancel { deadline: tokio::time::Instant },
+}
+
 pub struct ResponseStream {
     pub rx_event: mpsc::Receiver<Result<ResponseEvent, ApiError>>,
     /// Server-assigned `x-request-id` response header, when present.
     pub upstream_request_id: Option<String>,
     /// Requests a graceful interrupt. Keep consuming events through completion.
-    pub interrupt: Option<oneshot::Sender<()>>,
+    /// Only `Cancel` validates and waits for an interruption acknowledgement.
+    pub interrupt: Option<oneshot::Sender<ResponseInterrupt>>,
 }
 
 impl Stream for ResponseStream {

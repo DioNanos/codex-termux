@@ -322,6 +322,7 @@ impl Session {
             .await;
             let turn = active.get_or_insert_with(ActiveTurn::default);
             debug_assert!(turn.task.is_none());
+            turn.finishing = None;
             Arc::clone(&turn.turn_state)
         };
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
@@ -659,11 +660,14 @@ impl Session {
             .turn_metadata_state
             .cancel_git_enrichment_task();
 
+        let finishing = CancellationToken::new();
+        let finish_recording = finishing.clone().drop_guard();
         let turn_state = {
             let mut active = self.active_turn.lock().await;
             active.as_mut().and_then(|active_turn| {
                 let task = active_turn.task.take()?;
                 task.handle.detach();
+                active_turn.finishing = Some(finishing);
                 Some(Arc::clone(&active_turn.turn_state))
             })
         };
@@ -696,6 +700,7 @@ impl Session {
             PersistContext::Standard,
         )
         .await;
+        drop(finish_recording);
         let turn_telemetry = &turn_context.session_telemetry;
         // Emit token usage metrics.
         {

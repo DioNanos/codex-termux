@@ -1239,16 +1239,23 @@ async fn injected_response_item_reopens_turn_after_final_answer() {
     server.shutdown().await;
 }
 
-#[test_case(false; "completed_reasoning")]
-#[test_case(true; "discarded_reasoning")]
+#[test_case(false, Some("response.interrupt.accepted"); "completed_reasoning")]
+#[test_case(true, Some("response.interrupt.accepted"); "discarded_reasoning")]
+#[test_case(false, Some("response.interrupt.failed"); "rejected_interrupt")]
+#[test_case(false, None; "missing_acknowledgement")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn steer_interrupts_and_drains_websocket(discard_partial: bool) -> anyhow::Result<()> {
+async fn steer_interrupts_and_drains_websocket(
+    discard_partial: bool,
+    acknowledgement: Option<&str>,
+) -> anyhow::Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
 
     let mut interrupted = ev_completed_with_tokens("resp-interrupted", /*total_tokens*/ 42);
-    interrupted["type"] = json!("response.incomplete");
-    interrupted["response"]["status"] = json!("incomplete");
-    interrupted["response"]["incomplete_details"] = json!({"reason": "interrupted"});
+    if acknowledgement == Some("response.interrupt.accepted") {
+        interrupted["type"] = json!("response.incomplete");
+        interrupted["response"]["status"] = json!("incomplete");
+        interrupted["response"]["incomplete_details"] = json!({"reason": "interrupted"});
+    }
     let server = responses::start_websocket_server(vec![vec![
         vec![ev_response_created("warm-1"), ev_completed("warm-1")],
         vec![
@@ -1256,13 +1263,15 @@ async fn steer_interrupts_and_drains_websocket(discard_partial: bool) -> anyhow:
             ev_reasoning_item_added("reason-1", &["thinking"]),
         ],
         // Finish the active response only after receiving response.interrupt.
-        vec![
-            json!({
-                "type": "response.interrupt.accepted",
-                "response_id": "resp-interrupted",
-                "sequence_number": 3,
+        [
+            acknowledgement.map(|kind| {
+                json!({
+                    "type": kind,
+                    "response_id": "resp-interrupted",
+                    "sequence_number": 3,
+                })
             }),
-            if discard_partial {
+            Some(if discard_partial {
                 json!({
                     "type": "response.output_item.interrupted",
                     "response_id": "resp-interrupted",
@@ -1272,9 +1281,12 @@ async fn steer_interrupts_and_drains_websocket(discard_partial: bool) -> anyhow:
                 })
             } else {
                 ev_reasoning_item("reason-1", &["thinking"], &[])
-            },
-            interrupted,
-        ],
+            }),
+            Some(interrupted),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
         vec![
             ev_response_created("resp-follow-up"),
             ev_completed("resp-follow-up"),

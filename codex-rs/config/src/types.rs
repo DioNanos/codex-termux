@@ -194,6 +194,8 @@ pub enum WindowsSandboxModeToml {
 #[schemars(deny_unknown_fields)]
 pub struct WindowsToml {
     pub sandbox: Option<WindowsSandboxModeToml>,
+    /// False blocks both explicit MXC configuration and automatic selection.
+    pub allow_mxc: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, JsonSchema)]
@@ -244,7 +246,8 @@ pub enum HistoryPersistence {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AnalyticsConfigToml {
-    /// When `false`, disables analytics across Codex product surfaces in this profile.
+    /// When `false`, disables OpenAI analytics across Codex product surfaces in this profile.
+    /// Custom OTLP metrics exporters remain enabled; set `otel.metrics_exporter = "none"` to disable them.
     pub enabled: Option<bool>,
 }
 
@@ -639,7 +642,8 @@ pub struct OtelConfigToml {
     /// Optional trace exporter
     pub trace_exporter: Option<OtelExporterKind>,
 
-    /// Optional metrics exporter
+    /// Metrics exporter. Defaults to `statsig`, which follows `analytics.enabled`.
+    /// Custom OTLP exporters are independent of `analytics.enabled`; `none` disables metrics export.
     pub metrics_exporter: Option<OtelExporterKind>,
 
     /// Attributes to add to every exported trace span.
@@ -775,14 +779,14 @@ pub enum RightClickPaste {
     Off,
 }
 
-/// When transcript mouse selections are copied on release.
+/// When mouse selections are copied on release.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CopyOnSelect {
     /// Use the terminal-specific default.
     #[default]
     Auto,
-    /// Copy every nonempty transcript mouse selection on release.
+    /// Copy every nonempty transcript or footer mouse selection on release.
     Always,
     /// Require an explicit copy action.
     Never,
@@ -887,12 +891,17 @@ pub struct Tui {
     #[schemars(schema_with = "crate::tui_mouse_scroll::schema")]
     pub mouse_scroll_speed: Option<f64>,
 
-    /// Copy selected transcript text when the mouse button is released.
+    /// Copy selected transcript or footer text when the mouse button is released.
     /// Defaults to `auto`: enabled except in direct terminals known to forward their native
     /// copy shortcut (Ghostty 1.2+, Kitty on macOS, Windows Terminal, and VS Code on Windows).
     /// Unknown terminals, Ghostty without a recognized version, and tmux/Zellij default to copying.
     #[serde(default)]
     pub copy_on_select: CopyOnSelect,
+
+    /// Deselect transcript text after Copy on select confirms clipboard delivery.
+    /// Defaults to `false` and has no effect when Copy on select is off.
+    #[serde(default)]
+    pub copy_on_select_clear_selection: bool,
 
     /// Right-click text paste fallback. Defaults to `auto` (Windows/WSL/Linux).
     /// `on` also enables macOS; neither mode reads over SSH or in recognized VS Code terminals.
@@ -1005,6 +1014,8 @@ pub struct ExternalConfigMigrationPrompts {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct Notice {
+    /// Tracks whether the user has acknowledged the AWS GovCloud guidance.
+    pub hide_gov_cloud_guidance: Option<bool>,
     /// Tracks whether the user has acknowledged the full access warning prompt.
     pub hide_full_access_warning: Option<bool>,
     /// Tracks whether the user has acknowledged the Windows world-writable directories warning.
@@ -1030,11 +1041,49 @@ pub use crate::skills_config::BundledSkillsConfig;
 pub use crate::skills_config::SkillConfig;
 pub use crate::skills_config::SkillsConfig;
 
+/// Default activation settings for installed plugins.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PluginsDefaultConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+/// Plugin activation and capability settings loaded from configuration layers.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PluginsConfigToml {
+    /// Defaults for installed plugin activation. Omission preserves source enablement.
+    /// Explicit plugin enablement settings override this default, but cannot enable
+    /// an installation disabled by its source.
+    #[serde(default, rename = "_default", skip_serializing_if = "Option::is_none")]
+    pub default: Option<PluginsDefaultConfig>,
+
+    #[serde(default, flatten)]
+    pub plugins: HashMap<String, PluginConfig>,
+}
+
+impl PluginsConfigToml {
+    /// Whether configuration permits a source-enabled plugin to remain active.
+    /// Without `_default`, preserve legacy source and account enablement.
+    /// Otherwise, an explicit enablement setting overrides the configured default.
+    pub fn allows_plugin(&self, plugin_id: &str) -> bool {
+        let Some(default) = &self.default else {
+            return true;
+        };
+        self.plugins
+            .get(plugin_id)
+            .and_then(|plugin| plugin.enabled)
+            .unwrap_or(default.enabled)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct PluginConfig {
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
+    /// Explicit activation override. Omission inherits the installed-plugin default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 
     /// Per-MCP-server policy overlays for MCP servers contributed by this plugin.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

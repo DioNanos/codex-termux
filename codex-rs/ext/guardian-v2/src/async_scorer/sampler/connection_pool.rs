@@ -576,8 +576,10 @@ impl ConnectionLease {
         }
     }
 
-    pub(super) fn reuse(self) {
-        if let Connection::Websocket(connection) = self.connection {
+    pub(super) async fn reuse(self) {
+        if let Connection::Websocket(connection) = self.connection
+            && !connection.connection.is_closed().await
+        {
             self.pool
                 .idle_connections
                 .lock()
@@ -590,3 +592,7 @@ impl ConnectionLease {
 #[cfg(test)]
 #[path = "connection_pool_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "connection_pool_cancellation_tests.rs"]
+mod cancellation_tests;

@@ -46,6 +46,10 @@ pub struct Cli {
     #[clap(skip)]
     pub agents_overview: bool,
 
+    /// Internal: the launching CLI verified that the local daemon has a managed backend.
+    #[clap(skip)]
+    pub managed_daemon: bool,
+
     // Internal controls set by the top-level `codex fork` subcommand.
     // These are not exposed as user flags on the base `codex` command.
     #[clap(skip)]

@@ -40,6 +40,7 @@ use core_test_support::responses;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
@@ -1526,6 +1527,230 @@ async fn apps_guidance_and_deferred_namespace_appear_after_recovery_within_a_tur
         )
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_discovered_apps_tool_survives_startup_failure_and_recovers() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    // Holding MCP initialization must not block inference or connector directory requests.
+    let mcp_server = responses::start_mock_server().await;
+    let (gated_apps, startup) = AppsTestServer::mount_with_startup_control(&mcp_server).await?;
+    let apps = AppsTestServer::mount_searchable(&server).await?;
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.mcp_server_contributor(Arc::new(AppsMcpServerContributor {
+        id: "hosted_plugin_runtime",
+        url: format!("{}/api/codex/ps/mcp", gated_apps.chatgpt_base_url),
+        root_resolved: None,
+    }));
+    let extensions = Arc::new(extensions.build());
+    let code_mode_host = codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")?;
+    let builder = || {
+        search_capable_apps_builder(apps.chatgpt_base_url.clone())
+            .with_extensions(Arc::clone(&extensions))
+            .with_code_mode_host_program(code_mode_host.clone())
+            .with_model_info_override("gpt-5.5", |model| {
+                model.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeMode);
+            })
+            .with_config(|config| {
+                config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
+                config
+                    .features
+                    .enable(Feature::CodeMode)
+                    .expect("test config should allow Code Mode");
+                config
+                    .features
+                    .enable(Feature::CodeModeHost)
+                    .expect("test config should allow the Code Mode host");
+                config
+                    .features
+                    .enable(Feature::DefaultModeRequestUserInput)
+                    .expect("test config should allow user input");
+            })
+    };
+    let warm = builder().build_with_auto_env(&server).await?;
+    wait_for_mcp_server(&warm.codex, CODEX_APPS_MCP_SERVER_NAME).await?;
+    warm.codex.ensure_rollout_materialized().await;
+
+    // Restart with the persisted catalog and hold discovery until the model has used it.
+    // Queue recovery too: startup schedules its retry immediately after reporting failure.
+    let initial_startup = startup.hold_next_successful_initialize();
+    let recovery = startup.hold_next_successful_initialize();
+    let test = builder().restart_with_auto_env(&server, &warm).await?;
+    let question = json!({
+        "questions": [{
+            "id": "continue",
+            "header": "Continue",
+            "question": "Continue the tool call?",
+            "options": [
+                {"label": "Yes (Recommended)", "description": "Continue."},
+                {"label": "No", "description": "Stop."}
+            ]
+        }]
+    });
+    let response = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("discover"),
+                ev_custom_tool_call(
+                    "discover",
+                    "exec",
+                    "const tool = ALL_TOOLS.find(t => t.name.endsWith('list_events'));\n\
+                     store('calendar-tool', tool.name); text(tool.name);",
+                ),
+                ev_completed("discover"),
+            ]),
+            sse(vec![
+                ev_response_created("after-discovery"),
+                ev_function_call(
+                    "after-discovery",
+                    "request_user_input",
+                    &question.to_string(),
+                ),
+                ev_completed("after-discovery"),
+            ]),
+            sse(vec![
+                ev_response_created("invoke"),
+                ev_custom_tool_call(
+                    "invoke",
+                    "exec",
+                    "const pending = tools[load('calendar-tool')]({});\n\
+                     yield_control();\n\
+                     text(await pending);",
+                ),
+                ev_completed("invoke"),
+            ]),
+            sse(vec![
+                ev_response_created("after-invocation"),
+                ev_function_call(
+                    "after-invocation",
+                    "request_user_input",
+                    &question.to_string(),
+                ),
+                ev_completed("after-invocation"),
+            ]),
+        ],
+    )
+    .await;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Discover Calendar, then list events.".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let EventMsg::RequestUserInput(discovered) = wait_for_event(&test.codex, |event| {
+        assert!(
+            !matches!(event, EventMsg::TurnComplete(_)),
+            "turn ended before discovering the cached tool"
+        );
+        matches!(event, EventMsg::RequestUserInput(_))
+    })
+    .await
+    else {
+        unreachable!()
+    };
+
+    // Dropping the held response fails it; fail the transport retry as well.
+    startup.fail_next_initialize_attempts(/*attempts*/ 1);
+    drop(initial_startup);
+    wait_for_event(&test.codex, |event| {
+        matches!(
+            event, EventMsg::McpStartupUpdate(update)
+                if update.server == CODEX_APPS_MCP_SERVER_NAME
+                    && matches!(update.status, codex_protocol::protocol::McpStartupStatus::Failed { .. })
+        )
+    })
+    .await;
+    test.codex
+        .submit(Op::UserInputAnswer {
+            id: discovered.turn_id,
+            response: RequestUserInputResponse {
+                answers: HashMap::from([(
+                    "continue".to_string(),
+                    RequestUserInputAnswer {
+                        answers: vec!["Yes (Recommended)".to_string()],
+                    },
+                )]),
+            },
+        })
+        .await?;
+
+    // This prompt is after the invocation in the second cell: the function must still exist,
+    // and waiting for its connection must leave unrelated tools able to execute.
+    let EventMsg::RequestUserInput(invoked) = wait_for_event(&test.codex, |event| {
+        assert!(
+            !matches!(event, EventMsg::TurnComplete(_)),
+            "turn ended before invoking the cached tool"
+        );
+        matches!(event, EventMsg::RequestUserInput(_))
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let requests = response.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        super::code_mode::custom_tool_output_last_non_empty_text(&requests[1], "discover")
+            .expect("discovery should return the cached tool name")
+            .ends_with("list_events")
+    );
+    let running = super::code_mode::custom_tool_output_last_non_empty_text(&requests[3], "invoke")
+        .expect("the invocation should wait for Apps recovery");
+    let cell_id = running
+        .strip_prefix("Script running with cell ID ")
+        .and_then(|text| text.lines().next())
+        .expect("invoking the discovered function should yield, not fail");
+    let finished = responses::mount_function_call_agent_response(
+        &server,
+        "finish",
+        &json!({"cell_id": cell_id, "yield_time_ms": 10_000}).to_string(),
+        "wait",
+    )
+    .await;
+    recovery
+        .send(())
+        .expect("the shared Apps retry should still be waiting");
+    test.codex
+        .submit(Op::UserInputAnswer {
+            id: invoked.turn_id,
+            response: RequestUserInputResponse {
+                answers: HashMap::from([(
+                    "continue".to_string(),
+                    RequestUserInputAnswer {
+                        answers: vec!["Yes (Recommended)".to_string()],
+                    },
+                )]),
+            },
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let output = finished
+        .completion
+        .single_request()
+        .function_call_output("finish");
+    assert!(
+        output["output"]
+            .as_array()
+            .expect("wait should return Code Mode content items")
+            .iter()
+            .any(|item| item["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("called calendar_list_events"))),
+        "{output}"
+    );
+    let calls = core_test_support::apps_test_server::recorded_apps_tool_calls(&mcp_server).await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["params"]["name"], "calendar_list_events");
+    assert_eq!(startup.initialize_attempts(), 4);
+    test.codex.shutdown_and_wait().await?;
     Ok(())
 }
 

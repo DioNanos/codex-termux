@@ -1,5 +1,4 @@
 > [!NOTE]
->
 > ## Release policy
 >
 > This project is active and follows a **big releases only** policy.
@@ -8,7 +7,6 @@
 > Existing releases remain available and installable.
 > For day-to-day Android/Termux improvements and multi-platform builds, see
 > [codex-vl](https://github.com/DioNanos/codex-vl).
-
 # Codex Termux
 
 > Native Codex CLI for **Termux / Android ARM64**.
@@ -103,7 +101,7 @@ What this fork does not do:
 ## Releases and Updates
 
 - Latest GitHub release: [releases/latest](https://github.com/DioNanos/codex-termux/releases/latest)
-- Upstream base: OpenAI Codex `rust-v0.162.1`, published as `0.162.1-termux.1` on
+- Upstream base: OpenAI Codex `rust-v0.163.0`, published as `0.163.0-termux.1` on
   the npm `latest` channel with a matching GitHub tag and release.
 - npm package: [`@mmmbuto/codex-cli-termux`](https://www.npmjs.com/package/@mmmbuto/codex-cli-termux)
 - Legacy `@mmmbuto/codex-cli-lts` (OpenAI Codex 0.80.x) is archived; current builds live in this package or in [`@mmmbuto/codex-vl`](https://www.npmjs.com/package/@mmmbuto/codex-vl) (multi-platform).
@@ -123,7 +121,6 @@ Maintainer publish flow:
 
 - [Changelog](./CHANGELOG.md)
 - [Patch inventory](./patches/README.md)
-- [Continuous integration](./docs/ci.md)
 - [Building from source](./BUILDING.md)
 - [Install docs](./docs/install.md)
 - [Authentication](./docs/authentication.md)
@@ -150,7 +147,7 @@ To report a vulnerability, see [SECURITY.md](./SECURITY.md).
 
 - [OpenAI Codex CLI on Android via Termux](https://timharbakon.com/openai-codex-cli-android-termux/)
   - independent third-party walkthrough covering Termux setup, the Bionic-libc incompatibility
-    this package solves, and a small Hono test project.
+  this package solves, and a small Hono test project.
 
 ## License
 

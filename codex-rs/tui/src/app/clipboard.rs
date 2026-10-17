@@ -3,6 +3,8 @@
 use super::*;
 use crate::chatwidget::KeyEventAction;
 use crate::clipboard_copy::CopyFormat;
+use crate::clipboard_copy::worker::PasteSource;
+use crate::clipboard_paste::PasteImageError;
 
 impl App {
     pub(super) fn handle_clipboard_key_action(
@@ -18,15 +20,34 @@ impl App {
                     .copy(text, CopyFormat::Markdown, tui.frame_requester());
                 self.chat_widget.show_copy_result("last message", result);
             }
-            KeyEventAction::PasteImage => {
+            KeyEventAction::PasteImage { text_fallback } => {
+                if text_fallback.is_some()
+                    && self
+                        .right_click_paste_target(tui, PasteSource::Clipboard, text_fallback)
+                        .is_none()
+                {
+                    return;
+                }
                 // Finish paste before the next key, but never wait on the copy worker's lock.
-                if tui.clipboard.is_busy() {
-                    self.chat_widget.add_info_message(
-                        "Clipboard busy; try image paste after it finishes".into(),
-                        /*hint*/ None,
-                    );
+                if tui.clipboard.is_busy() || self.pending_right_click_paste.is_some() {
+                    self.chat_widget
+                        .add_info_message("Clipboard busy; try again".into(), /*hint*/ None);
                 } else {
-                    self.chat_widget.paste_image();
+                    match self.chat_widget.paste_image() {
+                        Ok(()) => {}
+                        Err(PasteImageError::NoImage(_)) if text_fallback.is_some() => {
+                            self.start_clipboard_text_paste(
+                                tui,
+                                PasteSource::Clipboard,
+                                text_fallback,
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!("failed to paste image: {err}");
+                            self.chat_widget
+                                .add_error_message(format!("Failed to paste image: {err}"));
+                        }
+                    }
                 }
             }
         }
@@ -38,6 +59,12 @@ impl App {
             if let Some(characters) = self.chat_widget.finish_clipboard(completion, current) {
                 self.transcript_view
                     .show_copy_feedback(&completion.1, characters);
+            }
+            {
+                let mut selection = self.chat_widget.rendered_selection.borrow_mut();
+                let crate::rendered_selection::RenderedSelection { view, cells, .. } =
+                    &mut *selection;
+                view.finish_copy(cells, completion, current);
             }
             let follow =
                 self.transcript_view

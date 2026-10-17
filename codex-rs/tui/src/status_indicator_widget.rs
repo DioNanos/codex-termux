@@ -136,6 +136,11 @@ impl StatusIndicatorWidget {
         self.app_event_tx.interrupt();
     }
 
+    pub(crate) fn set_motion_preferences(&mut self, tui: &codex_config::types::Tui) {
+        self.animations_enabled = tui.animations;
+        self.effects = tui.effects;
+    }
+
     /// Update the animated header label (left of the brackets).
     pub(crate) fn update_header(&mut self, header: String) {
         if self.header != header {
@@ -382,31 +387,19 @@ mod tests {
         // Without the waiting-background branch a waiting-only status falls
         // back to the 1 s idle ticker and progress re-renders at 32 ms.
         assert_eq!(
-            frame_interval_for_state(
-                /*animations_with_progress_or_shimmer*/ false,
-                /*waiting_on_background_terminal*/ true
-            ),
+            frame_interval_for_state(false, true),
             Duration::from_millis(200)
         );
         assert_eq!(
-            frame_interval_for_state(
-                /*animations_with_progress_or_shimmer*/ true,
-                /*waiting_on_background_terminal*/ true
-            ),
+            frame_interval_for_state(true, true),
             Duration::from_millis(32)
         );
         assert_eq!(
-            frame_interval_for_state(
-                /*animations_with_progress_or_shimmer*/ true,
-                /*waiting_on_background_terminal*/ false
-            ),
+            frame_interval_for_state(true, false),
             Duration::from_millis(32)
         );
         assert_eq!(
-            frame_interval_for_state(
-                /*animations_with_progress_or_shimmer*/ false,
-                /*waiting_on_background_terminal*/ false
-            ),
+            frame_interval_for_state(false, false),
             Duration::from_millis(1_000)
         );
     }

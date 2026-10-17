@@ -1147,30 +1147,74 @@ async fn sqlite_recovery_warning_shows_backup_and_metadata_limitations() {
 
 #[tokio::test]
 async fn startup_config_warning_is_not_repeated_by_thread() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let message = "Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings.";
-
-    for notification in [
-        ServerNotification::ConfigWarning(ConfigWarningNotification {
-            summary: message.to_string(),
-            details: None,
-            path: None,
-            range: None,
-        }),
-        ServerNotification::Warning(WarningNotification {
-            thread_id: Some("thread-1".to_string()),
-            message: message.to_string(),
-        }),
-    ] {
-        chat.handle_server_notification(notification, /*replay_kind*/ None);
+    let mut warnings = Vec::new();
+    for (local_daemon, managed_daemon) in [(false, false), (true, true), (true, false)] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        if local_daemon {
+            chat.remote_connection =
+                Some(crate::status::remote_connection::RemoteConnectionStatus {
+                    address: "local".into(),
+                    version: "v0.153.0".into(),
+                    is_local_daemon: true,
+                    is_managed_daemon: managed_daemon,
+                });
+        }
+        let message = "Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings.";
+        for notification in [
+            ServerNotification::ConfigWarning(ConfigWarningNotification {
+                summary: message.to_string(),
+                details: None,
+                path: None,
+                range: None,
+            }),
+            ServerNotification::Warning(WarningNotification {
+                thread_id: Some("thread-1".to_string()),
+                message: message.to_string(),
+            }),
+            ServerNotification::ConfigWarning(ConfigWarningNotification {
+                summary: "Second config warning".into(),
+                details: Some("A different setting needs attention.".into()),
+                path: None,
+                range: None,
+            }),
+        ] {
+            chat.handle_server_notification(notification, /*replay_kind*/ None);
+        }
+        let cells: Vec<Arc<dyn HistoryCell>> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(Arc::from(cell)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cells.len(), 2);
+        let original_warnings = history_cell::warning_entries(&cells);
+        chat.open_warnings(&cells);
+        let first = super::helpers::render_bottom_popup(&chat, /*width*/ 80);
+        if local_daemon && !managed_daemon {
+            assert!(
+                !first.contains("/daemon"),
+                "unmanaged servers cannot be restarted"
+            );
+        } else {
+            warnings.push(format!("local daemon: {local_daemon}\n{first}"));
+        }
+        chat.handle_key_event(KeyCode::Right.into());
+        let second = super::helpers::render_bottom_popup(&chat, /*width*/ 80);
+        assert!(second.contains("Second config warning"));
+        assert!(
+            !second.contains("/daemon"),
+            "one restart hint per warning panel"
+        );
+        chat.handle_key_event(KeyCode::Esc.into());
+        let dismissed = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|event| match event {
+                AppEvent::UpdateWarnings { dismissed, .. } => Some(dismissed),
+                _ => None,
+            })
+            .expect("closing the panel dismisses the viewed diagnostics");
+        assert_eq!(dismissed, original_warnings);
     }
-
-    let cells = drain_insert_history_transcript(&mut rx);
-    assert_eq!(cells.len(), 1);
-    insta::assert_snapshot!(lines_to_single_string(&cells[0]), @"
-    ⚠ Codex is ignoring 1 unrecognized configuration setting. Check for typos or
-      deprecated settings.
-    ");
+    insta::assert_snapshot!("startup_config_warning_panel", warnings.join("\n\n"));
 }
 
 #[tokio::test]

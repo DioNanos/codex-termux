@@ -180,6 +180,10 @@ impl AmbientPet {
         self.animation_started_at = Instant::now();
     }
 
+    pub(crate) fn set_animations_enabled(&mut self, enabled: bool) {
+        self.animations_enabled = enabled;
+    }
+
     pub(crate) fn image_enabled(&self) -> bool {
         self.support.protocol().is_some()
     }

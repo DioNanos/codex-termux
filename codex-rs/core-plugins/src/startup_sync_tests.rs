@@ -1231,6 +1231,28 @@ async fn sync_openai_plugins_repo_via_http_cleans_up_staged_dir_on_extract_failu
     assert!(!has_plugins_clone_dirs(tmp.path()));
 }
 
+/// Plugin executables keep their access permissions, but not setuid, setgid, or sticky bits.
+#[cfg(unix)]
+#[test]
+fn extract_zipball_preserves_only_unix_access_permissions() {
+    use std::io::Cursor;
+    use std::os::unix::fs::PermissionsExt;
+
+    let destination = tempdir().expect("tempdir");
+    let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
+    // unix_permissions() strips special bits on write; encode the untrusted mode directly.
+    let options = SimpleFileOptions::default().external_attributes(0o107755 << 16);
+    archive
+        .start_file("repo/script", options)
+        .expect("add script");
+    let bytes = archive.finish().expect("finish archive").into_inner();
+
+    extract_zipball_to_dir(&bytes, destination.path()).expect("extract archive");
+
+    let script = std::fs::metadata(destination.path().join("script")).expect("script metadata");
+    assert_eq!(script.permissions().mode() & 0o7777, 0o755);
+}
+
 #[tokio::test]
 async fn sync_openai_plugins_repo_skips_archive_download_when_sha_matches() {
     let tmp = tempdir().expect("tempdir");

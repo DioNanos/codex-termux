@@ -356,6 +356,26 @@ pub fn format_context_snapshot(
     result
 }
 
+/// Sort standalone JSON object lines embedded in rendered context. Cargo and Bazel can enable
+/// different serde_json map ordering features, but the model-visible values are the same.
+pub fn normalize_json_lines(snapshot: &str) -> String {
+    snapshot
+        .lines()
+        .map(|line| {
+            let json = line.trim_start();
+            if !json.starts_with('{') {
+                return line.to_owned();
+            }
+            let Ok(mut value) = serde_json::from_str::<Value>(json) else {
+                return line.to_owned();
+            };
+            value.sort_all_objects();
+            format!("{}{}", &line[..line.len() - json.len()], value)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn render_window_settings(
     result: &mut String,
     windows: &[Window<'_>],
@@ -690,6 +710,10 @@ fn render_item(
                 .map(|text| render_text(&text, TextSource::Other, options, normalizer))
                 .unwrap_or_else(|| "<NO_COMMAND>".to_string());
             format!("{index:02}:local_shell_call:{command}")
+        }
+        "configuration_update" => {
+            let reasoning = normalizer.json(&item["reasoning"]);
+            format!("{index:02}:configuration_update:reasoning={reasoning}")
         }
         "reasoning" => {
             let summary = item

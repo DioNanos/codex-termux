@@ -8,6 +8,7 @@ use crate::reasons::REASON_METHOD_NOT_ALLOWED;
 use crate::reasons::REASON_MITM_HOOK_DENIED;
 use crate::responses::blocked_text_response;
 use crate::responses::text_response;
+use crate::runtime::HostAuthorization;
 use crate::runtime::HostBlockDecision;
 use crate::runtime::HostBlockReason;
 use crate::state::BlockedRequest;
@@ -74,6 +75,16 @@ struct MitmPolicyContext {
     scheme: Scheme,
     mode: NetworkMode,
     app_state: Arc<NetworkProxyState>,
+}
+
+impl MitmPolicyContext {
+    fn credential_destination(&self, req: &Request) -> String {
+        let authority = authority_header_value(&self.target_host, self.target_port, &self.scheme);
+        let path = path_and_query(req.uri());
+        // Server-wide OPTIONS must not borrow authority from a narrower credential URL prefix.
+        let credential_path = if path == "*" { "/" } else { &path };
+        format!("{}://{authority}{credential_path}", self.scheme)
+    }
 }
 
 #[derive(Clone)]
@@ -247,6 +258,7 @@ async fn handle_mitm_request(
 }
 
 async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Result<Response> {
+    let credential_destination = request_ctx.policy.credential_destination(&req);
     let hook_actions = match evaluate_mitm_policy(&req, &request_ctx.policy).await? {
         MitmPolicyDecision::Allow { hook_actions } => hook_actions,
         MitmPolicyDecision::Block(response) => return Ok(response),
@@ -267,12 +279,6 @@ async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Resu
         .authority(authority.as_str())
         .path_and_query(path.as_str())
         .build()?;
-    // Server-wide OPTIONS must not borrow authority from a narrower credential URL prefix.
-    let credential_path = if path == "*" { "/" } else { &path };
-    let credential_destination = format!(
-        "{}://{authority}{credential_path}",
-        request_ctx.policy.scheme
-    );
     request_ctx
         .policy
         .app_state
@@ -390,7 +396,12 @@ async fn evaluate_mitm_policy(
     if matches!(
         policy
             .app_state
-            .host_blocked(&policy.target_host, policy.target_port)
+            .host_blocked_with_local_binding(
+                &policy.target_host,
+                policy.target_port,
+                /*allow_local_binding*/ None,
+                HostAuthorization::Approved,
+            )
             .await?,
         HostBlockDecision::Blocked(HostBlockReason::NotAllowedLocal)
     ) {
@@ -418,7 +429,11 @@ async fn evaluate_mitm_policy(
 
     let hook_actions = match policy
         .app_state
-        .evaluate_mitm_hook_request(&policy.target_host, req)
+        .evaluate_mitm_hook_request(
+            &policy.target_host,
+            req,
+            &[policy.credential_destination(req)],
+        )
         .await?
     {
         HookEvaluation::Matched { actions } => Some(actions),

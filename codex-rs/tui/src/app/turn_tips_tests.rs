@@ -190,6 +190,7 @@ async fn turn_tip_placements_and_completion_barrier() -> Result<()> {
         (true, 1, 80, 12),
         (true, 1, 80, 6),
         (false, 1, 80, 12),
+        (false, 1, 80, 24),
         (false, 30, 80, 12),
         (false, 1, 80, 9),
         (false, 1, 80, 10),
@@ -281,6 +282,44 @@ async fn turn_tip_placements_and_completion_barrier() -> Result<()> {
             assert_eq!(app.turn_tips.completions_shown, usize::from(!working));
         }
         if !working && shown {
+            if rows == 1 && size == tui.terminal.size()? {
+                app.local_settings.tui.copy_on_select = CopyOnSelect::Always;
+                let (row, line) = screen
+                    .lines()
+                    .enumerate()
+                    .find(|(_, line)| line.contains("└ Tip:"))
+                    .unwrap();
+                let column = line[..line.find("/help").unwrap()].chars().count() as u16;
+                for (kind, column) in [
+                    (Down(Left), column),
+                    (Drag(Left), column + 5),
+                    (Up(Left), column + 5),
+                ] {
+                    assert!(app.handle_rendered_selection_event(
+                        &mut tui,
+                        &TuiEvent::Mouse(MouseEvent {
+                            kind,
+                            column,
+                            row: row as u16,
+                            modifiers: KeyModifiers::NONE,
+                        }),
+                    )?);
+                    app.render_owned_transcript(&mut tui, size)?;
+                }
+                let mut selection = app.chat_widget.rendered_selection.borrow_mut();
+                let crate::rendered_selection::RenderedSelection { view, cells, .. } =
+                    &mut *selection;
+                assert_eq!(view.selected_text(cells), Some("/help".into()));
+                screens.push(format!(
+                    "Completion tip selected, {width}x{height}\n{}",
+                    crate::chatwidget::tests::helpers::normalize_completion_timestamps(
+                        app.transcript_cells.last().unwrap().as_ref(),
+                        buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
+                            &tui.terminal,
+                        )),
+                    )
+                ));
+            }
             assert!(
                 !app.transcript_cells
                     .iter()
@@ -448,6 +487,46 @@ async fn working_tip_stays_put_through_mouse_selection() -> Result<()> {
         app.transcript_view.selected_text(&app.transcript_cells),
         Some("ponse".into()),
     );
+    // Start from the usual following viewport, without an existing transcript selection.
+    app.transcript_view.jump_to_latest();
+    app.local_settings.tui.copy_on_select = CopyOnSelect::Always;
+    app.render_owned_transcript(&mut tui, size)?;
+    let before = buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
+        &tui.terminal,
+    ));
+    let (tip_row, tip_line) = before
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("└ Tip:"))
+        .unwrap();
+    let column = tip_line[..tip_line.find("/help").unwrap()].chars().count() as u16;
+    for (kind, column) in [
+        (Down(Left), column),
+        (Drag(Left), column + 5),
+        (Up(Left), column + 5),
+    ] {
+        assert!(app.handle_rendered_selection_event(
+            &mut tui,
+            &TuiEvent::Mouse(MouseEvent {
+                kind,
+                column,
+                row: tip_row as u16,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )?);
+        app.render_owned_transcript(&mut tui, size)?;
+    }
+    {
+        let mut selection = app.chat_widget.rendered_selection.borrow_mut();
+        let crate::rendered_selection::RenderedSelection { view, cells, .. } = &mut *selection;
+        assert_eq!(view.selected_text(cells), Some("/help".into()));
+    }
+    insta::assert_snapshot!(
+        "working_tip_selected",
+        crate::chatwidget::tests::helpers::normalize_snapshot_paths(buffer_text(
+            crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal),
+        ))
+    );
     app.transcript_view.jump_to_latest();
     app.chat_widget
         .on_rate_limit_snapshot(Some(serde_json::from_value(serde_json::json!({
@@ -473,6 +552,11 @@ async fn working_tip_stays_put_through_mouse_selection() -> Result<()> {
         ))
         .contains("└ Tip:")
     );
+    {
+        let mut selection = app.chat_widget.rendered_selection.borrow_mut();
+        let crate::rendered_selection::RenderedSelection { view, cells, .. } = &mut *selection;
+        assert_eq!(view.selected_text(cells), None);
+    }
     server.shutdown().await?;
     tui.set_owned_screen(/*owned*/ false)?;
     Ok(())

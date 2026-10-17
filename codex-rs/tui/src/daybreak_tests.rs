@@ -24,14 +24,39 @@ fn turn_program_uses_catalog_and_preserves_legacy_models() {
             Some(CyberAccessProgram::Standard),
         ),
         ("unlisted-model", false, None),
+        ("unlisted-model", true, None),
     ] {
         assert_eq!(
             program_for_turn(&models, name, /*eligible_account*/ true, enabled),
             Ok(expected)
         );
     }
-    for (name, eligible_account) in [("unlisted-model", true), (model.model.as_str(), false)] {
-        assert!(program_for_turn(&models, name, eligible_account, /*enabled*/ true).is_err());
+    assert!(
+        program_for_turn(
+            &models,
+            &model.model,
+            /*eligible_account*/ false,
+            /*enabled*/ true
+        )
+        .is_err()
+    );
+    for (programs, rejects) in [
+        (None, false),
+        (Some(vec![]), false),
+        (Some(vec![CyberAccessProgram::Standard]), true),
+    ] {
+        model.available_access_programs = programs.map(|cyber| ModelAccessPrograms { cyber });
+        let result = program_for_turn(
+            std::slice::from_ref(&model),
+            &model.model,
+            /*eligible_account*/ true,
+            /*enabled*/ true,
+        );
+        if rejects {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result, Ok(None));
+        }
     }
 }
 

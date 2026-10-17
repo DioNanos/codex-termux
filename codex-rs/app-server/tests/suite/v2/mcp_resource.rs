@@ -105,7 +105,7 @@ use rmcp::model::ReadResourceResult;
 use rmcp::model::Resource;
 use rmcp::model::ResourceContents;
 use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::service::RequestContext;
 use rmcp::service::RoleServer;
 use rmcp::transport::StreamableHttpServerConfig;
@@ -615,6 +615,8 @@ async fn metadata_and_mcp_requests_complete_while_unrelated_resume_loads_config(
             thread_id: "00000000-0000-4000-8000-000000000000".to_string(),
             cwd: Some(resume_cwd.path().to_string_lossy().into_owned()),
             history: Some(vec![ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -1374,8 +1376,8 @@ struct ResourceAppsMcpServer {
 }
 
 impl ServerHandler for ResourceAppsMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_resources().build())
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::new(ServerCapabilities::builder().enable_resources().build())
             .with_protocol_version(ProtocolVersion::V_2025_06_18);
         if self.calls.tools_enabled.load(Ordering::Relaxed) {
             info.capabilities.tools = Some(Default::default());
