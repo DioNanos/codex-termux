@@ -35,7 +35,10 @@ jobs:
 
   sdks:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # This fork has no upstream remote cache and no upstream runners, so a
+    # cold Linux run needs more than the upstream 20 minutes. Restore 20
+    # when that cache or those runners are available.
+    timeout-minutes: 45
     environment:
       name: bazel
       deployment: false

@@ -11,11 +11,17 @@ jobs:
   # workflow_dispatch trigger so maintainers can rerun flaky suites directly.
   rust-ci-full:
     name: rust-ci-full
+    permissions:
+      contents: read
+      actions: write
     uses: ./.github/workflows/rust-ci-full.yml
     secrets: inherit
 
   v8-canary:
     name: v8-canary
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/v8-canary.yml
     secrets: inherit
 

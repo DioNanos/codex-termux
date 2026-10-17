@@ -1686,6 +1686,17 @@ jobs:
         if: vars.CODEX_PROVISIONED_MACOS_CANDIDATE == 'true'
         run: rm dist/provisioned-macos-verified-candidate-*/SHA256SUMS
 
+      - name: Download verified provisioned macOS packages
+        if: vars.CODEX_PROVISIONED_MACOS_CANDIDATE == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: "provisioned-macos-verified-candidate-*"
+
+      - name: Remove per-architecture checksum filenames before release upload
+        if: vars.CODEX_PROVISIONED_MACOS_CANDIDATE == 'true'
+        run: rm dist/provisioned-macos-verified-candidate-*/SHA256SUMS
+
       - name: List
         run: ls -R dist/
 

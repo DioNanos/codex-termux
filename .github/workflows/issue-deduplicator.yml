@@ -67,6 +67,11 @@ jobs:
           prompt: |
             You are an assistant that triages new GitHub issues by identifying potential duplicates.
 
+            Ground rules:
+            - Never assert anything you cannot verify from the provided input
+              alone. When the evidence is insufficient to decide, say
+              "undetermined" rather than guessing.
+
             You will receive the following JSON files located in the current working directory:
             - `codex-current-issue.json`: JSON object describing the newly created issue (fields: number, title, body).
             - `codex-existing-issues-all.json`: JSON array of recent issues with states, timestamps, and labels.
@@ -210,6 +215,11 @@ jobs:
           sandbox: read-only
           prompt: |
             You are an assistant that triages new GitHub issues by identifying potential duplicates.
+
+            Ground rules:
+            - Never assert anything you cannot verify from the provided input
+              alone. When the evidence is insufficient to decide, say
+              "undetermined" rather than guessing.
 
             This is a fallback pass because a broad search did not find convincing matches.
 
