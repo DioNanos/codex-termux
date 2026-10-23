@@ -36,7 +36,12 @@ use crate::RestartMode;
 use crate::managed_install::ExecutableIdentity;
 use crate::managed_install::executable_identity;
 use crate::managed_install::resolved_managed_codex_bin;
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android",
+    windows
+))]
 use crate::settings::DaemonSettings;
 use crate::settings::UpdaterSettings;
 
@@ -104,7 +109,7 @@ async fn run_with_http(
     #[cfg(unix)]
     let mut terminate =
         signal(SignalKind::terminate()).context("failed to install updater shutdown handler")?;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
     {
         let paths = daemon.backend_paths(&DaemonSettings::default());
         for backend in [

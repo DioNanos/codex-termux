@@ -1,9 +1,9 @@
 //! Native process identities and zombie state, independent of locale and timezone.
 //! Boot IDs prevent records surviving reboot from matching reused process identifiers.
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android", test))]
 use anyhow::Context;
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android", test))]
 use anyhow::Result;
 use serde::Deserialize;
 use serde::Serialize;
@@ -28,7 +28,11 @@ pub(super) enum ProcessIdentity {
     },
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+// Android uses the Linux identity source when `/proc/<pid>/stat` field 22 and
+// `/proc/sys/kernel/random/boot_id` are both readable. Where the boot ID
+// cannot be read, the `.ok()` fallback in `pid_start.rs` leaves the record
+// legacy instead of writing a partial identity.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
 impl ProcessIdentity {
     pub(super) async fn matches_process(&self, pid: u32) -> Result<(bool, bool)> {
         // A different boot proves staleness even when the reused PID is inaccessible.
@@ -65,7 +69,7 @@ impl ProcessIdentity {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
 impl super::PidBackend {
     pub(crate) async fn promote_legacy_identity(&self) -> Result<()> {
         let _reservation = self.acquire_reservation_lock().await?;
@@ -193,7 +197,7 @@ async fn read_boot_id() -> Result<String> {
         .to_owned())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) async fn read_process_details(pid: u32) -> Result<(bool, ProcessIdentity)> {
     let stat = tokio::fs::read(format!("/proc/{pid}/stat"))
         .await
@@ -208,7 +212,18 @@ pub(super) async fn read_process_details(pid: u32) -> Result<(bool, ProcessIdent
     ))
 }
 
+/// Read only the start ticks of a process, without its boot ID, so callers
+/// can compare a legacy record whose recorded start time is already in ticks
+/// against the live process even when identity records are unavailable.
 #[cfg(target_os = "linux")]
+pub(super) async fn read_start_ticks(pid: u32) -> Result<u64> {
+    let stat = tokio::fs::read(format!("/proc/{pid}/stat"))
+        .await
+        .with_context(|| format!("failed to read process stat for pid-managed process {pid}"))?;
+    Ok(parse_stat(&stat)?.1)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 async fn read_boot_id() -> Result<String> {
     let boot_id = tokio::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .await
@@ -218,7 +233,7 @@ async fn read_boot_id() -> Result<String> {
     Ok(boot_id.to_owned())
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn parse_stat(stat: &[u8]) -> Result<(String, u64)> {
     // comm (field 2) can contain spaces and closing parentheses. The final ')'
     // terminates it; splitting the whole line on whitespace miscounts fields.

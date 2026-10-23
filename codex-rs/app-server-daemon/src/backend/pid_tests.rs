@@ -296,7 +296,7 @@ async fn legacy_start_time_mismatch_preserves_record_and_process() {
         backend.is_starting_or_running().await.map(|_| ()),
         backend.start().await.map(|_| ()),
         backend.stop().await,
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
         backend.promote_legacy_identity().await,
     ] {
         assert!(
@@ -307,6 +307,93 @@ async fn legacy_start_time_mismatch_preserves_record_and_process() {
         );
     }
     assert_eq!(std::fs::read(&backend.pid_file).unwrap(), contents);
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn legacy_tick_mismatch_marks_reused_pid_stale() {
+    use super::identity::ProcessIdentity;
+
+    let temp = TempDir::new().unwrap();
+    let backend = PidBackend::new(
+        temp.path().join("codex"),
+        temp.path().join("app-server.pid"),
+        /*remote_control_enabled*/ false,
+    );
+    // The recorded PID stays alive and keeps the same user (the test process),
+    // but the recorded start ticks belong to an earlier process: the PID was
+    // reused by another same-user process, so the record is stale.
+    let (_, identity) = super::identity::read_process_details(std::process::id())
+        .await
+        .unwrap();
+    let ProcessIdentity::Linux { start_ticks, .. } = identity else {
+        panic!("expected a linux identity on a tick-format host");
+    };
+    let record = PidRecord {
+        pid: std::process::id(),
+        process_start_time: (start_ticks + 1000).to_string(),
+        process_identity: None,
+        executable_identity: None,
+    };
+    std::fs::write(&backend.pid_file, serde_json::to_vec(&record).unwrap()).unwrap();
+    backend.stop().await.expect("stale record cleanup");
+    assert!(!backend.pid_file.exists());
+    assert!(!backend.pid_file.with_extension("shutdown").exists());
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn legacy_tick_record_with_live_ticks_still_names_daemon() {
+    use super::identity::ProcessIdentity;
+
+    let (_, identity) = super::identity::read_process_details(std::process::id())
+        .await
+        .unwrap();
+    let ProcessIdentity::Linux { start_ticks, .. } = identity else {
+        panic!("expected a linux identity on a tick-format host");
+    };
+    let record = PidRecord {
+        pid: std::process::id(),
+        process_start_time: start_ticks.to_string(),
+        process_identity: None,
+        executable_identity: None,
+    };
+    assert!(
+        super::process_matches_record(&record)
+            .await
+            .expect("verify process")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn legacy_record_for_dead_process_is_stale() {
+    let temp = TempDir::new().unwrap();
+    let backend = PidBackend::new(
+        temp.path().join("codex"),
+        temp.path().join("app-server.pid"),
+        /*remote_control_enabled*/ false,
+    );
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sleeper shim");
+    let pid = child.id();
+    child.kill().expect("kill sleeper shim");
+    child.wait().expect("reap sleeper shim");
+    let record = PidRecord {
+        pid,
+        process_start_time: "unused legacy text".to_string(),
+        process_identity: None,
+        executable_identity: None,
+    };
+    std::fs::write(&backend.pid_file, serde_json::to_vec(&record).unwrap()).unwrap();
+    backend.stop().await.expect("stale record cleanup");
+    assert!(!backend.pid_file.exists());
+    assert!(!backend.pid_file.with_extension("shutdown").exists());
 }
 
 #[cfg(unix)]
@@ -532,14 +619,14 @@ async fn exited_unreaped_updater_is_reaped() {
         .arg("60")
         .spawn()
         .expect("spawn updater shim");
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
     let process_identity = Some(
         super::identity::read_process_details(child.id())
             .await
             .unwrap()
             .1,
     );
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
     let process_identity = None;
     let record = PidRecord {
         pid: child.id(),
@@ -663,7 +750,7 @@ async fn stale_creation_time_never_stops_reused_pid() {
         temp.path().join("server.pid"),
         /*remote_control_enabled*/ false,
     );
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
     let identities = {
         use super::identity::ProcessIdentity;
         let (_, identity) = super::identity::read_process_details(std::process::id())
@@ -687,7 +774,7 @@ async fn stale_creation_time_never_stops_reused_pid() {
         }
         [Some(stale_time), Some(stale_epoch)]
     };
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
     let identities = [None];
     for process_identity in identities {
         let record = PidRecord {
@@ -1043,6 +1130,56 @@ async fn recorded_start_time_matches_live_process() {
         super::process_matches_record(&record)
             .await
             .expect("verify process")
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
+#[tokio::test]
+async fn identity_record_matches_live_process() {
+    // The record format Android writes now that it carries a native identity:
+    // the legacy start-time string is ignored, the identity decides.
+    let (_, identity) = super::identity::read_process_details(std::process::id())
+        .await
+        .unwrap();
+    let record = PidRecord {
+        pid: std::process::id(),
+        process_start_time: "stale legacy text".to_string(),
+        process_identity: Some(identity),
+        executable_identity: None,
+    };
+    assert!(
+        super::process_matches_record(&record)
+            .await
+            .expect("verify process")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_tick_mismatch_classification_covers_all_outcomes() {
+    use super::classify_legacy_start_time_mismatch;
+
+    // Equal ticks still name the recorded daemon.
+    assert_eq!(
+        classify_legacy_start_time_mismatch("12345", Some(12345)),
+        Some(true)
+    );
+    // Different ticks prove a same-user PID reuse: the record is stale.
+    assert_eq!(
+        classify_legacy_start_time_mismatch("12345", Some(54321)),
+        Some(false)
+    );
+    // Without live ticks the mismatch stays inconclusive.
+    assert_eq!(classify_legacy_start_time_mismatch("12345", None), None);
+    // Wall-clock records never parse as ticks and keep the retry advice.
+    assert_eq!(
+        classify_legacy_start_time_mismatch("Thu Oct 23 11:41:24 2026", Some(12345)),
+        None
+    );
+    // Surrounding whitespace does not change the tick verdict.
+    assert_eq!(
+        classify_legacy_start_time_mismatch(" 12345 ", Some(12345)),
+        Some(true)
     );
 }
 

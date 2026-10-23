@@ -83,7 +83,14 @@ ignore = [
     { id = "RUSTSEC-2026-0118", reason = "hickory-proto v0.25.2 is pulled in via rama-dns/rama-tcp used by codex-network-proxy; DNSSEC features are not enabled; remove when rama updates to hickory 0.26.1 or hickory-net" },
     { id = "RUSTSEC-2026-0119", reason = "hickory-proto v0.25.2 is pulled in via rama-dns/rama-tcp used by codex-network-proxy; no fixed rama release is available yet; remove when rama updates to hickory 0.26.1 or hickory-net" },
     { id = "RUSTSEC-2026-0194", reason = "quick-xml v0.39.4 remains via plist/syntect and wayland-scanner; plist does not exercise the affected APIs and wayland-scanner parses trusted build-time XML; remove when rust-plist#191 and wayland-rs#938 are released" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant 4.x is unmaintained; pulled in via zbus 4.4 used by keyring/secret-service (credential store) and codex-tui; no patched release; remove when they move to zbus 5" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names 3.0.0 is unmaintained; pulled in via zbus 4.4 used by keyring/secret-service (credential store) and codex-tui; no patched release; remove when they move to zbus 5" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 4.2.0 is unmaintained; pulled in via zbus 4.4 used by keyring/secret-service (credential store) and codex-tui; no patched release; remove when they move to zbus 5" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml v0.39.4 remains via plist/syntect and wayland-scanner; plist does not exercise the affected APIs and wayland-scanner parses trusted build-time XML; remove when rust-plist#191 and wayland-rs#938 are released" },
+{ id = "RUSTSEC-2026-0221", reason = "event-listener 5.4.1: current stack-listener users use Event<()> only; no non-Send tags or with_tag calls in the release dependency graph. Remove at event-listener >=5.4.2; re-review on caller or tag changes." },
+{ id = "RUSTSEC-2026-0186", reason = "memmap2 0.9.10: current gix users do not call affected range APIs; tantivy uses advise on offset 0 and the full mapping. Remove at memmap2 >=0.9.11; re-review on range API or mapping-call changes." },
+{ id = "RUSTSEC-2026-0205", reason = "scc 2.4.0 is used only through serial_test 3.3.1 in dev-dependencies, using HashMap rather than the affected ordered insert path. Remove when serial_test selects a patched scc (currently >=3.8.4); re-review if scc becomes a release dependency or its used APIs change." },
+{ id = "RUSTSEC-2026-0306", reason = "faster-hex 0.10.0: current callers use checked hex_decode, which enforces src.len() >= 2*dst.len() before AVX2; AArch64 does not compile the affected AVX2 branch. Remove at faster-hex >=0.10.1; re-review on unchecked calls or decoding-invariant changes." },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

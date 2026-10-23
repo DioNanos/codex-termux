@@ -1,3 +1,19 @@
+# [0.163.0-termux.2] - 2026-10-23
+
+## Codex Termux 0.163.0-termux.2 — upstream rust-v0.163.0
+
+- Daemon: a legacy PID record no longer blocks startup when its PID has been
+  reused by another process of the same user. New records carry the native
+  process identity (start ticks from `/proc/<pid>/stat` plus the boot ID) when
+  the boot ID is readable; otherwise the record stays legacy, and a clock-tick
+  start time that differs from the live process marks the record as stale. A
+  wall-clock start time keeps the locale and timezone retry advice. Fixes #33.
+- CI: `verify-patches.sh` anchors the same-user PID reuse patch on the
+  classifier, the tick reader, the Android cfg gates and the two regression
+  tests, so emptying any hunk turns the gate red.
+- Policy: the `cargo-deny` advisory comments for `zbus` name the correct
+  advisory numbers.
+
 # [0.163.0-termux.1] - 2026-10-17
 
 ## Codex Termux 0.163.0-termux.1 — upstream rust-v0.163.0

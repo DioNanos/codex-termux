@@ -11,5 +11,12 @@ ignore = [
     "RUSTSEC-2026-0118", # hickory-proto via rama-dns/rama-tcp; remove when rama updates to hickory 0.26.1 or hickory-net
     "RUSTSEC-2026-0119", # hickory-proto via rama-dns/rama-tcp; remove when rama updates to hickory 0.26.1 or hickory-net
     "RUSTSEC-2026-0194", # quick-xml via plist/syntect and wayland-scanner; trusted inputs only; remove when rust-plist#191 and wayland-rs#938 are released
+    "RUSTSEC-2026-0370", # zvariant 4.x via zbus 4.4 (keyring/secret-service, codex-tui); unmaintained; remove when they move to zbus 5
+    "RUSTSEC-2026-0371", # zbus_names 3.0.0 via zbus 4.4 (keyring/secret-service, codex-tui); unmaintained; remove when they move to zbus 5
+    "RUSTSEC-2026-0372", # zvariant_derive 4.2.0 via zbus 4.4 (keyring/secret-service, codex-tui); unmaintained; remove when they move to zbus 5
     "RUSTSEC-2026-0195", # quick-xml via plist/syntect and wayland-scanner; trusted inputs only; remove when rust-plist#191 and wayland-rs#938 are released
+    "RUSTSEC-2026-0221", # event-listener 5.4.1 via async-lock/async-process/zbus/sqlx/webrtc; Event<()> only, no non-Send tags; remove at >=5.4.2
+    "RUSTSEC-2026-0186", # memmap2 0.9.10 via gix and tantivy; no affected range API called; remove at >=0.9.11
+    "RUSTSEC-2026-0205", # scc 2.4.0 via serial_test 3.3.1 (dev-only), HashMap only; remove when serial_test selects scc >=3.8.4
+    "RUSTSEC-2026-0306", # faster-hex 0.10.0 via gix-hash/gix-packetline; checked hex_decode only; remove at >=0.10.1
 ]

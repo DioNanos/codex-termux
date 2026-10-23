@@ -587,6 +587,26 @@ fn classify_probe(probe: KillProbe, details: DetailsOutcome) -> ProbeVerdict {
     }
 }
 
+/// Compare a legacy recorded start time against the live process's start
+/// ticks for a live, signalable PID.
+///
+/// Records written without a native process identity carry either a
+/// wall-clock string (the `ps -o lstart=` format used off Android) or the
+/// start ticks from `/proc/<pid>/stat` field 22 (the Android format).
+/// Ticks identify a process exactly, so a tick record settles the mismatch:
+/// equal ticks still name the recorded daemon, different ticks prove the
+/// PID was reused by another same-user process. Wall-clock records do not
+/// parse as ticks and stay inconclusive, keeping the locale/timezone retry
+/// advice, which only makes sense for a wall-clock time.
+#[cfg(unix)]
+fn classify_legacy_start_time_mismatch(
+    recorded: &str,
+    live_start_ticks: Option<u64>,
+) -> Option<bool> {
+    let recorded_ticks: u64 = recorded.trim().parse().ok()?;
+    Some(recorded_ticks == live_start_ticks?)
+}
+
 #[cfg(unix)]
 fn terminate_process(pid: u32) -> Result<()> {
     let raw_pid = libc::pid_t::try_from(pid)
@@ -680,7 +700,11 @@ async fn process_matches_record_with_probe(
     }
 
     let details = async {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "android"
+        ))]
         if let Some(expected) = &record.process_identity {
             return expected.matches_process(record.pid).await;
         }
@@ -688,12 +712,32 @@ async fn process_matches_record_with_probe(
         let matches = start_time == record.process_start_time;
         let is_zombie = state.starts_with('Z');
         if !matches && !is_zombie {
-            bail!(
-                "cannot verify pid-managed process {}: legacy start time changed; PID record retained. \
-                 Retry with the locale and timezone used to start the daemon. If the system clock \
-                 changed, stop the original process before restarting the daemon",
-                record.pid
-            );
+            // Tick-format records -- the Android legacy format, whose start
+            // time is /proc/<pid>/stat field 22 in clock ticks since boot --
+            // identify a process exactly: a live, signalable process with
+            // different ticks is a same-user PID reuse, and equal ticks still
+            // name the daemon. Wall-clock records cannot be compared this way
+            // and keep the retry advice.
+            #[cfg(target_os = "linux")]
+            let live_start_ticks = identity::read_start_ticks(record.pid).await.ok();
+            #[cfg(target_os = "android")]
+            let live_start_ticks = start_time.parse::<u64>().ok();
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let live_start_ticks = None;
+            match classify_legacy_start_time_mismatch(&record.process_start_time, live_start_ticks)
+            {
+                // A live PID with different start ticks was reused by another
+                // same-user process: the record is stale and the daemon
+                // restarts instead of failing every invocation.
+                Some(/*is_the_daemon*/ false) => return Ok((false, false)),
+                Some(/*is_the_daemon*/ true) => return Ok((false, true)),
+                None => bail!(
+                    "cannot verify pid-managed process {}: legacy start time changed; PID record retained. \
+                     Retry with the locale and timezone used to start the daemon. If the system clock \
+                     changed, stop the original process before restarting the daemon",
+                    record.pid
+                ),
+            }
         }
         Ok((is_zombie, matches))
     }

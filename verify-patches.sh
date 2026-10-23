@@ -620,6 +620,29 @@ else
   fail
 fi
 
+printf "Patch #32 (Same-user PID reuse detected for legacy daemon records): "
+# A legacy PID record without a native process identity used to fail every
+# later start once the same-user PID was reused. The fork keeps three points
+# in agreement: Android writes and verifies native identities when the
+# boot ID and /proc stat start ticks are readable; otherwise new records
+# remain legacy. For a legacy record already in ticks, a mismatch against
+# the live process marks the record stale; equal ticks preserve it, and
+# wall-clock records keep the locale/timezone retry advice.
+# The classifier and the tick reader are pinned by symbol, the Android
+# enablement by the cfg gates on the two files that carry it, and the
+# behaviour by the two test names, so emptying any hunk turns this red.
+if grep -q 'fn classify_legacy_start_time_mismatch' codex-rs/app-server-daemon/src/backend/pid.rs \
+  && grep -q 'is a same-user PID reuse' codex-rs/app-server-daemon/src/backend/pid.rs \
+  && grep -q 'pub(super) async fn read_start_ticks' codex-rs/app-server-daemon/src/backend/pid_identity.rs \
+  && grep -q 'target_os = "android"' codex-rs/app-server-daemon/src/backend/pid_identity.rs \
+  && grep -q 'target_os = "android"' codex-rs/app-server-daemon/src/backend/pid_start.rs \
+  && grep -q 'legacy_tick_mismatch_marks_reused_pid_stale' codex-rs/app-server-daemon/src/backend/pid_tests.rs \
+  && grep -q 'legacy_tick_mismatch_classification_covers_all_outcomes' codex-rs/app-server-daemon/src/backend/pid_tests.rs; then
+  pass
+else
+  fail
+fi
+
 printf "release version contract (Cargo/npm/notes/changelog): "
 if ! cargo_workspace_version="$(awk '
   /^\[workspace.package\]$/ { workspace_package = 1; next }

@@ -25,7 +25,7 @@ fn reads_earlier_linux_identity_field() {
     assert_eq!(serde_json::to_value(record).unwrap(), expected);
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
 #[tokio::test]
 async fn previous_boot_does_not_require_process_inspection() {
     let (_, identity) = super::read_process_details(std::process::id())
