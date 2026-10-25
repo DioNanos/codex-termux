@@ -1,40 +1,74 @@
-# Codex CLI for Termux
+# Codex Termux
 
-> Android Termux package built from upstream OpenAI Codex `rust-v0.163.0`.
+[![npm termux](https://img.shields.io/npm/v/@mmmbuto/codex-cli-termux?style=flat-square&logo=npm)](https://www.npmjs.com/package/@mmmbuto/codex-cli-termux)
+[![latest release](https://img.shields.io/github/v/release/DioNanos/codex-termux?style=flat-square)](https://github.com/DioNanos/codex-termux/releases/latest)
 
-Package metadata for the Termux-focused line `@mmmbuto/codex-cli-termux`.
+> [!IMPORTANT]
+> **End of life.** Codex is finally an official Termux package.
+> `0.163.0-termux.3` is the final release of `@mmmbuto/codex-cli-termux`:
+> from now on, Codex for Termux stays on the official package.
 
-## Install
+## Thank you
+
+To everyone who installed this package, ran it on real phones and
+reported issues: thank you. You kept Codex alive on Android until it
+had an official home.
+
+## The switch is automatic
+
+Once you are on the final release, the first interactive launch installs the
+official `codex` package, verifies it and starts it. The old npm package stays
+installed and inert: it is not removed for you.
+
+Your `~/.codex` (config, login, sessions) is reused as-is. If anything fails, it
+prints the manual steps and uses the bundled binary for that run.
+
+## Manual switch
+
+Already on the official package? Remove the old npm one, then put the command
+back:
 
 ```bash
-pkg update && pkg upgrade -y
-pkg install nodejs-lts -y
-npm install -g @mmmbuto/codex-cli-termux@latest
+npm uninstall -g @mmmbuto/codex-cli-termux
+pkg install --reinstall codex
+hash -r
 codex --version
-codex login
 ```
 
-## Notes
+The reinstall is not optional: npm can remove the `codex` command together with
+the package. The old `codex-exec` command belongs to the npm package and
+disappears with it.
 
-- Android 10+ / API 29+ on Termux ARM64 (the release binary is built for API 29)
-- Built from upstream `rust-v0.163.0`
-- Carries only the Termux compatibility delta needed for packaging and runtime
-- Real code-mode (`exec`/`wait`) runs through the bundled `codex-code-mode-host` helper (out-of-process since rust-v0.147.0), shipped in `bin/` alongside `codex.bin`
-- Realtime voice (`/voice`) is not available in this Termux build yet: the
-  upstream voice helper has no Android audio backend and is not shipped in this
-  package.
-- Ships a static `codex-package.json` manifest (`layoutVersion: 1`,
-  `variant: "codex-termux"`, `target: "aarch64-linux-android"`,
-  `entrypoint: "bin/codex.bin"`), so the managed daemon's variant check passes
-  and `remote-control start` works straight from npm: on Android the daemon
-  reuses the launcher-selected binary (`CODEX_SELF_EXE`) instead of staging a
-  standalone package
-- Packaged launchers preserve bundled `libc++_shared.so` visibility
-- Android ELFs are hardened with `RUNPATH=$ORIGIN`
-- Fork-owned Android `rusty_v8` prebuilds are used for maintainer cross-builds
-- GitHub Actions builds the Android ARM64 tarball from an exact sanitized candidate ref; the maintainer verifies that artifact and publishes the unchanged tarball locally before promoting GitHub `main` and the release
+Not migrated yet? Install the official package first:
 
-See the main repository for release notes and patch inventory:
+```bash
+pkg install codex
+```
 
-- https://github.com/DioNanos/codex-termux
-- https://github.com/DioNanos/codex-termux/blob/main/patches/README.md
+If `pkg install codex` reports the package as already installed but `codex`
+still runs the old launcher, use `pkg install --reinstall codex`.
+
+From then on, update with `pkg upgrade codex`.
+
+## Want the extras?
+
+The official package is plain Codex. For `/loop`, `/goal`, `/vivling`,
+`/vl` and `/remote-control`, install [codex-vl](https://github.com/DioNanos/codex-vl):
+
+```bash
+npm install -g @mmmbuto/codex-vl
+```
+
+It runs as `codex-vl`, side by side with the official `codex`: no PATH
+conflict. Termux, Linux and macOS.
+
+## Links
+
+- Official package: [termux-packages/packages/codex](https://github.com/termux/termux-packages/tree/master/packages/codex)
+- Extras: [DioNanos/codex-vl](https://github.com/DioNanos/codex-vl)
+- Past releases: [GitHub](https://github.com/DioNanos/codex-termux/releases) · [npm](https://www.npmjs.com/package/@mmmbuto/codex-cli-termux)
+
+## License
+
+Apache 2.0, inherited from OpenAI Codex (original work: OpenAI).
+See [LICENSE](./LICENSE).

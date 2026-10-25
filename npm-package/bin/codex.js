@@ -4,6 +4,8 @@ import { spawn, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
+import { launchOfficial, runMigration, useOfficial } from './migrate-to-termux-pkg.js';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
@@ -99,6 +101,21 @@ const finalArgs =
     : isOption || isKnownSubcommand || knownSubcommands === null
       ? args
       : ['exec', ...args];
+
+// One-time handover to the official Termux package. It happens only in an
+// interactive session and only when the official command is installed and
+// verified; every other outcome falls through to the bundled binary below.
+if (process.platform === 'android') {
+  const migration = runMigration({ env, args: finalArgs, packageBinDir: __dirname });
+  if (useOfficial(migration)) {
+    process.exit(launchOfficial({
+      path: migration.officialPath,
+      env,
+      args: finalArgs,
+      packageBinDir: __dirname,
+    }));
+  }
+}
 
 const child = spawn(binaryPath, finalArgs, {
   stdio: 'inherit',
